@@ -85,15 +85,22 @@ jobs:
         # Check if we should include all history
         if [[ "${{ github.event.inputs.include_all_history }}" == "true" ]]; then
           echo "Including all commits from the beginning of the repository"
-          COMMIT_RANGE="HEAD"
+          COMMIT_RANGE=""  # Empty range means all commits
           PREVIOUS_TAG="the beginning"
         else
-          # Get the previous tag
-          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          # Get the latest tag (not including the one we just created)
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           
-          # If no previous tag, get all commits
+          # Try to get the previous tag before the latest
+          if [ -n "$LATEST_TAG" ]; then
+            PREVIOUS_TAG=$(git describe --tags --abbrev=0 ${LATEST_TAG}^ 2>/dev/null || echo "")
+          else
+            PREVIOUS_TAG=""
+          fi
+          
+          # Set commit range
           if [ -z "$PREVIOUS_TAG" ]; then
-            COMMIT_RANGE="HEAD"
+            COMMIT_RANGE=""  # Empty range means all commits
             PREVIOUS_TAG="the beginning"
           else
             COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
@@ -115,7 +122,14 @@ jobs:
         touch "$TEMP_DIR/others.txt"
         
         # Process commits with extended format to get email for GitHub username
-        git log $COMMIT_RANGE --pretty=format:"%s|%h|%an|%ae|%b" | while IFS='|' read -r message hash author email body; do
+        # Build git log command based on whether we have a range
+        if [ -z "$COMMIT_RANGE" ]; then
+          GIT_LOG_ARGS=""
+        else
+          GIT_LOG_ARGS="$COMMIT_RANGE"
+        fi
+        
+        git log $GIT_LOG_ARGS --pretty=format:"%s|%h|%an|%ae|%b" | while IFS='|' read -r message hash author email body; do
           # Skip version bump commits
           if [[ "$message" =~ ^Bump\ version|^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             continue
@@ -207,9 +221,20 @@ jobs:
         echo -e "$CHANGELOG" > changelog.md
         
         # Also save a summary
-        COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE 2>/dev/null || echo "0")
+        if [ -z "$COMMIT_RANGE" ]; then
+          COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+        else
+          COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE 2>/dev/null || echo "0")
+        fi
         echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
         echo "previous_tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+        
+        # Read changelog content and save to output
+        CHANGELOG_CONTENT=$(cat changelog.md)
+        # Use EOF delimiter for multi-line content
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
     
     - name: Push changes
       run: |
@@ -238,10 +263,10 @@ jobs:
           
           ${{ steps.changelog.outputs.commit_count }} commits since ${{ steps.changelog.outputs.previous_tag }}
           
-          $(cat changelog.md)
+          ${{ steps.changelog.outputs.changelog }}
           
           ### Full Changelog
-          https://github.com/${{ github.repository }}/compare/v${{ steps.current_version.outputs.version }}...${{ steps.bump_version.outputs.tag_name }}
+          ${{ github.event.inputs.include_all_history == 'true' && format('https://github.com/{0}/commits/{1}', github.repository, steps.bump_version.outputs.tag_name) || format('https://github.com/{0}/compare/v{1}...{2}', github.repository, steps.current_version.outputs.version, steps.bump_version.outputs.tag_name) }}
         draft: false
         prerelease: false
     
