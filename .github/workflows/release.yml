@@ -74,6 +74,123 @@ jobs:
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
         echo "tag_name=v$NEW_VERSION" >> $GITHUB_OUTPUT
     
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Get the previous tag
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        
+        # If no previous tag, get all commits
+        if [ -z "$PREVIOUS_TAG" ]; then
+          COMMIT_RANGE="HEAD"
+        else
+          COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+        fi
+        
+        # Get commits and categorize them
+        echo "Extracting commits from $COMMIT_RANGE"
+        
+        # Create temporary files for categories
+        TEMP_DIR=$(mktemp -d)
+        touch "$TEMP_DIR/features.txt"
+        touch "$TEMP_DIR/fixes.txt"
+        touch "$TEMP_DIR/enhancements.txt"
+        touch "$TEMP_DIR/docs.txt"
+        touch "$TEMP_DIR/chores.txt"
+        touch "$TEMP_DIR/breaking.txt"
+        touch "$TEMP_DIR/others.txt"
+        
+        # Process commits with extended format to get email for GitHub username
+        git log $COMMIT_RANGE --pretty=format:"%s|%h|%an|%ae|%b" | while IFS='|' read -r message hash author email body; do
+          # Skip version bump commits
+          if [[ "$message" =~ ^Bump\ version|^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            continue
+          fi
+          
+          # Try to extract GitHub username from email or use author name
+          github_user=""
+          if [[ "$email" =~ ^([^@]+)@users\.noreply\.github\.com$ ]]; then
+            github_user="${BASH_REMATCH[1]}"
+          elif [[ "$email" =~ ^[0-9]+-([^@]+)@users\.noreply\.github\.com$ ]]; then
+            github_user="${BASH_REMATCH[1]}"
+          else
+            # Use author name as fallback, replace spaces with hyphens
+            github_user="${author// /-}"
+          fi
+          
+          # Extract PR number if present
+          pr_ref=""
+          if [[ "$message" =~ \(#([0-9]+)\)$ ]]; then
+            pr_ref=" (#${BASH_REMATCH[1]})"
+            # Remove PR reference from message for cleaner output
+            message="${message% (#*}"
+          fi
+          
+          # Format commit line
+          commit_line="- ${message}${pr_ref} (\`${hash}\`) by @${github_user}"
+          
+          # Check for breaking changes in body
+          if [[ "$body" =~ BREAKING[[:space:]]CHANGE|BREAKING-CHANGE ]] || [[ "$message" =~ ^[Bb]reaking:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/breaking.txt"
+          # Extract conventional commit type or detect from message patterns
+          elif [[ "$message" =~ ^feat(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]eature:\ (.+)$ ]] || [[ "$message" =~ ^[Aa]dd:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/features.txt"
+          elif [[ "$message" =~ ^fix(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ix:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ixed\ (.+)$ ]] || [[ "$message" =~ ^[Bb]ug:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/fixes.txt"
+          elif [[ "$message" =~ ^enhance(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ee]nhance:\ (.+)$ ]] || [[ "$message" =~ ^[Ii]mprove:\ (.+)$ ]] || [[ "$message" =~ ^[Uu]pdate:\ (.+)$ ]] || [[ "$message" =~ ^[Rr]efactor:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/enhancements.txt"
+          elif [[ "$message" =~ ^docs(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]oc:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]ocument:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/docs.txt"
+          elif [[ "$message" =~ ^chore(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]hore:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]i:\ (.+)$ ]] || [[ "$message" =~ ^[Tt]est:\ (.+)$ ]] || [[ "$message" =~ ^[Bb]uild:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/chores.txt"
+          else
+            echo "$commit_line" >> "$TEMP_DIR/others.txt"
+          fi
+        done
+        
+        # Build changelog sections
+        CHANGELOG=""
+        
+        # Breaking changes should be highlighted first
+        if [ -s "$TEMP_DIR/breaking.txt" ]; then
+          CHANGELOG="${CHANGELOG}### ⚠️ BREAKING CHANGES\n$(cat "$TEMP_DIR/breaking.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/features.txt" ]; then
+          CHANGELOG="${CHANGELOG}### 🚀 Features\n$(cat "$TEMP_DIR/features.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/enhancements.txt" ]; then
+          CHANGELOG="${CHANGELOG}### ✨ Enhancements\n$(cat "$TEMP_DIR/enhancements.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/fixes.txt" ]; then
+          CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes\n$(cat "$TEMP_DIR/fixes.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/docs.txt" ]; then
+          CHANGELOG="${CHANGELOG}### 📚 Documentation\n$(cat "$TEMP_DIR/docs.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/chores.txt" ]; then
+          CHANGELOG="${CHANGELOG}### 🔧 Chores\n$(cat "$TEMP_DIR/chores.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/others.txt" ]; then
+          CHANGELOG="${CHANGELOG}### 📝 Other Changes\n$(cat "$TEMP_DIR/others.txt")\n\n"
+        fi
+        
+        # Clean up temp files
+        rm -rf "$TEMP_DIR"
+        
+        # Save to file for multi-line output
+        echo -e "$CHANGELOG" > changelog.md
+        
+        # Also save a summary
+        COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE 2>/dev/null || echo "0")
+        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+        echo "previous_tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+    
     - name: Push changes
       run: |
         git push origin main
@@ -95,9 +212,12 @@ jobs:
           ## What's Changed
           
           **Version bump**: ${{ github.event.inputs.version_bump }}
+          **Previous version**: ${{ steps.current_version.outputs.version }}
+          **New version**: ${{ steps.bump_version.outputs.new_version }}
           
-          Previous version: ${{ steps.current_version.outputs.version }}
-          New version: ${{ steps.bump_version.outputs.new_version }}
+          ${{ steps.changelog.outputs.commit_count }} commits since ${{ steps.changelog.outputs.previous_tag }}
+          
+          $(cat changelog.md)
           
           ### Full Changelog
           https://github.com/${{ github.repository }}/compare/v${{ steps.current_version.outputs.version }}...${{ steps.bump_version.outputs.tag_name }}
