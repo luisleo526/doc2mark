@@ -88,6 +88,9 @@ docs = [
     "myst-parser>=2.0.0",
 ]
 
+[project.scripts]
+doc2mark = "doc2mark.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/luisleo526/doc2mark"
 Documentation = "https://doc2mark.readthedocs.io"
@@ -96,7 +99,7 @@ Issues = "https://github.com/luisleo526/doc2mark/issues"
 Changelog = "https://github.com/luisleo526/doc2mark/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["doc2mark"]
+packages = ["doc2mark", "doc2mark.core", "doc2mark.formats", "doc2mark.ocr", "doc2mark.pipelines", "doc2mark.utils"]
 include-package-data = true
 
 [tool.setuptools.dynamic]
