@@ -4,7 +4,7 @@ A Python package that unifies document processing across multiple formats
 with advanced AI-powered OCR capabilities.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "Hao Liang Wen"
 __email__ = "luisleo52655@gmail.com"
 
