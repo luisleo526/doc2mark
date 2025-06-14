@@ -3,6 +3,17 @@
 .env.local
 .env.*.local
 
+.idea
+
+.claude/
+
+.vscode/
+
+.pytest_cache/
+
+.coverage
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
