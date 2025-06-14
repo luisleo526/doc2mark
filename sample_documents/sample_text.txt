@@ -1,0 +1,62 @@
+Sample Plain Text Document
+
+This is a comprehensive plain text document that demonstrates various text formatting and content types.
+
+Generated on: 2025-06-13 21:47:32
+
+INTRODUCTION
+============
+This document contains multiple sections with different types of content to test text processing capabilities.
+
+PRODUCT CATALOG
+===============
+Product Name    | Category     | Price   | Stock
+----------------|--------------|---------|-------
+Laptop          | Electronics  | $999.99 | 25
+Smartphone      | Electronics  | $699.99 | 50
+Desk Chair      | Furniture    | $199.99 | 15
+Coffee Mug      | Kitchen      | $12.99  | 100
+
+QUARTERLY SALES REPORT
+======================
+Department: Sales
+Q1: $10,000
+Q2: $12,000
+Q3: $15,000
+Q4: $18,000
+Total: $55,000
+
+Department: Marketing  
+Q1: $5,000
+Q2: $6,000
+Q3: $7,000
+Q4: $8,000
+Total: $26,000
+
+GRAND TOTAL: $81,000
+
+BULLET POINTS
+=============
+• Key features demonstrated
+• Multiple content types
+• Structured data representation
+• Various formatting styles
+• Comprehensive test coverage
+
+NUMBERED LIST
+=============
+1. First item with detailed description
+2. Second item with additional information
+3. Third item with complex data
+4. Fourth item with nested content
+5. Final item with summary
+
+CONTACT INFORMATION
+===================
+Company: Sample Corp
+Address: 123 Test Street, Demo City, DC 12345
+Phone: (555) 123-4567
+Email: contact@sample.com
+Website: https://www.sample.com
+
+END OF DOCUMENT

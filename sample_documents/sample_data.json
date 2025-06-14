@@ -1,0 +1,88 @@
+{
+  "document_info": {
+    "title": "Sample JSON Document",
+    "created": "2025-06-13T21:47:32.350473",
+    "version": "1.0",
+    "author": "UnifyDoc Test Suite"
+  },
+  "products": [
+    {
+      "id": 1,
+      "name": "Laptop",
+      "category": "Electronics",
+      "price": 999.99,
+      "stock": 25
+    },
+    {
+      "id": 2,
+      "name": "Smartphone",
+      "category": "Electronics",
+      "price": 699.99,
+      "stock": 50
+    },
+    {
+      "id": 3,
+      "name": "Desk Chair",
+      "category": "Furniture",
+      "price": 199.99,
+      "stock": 15
+    },
+    {
+      "id": 4,
+      "name": "Coffee Mug",
+      "category": "Kitchen",
+      "price": 12.99,
+      "stock": 100
+    }
+  ],
+  "sales_report": {
+    "departments": {
+      "Sales": {
+        "Q1": 10000,
+        "Q2": 12000,
+        "Q3": 15000,
+        "Q4": 18000
+      },
+      "Marketing": {
+        "Q1": 5000,
+        "Q2": 6000,
+        "Q3": 7000,
+        "Q4": 8000
+      },
+      "HR": {
+        "Q1": 3000,
+        "Q2": 3200,
+        "Q3": 3500,
+        "Q4": 3800
+      }
+    },
+    "totals": {
+      "Sales": 55000,
+      "Marketing": 26000,
+      "HR": 13500,
+      "grand_total": 94500
+    }
+  },
+  "metadata": {
+    "file_types": [
+      "txt",
+      "md",
+      "csv",
+      "json",
+      "docx",
+      "pptx",
+      "xlsx"
+    ],
+    "features": [
+      "tables",
+      "images",
+      "merged_cells",
+      "text_formatting"
+    ],
+    "test_scenarios": [
+      "structured_data",
+      "unstructured_data",
+      "mixed_content"
+    ]
+  }
+}
