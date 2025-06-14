@@ -135,40 +135,7 @@ class UnifiedDocumentLoader:
         """Initialize all format processors."""
         # Import processors lazily to avoid circular imports
         try:
-            # Try to use UnifiedProcessor first (for compatibility with advanced pipelines)
-            try:
-                from doc2mark.formats.unified_processor import UnifiedProcessor
-                unified_processor = UnifiedProcessor(ocr=self.ocr)
-
-                # Use unified processor for all supported formats
-                for fmt in [
-                    # Office formats
-                    DocumentFormat.DOCX, DocumentFormat.XLSX, DocumentFormat.PPTX,
-                    # Legacy formats
-                    DocumentFormat.DOC, DocumentFormat.XLS, DocumentFormat.PPT,
-                    DocumentFormat.RTF, DocumentFormat.PPS,
-                    # PDF
-                    DocumentFormat.PDF,
-                    # Text/Data formats
-                    DocumentFormat.TXT, DocumentFormat.CSV, DocumentFormat.TSV,
-                    DocumentFormat.JSON, DocumentFormat.JSONL,
-                    # Markup formats
-                    DocumentFormat.HTML, DocumentFormat.XML, DocumentFormat.MARKDOWN
-                ]:
-                    self._processors[fmt] = unified_processor
-
-                logger.info("Using UnifiedProcessor with advanced pipelines for all formats")
-
-                return  # Exit early since UnifiedProcessor is working
-
-            except ImportError:
-                logger.info("UnifiedProcessor not available, using individual processors")
-                raise
-
-        except ImportError as e:
-            logger.warning(f"UnifiedProcessor failed, falling back to individual processors: {e}")
-
-            # Fallback to individual processors
+            # Import all processors
             from doc2mark.formats.office import OfficeProcessor
             from doc2mark.formats.pdf import PDFProcessor
             from doc2mark.formats.text import TextProcessor
@@ -183,7 +150,7 @@ class UnifiedDocumentLoader:
             legacy_processor = LegacyProcessor(ocr=self.ocr)
 
             # Register processors for each format
-            # Office formats
+            # Office formats - use our new OfficeProcessor
             self._processors[DocumentFormat.DOCX] = office_processor
             self._processors[DocumentFormat.XLSX] = office_processor
             self._processors[DocumentFormat.PPTX] = office_processor
@@ -207,6 +174,24 @@ class UnifiedDocumentLoader:
                         DocumentFormat.PPT, DocumentFormat.RTF,
                         DocumentFormat.PPS]:
                 self._processors[fmt] = legacy_processor
+
+            logger.info("Using individual format processors with enhanced image extraction")
+
+            # Try to import UnifiedProcessor for non-Office formats if needed
+            try:
+                from doc2mark.formats.unified_processor import UnifiedProcessor
+                unified_processor = UnifiedProcessor(ocr=self.ocr)
+                
+                # Only use UnifiedProcessor for formats not handled by our processors
+                # This allows backward compatibility while ensuring Office formats use our new code
+                logger.info("UnifiedProcessor available for additional format support")
+                
+            except ImportError:
+                logger.info("UnifiedProcessor not available, using individual processors only")
+
+        except ImportError as e:
+            logger.error(f"Failed to import required processors: {e}")
+            raise ImportError(f"Required format processors not available: {str(e)}")
 
     def load(
             self,

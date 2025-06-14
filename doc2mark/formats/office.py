@@ -93,13 +93,13 @@ class OfficeProcessor(BaseProcessor):
 
         # Process based on format
         if extension == 'docx':
-            content, metadata = self._process_docx(file_path, **kwargs)
+            content, metadata, images = self._process_docx(file_path, **kwargs)
             doc_format = DocumentFormat.DOCX
         elif extension == 'xlsx':
-            content, metadata = self._process_xlsx(file_path, **kwargs)
+            content, metadata, images = self._process_xlsx(file_path, **kwargs)
             doc_format = DocumentFormat.XLSX
         elif extension == 'pptx':
-            content, metadata = self._process_pptx(file_path, **kwargs)
+            content, metadata, images = self._process_pptx(file_path, **kwargs)
             doc_format = DocumentFormat.PPTX
         else:
             raise ProcessingError(f"Unsupported Office format: {extension}")
@@ -114,10 +114,11 @@ class OfficeProcessor(BaseProcessor):
 
         return ProcessedDocument(
             content=content,
-            metadata=doc_metadata
+            metadata=doc_metadata,
+            images=images
         )
 
-    def _process_docx(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
+    def _process_docx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
         """Process DOCX document."""
         try:
             doc = self.python_docx.Document(str(file_path))
@@ -157,15 +158,16 @@ class OfficeProcessor(BaseProcessor):
                 'title': doc.core_properties.title,
                 'creation_date': str(doc.core_properties.created) if doc.core_properties.created else None,
                 'modification_date': str(doc.core_properties.modified) if doc.core_properties.modified else None,
+                'image_count': len(images),
             }
 
-            return '\n'.join(markdown_parts), metadata
+            return '\n'.join(markdown_parts), metadata, images
 
         except Exception as e:
             logger.error(f"Failed to process DOCX: {e}")
             raise ProcessingError(f"DOCX processing failed: {str(e)}")
 
-    def _process_xlsx(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
+    def _process_xlsx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
         """Process XLSX document."""
         try:
             wb = self.openpyxl.load_workbook(str(file_path), data_only=True)
@@ -216,16 +218,15 @@ class OfficeProcessor(BaseProcessor):
                 'sheet_names': wb.sheetnames,
                 'total_cells': total_cells,
                 'image_count': len(images),
-                'images': images
             }
 
-            return '\n'.join(markdown_parts), metadata
+            return '\n'.join(markdown_parts), metadata, images
 
         except Exception as e:
             logger.error(f"Failed to process XLSX: {e}")
             raise ProcessingError(f"XLSX processing failed: {str(e)}")
 
-    def _process_pptx(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
+    def _process_pptx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
         """Process PPTX document."""
         try:
             prs = self.python_pptx.Presentation(str(file_path))
@@ -282,10 +283,9 @@ class OfficeProcessor(BaseProcessor):
                 'image_count': image_count,
                 'title': prs.core_properties.title,
                 'author': prs.core_properties.author,
-                'images': images
             }
 
-            return '\n'.join(markdown_parts), metadata
+            return '\n'.join(markdown_parts), metadata, images
 
         except Exception as e:
             logger.error(f"Failed to process PPTX: {e}")
