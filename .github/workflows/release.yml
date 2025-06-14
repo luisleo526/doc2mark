@@ -134,7 +134,11 @@ jobs:
           GIT_LOG_ARGS="$COMMIT_RANGE"
         fi
         
-        git log $GIT_LOG_ARGS --pretty=format:"%s|%h|%an|%ae|%b" | while IFS='|' read -r message hash author email body; do
+        # Save git log output to a temporary file to avoid subshell issues
+        git log $GIT_LOG_ARGS --pretty=format:"%s|%h|%an|%ae" > "$TEMP_DIR/commits.txt"
+        
+        # Process commits from the file
+        while IFS='|' read -r message hash author email; do
           # Skip version bump commits and merge commits
           if [[ "$message" =~ ^Bump\ version|^v[0-9]+\.[0-9]+\.[0-9]+ ]] || [[ "$message" =~ ^Merge\ branch|^Merge\ pull\ request ]]; then
             continue
@@ -167,14 +171,17 @@ jobs:
           commit_line="- ${message}${pr_ref} (\`${hash}\`) by @${github_user}"
           
           # Extract the first word (case-insensitive) and check type
-          # Handle both colon (:) and semicolon (;) as delimiters
-          first_word=""
-          if [[ "$message" =~ ^([^[:space:][:;]]+) ]]; then
-            first_word="${BASH_REMATCH[1],,}"  # Convert to lowercase
-          fi
+          # Get first word by removing everything after first space, colon, or semicolon
+          first_word="${message%% *}"     # Remove everything after first space
+          first_word="${first_word%%:*}"  # Remove everything after first colon
+          first_word="${first_word%%;*}"  # Remove everything after first semicolon
+          first_word="${first_word,,}"    # Convert to lowercase
           
-          # Check for breaking changes in body
-          if [[ "$body" =~ BREAKING[[:space:]]CHANGE|BREAKING-CHANGE ]] || [[ "$first_word" == "breaking" ]]; then
+          # Remove any parentheses for conventional commits like "feat(scope)"
+          first_word="${first_word%%(*}"
+          
+          # Check for breaking changes
+          if [[ "$first_word" == "breaking" ]]; then
             echo "$commit_line" >> "$TEMP_DIR/breaking.txt"
           # Check first word only (case-insensitive)
           elif [[ "$first_word" =~ ^(feat|feature|add|implement)$ ]]; then
@@ -192,7 +199,7 @@ jobs:
           else
             echo "$commit_line" >> "$TEMP_DIR/others.txt"
           fi
-        done
+        done < "$TEMP_DIR/commits.txt"
         
         # Build changelog sections
         CHANGELOG=""
