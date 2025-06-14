@@ -877,7 +877,7 @@ class PDFLoader:
             return ""
 
         html_lines = ["<!-- Complex table converted to HTML for better structure preservation -->"]
-        html_lines.append("<table>")
+        html_lines.append('<table border="1" style="border-collapse: collapse; width: 100%;">')
 
         processed_cells = set()
 
@@ -899,9 +899,9 @@ class PDFLoader:
                 # Convert newlines to <br>
                 cell_text = cell_text.replace('\n', '<br>')
 
-                # Determine cell attributes
+                # Determine cell attributes and style
                 cell_attrs = []
-
+                
                 # Check if this cell has spans
                 if (row_idx, col_idx) in table_info['cell_spans']:
                     rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
@@ -918,10 +918,18 @@ class PDFLoader:
 
                 # Determine if header cell (first row typically)
                 cell_tag = "th" if row_idx == 0 else "td"
+                
+                # Build style attribute
+                if cell_tag == "th":
+                    # Header cell styling
+                    style = 'style="background-color: #f0f0f0; font-weight: bold; padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
+                else:
+                    # Data cell styling
+                    style = 'style="padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
 
                 # Build cell HTML
                 attrs_str = " " + " ".join(cell_attrs) if cell_attrs else ""
-                html_lines.append(f'    <{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>')
+                html_lines.append(f'    <{cell_tag}{attrs_str} {style}>{cell_text}</{cell_tag}>')
 
             html_lines.append("  </tr>")
 
@@ -1117,19 +1125,8 @@ class PDFLoader:
         json_data = self.convert_to_json(extract_images=extract_images, ocr_images=ocr_images,
                                          show_progress=show_progress)
 
-        # Convert to markdown string
-        markdown_parts = []
-
-        for item in json_data["content"]:
-            if item["type"].startswith("text:"):
-                markdown_parts.append(item["content"])
-            elif item["type"] == "table":
-                markdown_parts.append(item["content"])  # Table is already in markdown format
-            elif item["type"] == "image":
-                # Include image as markdown with base64 data URL
-                markdown_parts.append(f'![Image](data:image/png;base64,{item["content"]})\n')
-
-        return "\n".join(markdown_parts)
+        # Use the pdf_to_markdown function for consistent formatting
+        return pdf_to_markdown(json_data)
 
     def save_json(self, output_path: Union[str, Path], json_data: Dict[str, Any]):
         """Save the extracted data to JSON file"""
@@ -1144,18 +1141,11 @@ class PDFLoader:
         """Save the content as a markdown file with embedded images"""
         output_path = Path(output_path)
 
+        # Use the pdf_to_markdown function for consistent formatting
+        markdown_content = pdf_to_markdown(json_data)
+        
         with open(output_path, 'w', encoding='utf-8') as f:
-            for item in json_data["content"]:
-                if item["type"].startswith("text:"):
-                    # All text types including text:image_description
-                    f.write(item["content"])
-                    f.write("\n")
-                elif item["type"] == "table":
-                    f.write(item["content"])  # Table is already in markdown format
-                    f.write("\n")
-                elif item["type"] == "image":
-                    # Write image as markdown with base64 data URL
-                    f.write(f'![Image](data:image/png;base64,{item["content"]})\n\n')
+            f.write(markdown_content)
 
         logger.info(f"Markdown saved to: {output_path}")
 
@@ -1222,6 +1212,94 @@ def pdf_to_simple_json(
 
     finally:
         converter.close()
+
+
+def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
+    """
+    Convert PDF JSON data to markdown string with proper formatting.
+    
+    This function ensures PDFs get the same quality markdown output as Office documents,
+    including proper headers, formatted tables, and OCR results in XML code blocks.
+    
+    Args:
+        json_data: The JSON data from pdf_to_simple_json
+        
+    Returns:
+        Formatted markdown string
+    """
+    markdown_parts = []
+    current_page = None
+    
+    for item in json_data.get("content", []):
+        item_type = item.get("type", "")
+        content = item.get("content", "")
+        
+        # Skip empty content
+        if not content or not content.strip():
+            continue
+            
+        # Add page separator if needed (but not at the beginning)
+        if 'page' in item and item['page'] != current_page:
+            if current_page is not None and markdown_parts:
+                # Only add page break if we have content and it's not the first page
+                pass  # Don't add page numbers in markdown for cleaner output
+            current_page = item['page']
+        
+        if item_type == "text:title":
+            # Use # for main titles
+            markdown_parts.append(f"# {content}")
+            markdown_parts.append("")  # Empty line after title
+            
+        elif item_type == "text:section":
+            # Use ## for section headers
+            markdown_parts.append(f"## {content}")
+            markdown_parts.append("")  # Empty line after section
+            
+        elif item_type == "text:normal":
+            # Regular paragraphs
+            markdown_parts.append(content)
+            markdown_parts.append("")  # Empty line after paragraph
+            
+        elif item_type == "text:list":
+            # List items (already formatted with bullets/numbers)
+            markdown_parts.append(content)
+            markdown_parts.append("")  # Empty line after list
+            
+        elif item_type == "text:caption":
+            # Captions in italics
+            markdown_parts.append(f"*{content}*")
+            markdown_parts.append("")  # Empty line after caption
+            
+        elif item_type == "text:image_description":
+            # Handle OCR results with XML tags in code blocks
+            ocr_text = content
+            if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
+                ocr_text = ocr_text[18:-19]  # Remove tags
+            
+            markdown_parts.append("```xml")
+            markdown_parts.append("<ocr_result>")
+            markdown_parts.append(ocr_text)
+            markdown_parts.append("</ocr_result>")
+            markdown_parts.append("```")
+            markdown_parts.append("")  # Empty line after OCR result
+            
+        elif item_type == "table":
+            # Tables are already in markdown or HTML format
+            markdown_parts.append(content)
+            # Table content already includes trailing newlines
+            
+        elif item_type == "image":
+            # Base64 images
+            markdown_parts.append(f'![Image](data:image/png;base64,{content})')
+            markdown_parts.append("")  # Empty line after image
+    
+    # Clean up extra empty lines
+    result = "\n".join(markdown_parts)
+    # Remove multiple consecutive empty lines
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    
+    return result.strip()
 
 
 # Example usage

@@ -533,8 +533,13 @@ class UnifiedProcessor(BaseProcessor):
         if output_format == OutputFormat.MARKDOWN:
             # Use existing conversion methods
             try:
-                from doc2mark.pipelines import office_to_markdown
-                return office_to_markdown(json_data)
+                # Check if this is PDF data (has 'pages' key and no 'slides')
+                if 'pages' in json_data and 'slides' not in json_data:
+                    from doc2mark.pipelines import pdf_to_markdown
+                    return pdf_to_markdown(json_data)
+                else:
+                    from doc2mark.pipelines import office_to_markdown
+                    return office_to_markdown(json_data)
             except:
                 return self._json_to_markdown(json_data)
 
@@ -560,7 +565,12 @@ class UnifiedProcessor(BaseProcessor):
             # Default to markdown
             logger.warning(f"Unsupported output format: {output_format}, defaulting to markdown")
             try:
-                from doc2mark.pipelines import office_to_markdown
-                return office_to_markdown(json_data)
+                # Check if this is PDF data (has 'pages' key and no 'slides')
+                if 'pages' in json_data and 'slides' not in json_data:
+                    from doc2mark.pipelines import pdf_to_markdown
+                    return pdf_to_markdown(json_data)
+                else:
+                    from doc2mark.pipelines import office_to_markdown
+                    return office_to_markdown(json_data)
             except:
                 return self._json_to_markdown(json_data)
