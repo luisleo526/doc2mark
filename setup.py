@@ -7,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="doc2mark",
-    version="0.0.1",
+    version="0.0.2",
     author="HaoLiangWen",
     author_email="luisleo52655@gmail.com",
     description="AI-powered universal document processor with GPT-4V OCR",
