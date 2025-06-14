@@ -1,5 +1,6 @@
 """Main UnifiedDocumentLoader implementation."""
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -278,7 +279,7 @@ class UnifiedDocumentLoader:
                     output_format=output_format,
                     extract_images=extract_images,
                     ocr_images=ocr_images,
-                        preserve_layout=True,  # Keep for compatibility
+                    preserve_layout=True,  # Keep for compatibility
                     show_progress=show_progress,
                     # Format-specific
                     encoding=encoding,
@@ -287,7 +288,7 @@ class UnifiedDocumentLoader:
             else:
                 # Fallback processors need parameter mapping
                 processor_kwargs = {}
-                
+
                 # Map common parameters
                 if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
                     processor_kwargs['extract_images'] = extract_images
@@ -302,10 +303,10 @@ class UnifiedDocumentLoader:
                         processor_kwargs['delimiter'] = delimiter
                 elif processor.__class__.__name__ == 'MarkupProcessor':
                     processor_kwargs['encoding'] = encoding
-                
+
                 # Process with mapped parameters
                 result = processor.process(file_path, **processor_kwargs)
-                
+
                 # Apply output format conversion if needed
                 if output_format != OutputFormat.MARKDOWN:
                     # Convert content to requested format

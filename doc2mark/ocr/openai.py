@@ -32,8 +32,11 @@ from doc2mark.ocr.prompts import (
 logger = logging.getLogger(__name__)
 
 
-def prepare_prompt(data: Dict[str, str]) -> ChatPromptTemplate:
+def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
     """Prepare prompt for LangChain batch processing."""
+    
+    if not LANGCHAIN_AVAILABLE:
+        raise ImportError("LangChain is required for prepare_prompt function")
 
     prompt_text = data.get('prompt', DEFAULT_OCR_PROMPT)
 

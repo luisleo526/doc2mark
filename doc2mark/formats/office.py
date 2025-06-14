@@ -194,11 +194,29 @@ class OfficeProcessor(BaseProcessor):
                         markdown_parts.append(table_md)
                         markdown_parts.append("")
 
+            # Extract images if requested
+            images = []
+            if kwargs.get('extract_images', False) and self.ocr:
+                images = self._extract_xlsx_images(file_path)
+                
+                # Add extracted image text to content if available
+                if images:
+                    image_texts = [img['text'] for img in images if img.get('text', '').strip()]
+                    if image_texts:
+                        markdown_parts.append("## Extracted Images")
+                        markdown_parts.append("")
+                        for i, text in enumerate(image_texts, 1):
+                            markdown_parts.append(f"### Image {i}")
+                            markdown_parts.append(text)
+                            markdown_parts.append("")
+
             # Metadata
             metadata = {
                 'page_count': len(wb.sheetnames),
                 'sheet_names': wb.sheetnames,
-                'total_cells': total_cells
+                'total_cells': total_cells,
+                'image_count': len(images),
+                'images': images
             }
 
             return '\n'.join(markdown_parts), metadata
@@ -233,9 +251,6 @@ class OfficeProcessor(BaseProcessor):
                     # Count images
                     if shape.shape_type == 13:  # Picture
                         image_count += 1
-                        if kwargs.get('extract_images', False) and self.ocr:
-                            # TODO: Extract and process image
-                            pass
 
                 # Process tables
                 for shape in slide.shapes:
@@ -244,6 +259,22 @@ class OfficeProcessor(BaseProcessor):
                         markdown_parts.append(table_md)
                         markdown_parts.append("")
 
+            # Extract images if requested
+            images = []
+            if kwargs.get('extract_images', False) and self.ocr:
+                images = self._extract_pptx_images(file_path)
+                
+                # Add extracted image text to content if available
+                if images:
+                    image_texts = [img['text'] for img in images if img.get('text', '').strip()]
+                    if image_texts:
+                        markdown_parts.append("## Extracted Images")
+                        markdown_parts.append("")
+                        for i, text in enumerate(image_texts, 1):
+                            markdown_parts.append(f"### Image {i}")
+                            markdown_parts.append(text)
+                            markdown_parts.append("")
+
             # Metadata
             metadata = {
                 'page_count': len(prs.slides),
@@ -251,6 +282,7 @@ class OfficeProcessor(BaseProcessor):
                 'image_count': image_count,
                 'title': prs.core_properties.title,
                 'author': prs.core_properties.author,
+                'images': images
             }
 
             return '\n'.join(markdown_parts), metadata
@@ -377,5 +409,121 @@ class OfficeProcessor(BaseProcessor):
 
         except Exception as e:
             logger.warning(f"Failed to extract images from DOCX: {e}")
+
+        return images
+
+    def _extract_xlsx_images(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract images from XLSX file using batch OCR."""
+        images = []
+
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zip_file:
+                # Collect all images for batch processing
+                image_batch = []
+                image_info = []
+
+                # Find image files in the media folder
+                for file_info in zip_file.filelist:
+                    if file_info.filename.startswith('xl/media/'):
+                        image_data = zip_file.read(file_info.filename)
+                        image_batch.append(image_data)
+                        image_info.append({
+                            'filename': file_info.filename,
+                            'size': len(image_data)
+                        })
+
+                # Batch process OCR if we have images and OCR is available
+                if image_batch and self.ocr:
+                    try:
+                        # Prepare OCR kwargs with language configuration if available
+                        ocr_kwargs = {}
+                        if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
+                            ocr_kwargs['language'] = self.ocr.config.language
+                            logger.info(
+                                f"🌍 Passing language configuration to Office batch OCR: {self.ocr.config.language}")
+
+                        logger.info(f"🚀 Processing {len(image_batch)} XLSX images with batch OCR")
+                        ocr_results = self.ocr.batch_process_images(image_batch, **ocr_kwargs)
+
+                        # Combine results
+                        for info, ocr_result in zip(image_info, ocr_results):
+                            text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
+                            info['text'] = text
+                            images.append(info)
+
+                        logger.info(f"✅ XLSX batch OCR completed successfully")
+
+                    except Exception as e:
+                        logger.warning(f"Failed to batch OCR XLSX images: {e}")
+                        # Add images without OCR text
+                        for info in image_info:
+                            info['text'] = ''
+                            images.append(info)
+                else:
+                    # No OCR available, add images without text
+                    for info in image_info:
+                        info['text'] = ''
+                        images.append(info)
+
+        except Exception as e:
+            logger.warning(f"Failed to extract images from XLSX: {e}")
+
+        return images
+
+    def _extract_pptx_images(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract images from PPTX file using batch OCR."""
+        images = []
+
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zip_file:
+                # Collect all images for batch processing
+                image_batch = []
+                image_info = []
+
+                # Find image files in the media folder
+                for file_info in zip_file.filelist:
+                    if file_info.filename.startswith('ppt/media/'):
+                        image_data = zip_file.read(file_info.filename)
+                        image_batch.append(image_data)
+                        image_info.append({
+                            'filename': file_info.filename,
+                            'size': len(image_data)
+                        })
+
+                # Batch process OCR if we have images and OCR is available
+                if image_batch and self.ocr:
+                    try:
+                        # Prepare OCR kwargs with language configuration if available
+                        ocr_kwargs = {}
+                        if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
+                            ocr_kwargs['language'] = self.ocr.config.language
+                            logger.info(
+                                f"🌍 Passing language configuration to Office batch OCR: {self.ocr.config.language}")
+
+                        logger.info(f"🚀 Processing {len(image_batch)} PPTX images with batch OCR")
+                        ocr_results = self.ocr.batch_process_images(image_batch, **ocr_kwargs)
+
+                        # Combine results
+                        for info, ocr_result in zip(image_info, ocr_results):
+                            text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
+                            info['text'] = text
+                            images.append(info)
+
+                        logger.info(f"✅ PPTX batch OCR completed successfully")
+
+                    except Exception as e:
+                        logger.warning(f"Failed to batch OCR PPTX images: {e}")
+                        # Add images without OCR text
+                        for info in image_info:
+                            info['text'] = ''
+                            images.append(info)
+                else:
+                    # No OCR available, add images without text
+                    for info in image_info:
+                        info['text'] = ''
+                        images.append(info)
+
+        except Exception as e:
+            logger.warning(f"Failed to extract images from PPTX: {e}")
 
         return images

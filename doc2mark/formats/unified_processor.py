@@ -146,7 +146,7 @@ class UnifiedProcessor(BaseProcessor):
             # Note: office_to_json doesn't support all the OCR parameters
             # It only accepts: file_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
             # So we don't pass the unsupported parameters
-            
+
             # Use the provided parameters for image extraction and OCR
             json_data = office_to_json(
                 file_path=file_path,
@@ -206,7 +206,7 @@ class UnifiedProcessor(BaseProcessor):
             # Note: office_to_json doesn't support all the OCR parameters
             # It only accepts: file_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
             # So we don't pass the unsupported parameters
-            
+
             # Process the converted file with provided parameters
             json_data = office_to_json(
                 file_path=converted_path,
@@ -268,7 +268,7 @@ class UnifiedProcessor(BaseProcessor):
             # Note: pdf_to_simple_json doesn't support all the OCR parameters
             # It only accepts: pdf_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
             # So we don't pass the unsupported parameters
-            
+
             # Process PDF with provided parameters
             json_data = pdf_to_simple_json(
                 pdf_path=file_path,
