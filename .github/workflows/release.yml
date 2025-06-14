@@ -108,6 +108,7 @@ jobs:
         touch "$TEMP_DIR/features.txt"
         touch "$TEMP_DIR/fixes.txt"
         touch "$TEMP_DIR/enhancements.txt"
+        touch "$TEMP_DIR/refactor.txt"
         touch "$TEMP_DIR/docs.txt"
         touch "$TEMP_DIR/chores.txt"
         touch "$TEMP_DIR/breaking.txt"
@@ -150,8 +151,10 @@ jobs:
             echo "$commit_line" >> "$TEMP_DIR/features.txt"
           elif [[ "$message" =~ ^fix(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ix:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ixed\ (.+)$ ]] || [[ "$message" =~ ^[Bb]ug:\ (.+)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/fixes.txt"
-          elif [[ "$message" =~ ^enhance(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ee]nhance:\ (.+)$ ]] || [[ "$message" =~ ^[Ii]mprove:\ (.+)$ ]] || [[ "$message" =~ ^[Uu]pdate:\ (.+)$ ]] || [[ "$message" =~ ^[Rr]efactor:\ (.+)$ ]]; then
+          elif [[ "$message" =~ ^enhance(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ee]nhance:\ (.+)$ ]] || [[ "$message" =~ ^[Ii]mprove:\ (.+)$ ]] || [[ "$message" =~ ^[Uu]pdate:\ (.+)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/enhancements.txt"
+          elif [[ "$message" =~ ^refactor(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Rr]efactor:\ (.+)$ ]]; then
+            echo "$commit_line" >> "$TEMP_DIR/refactor.txt"
           elif [[ "$message" =~ ^docs(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]oc:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]ocument:\ (.+)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/docs.txt"
           elif [[ "$message" =~ ^chore(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]hore:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]i:\ (.+)$ ]] || [[ "$message" =~ ^[Tt]est:\ (.+)$ ]] || [[ "$message" =~ ^[Bb]uild:\ (.+)$ ]]; then
@@ -179,6 +182,10 @@ jobs:
         
         if [ -s "$TEMP_DIR/fixes.txt" ]; then
           CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes\n$(cat "$TEMP_DIR/fixes.txt")\n\n"
+        fi
+        
+        if [ -s "$TEMP_DIR/refactor.txt" ]; then
+          CHANGELOG="${CHANGELOG}### ♻️ Refactoring\n$(cat "$TEMP_DIR/refactor.txt")\n\n"
         fi
         
         if [ -s "$TEMP_DIR/docs.txt" ]; then
