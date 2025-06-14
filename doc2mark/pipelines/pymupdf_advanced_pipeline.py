@@ -583,56 +583,43 @@ class PDFLoader:
 
         try:
             tables = page.find_tables()
+            if hasattr(tables, 'tables'):
+                for table_idx, table in enumerate(tables.tables):
+                    # Store table bbox for excluding from text extraction
+                    table_bboxes.append(tuple(table.bbox))
 
-            for table_idx, table in enumerate(tables.tables):
-                # Store table bbox for excluding from text extraction
-                table_bboxes.append(tuple(table.bbox))
+                    # Extract table content with enhanced cell analysis
+                    markdown_table = self._convert_table_to_markdown_enhanced(table)
 
-                # Extract table content
-                markdown_table = self._convert_table_to_markdown(table)
+                    if markdown_table.strip():
+                        table_items.append(SimpleContent(
+                            type="table",  # Table type for better identification
+                            content=markdown_table,
+                            page=page_num + 1,
+                            position_y=table.bbox[1]
+                        ))
 
-                if markdown_table.strip():
-                    table_items.append(SimpleContent(
-                        type="table",  # Table type for better identification
-                        content=markdown_table,
-                        page=page_num + 1,
-                        position_y=table.bbox[1]
-                    ))
-                    logger.debug(
-                        f"Extracted table {table_idx} on page {page_num + 1}: {table.row_count}x{table.col_count}")
-
-        except AttributeError:
+        except AttributeError as e:
             logger.debug("Table extraction not available in this PyMuPDF version")
         except Exception as e:
             logger.warning(f"Failed to extract tables: {e}")
 
         return table_items, table_bboxes
 
-    def _convert_table_to_markdown(self, table) -> str:
-        """Convert a table to markdown format with support for complex structures
-        
-        This enhanced version handles:
-        - Merged cells (rowspan/colspan)
-        - Complex table structures
-        - Cell span detection and labeling
-        - Optional HTML table output for very complex tables
-        
-        Line breaks within table cells are preserved using HTML <br> tags.
-        """
+    def _convert_table_to_markdown_enhanced(self, table) -> str:
+        """Enhanced table conversion with better merged cell detection using cell boundaries"""
         if not table:
             return ""
 
         try:
-            # Get detailed table information
+            # Always use extract() method for consistency
             extracted_data = table.extract()
-
             if not extracted_data or not any(extracted_data):
                 return ""
-
-            # Analyze table structure for complexity
-            table_info = self._analyze_table_structure(extracted_data)
-
-            # If table is too complex, use HTML format
+            
+            # Use boundary-based analysis for better merge detection
+            table_info = self._analyze_table_with_boundaries(table, extracted_data)
+            
             if table_info['is_complex']:
                 return self._convert_table_to_html(extracted_data, table_info)
             else:
@@ -640,188 +627,244 @@ class PDFLoader:
 
         except Exception as e:
             logger.warning(f"Failed to convert table to markdown: {e}")
-            return ""
+            # Fallback to original method
+            return self._convert_table_to_markdown(table)
 
-    def _analyze_table_structure(self, table_data: List[List]) -> Dict[str, Any]:
-        """Analyze table structure to detect merged cells and complexity
-        
-        Returns:
-            Dictionary with table analysis:
-            - is_complex: Whether table has merged cells
-            - merged_cells: List of merged cell info
-            - row_count: Number of rows
-            - col_count: Number of columns
-            - cell_spans: Dict mapping (row, col) to (rowspan, colspan)
-        """
-        if not table_data:
+    def _analyze_table_with_boundaries(self, table, extracted_data: List[List]) -> Dict[str, Any]:
+        """Analyze table using cell boundaries if available"""
+        if not extracted_data:
             return {'is_complex': False, 'merged_cells': [], 'row_count': 0, 'col_count': 0, 'cell_spans': {}}
 
-        row_count = len(table_data)
-        col_count = max(len(row) for row in table_data) if table_data else 0
-
-        # Initialize analysis structures
-        cell_spans = {}
-        merged_cells = []
-        is_complex = False
-
-        # Create a normalized table (all rows same length)
+        row_count = len(extracted_data)
+        col_count = max(len(row) for row in extracted_data) if extracted_data else 0
+        
+        # Normalize table data
         normalized = []
-        for row in table_data:
+        for row in extracted_data:
             normalized_row = list(row) + [None] * (col_count - len(row))
             normalized.append(normalized_row)
-
-        # Enhanced merged cell detection
-        # Track cells we've already identified as part of a merge
-        identified_merges = set()
-
-        for row_idx in range(row_count):
-            for col_idx in range(col_count):
-                # Skip if already identified as part of a merge
-                if (row_idx, col_idx) in identified_merges:
-                    continue
-
-                cell = normalized[row_idx][col_idx]
-
-                if cell is None or str(cell).strip() == "":
-                    # Empty cell - check if part of a merge
-                    span_info = self._detect_cell_span(normalized, row_idx, col_idx)
-                    if span_info:
-                        merged_cells.append(span_info)
+        
+        # Try to get cell boundaries
+        boundaries = self._get_cell_boundaries(table)
+        
+        if boundaries:
+            # Use boundary-based detection
+            merge_info = self._detect_merges_from_boundaries(boundaries, normalized)
+            return merge_info
+        else:
+            # Fallback to pattern-based detection
+            cell_spans = {}
+            merged_cells = []
+            is_complex = False
+            
+            # Track cells that are part of a horizontal merge to avoid false rowspan detection
+            cells_in_colspan = set()
+            
+            # First pass: detect colspans
+            for row_idx in range(row_count):
+                for col_idx in range(col_count):
+                    cell = normalized[row_idx][col_idx]
+                    
+                    # Skip None/empty cells
+                    if cell is None or self._is_cell_empty(cell):
+                        continue
+                    
+                    # Calculate colspan for this cell
+                    colspan = 1
+                    for check_col in range(col_idx + 1, col_count):
+                        if check_col < len(normalized[row_idx]) and self._is_cell_empty(normalized[row_idx][check_col]):
+                            colspan += 1
+                            # Mark these cells as part of a colspan
+                            cells_in_colspan.add((row_idx, check_col))
+                        else:
+                            break
+                    
+                    if colspan > 1:
+                        cell_spans[(row_idx, col_idx)] = (1, colspan)  # rowspan=1 for now
                         is_complex = True
+            
+            # Second pass: detect rowspans (only for cells not part of a colspan)
+            for row_idx in range(row_count):
+                for col_idx in range(col_count):
+                    cell = normalized[row_idx][col_idx]
+                    
+                    # Skip if this cell is part of a colspan
+                    if (row_idx, col_idx) in cells_in_colspan:
+                        continue
+                    
+                    # Skip None/empty cells
+                    if cell is None or self._is_cell_empty(cell):
+                        continue
+                    
+                    # Skip if we already detected a colspan for this cell
+                    if (row_idx, col_idx) in cell_spans:
+                        continue
+                    
+                    # Calculate rowspan
+                    rowspan = 1
+                    for check_row in range(row_idx + 1, row_count):
+                        # Check if the cell below is empty AND not part of a colspan
+                        if (check_row < len(normalized) and 
+                            col_idx < len(normalized[check_row]) and 
+                            self._is_cell_empty(normalized[check_row][col_idx]) and
+                            (check_row, col_idx) not in cells_in_colspan):
+                            rowspan += 1
+                        else:
+                            break
+                    
+                    if rowspan > 1:
+                        cell_spans[(row_idx, col_idx)] = (rowspan, 1)  # colspan=1
+                        is_complex = True
+            
+            # Build merged cells list
+            for (row_idx, col_idx), (rowspan, colspan) in cell_spans.items():
+                merged_cells.append({
+                    'row': row_idx,
+                    'col': col_idx,
+                    'rowspan': rowspan,
+                    'colspan': colspan,
+                    'content': str(normalized[row_idx][col_idx])
+                })
+            
+            return {
+                'is_complex': is_complex,
+                'merged_cells': merged_cells,
+                'row_count': row_count,
+                'col_count': col_count,
+                'cell_spans': cell_spans
+            }
 
-                        # Mark cells as identified
-                        if span_info['type'] == 'rowspan_continuation':
-                            for r in range(span_info['source_row'], row_idx + 1):
-                                identified_merges.add((r, col_idx))
-                        elif span_info['type'] == 'colspan_continuation':
-                            for c in range(span_info['source_col'], col_idx + 1):
-                                identified_merges.add((row_idx, c))
-                else:
-                    # Non-empty cell - check if it spans multiple cells
-                    rowspan, colspan = self._calculate_cell_span(normalized, row_idx, col_idx, str(cell))
-
-                    if rowspan > 1 or colspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (rowspan, colspan)
-
-                        # Mark all spanned cells as identified
-                        for r in range(row_idx, min(row_idx + rowspan, row_count)):
-                            for c in range(col_idx, min(col_idx + colspan, col_count)):
-                                identified_merges.add((r, c))
-
-                        merged_cells.append({
-                            'row': row_idx,
-                            'col': col_idx,
-                            'rowspan': rowspan,
-                            'colspan': colspan,
-                            'content': str(cell)
+    def _get_cell_boundaries(self, table) -> List[Dict]:
+        """Extract cell boundary information from table if available"""
+        boundaries = []
+        try:
+            # Try to access table cells with boundary info (newer PyMuPDF)
+            if hasattr(table, 'cells'):
+                for cell in table.cells:
+                    if len(cell) >= 7:  # Has position info
+                        boundaries.append({
+                            'bbox': (cell[0], cell[1], cell[2], cell[3]),
+                            'text': cell[4],
+                            'row': cell[5],
+                            'col': cell[6]
                         })
-                        is_complex = True
+        except:
+            pass
+        return boundaries
 
+    def _detect_merges_from_boundaries(self, boundaries: List[Dict], normalized_data: List[List]) -> Dict:
+        """Detect merged cells using boundary information"""
+        cell_spans = {}
+        merged_cells = []
+        
+        # Group cells by position
+        cell_map = {}
+        for bound in boundaries:
+            key = (bound['row'], bound['col'])
+            cell_map[key] = bound
+        
+        # Analyze overlapping boundaries
+        for (row, col), cell in cell_map.items():
+            bbox = cell['bbox']
+            rowspan = 1
+            colspan = 1
+            
+            # Check how many cells this bbox covers
+            for (other_row, other_col), other_cell in cell_map.items():
+                if (other_row, other_col) == (row, col):
+                    continue
+                    
+                other_bbox = other_cell['bbox']
+                
+                # Check if bboxes overlap significantly
+                if self._bboxes_overlap_significantly(bbox, other_bbox):
+                    # This indicates a merged cell
+                    if other_row > row:
+                        rowspan = max(rowspan, other_row - row + 1)
+                    if other_col > col:
+                        colspan = max(colspan, other_col - col + 1)
+            
+            if rowspan > 1 or colspan > 1:
+                cell_spans[(row, col)] = (rowspan, colspan)
+                merged_cells.append({
+                    'row': row,
+                    'col': col,
+                    'rowspan': rowspan,
+                    'colspan': colspan,
+                    'content': normalized_data[row][col] if row < len(normalized_data) and col < len(normalized_data[row]) else ""
+                })
+        
         return {
-            'is_complex': is_complex,
-            'merged_cells': merged_cells,
-            'row_count': row_count,
-            'col_count': col_count,
-            'cell_spans': cell_spans
+            'cell_spans': cell_spans,
+            'merged_cells': merged_cells
         }
 
-    def _detect_cell_span(self, table: List[List], row: int, col: int) -> Optional[Dict]:
-        """Detect if an empty cell is part of a span from another cell"""
-        # Check if empty cell is part of a row span from above
-        if row > 0:
-            above_cell = table[row - 1][col]
-            if above_cell and str(above_cell).strip():
-                # Check if cells below also empty (indicating rowspan)
-                span_rows = 1
-                for check_row in range(row, len(table)):
-                    if not table[check_row][col] or str(table[check_row][col]).strip() == "":
-                        span_rows += 1
-                    else:
-                        break
+    def _bboxes_overlap_significantly(self, bbox1: tuple, bbox2: tuple, threshold: float = 0.8) -> bool:
+        """Check if two bboxes overlap significantly (indicating merged cells)"""
+        x0_1, y0_1, x1_1, y1_1 = bbox1
+        x0_2, y0_2, x1_2, y1_2 = bbox2
+        
+        # Calculate intersection
+        x0_int = max(x0_1, x0_2)
+        y0_int = max(y0_1, y0_2)
+        x1_int = min(x1_1, x1_2)
+        y1_int = min(y1_1, y1_2)
+        
+        if x1_int < x0_int or y1_int < y0_int:
+            return False
+        
+        # Calculate overlap area
+        intersection_area = (x1_int - x0_int) * (y1_int - y0_int)
+        area1 = (x1_1 - x0_1) * (y1_1 - y0_1)
+        area2 = (x1_2 - x0_2) * (y1_2 - y0_2)
+        
+        # Check if overlap is significant relative to smaller cell
+        min_area = min(area1, area2)
+        if min_area > 0:
+            overlap_ratio = intersection_area / min_area
+            return overlap_ratio >= threshold
+        
+        return False
 
-                if span_rows > 1:
-                    return {
-                        'type': 'rowspan_continuation',
-                        'source_row': row - 1,
-                        'source_col': col,
-                        'span_rows': span_rows
-                    }
-
-        # Check if empty cell is part of a col span from left
-        if col > 0:
-            left_cell = table[row][col - 1]
-            if left_cell and str(left_cell).strip():
-                # Check if cells to right also empty (indicating colspan)
-                span_cols = 1
-                for check_col in range(col, len(table[row])):
-                    if not table[row][check_col] or str(table[row][check_col]).strip() == "":
-                        span_cols += 1
-                    else:
-                        break
-
-                if span_cols > 1:
-                    return {
-                        'type': 'colspan_continuation',
-                        'source_row': row,
-                        'source_col': col - 1,
-                        'span_cols': span_cols
-                    }
-
-        return None
-
-    def _calculate_cell_span(self, table: List[List], row: int, col: int, cell_content: str) -> Tuple[int, int]:
-        """Calculate how many rows and columns a cell spans"""
-        rowspan = 1
-        colspan = 1
-
-        # Check colspan: count consecutive empty cells to the right
-        for check_col in range(col + 1, len(table[row])):
-            if not table[row][check_col] or str(table[row][check_col]).strip() == "":
-                # Additional check: ensure it's not a different empty cell
-                if row > 0 and (not table[row - 1][check_col] or str(table[row - 1][check_col]).strip() == ""):
-                    colspan += 1
-                else:
-                    break
-            else:
-                break
-
-        # Check rowspan: count consecutive empty cells below
-        for check_row in range(row + 1, len(table)):
-            if col < len(table[check_row]):
-                if not table[check_row][col] or str(table[check_row][col]).strip() == "":
-                    # Additional check: ensure it's not a different empty cell
-                    if col > 0 and (not table[check_row][col - 1] or str(table[check_row][col - 1]).strip() == ""):
-                        rowspan += 1
-                    else:
-                        break
-                else:
-                    break
-            else:
-                break
-
-        return rowspan, colspan
+    def _is_cell_empty(self, cell) -> bool:
+        """Enhanced check if a cell is truly empty"""
+        if cell is None:
+            return True
+        
+        cell_str = str(cell).strip()
+        
+        # Check for various empty representations
+        if not cell_str:
+            return True
+        
+        # Check for whitespace-only content
+        if cell_str.isspace():
+            return True
+        
+        # Check for common PDF empty cell patterns
+        empty_patterns = ['', ' ', '\xa0', '\u00a0', '-', '–', '—', '.', '..', '...']
+        if cell_str in empty_patterns:
+            return True
+        
+        # Check if it's just Unicode spaces
+        if all(c in ' \t\n\r\f\v\xa0\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000' for c in cell_str):
+            return True
+        
+        return False
 
     def _convert_table_to_simple_markdown(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert simple table to markdown format with span annotations"""
+        """Convert simple table to markdown format"""
         if not table_data:
             return ""
 
         markdown_lines = []
-        processed_cells = set()  # Track cells that are part of spans
-
-        # Add table complexity note if needed
-        if table_info['merged_cells']:
-            markdown_lines.append("<!-- Table contains merged cells (marked with *) -->")
+        col_count = table_info['col_count']
 
         # Process each row
         for row_idx, row in enumerate(table_data):
             row_cells = []
 
-            for col_idx in range(table_info['col_count']):
-                # Skip if this cell is part of a span
-                if (row_idx, col_idx) in processed_cells:
-                    continue
-
+            for col_idx in range(col_count):
                 # Get cell content
                 if col_idx < len(row) and row[col_idx] is not None:
                     cell_text = str(row[col_idx]).strip()
@@ -833,40 +876,15 @@ class PDFLoader:
                 # Escape pipe characters
                 cell_text = cell_text.replace("|", "\\|")
 
-                # Check if this cell has spans
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-
-                    # Mark spanned cells as processed
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            if r != row_idx or c != col_idx:
-                                processed_cells.add((r, c))
-
-                    # Add span indicator
-                    if rowspan > 1 or colspan > 1:
-                        span_note = f"*[{rowspan}x{colspan}]*"
-                        cell_text = f"{cell_text} {span_note}" if cell_text else span_note
-
-                # For cells that span multiple columns, repeat the content
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    _, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    for _ in range(colspan):
-                        row_cells.append(cell_text)
-                else:
-                    row_cells.append(cell_text)
-
-            # Ensure row has correct number of columns
-            while len(row_cells) < table_info['col_count']:
-                row_cells.append("")
+                row_cells.append(cell_text)
 
             # Create table row
-            row_text = "| " + " | ".join(row_cells[:table_info['col_count']]) + " |"
+            row_text = "| " + " | ".join(row_cells) + " |"
             markdown_lines.append(row_text)
 
             # Add separator after first row
             if row_idx == 0:
-                separator = "|" + "|".join([" --- " for _ in range(table_info['col_count'])]) + "|"
+                separator = "|" + "|".join([" --- " for _ in range(col_count)]) + "|"
                 markdown_lines.append(separator)
 
         return "\n".join(markdown_lines) + "\n\n"
