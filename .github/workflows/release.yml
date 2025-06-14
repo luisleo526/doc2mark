@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      force_github_username:
+        description: 'Force all commits to use this GitHub username (e.g., luisleo526)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   release:
@@ -130,14 +135,18 @@ jobs:
         fi
         
         git log $GIT_LOG_ARGS --pretty=format:"%s|%h|%an|%ae|%b" | while IFS='|' read -r message hash author email body; do
-          # Skip version bump commits
-          if [[ "$message" =~ ^Bump\ version|^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          # Skip version bump commits and merge commits
+          if [[ "$message" =~ ^Bump\ version|^v[0-9]+\.[0-9]+\.[0-9]+ ]] || [[ "$message" =~ ^Merge\ branch|^Merge\ pull\ request ]]; then
             continue
           fi
           
           # Try to extract GitHub username from email or use author name
           github_user=""
-          if [[ "$email" =~ ^([^@]+)@users\.noreply\.github\.com$ ]]; then
+          
+          # Check if force_github_username is provided
+          if [ -n "${{ github.event.inputs.force_github_username }}" ]; then
+            github_user="${{ github.event.inputs.force_github_username }}"
+          elif [[ "$email" =~ ^([^@]+)@users\.noreply\.github\.com$ ]]; then
             github_user="${BASH_REMATCH[1]}"
           elif [[ "$email" =~ ^[0-9]+-([^@]+)@users\.noreply\.github\.com$ ]]; then
             github_user="${BASH_REMATCH[1]}"
@@ -157,21 +166,28 @@ jobs:
           # Format commit line
           commit_line="- ${message}${pr_ref} (\`${hash}\`) by @${github_user}"
           
+          # Extract the first word (case-insensitive) and check type
+          # Handle both colon (:) and semicolon (;) as delimiters
+          first_word=""
+          if [[ "$message" =~ ^([^[:space:][:;]]+) ]]; then
+            first_word="${BASH_REMATCH[1],,}"  # Convert to lowercase
+          fi
+          
           # Check for breaking changes in body
-          if [[ "$body" =~ BREAKING[[:space:]]CHANGE|BREAKING-CHANGE ]] || [[ "$message" =~ ^[Bb]reaking:\ (.+)$ ]]; then
+          if [[ "$body" =~ BREAKING[[:space:]]CHANGE|BREAKING-CHANGE ]] || [[ "$first_word" == "breaking" ]]; then
             echo "$commit_line" >> "$TEMP_DIR/breaking.txt"
-          # Extract conventional commit type or detect from message patterns
-          elif [[ "$message" =~ ^feat(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]eature:\ (.+)$ ]] || [[ "$message" =~ ^[Aa]dd:\ (.+)$ ]]; then
+          # Check first word only (case-insensitive)
+          elif [[ "$first_word" =~ ^(feat|feature|add|implement)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/features.txt"
-          elif [[ "$message" =~ ^fix(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ix:\ (.+)$ ]] || [[ "$message" =~ ^[Ff]ixed\ (.+)$ ]] || [[ "$message" =~ ^[Bb]ug:\ (.+)$ ]]; then
+          elif [[ "$first_word" =~ ^(fix|fixed|bug|resolve|resolved)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/fixes.txt"
-          elif [[ "$message" =~ ^enhance(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Ee]nhance:\ (.+)$ ]] || [[ "$message" =~ ^[Ii]mprove:\ (.+)$ ]] || [[ "$message" =~ ^[Uu]pdate:\ (.+)$ ]]; then
+          elif [[ "$first_word" =~ ^(enhance|enhancement|improve|improvement|update|updated|upgrade)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/enhancements.txt"
-          elif [[ "$message" =~ ^refactor(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Rr]efactor:\ (.+)$ ]]; then
+          elif [[ "$first_word" =~ ^(refactor|refactoring|reorganize|restructure)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/refactor.txt"
-          elif [[ "$message" =~ ^docs(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]oc:\ (.+)$ ]] || [[ "$message" =~ ^[Dd]ocument:\ (.+)$ ]]; then
+          elif [[ "$first_word" =~ ^(docs|doc|document|documentation|readme)$ ]]; then
             echo "$commit_line" >> "$TEMP_DIR/docs.txt"
-          elif [[ "$message" =~ ^chore(\(.+\))?:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]hore:\ (.+)$ ]] || [[ "$message" =~ ^[Cc]i:\ (.+)$ ]] || [[ "$message" =~ ^[Tt]est:\ (.+)$ ]] || [[ "$message" =~ ^[Bb]uild:\ (.+)$ ]]; then
+          elif [[ "$first_word" =~ ^(chore|ci|test|tests|build|remove|delete|cleanup)$ ]] || [[ "$message" =~ CI/CD|workflow|\.gitignore ]]; then
             echo "$commit_line" >> "$TEMP_DIR/chores.txt"
           else
             echo "$commit_line" >> "$TEMP_DIR/others.txt"
@@ -260,6 +276,7 @@ jobs:
           **Previous version**: ${{ steps.current_version.outputs.version }}
           **New version**: ${{ steps.bump_version.outputs.new_version }}
           ${{ github.event.inputs.include_all_history == 'true' && '**Initial Release**: Including complete commit history' || '' }}
+          ${{ github.event.inputs.force_github_username != '' && format('**Author**: All commits attributed to @{0}', github.event.inputs.force_github_username) || '' }}
           
           ${{ steps.changelog.outputs.commit_count }} commits since ${{ steps.changelog.outputs.previous_tag }}
           
