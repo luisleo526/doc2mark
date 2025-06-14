@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine bump2version
+    
+    - name: Configure Git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+    
+    - name: Get current version
+      id: current_version
+      run: |
+        echo "version=$(python -c "import re; content = open('setup.py').read(); print(re.search(r'version=\"([^\"]+)\"', content).group(1))")" >> $GITHUB_OUTPUT
+    
+    - name: Bump version
+      id: bump_version
+      run: |
+        # Create .bumpversion.cfg if it doesn't exist
+        if [ ! -f .bumpversion.cfg ]; then
+          cat > .bumpversion.cfg << EOF
+        [bumpversion]
+        current_version = ${{ steps.current_version.outputs.version }}
+        commit = True
+        tag = True
+        tag_name = v{new_version}
+        
+        [bumpversion:file:setup.py]
+        search = version="{current_version}"
+        replace = version="{new_version}"
+        EOF
+        fi
+        
+        # Bump the version
+        bump2version ${{ github.event.inputs.version_bump }} --verbose
+        
+        # Get the new version
+        NEW_VERSION=$(python -c "import re; content = open('setup.py').read(); print(re.search(r'version=\"([^\"]+)\"', content).group(1))")
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "tag_name=v$NEW_VERSION" >> $GITHUB_OUTPUT
+    
+    - name: Push changes
+      run: |
+        git push origin main
+        git push origin ${{ steps.bump_version.outputs.tag_name }}
+    
+    - name: Build package
+      run: |
+        python -m build
+    
+    - name: Create GitHub Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.bump_version.outputs.tag_name }}
+        release_name: Release ${{ steps.bump_version.outputs.new_version }}
+        body: |
+          ## What's Changed
+          
+          **Version bump**: ${{ github.event.inputs.version_bump }}
+          
+          Previous version: ${{ steps.current_version.outputs.version }}
+          New version: ${{ steps.bump_version.outputs.new_version }}
+          
+          ### Full Changelog
+          https://github.com/${{ github.repository }}/compare/v${{ steps.current_version.outputs.version }}...${{ steps.bump_version.outputs.tag_name }}
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/doc2mark-${{ steps.bump_version.outputs.new_version }}.tar.gz
+        asset_name: doc2mark-${{ steps.bump_version.outputs.new_version }}.tar.gz
+        asset_content_type: application/gzip
+    
+    - name: Upload wheel to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/doc2mark-${{ steps.bump_version.outputs.new_version }}-py3-none-any.whl
+        asset_name: doc2mark-${{ steps.bump_version.outputs.new_version }}-py3-none-any.whl
+        asset_content_type: application/zip
+    
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        if [ -n "$TWINE_PASSWORD" ]; then
+          twine upload dist/*
+        else
+          echo "PyPI token not configured, skipping upload to PyPI"
+        fi 
