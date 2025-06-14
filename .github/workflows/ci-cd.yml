@@ -51,13 +51,13 @@ jobs:
     
     - name: Check code formatting
       run: |
-        black --check unifydoc tests || true
-        isort --check-only unifydoc tests || true
+        black --check doc2mark tests || true
+        isort --check-only doc2mark tests || true
     
     - name: Lint code
       run: |
-        flake8 unifydoc tests --max-line-length=120 || true
-        pylint unifydoc --exit-zero
+        flake8 doc2mark tests --max-line-length=120 || true
+        pylint doc2mark --exit-zero
 
   test:
     name: Test - Python ${{ matrix.python-version }} on ${{ matrix.os }}
@@ -106,7 +106,7 @@ jobs:
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       run: |
-        python -m pytest tests -v -m "not integration" --cov=unifydoc --cov-report=xml --cov-report=html
+        python -m pytest tests -v -m "not integration" --cov=doc2mark --cov-report=xml --cov-report=html
     
     - name: Run integration tests (if API key available)
       if: matrix.python-version == '3.10' && matrix.os == 'ubuntu-latest' && github.event_name != 'pull_request'
@@ -114,7 +114,7 @@ jobs:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       run: |
         if [ -n "$OPENAI_API_KEY" ]; then
-          python -m pytest tests -v -m integration --cov=unifydoc --cov-append --cov-report=xml
+          python -m pytest tests -v -m integration --cov=doc2mark --cov-append --cov-report=xml
         else
           echo "Skipping integration tests - no API key available"
         fi
