@@ -2,31 +2,20 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: 
+      - main
+      - develop
     tags:
       - 'v*.*.*'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'README.md'
-      - 'CHANGELOG.md'
-      - 'CONTRIBUTING.md'
+    paths:
+      - 'doc2mark/**'
   pull_request:
-    branches: [ main, master, develop ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'README.md'
-      - 'CHANGELOG.md'
-      - 'CONTRIBUTING.md'
-  schedule:
-    # Run every Monday at 00:00 UTC
-    - cron: '0 0 * * 1'
-  workflow_dispatch:
+    types:
+      - opened
+    branches:
+      - 'feature/**'
+    paths:
+      - 'doc2mark/**'
 
 jobs:
   quality:
