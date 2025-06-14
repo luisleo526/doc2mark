@@ -61,16 +61,6 @@ class UnifiedProcessor(BaseProcessor):
             ocr_images: bool = False,
             preserve_layout: bool = True,
             show_progress: bool = False,
-            # OCR-specific parameters
-            language: Optional[str] = None,
-            content_type: Optional[str] = None,
-            instructions: Optional[str] = None,
-            prompt_template_override: Optional[Union[str, Any]] = None,
-            # Image saving options
-            save_images_locally: bool = False,
-            local_image_dir: str = './images',
-            # Performance parameters
-            batch_size: Optional[int] = None,
             # Format-specific parameters
             encoding: str = 'utf-8',
             delimiter: Optional[str] = None,
@@ -82,31 +72,11 @@ class UnifiedProcessor(BaseProcessor):
             file_path: Path to the document file
             output_format: Desired output format (e.g., OutputFormat.MARKDOWN)
             extract_images: Whether to extract images from the document
-                - True: Extract images as base64 data
-                - False: Skip image extraction entirely
             ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
-                - True: Use batch OCR processing to convert images to text descriptions
-                - False: Keep images as base64 data in output
             preserve_layout: Whether to preserve document layout during processing
             show_progress: Whether to display progress messages during processing
-            
-            # OCR-specific parameters:
-            language: Language hint for OCR processing
-            content_type: Content type hint for OCR
-            instructions: Custom OCR instructions
-            prompt_template_override: Override prompt template
-            
-            # Image saving options:
-            save_images_locally: Save images to disk
-            local_image_dir: Directory for saved images
-            
-            # Performance parameters:
-            batch_size: Batch size for image processing
-            
-            # Format-specific parameters:
             encoding: Text file encoding
             delimiter: CSV delimiter
-            
             **kwargs: Any remaining parameters
             
         Returns:
@@ -114,16 +84,6 @@ class UnifiedProcessor(BaseProcessor):
             
         Raises:
             ProcessingError: If document processing fails
-            
-        Examples:
-            # Extract images as base64 (no OCR)
-            processor.process("doc.pdf", extract_images=True, ocr_images=False)
-            
-            # Extract images and perform batch OCR
-            processor.process("doc.pdf", extract_images=True, ocr_images=True)
-            
-            # Text only (no images)
-            processor.process("doc.pdf", extract_images=False)
         """
         file_path = Path(file_path)
         extension = file_path.suffix.lower().lstrip('.')
@@ -137,13 +97,6 @@ class UnifiedProcessor(BaseProcessor):
                 file_path, file_size, extract_images, ocr_images,
                 output_format=output_format,
                 show_progress=show_progress,
-                language=language,
-                content_type=content_type,
-                instructions=instructions,
-                prompt_template_override=prompt_template_override,
-                save_images_locally=save_images_locally,
-                local_image_dir=local_image_dir,
-                batch_size=batch_size,
                 **kwargs
             )
         elif extension in ['doc', 'xls', 'ppt', 'rtf', 'pps']:
@@ -151,13 +104,6 @@ class UnifiedProcessor(BaseProcessor):
                 file_path, file_size, extract_images, ocr_images,
                 output_format=output_format,
                 show_progress=show_progress,
-                language=language,
-                content_type=content_type,
-                instructions=instructions,
-                prompt_template_override=prompt_template_override,
-                save_images_locally=save_images_locally,
-                local_image_dir=local_image_dir,
-                batch_size=batch_size,
                 **kwargs
             )
         elif extension == 'pdf':
@@ -165,13 +111,6 @@ class UnifiedProcessor(BaseProcessor):
                 file_path, file_size, extract_images, ocr_images,
                 output_format=output_format,
                 show_progress=show_progress,
-                language=language,
-                content_type=content_type,
-                instructions=instructions,
-                prompt_template_override=prompt_template_override,
-                save_images_locally=save_images_locally,
-                local_image_dir=local_image_dir,
-                batch_size=batch_size,
                 **kwargs
             )
         elif extension in ['txt', 'csv', 'tsv', 'json', 'jsonl', 'html', 'htm', 'xml', 'md', 'markdown']:
@@ -190,13 +129,6 @@ class UnifiedProcessor(BaseProcessor):
     def _process_modern_office(self, file_path: Path, file_size: int, extract_images: bool, ocr_images: bool,
                                output_format: Union[str, Any] = OutputFormat.MARKDOWN,
                                show_progress: bool = False,
-                               language: Optional[str] = None,
-                               content_type: Optional[str] = None,
-                               instructions: Optional[str] = None,
-                               prompt_template_override: Optional[Any] = None,
-                               save_images_locally: bool = False,
-                               local_image_dir: str = './images',
-                               batch_size: Optional[int] = None,
                                **kwargs) -> ProcessedDocument:
         """Process modern Office formats using office_advanced_pipeline.
         
@@ -211,28 +143,17 @@ class UnifiedProcessor(BaseProcessor):
             # Import the internal pipeline
             from doc2mark.pipelines import office_to_json, office_to_markdown
 
-            # Prepare OCR kwargs if provided
-            ocr_kwargs = {}
-            if language:
-                ocr_kwargs['language'] = language
-            if content_type:
-                ocr_kwargs['content_type'] = content_type
-            if instructions:
-                ocr_kwargs['instructions'] = instructions
-            if prompt_template_override:
-                ocr_kwargs['prompt_template'] = prompt_template_override
-            if save_images_locally:
-                ocr_kwargs['save_locally'] = save_images_locally
-                ocr_kwargs['local_image_dir'] = local_image_dir
-
+            # Note: office_to_json doesn't support all the OCR parameters
+            # It only accepts: file_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
+            # So we don't pass the unsupported parameters
+            
             # Use the provided parameters for image extraction and OCR
             json_data = office_to_json(
                 file_path=file_path,
                 extract_images=extract_images,
                 ocr_images=ocr_images,
                 show_progress=show_progress,
-                ocr=self.ocr,
-                **ocr_kwargs
+                ocr=self.ocr
             )
 
             # Convert to requested format
@@ -261,13 +182,6 @@ class UnifiedProcessor(BaseProcessor):
     def _process_legacy_office(self, file_path: Path, file_size: int, extract_images: bool, ocr_images: bool,
                                output_format: Union[str, Any] = OutputFormat.MARKDOWN,
                                show_progress: bool = False,
-                               language: Optional[str] = None,
-                               content_type: Optional[str] = None,
-                               instructions: Optional[str] = None,
-                               prompt_template_override: Optional[Any] = None,
-                               save_images_locally: bool = False,
-                               local_image_dir: str = './images',
-                               batch_size: Optional[int] = None,
                                **kwargs) -> ProcessedDocument:
         """Process legacy Office formats by converting first.
         
@@ -289,28 +203,17 @@ class UnifiedProcessor(BaseProcessor):
             # Convert to modern format
             converted_path = self._legacy_converter.convert_file(file_path)
 
-            # Prepare OCR kwargs if provided
-            ocr_kwargs = {}
-            if language:
-                ocr_kwargs['language'] = language
-            if content_type:
-                ocr_kwargs['content_type'] = content_type
-            if instructions:
-                ocr_kwargs['instructions'] = instructions
-            if prompt_template_override:
-                ocr_kwargs['prompt_template'] = prompt_template_override
-            if save_images_locally:
-                ocr_kwargs['save_locally'] = save_images_locally
-                ocr_kwargs['local_image_dir'] = local_image_dir
-
+            # Note: office_to_json doesn't support all the OCR parameters
+            # It only accepts: file_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
+            # So we don't pass the unsupported parameters
+            
             # Process the converted file with provided parameters
             json_data = office_to_json(
                 file_path=converted_path,
                 extract_images=extract_images,
                 ocr_images=ocr_images,
                 show_progress=show_progress,
-                ocr=self.ocr,
-                **ocr_kwargs
+                ocr=self.ocr
             )
 
             # Convert to requested format
@@ -348,13 +251,6 @@ class UnifiedProcessor(BaseProcessor):
     def _process_pdf(self, file_path: Path, file_size: int, extract_images: bool, ocr_images: bool,
                      output_format: Union[str, Any] = OutputFormat.MARKDOWN,
                      show_progress: bool = False,
-                     language: Optional[str] = None,
-                     content_type: Optional[str] = None,
-                     instructions: Optional[str] = None,
-                     prompt_template_override: Optional[Any] = None,
-                     save_images_locally: bool = False,
-                     local_image_dir: str = './images',
-                     batch_size: Optional[int] = None,
                      **kwargs) -> ProcessedDocument:
         """Process PDF files using pymupdf_advanced_pipeline.
         
@@ -369,28 +265,17 @@ class UnifiedProcessor(BaseProcessor):
             # Import the internal pipeline
             from doc2mark.pipelines import pdf_to_simple_json
 
-            # Prepare OCR kwargs if provided
-            ocr_kwargs = {}
-            if language:
-                ocr_kwargs['language'] = language
-            if content_type:
-                ocr_kwargs['content_type'] = content_type
-            if instructions:
-                ocr_kwargs['instructions'] = instructions
-            if prompt_template_override:
-                ocr_kwargs['prompt_template'] = prompt_template_override
-            if save_images_locally:
-                ocr_kwargs['save_locally'] = save_images_locally
-                ocr_kwargs['local_image_dir'] = local_image_dir
-
+            # Note: pdf_to_simple_json doesn't support all the OCR parameters
+            # It only accepts: pdf_path, output_path, output_markdown, extract_images, ocr_images, show_progress, ocr
+            # So we don't pass the unsupported parameters
+            
             # Process PDF with provided parameters
             json_data = pdf_to_simple_json(
                 pdf_path=file_path,
                 extract_images=extract_images,
                 ocr_images=ocr_images,
                 show_progress=show_progress,
-                ocr=self.ocr,
-                **ocr_kwargs
+                ocr=self.ocr
             )
 
             # Convert to requested format
@@ -440,12 +325,17 @@ class UnifiedProcessor(BaseProcessor):
                 from doc2mark.formats.text import TextProcessor
                 processor = TextProcessor()
 
+                # TextProcessor accepts encoding and delimiter through kwargs
+                processor_kwargs = {
+                    'encoding': encoding
+                }
+                if extension in ['csv', 'tsv'] and delimiter:
+                    processor_kwargs['delimiter'] = delimiter
+
                 # Process with TextProcessor
                 result = processor.process(
                     file_path,
-                    encoding=encoding,
-                    delimiter=delimiter,
-                    **kwargs
+                    **processor_kwargs
                 )
 
                 # Note: TextProcessor doesn't support image extraction/OCR
@@ -474,11 +364,15 @@ class UnifiedProcessor(BaseProcessor):
                 from doc2mark.formats.markup import MarkupProcessor
                 processor = MarkupProcessor()
 
+                # MarkupProcessor accepts encoding through kwargs
+                processor_kwargs = {
+                    'encoding': encoding
+                }
+
                 # Process with MarkupProcessor
                 result = processor.process(
                     file_path,
-                    encoding=encoding,
-                    **kwargs
+                    **processor_kwargs
                 )
 
                 # Note: MarkupProcessor doesn't support image extraction/OCR

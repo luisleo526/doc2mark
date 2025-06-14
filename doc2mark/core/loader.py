@@ -40,9 +40,6 @@ class UnifiedDocumentLoader:
             top_p: float = 1.0,
             frequency_penalty: float = 0.0,
             presence_penalty: float = 0.0,
-            # Tesseract-specific parameters
-            tesseract_lang: str = 'eng',
-            tesseract_config: str = '--psm 3 --oem 3',
             # General OCR parameters
             default_prompt: Optional[str] = None
     ):
@@ -67,10 +64,6 @@ class UnifiedDocumentLoader:
             top_p: Nucleus sampling parameter (0.0-1.0)
             frequency_penalty: Reduce word repetition (-2.0 to 2.0)
             presence_penalty: Encourage new topics (-2.0 to 2.0)
-            
-            # Tesseract-specific parameters:
-            tesseract_lang: Language code for Tesseract OCR (e.g., 'eng', 'chi_sim')
-            tesseract_config: Tesseract configuration string
             
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
@@ -220,19 +213,7 @@ class UnifiedDocumentLoader:
             output_format: Union[str, OutputFormat] = OutputFormat.MARKDOWN,
             extract_images: bool = False,
             ocr_images: bool = False,
-            preserve_layout: bool = True,
-            # Processing control parameters
             show_progress: bool = False,
-            # OCR-specific parameters for this load
-            language: Optional[str] = None,
-            content_type: Optional[str] = None,
-            instructions: Optional[str] = None,
-            prompt_template_override: Optional[Union[str, PromptTemplate]] = None,
-            # Image saving options
-            save_images_locally: bool = False,
-            local_image_dir: str = './images',
-            # Performance parameters
-            batch_size: Optional[int] = None,
             # Format-specific parameters
             encoding: str = 'utf-8',
             delimiter: Optional[str] = None
@@ -241,29 +222,13 @@ class UnifiedDocumentLoader:
         
         Args:
             file_path: Path to the document
-            output_format: Desired output format
-            extract_images: Whether to extract images as base64
+            output_format: Desired output format (MARKDOWN, JSON, TEXT)
+            extract_images: Whether to extract images as base64 (Office/PDF only)
             ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
-            preserve_layout: Whether to preserve document layout
-            
-            # Processing control parameters:
             show_progress: Whether to show progress messages during processing
             
-            # OCR-specific parameters for this load:
-            language: Language hint for OCR (e.g., 'English', 'Chinese')
-            content_type: Content type hint ('table', 'form', 'receipt', 'document')
-            instructions: Custom OCR instructions to override defaults
-            prompt_template_override: Override the default prompt template for this load
-            
-            # Image saving options:
-            save_images_locally: Save images to disk instead of base64 encoding
-            local_image_dir: Directory to save images when save_images_locally=True
-            
-            # Performance parameters:
-            batch_size: Batch size for processing multiple images
-            
             # Format-specific parameters:
-            encoding: Text encoding for text files (default: 'utf-8')
+            encoding: Text encoding for text/markup files (default: 'utf-8')
             delimiter: Delimiter for CSV files (auto-detect if None)
             
         Returns:
@@ -272,6 +237,14 @@ class UnifiedDocumentLoader:
         Raises:
             UnsupportedFormatError: If format is not supported
             ProcessingError: If processing fails
+            
+        Note:
+            - extract_images and ocr_images only work with Office and PDF formats
+            - show_progress only works when UnifiedProcessor is available
+            - encoding and delimiter only apply to text-based formats
+            
+            For advanced OCR configuration, use the constructor parameters or
+            update_ocr_configuration() method.
         """
         file_path = Path(file_path)
 
@@ -297,27 +270,62 @@ class UnifiedDocumentLoader:
         processor = self._processors[doc_format]
 
         try:
-            result = processor.process(
-                file_path,
-                output_format=output_format,
-                extract_images=extract_images,
-                ocr_images=ocr_images,
-                preserve_layout=preserve_layout,
-                show_progress=show_progress,
-                # OCR parameters
-                language=language,
-                content_type=content_type,
-                instructions=instructions,
-                prompt_template_override=prompt_template_override,
-                # Image saving
-                save_images_locally=save_images_locally,
-                local_image_dir=local_image_dir,
-                # Performance
-                batch_size=batch_size,
-                # Format-specific
-                encoding=encoding,
-                delimiter=delimiter
-            )
+            # Check if we're using UnifiedProcessor or fallback processors
+            if processor.__class__.__name__ == 'UnifiedProcessor':
+                # UnifiedProcessor handles all parameters directly
+                result = processor.process(
+                    file_path,
+                    output_format=output_format,
+                    extract_images=extract_images,
+                    ocr_images=ocr_images,
+                        preserve_layout=True,  # Keep for compatibility
+                    show_progress=show_progress,
+                    # Format-specific
+                    encoding=encoding,
+                    delimiter=delimiter
+                )
+            else:
+                # Fallback processors need parameter mapping
+                processor_kwargs = {}
+                
+                # Map common parameters
+                if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
+                    processor_kwargs['extract_images'] = extract_images
+                    # Note: These processors don't support all parameters
+                elif processor.__class__.__name__ == 'PDFProcessor':
+                    processor_kwargs['extract_images'] = extract_images
+                    processor_kwargs['use_ocr'] = ocr_images
+                    processor_kwargs['extract_tables'] = True
+                elif processor.__class__.__name__ == 'TextProcessor':
+                    processor_kwargs['encoding'] = encoding
+                    if delimiter:
+                        processor_kwargs['delimiter'] = delimiter
+                elif processor.__class__.__name__ == 'MarkupProcessor':
+                    processor_kwargs['encoding'] = encoding
+                
+                # Process with mapped parameters
+                result = processor.process(file_path, **processor_kwargs)
+                
+                # Apply output format conversion if needed
+                if output_format != OutputFormat.MARKDOWN:
+                    # Convert content to requested format
+                    if output_format == OutputFormat.JSON:
+                        # Create JSON structure
+                        json_data = {
+                            "filename": result.metadata.filename,
+                            "format": result.metadata.format.value,
+                            "content": [{"type": "text:normal", "content": result.content}],
+                            "metadata": {
+                                "size_bytes": result.metadata.size_bytes,
+                                "page_count": result.metadata.page_count,
+                                "word_count": result.metadata.word_count
+                            }
+                        }
+                        result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
+                        result.json_content = json_data.get('content', [])
+                    elif output_format == OutputFormat.TEXT:
+                        # Convert to plain text
+                        result.content = result.text
 
             # Cache result
             if self.cache_dir:
@@ -386,7 +394,8 @@ class UnifiedDocumentLoader:
             recursive: bool = True,
             show_progress: bool = True,
             save_files: bool = True,
-            **kwargs
+            encoding: str = 'utf-8',
+            delimiter: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process multiple documents in a directory with full result tracking.
@@ -394,17 +403,14 @@ class UnifiedDocumentLoader:
         Args:
             input_dir: Directory containing documents
             output_dir: Optional output directory (default: same as input)
-            output_format: Output format 
-            extract_images: Whether to extract images from documents
-                - True: Extract images as base64 data
-                - False: Skip image extraction entirely
+            output_format: Output format (MARKDOWN, JSON, TEXT)
+            extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
-                - True: Use batch OCR processing to convert images to text descriptions
-                - False: Keep images as base64 data in output
             recursive: Whether to process subdirectories
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
-            **kwargs: Additional processor options
+            encoding: Text encoding for text/markup files
+            delimiter: CSV delimiter (auto-detect if None)
             
         Returns:
             Dictionary mapping input paths to processing results
@@ -488,7 +494,9 @@ class UnifiedDocumentLoader:
                     output_format=output_format,
                     extract_images=extract_images,
                     ocr_images=ocr_images,
-                    **kwargs
+                    show_progress=show_progress,
+                    encoding=encoding,
+                    delimiter=delimiter
                 )
                 file_duration = time.time() - start_file_time
 
@@ -546,7 +554,8 @@ class UnifiedDocumentLoader:
             ocr_images: bool = False,
             show_progress: bool = True,
             save_files: bool = True,
-            **kwargs
+            encoding: str = 'utf-8',
+            delimiter: Optional[str] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process a specific list of files.
@@ -554,16 +563,13 @@ class UnifiedDocumentLoader:
         Args:
             file_paths: List of file paths to process
             output_dir: Optional output directory
-            output_format: Output format
-            extract_images: Whether to extract images from documents
-                - True: Extract images as base64 data
-                - False: Skip image extraction entirely
+            output_format: Output format (MARKDOWN, JSON, TEXT)
+            extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
-                - True: Use batch OCR processing to convert images to text descriptions
-                - False: Keep images as base64 data in output
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
-            **kwargs: Additional processor options
+            encoding: Text encoding for text/markup files
+            delimiter: CSV delimiter (auto-detect if None)
             
         Returns:
             Dictionary mapping input paths to processing results
@@ -606,7 +612,9 @@ class UnifiedDocumentLoader:
                     output_format=output_format,
                     extract_images=extract_images,
                     ocr_images=ocr_images,
-                    **kwargs
+                    show_progress=show_progress,
+                    encoding=encoding,
+                    delimiter=delimiter
                 )
                 file_duration = time.time() - start_file_time
 
@@ -922,47 +930,3 @@ class UnifiedDocumentLoader:
             logger.info("✅ OCR setup validation successful")
 
         return validation_results
-
-    def process_with_ocr_options(
-            self,
-            file_path: Union[str, Path],
-            output_format: OutputFormat = OutputFormat.MARKDOWN,
-            # OCR-specific options
-            language: Optional[str] = None,
-            content_type: Optional[str] = None,
-            prompt_template: Optional[str] = None,
-            instructions: Optional[str] = None,
-            **kwargs
-    ) -> ProcessedDocument:
-        """Process document with specific OCR options.
-        
-        Args:
-            file_path: Path to the document file
-            output_format: Desired output format
-            language: Expected language in the document
-            content_type: Hint about content type ('table', 'document', 'form')
-            prompt_template: Specific prompt template to use for this document
-            instructions: Custom OCR instructions
-            **kwargs: Additional processing options
-            
-        Returns:
-            ProcessedDocument with extracted content
-        """
-        # Build OCR options
-        ocr_options = {}
-        if language:
-            ocr_options['language'] = language
-        if content_type:
-            ocr_options['content_type'] = content_type
-        if prompt_template:
-            ocr_options['prompt_template'] = prompt_template
-        if instructions:
-            ocr_options['instructions'] = instructions
-
-        # Add OCR options to kwargs
-        kwargs.update(ocr_options)
-
-        logger.info(f"📄 Processing document with enhanced OCR options: {list(ocr_options.keys())}")
-
-        # Use the standard process method with enhanced options
-        return self.process(file_path, output_format, **kwargs)

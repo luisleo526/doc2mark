@@ -95,11 +95,9 @@ def test_processed_document_structure():
 
 def test_loader_with_different_parameters():
     """Test loader initialization with various parameters."""
-    # Test with custom parameters
+    # Test with basic tesseract provider
     loader = UnifiedDocumentLoader(
-        ocr_provider='tesseract',
-        tesseract_lang='eng',
-        tesseract_config='--psm 3'
+        ocr_provider='tesseract'
     )
     assert loader is not None
 
