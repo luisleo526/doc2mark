@@ -29,7 +29,7 @@ if [[ -n $(git status -s) ]]; then
 fi
 
 # Get current version
-CURRENT_VERSION=$(grep -E "__version__\s*=\s*['\"]" doc2mark/__init__.py | sed -E "s/__version__\s*=\s*['\"]([^'\"]+)['\"]/\1/")
+CURRENT_VERSION=$(grep -E "__version__\s*=\s*['\"]" doc2mark/__init__.py | sed -E 's/.*['\''"]([0-9]+\.[0-9]+\.[0-9]+)['\''"].*/\1/')
 echo -e "Current version: ${YELLOW}$CURRENT_VERSION${NC}"
 
 # Calculate new version
