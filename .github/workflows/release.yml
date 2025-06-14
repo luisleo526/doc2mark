@@ -12,6 +12,11 @@ on:
           - major
           - minor
           - patch
+      include_all_history:
+        description: 'Include all commits from the beginning (for initial release)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   release:
@@ -77,14 +82,22 @@ jobs:
     - name: Generate changelog
       id: changelog
       run: |
-        # Get the previous tag
-        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-        
-        # If no previous tag, get all commits
-        if [ -z "$PREVIOUS_TAG" ]; then
+        # Check if we should include all history
+        if [[ "${{ github.event.inputs.include_all_history }}" == "true" ]]; then
+          echo "Including all commits from the beginning of the repository"
           COMMIT_RANGE="HEAD"
+          PREVIOUS_TAG="the beginning"
         else
-          COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          # If no previous tag, get all commits
+          if [ -z "$PREVIOUS_TAG" ]; then
+            COMMIT_RANGE="HEAD"
+            PREVIOUS_TAG="the beginning"
+          else
+            COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+          fi
         fi
         
         # Get commits and categorize them
@@ -214,6 +227,7 @@ jobs:
           **Version bump**: ${{ github.event.inputs.version_bump }}
           **Previous version**: ${{ steps.current_version.outputs.version }}
           **New version**: ${{ steps.bump_version.outputs.new_version }}
+          ${{ github.event.inputs.include_all_history == 'true' && '**Initial Release**: Including complete commit history' || '' }}
           
           ${{ steps.changelog.outputs.commit_count }} commits since ${{ steps.changelog.outputs.previous_tag }}
           
