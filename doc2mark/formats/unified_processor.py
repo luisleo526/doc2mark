@@ -488,7 +488,16 @@ class UnifiedProcessor(BaseProcessor):
                 elif item_type == "text:normal":
                     markdown_parts.append(f"{content}\n")
                 elif item_type == "text:image_description":
-                    markdown_parts.append(f"*{content}*\n")
+                    # Handle OCR results with XML tags
+                    ocr_text = content
+                    if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
+                        ocr_text = ocr_text[18:-19]  # Remove tags
+                    
+                    markdown_parts.append("```xml")
+                    markdown_parts.append("<ocr_result>")
+                    markdown_parts.append(ocr_text)
+                    markdown_parts.append("</ocr_result>")
+                    markdown_parts.append("```\n")
                 elif item_type == "table":
                     markdown_parts.append(content)
                 elif item_type == "image":

@@ -2,6 +2,7 @@
 
 import logging
 import zipfile
+import base64
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 
@@ -14,11 +15,21 @@ from doc2mark.core.base import (
 )
 from doc2mark.ocr.base import BaseOCR
 
+# Import the advanced pipeline loader
+try:
+    from doc2mark.pipelines.office_advanced_pipeline import (
+        DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader
+    )
+    ADVANCED_PIPELINE_AVAILABLE = True
+except ImportError:
+    ADVANCED_PIPELINE_AVAILABLE = False
+    logging.warning("Advanced Office pipeline not available. Using basic processing.")
+
 logger = logging.getLogger(__name__)
 
 
 class OfficeProcessor(BaseProcessor):
-    """Processor for modern Office formats (DOCX, XLSX, PPTX)."""
+    """Processor for modern Office formats (DOCX, XLSX, PPTX) with advanced features."""
 
     def __init__(self, ocr: Optional[BaseOCR] = None):
         """Initialize Office processor.
@@ -84,25 +95,37 @@ class OfficeProcessor(BaseProcessor):
             file_path: Union[str, Path],
             **kwargs
     ) -> ProcessedDocument:
-        """Process Office document."""
+        """Process Office document using advanced pipeline if available."""
         file_path = Path(file_path)
         extension = file_path.suffix.lower().lstrip('.')
 
         # Get file size
         file_size = file_path.stat().st_size
 
-        # Process based on format
+        # Use advanced pipeline if available
+        if ADVANCED_PIPELINE_AVAILABLE:
+            content, metadata, images = self._process_with_advanced_pipeline(file_path, **kwargs)
+        else:
+            # Fallback to basic processing
+            if extension == 'docx':
+                content, metadata, images = self._process_docx_basic(file_path, **kwargs)
+                doc_format = DocumentFormat.DOCX
+            elif extension == 'xlsx':
+                content, metadata, images = self._process_xlsx_basic(file_path, **kwargs)
+                doc_format = DocumentFormat.XLSX
+            elif extension == 'pptx':
+                content, metadata, images = self._process_pptx_basic(file_path, **kwargs)
+                doc_format = DocumentFormat.PPTX
+            else:
+                raise ProcessingError(f"Unsupported Office format: {extension}")
+
+        # Determine format
         if extension == 'docx':
-            content, metadata, images = self._process_docx(file_path, **kwargs)
             doc_format = DocumentFormat.DOCX
         elif extension == 'xlsx':
-            content, metadata, images = self._process_xlsx(file_path, **kwargs)
             doc_format = DocumentFormat.XLSX
         elif extension == 'pptx':
-            content, metadata, images = self._process_pptx(file_path, **kwargs)
             doc_format = DocumentFormat.PPTX
-        else:
-            raise ProcessingError(f"Unsupported Office format: {extension}")
 
         # Build metadata
         doc_metadata = DocumentMetadata(
@@ -118,8 +141,100 @@ class OfficeProcessor(BaseProcessor):
             images=images
         )
 
-    def _process_docx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
-        """Process DOCX document."""
+    def _process_with_advanced_pipeline(
+        self, 
+        file_path: Path, 
+        **kwargs
+    ) -> Tuple[str, dict, List[Dict[str, Any]]]:
+        """Process document using advanced pipeline with all features."""
+        try:
+            # Configure options
+            extract_images = kwargs.get('extract_images', False)
+            ocr_images = extract_images and self.ocr is not None
+            
+            # Use the advanced pipeline
+            json_data = UniversalOfficeLoader.load(
+                file_path,
+                extract_images=extract_images,
+                ocr_images=ocr_images,
+                show_progress=kwargs.get('show_progress', False),
+                ocr=self.ocr
+            )
+            
+            # Convert JSON data to markdown
+            markdown_parts = []
+            images = []
+            
+            for item in json_data["content"]:
+                if item["type"] == "text:title":
+                    markdown_parts.append(f"# {item['content']}\n")
+                elif item["type"] == "text:section":
+                    markdown_parts.append(f"## {item['content']}\n")
+                elif item["type"] == "text:list":
+                    markdown_parts.append(f"{item['content']}\n")
+                elif item["type"] == "text:caption":
+                    markdown_parts.append(f"*{item['content']}*\n")
+                elif item["type"] == "text:normal":
+                    markdown_parts.append(f"{item['content']}\n")
+                elif item["type"] == "text:image_description":
+                    # Handle OCR results
+                    ocr_text = item['content']
+                    if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
+                        ocr_text = ocr_text[18:-19]  # Remove tags
+                    
+                    # Format OCR result in XML tags within markdown code block
+                    markdown_parts.append("```xml")
+                    markdown_parts.append("<ocr_result>")
+                    markdown_parts.append(ocr_text)
+                    markdown_parts.append("</ocr_result>")
+                    markdown_parts.append("```\n")
+                elif item["type"] == "table":
+                    # Tables already include proper formatting (markdown or HTML)
+                    markdown_parts.append(item["content"])
+                elif item["type"] == "image":
+                    # Store image data
+                    images.append({
+                        'data': base64.b64decode(item["content"]),
+                        'page': item.get('page', 1)
+                    })
+                    markdown_parts.append(f"![Image {len(images)}]\n")
+            
+            content = '\n'.join(markdown_parts)
+            
+            # Build metadata
+            metadata = {
+                'page_count': json_data.get('pages', 1),
+                'image_count': len(images),
+            }
+            
+            # Add format-specific metadata
+            if file_path.suffix.lower() == '.docx':
+                metadata['word_count'] = len(content.split())
+            elif file_path.suffix.lower() == '.xlsx':
+                # XLSX specific metadata is already included in json_data
+                pass
+            elif file_path.suffix.lower() == '.pptx':
+                # Count slides from content
+                slide_count = content.count('Slide ')
+                metadata['slide_count'] = max(slide_count, 1)
+            
+            return content, metadata, images
+            
+        except Exception as e:
+            logger.warning(f"Advanced pipeline processing failed: {e}, falling back to basic processing")
+            # Fallback to basic processing
+            extension = file_path.suffix.lower().lstrip('.')
+            if extension == 'docx':
+                return self._process_docx_basic(file_path, **kwargs)
+            elif extension == 'xlsx':
+                return self._process_xlsx_basic(file_path, **kwargs)
+            elif extension == 'pptx':
+                return self._process_pptx_basic(file_path, **kwargs)
+            else:
+                raise ProcessingError(f"Unsupported Office format: {extension}")
+
+    def _process_docx_basic(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
+        """Basic DOCX processing (fallback when advanced pipeline not available)."""
         try:
             doc = self.python_docx.Document(str(file_path))
 
@@ -141,14 +256,14 @@ class OfficeProcessor(BaseProcessor):
 
             # Process tables
             for table in doc.tables:
-                table_md = self._convert_docx_table_to_markdown(table)
+                table_md = self._convert_docx_table_to_markdown_basic(table)
                 markdown_parts.append(table_md)
                 markdown_parts.append("")
 
             # Extract images if requested
             images = []
             if kwargs.get('extract_images', False) and self.ocr:
-                images = self._extract_docx_images(file_path)
+                images = self._extract_docx_images_basic(file_path)
 
             # Metadata
             metadata = {
@@ -167,8 +282,8 @@ class OfficeProcessor(BaseProcessor):
             logger.error(f"Failed to process DOCX: {e}")
             raise ProcessingError(f"DOCX processing failed: {str(e)}")
 
-    def _process_xlsx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
-        """Process XLSX document."""
+    def _process_xlsx_basic(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
+        """Basic XLSX processing (fallback when advanced pipeline not available)."""
         try:
             wb = self.openpyxl.load_workbook(str(file_path), data_only=True)
 
@@ -199,7 +314,7 @@ class OfficeProcessor(BaseProcessor):
             # Extract images if requested
             images = []
             if kwargs.get('extract_images', False) and self.ocr:
-                images = self._extract_xlsx_images(file_path)
+                images = self._extract_xlsx_images_basic(file_path)
                 
                 # Add extracted image text to content if available
                 if images:
@@ -209,12 +324,16 @@ class OfficeProcessor(BaseProcessor):
                         markdown_parts.append("")
                         for i, text in enumerate(image_texts, 1):
                             markdown_parts.append(f"### Image {i}")
+                            markdown_parts.append("```xml")
+                            markdown_parts.append("<ocr_result>")
                             markdown_parts.append(text)
+                            markdown_parts.append("</ocr_result>")
+                            markdown_parts.append("```")
                             markdown_parts.append("")
 
             # Metadata
             metadata = {
-                'page_count': len(wb.sheetnames),
+                'page_count': len(wb.sheetnames),  # Using page_count to represent number of sheets
                 'sheet_names': wb.sheetnames,
                 'total_cells': total_cells,
                 'image_count': len(images),
@@ -226,8 +345,8 @@ class OfficeProcessor(BaseProcessor):
             logger.error(f"Failed to process XLSX: {e}")
             raise ProcessingError(f"XLSX processing failed: {str(e)}")
 
-    def _process_pptx(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
-        """Process PPTX document."""
+    def _process_pptx_basic(self, file_path: Path, **kwargs) -> Tuple[str, dict, List[Dict[str, Any]]]:
+        """Basic PPTX processing (fallback when advanced pipeline not available)."""
         try:
             prs = self.python_pptx.Presentation(str(file_path))
 
@@ -256,14 +375,14 @@ class OfficeProcessor(BaseProcessor):
                 # Process tables
                 for shape in slide.shapes:
                     if shape.has_table:
-                        table_md = self._convert_pptx_table_to_markdown(shape.table)
+                        table_md = self._convert_pptx_table_to_markdown_basic(shape.table)
                         markdown_parts.append(table_md)
                         markdown_parts.append("")
 
             # Extract images if requested
             images = []
             if kwargs.get('extract_images', False) and self.ocr:
-                images = self._extract_pptx_images(file_path)
+                images = self._extract_pptx_images_basic(file_path)
                 
                 # Add extracted image text to content if available
                 if images:
@@ -273,7 +392,11 @@ class OfficeProcessor(BaseProcessor):
                         markdown_parts.append("")
                         for i, text in enumerate(image_texts, 1):
                             markdown_parts.append(f"### Image {i}")
+                            markdown_parts.append("```xml")
+                            markdown_parts.append("<ocr_result>")
                             markdown_parts.append(text)
+                            markdown_parts.append("</ocr_result>")
+                            markdown_parts.append("```")
                             markdown_parts.append("")
 
             # Metadata
@@ -307,8 +430,8 @@ class OfficeProcessor(BaseProcessor):
 
         return ''.join(formatted_text)
 
-    def _convert_docx_table_to_markdown(self, table) -> str:
-        """Convert DOCX table to markdown."""
+    def _convert_docx_table_to_markdown_basic(self, table) -> str:
+        """Convert DOCX table to markdown (basic version)."""
         rows = []
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells]
@@ -316,8 +439,8 @@ class OfficeProcessor(BaseProcessor):
 
         return self._convert_list_to_markdown_table(rows)
 
-    def _convert_pptx_table_to_markdown(self, table) -> str:
-        """Convert PPTX table to markdown."""
+    def _convert_pptx_table_to_markdown_basic(self, table) -> str:
+        """Convert PPTX table to markdown (basic version)."""
         rows = []
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells]
@@ -354,8 +477,8 @@ class OfficeProcessor(BaseProcessor):
 
         return '\n'.join(lines)
 
-    def _extract_docx_images(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Extract images from DOCX file using batch OCR."""
+    def _extract_docx_images_basic(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract images from DOCX file using basic method."""
         images = []
 
         try:
@@ -412,8 +535,8 @@ class OfficeProcessor(BaseProcessor):
 
         return images
 
-    def _extract_xlsx_images(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Extract images from XLSX file using batch OCR."""
+    def _extract_xlsx_images_basic(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract images from XLSX file using basic method."""
         images = []
 
         try:
@@ -470,8 +593,8 @@ class OfficeProcessor(BaseProcessor):
 
         return images
 
-    def _extract_pptx_images(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Extract images from PPTX file using batch OCR."""
+    def _extract_pptx_images_basic(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract images from PPTX file using basic method."""
         images = []
 
         try:

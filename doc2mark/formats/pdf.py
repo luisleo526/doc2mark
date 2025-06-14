@@ -181,13 +181,32 @@ class PDFProcessor(BaseProcessor):
                         if ocr_text:
                             page_content.append(f"### Page {page_num + 1} (OCR)")
                             page_content.append("")
+                            page_content.append("```xml")
+                            page_content.append("<ocr_result>")
                             page_content.append(ocr_text)
+                            page_content.append("</ocr_result>")
+                            page_content.append("```")
                             total_words += len(ocr_text.split())
 
                             markdown_parts.extend(page_content)
                             markdown_parts.append("")
 
                         ocr_index += 1
+            
+            # Add extracted image OCR results if available
+            if images_extracted and any(img.get('text', '').strip() for img in images_extracted):
+                markdown_parts.append("## Extracted Images")
+                markdown_parts.append("")
+                
+                for i, img in enumerate(images_extracted, 1):
+                    if img.get('text', '').strip():
+                        markdown_parts.append(f"### Image {i} (Page {img['page']})")
+                        markdown_parts.append("```xml")
+                        markdown_parts.append("<ocr_result>")
+                        markdown_parts.append(img['text'])
+                        markdown_parts.append("</ocr_result>")
+                        markdown_parts.append("```")
+                        markdown_parts.append("")
 
             # Get metadata
             metadata_dict = pdf_doc.metadata
