@@ -17,6 +17,9 @@
 - **Comprehensive Error Handling**: Robust processing with detailed error reporting
 - **Caching Support**: Optional caching for improved performance on repeated processing
 
+## Futrue Plan
+- [ ] Image OCR with contextual support, and auto detect language
+
 ## 🚀 Quick Start
 
 ### Installation
