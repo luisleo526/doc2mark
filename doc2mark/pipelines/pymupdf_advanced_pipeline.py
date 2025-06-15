@@ -344,6 +344,10 @@ class PDFLoader:
                     )
 
                     if markdown_text.strip():  # Only add non-empty text
+                        # Debug logging for missing content
+                        if "demonstrates" in markdown_text.lower():
+                            logger.info(f"Found 'demonstrates' text: {markdown_text.strip()[:100]}... (type: {text_type})")
+                        
                         text_items.append(SimpleContent(
                             type=text_type,
                             content=markdown_text,
@@ -517,8 +521,26 @@ class PDFLoader:
             if not line_text:
                 continue
 
+            # First check if this is a list item BEFORE applying any formatting
+            list_match = re.match(
+                r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
+                line_text)
+            
+            if list_match:
+                # Handle list items without applying text formatting
+                marker = list_match.group(1)
+                if marker in '•\u2022\u25CF\u25AA\u25A0' or marker == '-' or marker == '*':
+                    # Bullet point
+                    markdown_line = re.sub(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', '- ',
+                                           line_text)
+                elif re.match(r'\d+[\.\)]', marker):
+                    # Numbered list
+                    markdown_line = re.sub(r'^(\d+)[\.\)]\s+', r'\1. ', line_text)
+                else:
+                    # Letter list (a., b., etc.) - convert to bullet
+                    markdown_line = re.sub(r'^[a-zA-Z][\.\)]\s+', '- ', line_text)
             # Detect headers based on size
-            if line_size > avg_size * 1.5:
+            elif line_size > avg_size * 1.5:
                 # Large text -> H1
                 markdown_line = f"# {line_text}"
             elif line_size > avg_size * 1.3:
@@ -531,30 +553,13 @@ class PDFLoader:
                 # Regular text
                 markdown_line = line_text
 
-                # Apply bold/italic formatting
+                # Apply bold/italic formatting only for non-list items
                 if is_bold and is_italic:
                     markdown_line = f"***{markdown_line}***"
                 elif is_bold:
                     markdown_line = f"**{markdown_line}**"
                 elif is_italic:
                     markdown_line = f"*{markdown_line}*"
-
-            # Detect list items (more comprehensive patterns)
-            list_match = re.match(
-                r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
-                line_text)
-            if list_match:
-                marker = list_match.group(1)
-                if marker in '•\u2022\u25CF\u25AA\u25A0' or marker == '-' or marker == '*':
-                    # Bullet point
-                    markdown_line = re.sub(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', '- ',
-                                           line_text)
-                elif re.match(r'\d+[\.\)]', marker):
-                    # Numbered list
-                    markdown_line = re.sub(r'^(\d+)[\.\)]\s+', r'\1. ', line_text)
-                else:
-                    # Letter list (a., b., etc.) - convert to bullet
-                    markdown_line = re.sub(r'^[a-zA-Z][\.\)]\s+', '- ', line_text)
 
             lines.append(markdown_line)
 
@@ -1248,9 +1253,16 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
     markdown_parts = []
     current_page = None
     
-    for item in json_data.get("content", []):
+    # Debug: Log all content items
+    logger.debug(f"Converting {len(json_data.get('content', []))} content items to markdown")
+    
+    for idx, item in enumerate(json_data.get("content", [])):
         item_type = item.get("type", "")
         content = item.get("content", "")
+        
+        # Debug: Log each item
+        if content and "demonstrates" in content.lower():
+            logger.info(f"Item {idx}: type={item_type}, content preview: {content.strip()[:100]}...")
         
         # Skip empty content
         if not content or not content.strip():
