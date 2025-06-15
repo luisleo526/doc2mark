@@ -96,6 +96,11 @@ class BaseOfficeLoader:
         - Automatic HTML conversion for complex tables
         - Line breaks preservation
         - Images within cells (with OCR support)
+        
+        Library-specific merged cell handling:
+        - DOCX: Merged cells share the same cell object (_tc), detected by comparing object IDs
+        - PPTX: Merged cells have empty strings '' in non-origin cells, with gridSpan/vMerge properties
+        - XLSX: Merged cells have None in non-origin cells, with explicit merged_cells.ranges
         """
         # Handle different table input types
         if hasattr(table_data, 'rows'):  # DOCX Table object
@@ -246,7 +251,11 @@ class BaseOfficeLoader:
             return self._convert_table_to_simple_markdown(table_data, table_info)
 
     def _analyze_table_structure(self, table_data: List[List]) -> Dict[str, Any]:
-        """Analyze table structure to detect merged cells and complexity"""
+        """Analyze table structure to detect merged cells and complexity
+        
+        This method is used for non-DOCX tables (PPTX and XLSX) where we need to detect merges
+        based on empty cells. DOCX tables handle merges differently using cell object IDs.
+        """
         if not table_data:
             return {'is_complex': False, 'merged_cells': [], 'row_count': 0, 'col_count': 0, 'cell_spans': {}}
 
@@ -298,15 +307,28 @@ class BaseOfficeLoader:
         }
 
     def _detect_cell_span(self, table: List[List], row: int, col: int) -> Optional[Dict]:
-        """Detect if an empty cell is part of a span from another cell"""
+        """Detect if an empty cell is part of a span from another cell
+        
+        Empty cells are represented as:
+        - None in XLSX (openpyxl)
+        - '' (empty string) in PPTX (python-pptx)
+        """
+        cell_value = table[row][col]
+        
+        # Check if this cell is truly empty (None or empty string)
+        if not (cell_value is None or (isinstance(cell_value, str) and cell_value == '')):
+            return None
+            
         # Check if empty cell is part of a row span from above
         if row > 0:
             above_cell = table[row - 1][col]
-            if above_cell and str(above_cell).strip():
-                # Check if cells below also empty (indicating rowspan)
+            # Check if cell above has content
+            if above_cell is not None and str(above_cell).strip() != '':
+                # Check if cells below are also empty (indicating rowspan)
                 span_rows = 1
                 for check_row in range(row, len(table)):
-                    if not table[check_row][col] or str(table[check_row][col]).strip() == "":
+                    check_cell = table[check_row][col]
+                    if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
                         span_rows += 1
                     else:
                         break
@@ -322,11 +344,13 @@ class BaseOfficeLoader:
         # Check if empty cell is part of a col span from left
         if col > 0:
             left_cell = table[row][col - 1]
-            if left_cell and str(left_cell).strip():
-                # Check if cells to right also empty (indicating colspan)
+            # Check if cell to the left has content
+            if left_cell is not None and str(left_cell).strip() != '':
+                # Check if cells to right are also empty (indicating colspan)
                 span_cols = 1
                 for check_col in range(col, len(table[row])):
-                    if not table[row][check_col] or str(table[row][check_col]).strip() == "":
+                    check_cell = table[row][check_col]
+                    if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
                         span_cols += 1
                     else:
                         break
@@ -342,30 +366,27 @@ class BaseOfficeLoader:
         return None
 
     def _calculate_cell_span(self, table: List[List], row: int, col: int, cell_content: str) -> Tuple[int, int]:
-        """Calculate how many rows and columns a cell spans"""
+        """Calculate how many rows and columns a cell spans
+        
+        Only counts consecutive None or empty string cells as part of the span
+        """
         rowspan = 1
         colspan = 1
 
         # Check colspan: count consecutive empty cells to the right
         for check_col in range(col + 1, len(table[row])):
-            if not table[row][check_col] or str(table[row][check_col]).strip() == "":
-                # Additional check: ensure it's not a different empty cell
-                if row > 0 and (not table[row - 1][check_col] or str(table[row - 1][check_col]).strip() == ""):
-                    colspan += 1
-                else:
-                    break
+            check_cell = table[row][check_col]
+            if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
+                colspan += 1
             else:
                 break
 
         # Check rowspan: count consecutive empty cells below
         for check_row in range(row + 1, len(table)):
             if col < len(table[check_row]):
-                if not table[check_row][col] or str(table[check_row][col]).strip() == "":
-                    # Additional check: ensure it's not a different empty cell
-                    if col > 0 and (not table[check_row][col - 1] or str(table[check_row][col - 1]).strip() == ""):
-                        rowspan += 1
-                    else:
-                        break
+                check_cell = table[check_row][col]
+                if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
+                    rowspan += 1
                 else:
                     break
             else:

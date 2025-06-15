@@ -832,29 +832,15 @@ class PDFLoader:
         return False
 
     def _is_cell_empty(self, cell) -> bool:
-        """Enhanced check if a cell is truly empty"""
+        """Enhanced check if a cell is truly empty: only '' (empty string) and None are considered empty."""
         if cell is None:
             return True
         
         cell_str = str(cell).strip()
-        
-        # Check for various empty representations
-        if not cell_str:
-            return True
-        
-        # Check for whitespace-only content
-        if cell_str.isspace():
-            return True
-        
-        # Check for common PDF empty cell patterns
-        empty_patterns = ['', ' ', '\xa0', '\u00a0', '-', '–', '—', '.', '..', '...']
+        # Only treat '' as empty (None is already handled above)
+        empty_patterns = ['']
         if cell_str in empty_patterns:
             return True
-        
-        # Check if it's just Unicode spaces
-        if all(c in ' \t\n\r\f\v\xa0\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000' for c in cell_str):
-            return True
-        
         return False
 
     def _convert_table_to_simple_markdown(self, table_data: List[List], table_info: Dict) -> str:
