@@ -1306,7 +1306,7 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
                 ocr_text = ocr_text[18:-19]  # Remove tags
             
-            markdown_parts.append("```xml")
+            markdown_parts.append("```")
             markdown_parts.append("<ocr_result>")
             markdown_parts.append(ocr_text)
             markdown_parts.append("</ocr_result>")

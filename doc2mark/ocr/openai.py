@@ -127,7 +127,9 @@ class VisionAgent:
             raise RuntimeError("LangChain not available")
 
         result = self._chain.invoke(input_dict)
-        return result.content
+        # Replace triple backticks with single backtick in the output
+        processed_content = result.content.replace('```', '`') if result.content else result.content
+        return processed_content
 
     def batch_invoke(self, input_dicts: List[Dict[str, str]]) -> List[str]:
         """
@@ -146,7 +148,8 @@ class VisionAgent:
 
         logger.info(f"✅ LangChain batch processing complete")
 
-        return [res[1].content for res in sorted_results]
+        # Replace triple backticks with single backtick in each output
+        return [res[1].content.replace('```', '`') if res[1].content else res[1].content for res in sorted_results]
 
 
 class OpenAIOCR(BaseOCR):
