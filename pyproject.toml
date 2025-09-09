@@ -65,8 +65,12 @@ ocr = [
     "langchain-openai>=0.0.2",
     "pytesseract>=0.3.10",
 ]
+mime = [
+    "python-magic>=0.4.27",
+    "python-magic-bin>=0.4.14; sys_platform == 'win32'",
+]
 all = [
-    "doc2mark[ocr]",
+    "doc2mark[ocr,mime]",
 ]
 dev = [
     "pytest>=7.0.0",

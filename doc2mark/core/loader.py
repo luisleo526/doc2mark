@@ -719,11 +719,12 @@ class UnifiedDocumentLoader:
 
         return output_files
 
-    def _detect_format(self, file_path: Path) -> DocumentFormat:
-        """Detect document format from file extension.
+    def _detect_format(self, file_path: Path, use_mime: bool = False) -> DocumentFormat:
+        """Detect document format from file extension or MIME type.
         
         Args:
             file_path: File path
+            use_mime: Whether to use MIME type detection
             
         Returns:
             Document format enum
@@ -731,6 +732,19 @@ class UnifiedDocumentLoader:
         Raises:
             UnsupportedFormatError: If format cannot be detected
         """
+        # First try MIME type detection if enabled
+        if use_mime:
+            try:
+                from doc2mark.core.mime_mapper import get_default_mapper
+                mapper = get_default_mapper()
+                doc_format = mapper.detect_format_from_file(file_path, use_content=False)
+                if doc_format:
+                    logger.debug(f"Detected format {doc_format} from MIME type for {file_path}")
+                    return doc_format
+            except Exception as e:
+                logger.debug(f"MIME type detection failed: {e}, falling back to extension")
+        
+        # Fall back to extension-based detection
         extension = file_path.suffix.lower().lstrip('.')
 
         # Try to match extension to format

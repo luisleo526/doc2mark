@@ -37,6 +37,9 @@ pip install doc2mark
 # With OCR support
 pip install doc2mark[ocr]
 
+# With MIME type content detection (optional)
+pip install doc2mark[mime]
+
 # With all dependencies
 pip install doc2mark[all]
 ```
@@ -272,6 +275,97 @@ result = loader.load(
 
 ## 🛠️ Advanced Features
 
+### MIME Type Detection and Support
+
+doc2mark includes a comprehensive MIME type mapper for detecting and handling document formats:
+
+```python
+from doc2mark.core import MimeTypeMapper, check_mime_support, DocumentFormat
+
+# Create a mapper instance
+mapper = MimeTypeMapper()
+
+# Check if a MIME type is supported and get its format
+supported, doc_format = mapper.check_support('application/pdf')
+print(f"PDF supported: {supported}, Format: {doc_format}")
+# Output: PDF supported: True, Format: DocumentFormat.PDF
+
+# Check multiple MIME types
+mime_types = [
+    'application/pdf',
+    'text/csv',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/unknown'
+]
+
+for mime_type in mime_types:
+    supported, fmt = mapper.check_support(mime_type)
+    if supported:
+        print(f"✅ {mime_type} -> {fmt}")
+    else:
+        print(f"❌ {mime_type} -> Not supported")
+
+# Using convenience function
+from doc2mark.core import check_mime_support
+
+supported, fmt = check_mime_support('text/plain')
+if supported:
+    print(f"Can process text files as: {fmt}")
+```
+
+#### MIME Type Features
+
+```python
+# Get MIME type for a format
+mime = mapper.get_mime_from_format(DocumentFormat.PDF)
+print(f"PDF MIME type: {mime}")
+
+# Get all MIME types for a format
+all_mimes = mapper.get_mime_from_format(DocumentFormat.PDF, primary_only=False)
+print(f"All PDF MIME types: {all_mimes}")
+
+# Detect format from file (uses MIME type detection)
+from doc2mark.core import detect_format_from_file
+
+doc_format = detect_format_from_file('document.pdf')
+print(f"Detected format: {doc_format}")
+
+# Register custom MIME types
+mapper.register_mime_type('application/x-custom-doc', DocumentFormat.DOCX)
+supported, fmt = mapper.check_support('application/x-custom-doc')
+print(f"Custom MIME registered: {supported}")
+
+# Get detailed MIME information
+info = mapper.get_mime_info('application/pdf')
+print(f"MIME Info: {info}")
+# Output: {'mime_type': 'application/pdf', 'supported': True, 
+#          'format': DocumentFormat.PDF, 'extensions': ['.pdf'], ...}
+
+# Suggest format for unknown MIME types
+suggested = mapper.suggest_format('text/x-custom-script')
+print(f"Suggested format for custom script: {suggested}")
+# Output: DocumentFormat.TXT
+```
+
+#### Integration with Document Loader
+
+The UnifiedDocumentLoader automatically uses MIME type detection for better format recognition:
+
+```python
+from doc2mark import UnifiedDocumentLoader
+
+loader = UnifiedDocumentLoader(ocr_provider='openai')
+
+# The loader automatically detects format using MIME types
+# This is especially useful for files with incorrect or missing extensions
+result = loader.load('document_without_extension')
+
+# Format detection order:
+# 1. MIME type detection (if enabled)
+# 2. File extension matching
+# 3. Special cases (e.g., .markdown -> .md)
+```
+
 ### Image Extraction and OCR
 
 ```python
@@ -460,6 +554,7 @@ result = loader.load(
 - **OCR (Tesseract)**: `pytesseract`, `Pillow`
 - **Office Formats**: `python-docx`, `openpyxl`, `python-pptx`
 - **PDF**: `PyMuPDF`
+- **MIME Detection** (optional): `python-magic`, `python-magic-bin` (Windows)
 - **Legacy Formats**: LibreOffice (system dependency)
 
 ## 🚀 Performance Tips
@@ -487,11 +582,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙋‍♂️ Support
 
 - **Issues**: [GitHub Issues](https://github.com/luisleo526/doc2mark/issues)
-- **Email**: luisleo52655@gmail.com
+- **Email**: <luisleo52655@gmail.com>
 - **Documentation**: See inline docstrings and examples above
 
 ## 🔄 Recent Updates
 
+- ✅ **NEW**: MIME type mapper for advanced format detection and support checking
+- ✅ **NEW**: `check_support()` method to verify MIME type support with format detection
+- ✅ **NEW**: Custom MIME type registration for proprietary formats
 - ✅ Enhanced OCR configuration with 8 specialized prompt templates
 - ✅ Advanced batch processing with progress tracking and error handling
 - ✅ Dynamic configuration updates without reinitialization

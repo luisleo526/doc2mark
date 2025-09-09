@@ -12,6 +12,13 @@ from doc2mark.core.base import (
     ConversionError
 )
 from doc2mark.core.loader import UnifiedDocumentLoader
+from doc2mark.core.mime_mapper import (
+    MimeTypeMapper,
+    get_default_mapper,
+    detect_format_from_mime,
+    detect_format_from_file,
+    check_mime_support
+)
 
 __all__ = [
     # Main loader
@@ -33,4 +40,11 @@ __all__ = [
     'UnsupportedFormatError',
     'OCRError',
     'ConversionError',
+    
+    # MIME Type Mapping
+    'MimeTypeMapper',
+    'get_default_mapper',
+    'detect_format_from_mime',
+    'detect_format_from_file',
+    'check_mime_support',
 ]
