@@ -138,6 +138,8 @@ class MimeTypeMapper:
             '.md': 'text/markdown',
             '.markdown': 'text/markdown',
             '.webp': 'image/webp',
+            '.csv': 'text/csv',  # Explicitly set CSV to avoid Windows mimetypes issues
+            '.tsv': 'text/tab-separated-values',
         }
         
         for ext, mime_type in custom_types.items():
