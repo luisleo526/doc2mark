@@ -4,11 +4,22 @@
 [![Python](https://img.shields.io/pypi/pyversions/doc2mark.svg)](https://pypi.org/project/doc2mark/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**doc2mark** converts documents to Markdown with AI-powered OCR. A unified API handles everything from PDFs to images to Office documents.
+**doc2mark** is a powerful Python library that converts 20+ document formats to clean, structured Markdown. Built with a unified API that handles everything from PDFs and Office documents to images and data files, with AI-powered OCR for text extraction from scanned documents and images.
+
+## 📖 Supported Formats
+
+| Category | Formats | Notes |
+|----------|---------|-------|
+| **PDF** | `.pdf` | Text extraction + OCR for scanned content |
+| **Microsoft Office** | `.docx`, `.xlsx`, `.pptx` | Full support with image extraction |
+| **Legacy Office** | `.doc`, `.xls`, `.ppt`, `.rtf`, `.pps` | Requires LibreOffice |
+| **Images** | `.png`, `.jpg`, `.jpeg`, `.webp` | OCR text extraction with OpenAI GPT-4 Vision |
+| **Text/Data** | `.txt`, `.csv`, `.tsv`, `.json`, `.jsonl` | Direct processing |
+| **Web/Markup** | `.html`, `.xml`, `.md`, `.markdown` | Structure preservation |
 
 ## ✨ Key Features
 
-- **Universal Format Support**: PDF, DOCX, XLSX, PPTX, Images (PNG, JPG, JPEG, WEBP), HTML, CSV, JSON, and more
+- **Universal Format Support**: 20+ document formats listed above
 - **AI-Powered OCR**: Extract text from scanned documents and images using OpenAI GPT-4 Vision or Tesseract
 - **Image Processing**: Process standalone images just like embedded images in documents
 - **Batch Processing**: Convert entire directories with progress tracking
@@ -38,7 +49,7 @@ from doc2mark import UnifiedDocumentLoader
 # Initialize loader with OpenAI
 loader = UnifiedDocumentLoader(ocr_provider='openai')
 
-# Convert any document to markdown
+# Convert any supported document to markdown
 result = loader.load('document.pdf')
 print(result.content)
 
@@ -70,8 +81,6 @@ result = loader.load(
     ocr_images=True       # Extract text via OCR
 )
 
-# Supported image formats
-# PNG, JPG, JPEG, WEBP
 ```
 
 ### Custom API Endpoints
@@ -220,22 +229,13 @@ for name, description in templates.items():
     print(f"  {name}: {description}")
 ```
 
-## 📖 Supported Formats
-
-| Category | Formats | Notes |
-|----------|---------|-------|
-| **PDF** | `.pdf` | Text extraction + OCR for scanned content |
-| **Microsoft Office** | `.docx`, `.xlsx`, `.pptx` | Full support with image extraction |
-| **Legacy Office** | `.doc`, `.xls`, `.ppt`, `.rtf`, `.pps` | Requires LibreOffice |
-| **Text/Data** | `.txt`, `.csv`, `.tsv`, `.json`, `.jsonl` | Direct processing |
-| **Web/Markup** | `.html`, `.xml`, `.md`, `.markdown` | Structure preservation |
-
 ## 🔍 Output Formats
 
 ### Markdown (Default)
 
 ```python
 result = loader.load('document.pdf')
+print(result.content)
 # Returns clean Markdown with preserved formatting
 ```
 
