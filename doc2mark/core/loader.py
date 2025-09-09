@@ -41,6 +41,7 @@ class UnifiedDocumentLoader:
             top_p: float = 1.0,
             frequency_penalty: float = 0.0,
             presence_penalty: float = 0.0,
+            base_url: Optional[str] = None,
             # General OCR parameters
             default_prompt: Optional[str] = None
     ):
@@ -65,6 +66,7 @@ class UnifiedDocumentLoader:
             top_p: Nucleus sampling parameter (0.0-1.0)
             frequency_penalty: Reduce word repetition (-2.0 to 2.0)
             presence_penalty: Encourage new topics (-2.0 to 2.0)
+            base_url: Optional base URL for OpenAI-compatible API endpoints
             
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
@@ -98,6 +100,7 @@ class UnifiedDocumentLoader:
                     timeout=timeout,
                     max_retries=max_retries,
                     default_prompt=default_prompt,
+                    base_url=base_url,
                     # Additional OpenAI parameters
                     top_p=top_p,
                     frequency_penalty=frequency_penalty,
@@ -141,6 +144,7 @@ class UnifiedDocumentLoader:
             from doc2mark.formats.text import TextProcessor
             from doc2mark.formats.markup import MarkupProcessor
             from doc2mark.formats.legacy import LegacyProcessor
+            from doc2mark.formats.image import ImageProcessor
 
             # Initialize processors with OCR support
             office_processor = OfficeProcessor(ocr=self.ocr)
@@ -148,6 +152,7 @@ class UnifiedDocumentLoader:
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
             legacy_processor = LegacyProcessor(ocr=self.ocr)
+            image_processor = ImageProcessor(ocr=self.ocr)
 
             # Register processors for each format
             # Office formats - use our new OfficeProcessor
@@ -174,6 +179,11 @@ class UnifiedDocumentLoader:
                         DocumentFormat.PPT, DocumentFormat.RTF,
                         DocumentFormat.PPS]:
                 self._processors[fmt] = legacy_processor
+            
+            # Image formats
+            for fmt in [DocumentFormat.PNG, DocumentFormat.JPG,
+                        DocumentFormat.JPEG, DocumentFormat.WEBP]:
+                self._processors[fmt] = image_processor
 
             logger.info("Using individual format processors with enhanced image extraction")
 
@@ -282,6 +292,9 @@ class UnifiedDocumentLoader:
                     processor_kwargs['extract_images'] = extract_images
                     processor_kwargs['use_ocr'] = ocr_images
                     processor_kwargs['extract_tables'] = True
+                elif processor.__class__.__name__ == 'ImageProcessor':
+                    processor_kwargs['extract_images'] = extract_images
+                    processor_kwargs['ocr_images'] = ocr_images
                 elif processor.__class__.__name__ == 'TextProcessor':
                     processor_kwargs['encoding'] = encoding
                     if delimiter:
@@ -681,15 +694,28 @@ class UnifiedDocumentLoader:
 
             for i, image_info in enumerate(result.images):
                 image_path = images_dir / f"image_{i:03d}.png"
-                # Handle both dict format (with 'data' key) and direct bytes
-                if isinstance(image_info, dict) and 'data' in image_info:
-                    image_data = image_info['data']
-                else:
+                
+                # Handle different image data formats
+                image_data = None
+                if isinstance(image_info, dict):
+                    # Check for different possible keys
+                    if 'data' in image_info:
+                        image_data = image_info['data']
+                    elif 'content' in image_info:
+                        # Base64 encoded data
+                        import base64
+                        image_data = base64.b64decode(image_info['content'])
+                elif isinstance(image_info, bytes):
                     image_data = image_info
-
-                with open(image_path, 'wb') as f:
-                    f.write(image_data)
-                output_files.append(str(image_path))
+                elif isinstance(image_info, str):
+                    # Assume it's base64 encoded
+                    import base64
+                    image_data = base64.b64decode(image_info)
+                
+                if image_data:
+                    with open(image_path, 'wb') as f:
+                        f.write(image_data)
+                    output_files.append(str(image_path))
 
         return output_files
 
@@ -715,6 +741,8 @@ class UnifiedDocumentLoader:
         # Special cases
         if extension == 'markdown':
             return DocumentFormat.MARKDOWN
+        elif extension == 'htm':
+            return DocumentFormat.HTML
 
         raise UnsupportedFormatError(
             f"Cannot detect format for extension: {extension}"

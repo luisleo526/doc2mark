@@ -92,7 +92,8 @@ class VisionAgent:
             api_key: Optional[str] = None,
             model: str = "gpt-4.1",
             temperature: float = 0,
-            max_tokens: int = 4096
+            max_tokens: int = 4096,
+            base_url: Optional[str] = None
     ):
         """Initialize the vision agent.
         
@@ -101,11 +102,13 @@ class VisionAgent:
             model: Model to use for OCR (default: gpt-4.1)
             temperature: Temperature for response generation
             max_tokens: Maximum tokens in response
+            base_url: Optional base URL for OpenAI-compatible API endpoints
         """
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY')
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.base_url = base_url or os.environ.get('OPENAI_BASE_URL')
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")
@@ -113,12 +116,22 @@ class VisionAgent:
             self._chain = None
         else:
             logger.info(f"🤖 Initializing LangChain VisionAgent with {model}")
-            self._llm = ChatOpenAI(
-                model=model,
-                api_key=self.api_key,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
+            if self.base_url:
+                logger.info(f"🌐 Using custom base URL: {self.base_url}")
+            
+            # Prepare kwargs for ChatOpenAI
+            llm_kwargs = {
+                "model": model,
+                "api_key": self.api_key,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            
+            # Add base_url if provided
+            if self.base_url:
+                llm_kwargs["base_url"] = self.base_url
+            
+            self._llm = ChatOpenAI(**llm_kwargs)
             self._chain = RunnableLambda(prepare_prompt) | self._llm
 
     def invoke(self, input_dict: Dict[str, str]) -> str:
@@ -167,6 +180,7 @@ class OpenAIOCR(BaseOCR):
             prompt_template: Optional[Union[str, PromptTemplate]] = None,
             timeout: int = 30,
             max_retries: int = 3,
+            base_url: Optional[str] = None,
             **kwargs
     ):
         """Initialize OpenAI OCR provider with comprehensive configuration.
@@ -182,6 +196,7 @@ class OpenAIOCR(BaseOCR):
             prompt_template: Template name from PROMPTS dict ('default', 'table_focused', etc.)
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
+            base_url: Optional base URL for OpenAI-compatible API endpoints
             **kwargs: Additional model parameters (passed to OpenAI API)
         """
         # Use provided API key or fall back to environment variable
@@ -194,6 +209,7 @@ class OpenAIOCR(BaseOCR):
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.max_retries = max_retries
+        self.base_url = base_url or os.environ.get('OPENAI_BASE_URL')
         self.model_kwargs = kwargs
 
         self.config = config or OCRConfig()
@@ -245,12 +261,15 @@ class OpenAIOCR(BaseOCR):
             )
 
         logger.info("🔗 Initializing LangChain VisionAgent for batch processing")
+        if self.base_url:
+            logger.info(f"🌐 Using custom base URL: {self.base_url}")
         try:
             self._vision_agent = VisionAgent(
                 api_key=api_key,
                 model=self.model,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_tokens=self.max_tokens,
+                base_url=self.base_url
             )
         except Exception as e:
             logger.error(f"❌ Failed to initialize VisionAgent: {e}")
@@ -347,12 +366,15 @@ class OpenAIOCR(BaseOCR):
 
         # Reinitialize vision agent
         logger.info("🔄 Reinitializing VisionAgent with new configuration...")
+        if self.base_url:
+            logger.info(f"🌐 Using custom base URL: {self.base_url}")
         try:
             self._vision_agent = VisionAgent(
                 api_key=self.api_key,
                 model=self.model,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_tokens=self.max_tokens,
+                base_url=self.base_url
             )
         except Exception as e:
             logger.error(f"❌ Failed to reinitialize VisionAgent: {e}")
@@ -581,7 +603,7 @@ class OpenAIOCR(BaseOCR):
         Returns:
             Dictionary with current configuration
         """
-        return {
+        config = {
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -595,6 +617,12 @@ class OpenAIOCR(BaseOCR):
             "langchain_available": LANGCHAIN_AVAILABLE,
             "vision_agent_ready": bool(self._vision_agent)
         }
+        
+        # Add base_url if configured
+        if self.base_url:
+            config["base_url"] = self.base_url
+            
+        return config
 
     @property
     def requires_api_key(self) -> bool:

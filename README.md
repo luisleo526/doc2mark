@@ -4,21 +4,16 @@
 [![Python](https://img.shields.io/pypi/pyversions/doc2mark.svg)](https://pypi.org/project/doc2mark/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**doc2mark** converts any document to Markdown while preserving complex structures like tables, using AI-powered OCR when needed. Built with a unified API that handles everything from simple text files to complex multi-format documents with advanced batch processing capabilities.
+**doc2mark** converts documents to Markdown with AI-powered OCR. A unified API handles everything from PDFs to images to Office documents.
 
 ## ✨ Key Features
 
-- **Universal Format Support**: PDF, DOCX, XLSX, PPTX, HTML, JSON, CSV, and more
-- **Advanced Batch Processing**: Process entire directories with progress tracking and error handling
-- **AI-Powered OCR**: Multiple providers (OpenAI GPT-4o, Tesseract) with specialized prompt templates
-- **Dynamic Configuration**: Update OCR settings on-the-fly without reinitializing
-- **Table Structure Preservation**: Maintains merged cells, multi-level headers, and complex layouts
-- **Multiple Output Formats**: Markdown (default), JSON, or plain text
-- **Comprehensive Error Handling**: Robust processing with detailed error reporting
-- **Caching Support**: Optional caching for improved performance on repeated processing
-
-## Futrue Plan
-- [ ] Image OCR with contextual support, and auto detect language
+- **Universal Format Support**: PDF, DOCX, XLSX, PPTX, Images (PNG, JPG, JPEG, WEBP), HTML, CSV, JSON, and more
+- **AI-Powered OCR**: Extract text from scanned documents and images using OpenAI GPT-4 Vision or Tesseract
+- **Image Processing**: Process standalone images just like embedded images in documents
+- **Batch Processing**: Convert entire directories with progress tracking
+- **Table Preservation**: Maintains complex table structures with merged cells
+- **Custom API Support**: Use OpenAI-compatible endpoints with base_url parameter
 
 ## 🚀 Quick Start
 
@@ -40,39 +35,53 @@ pip install doc2mark[all]
 ```python
 from doc2mark import UnifiedDocumentLoader
 
-# Initialize loader (defaults to OpenAI OCR)
-loader = UnifiedDocumentLoader()
+# Initialize loader with OpenAI
+loader = UnifiedDocumentLoader(ocr_provider='openai')
 
 # Convert any document to markdown
 result = loader.load('document.pdf')
 print(result.content)
+
+# Process images with OCR
+result = loader.load('screenshot.png', ocr_images=True)
+print(result.content)
+
+# Batch process multiple files
+results = loader.batch_process(
+    input_dir='documents/',
+    output_dir='output/',
+    ocr_images=True
+)
 ```
 
-### With Enhanced OCR Configuration
+### Image Processing
 
 ```python
-from doc2mark import UnifiedDocumentLoader
-from doc2mark.ocr.prompts import PromptTemplate
-
-# Configure OCR with advanced settings
+# Process single images just like any other document
 loader = UnifiedDocumentLoader(
     ocr_provider='openai',
-    api_key='your-openai-api-key'  # or set OPENAI_API_KEY env var
-    model='gpt-4.1',  # Latest model
-    temperature=0.1,
-    max_tokens=4096,
-    max_workers=5,
-    prompt_template=PromptTemplate.DOCUMENT_FOCUSED,
-    timeout=60,
-    max_retries=3
+    model='gpt-4o-mini'  # Cost-effective for OCR
 )
 
-# Process with image extraction and OCR
+# Extract text from image
 result = loader.load(
-    'scanned_document.pdf',
-    extract_images=True,
-    ocr_images=True,
-    show_progress=True
+    'screenshot.png',
+    extract_images=True,  # Include image data
+    ocr_images=True       # Extract text via OCR
+)
+
+# Supported image formats
+# PNG, JPG, JPEG, WEBP
+```
+
+### Custom API Endpoints
+
+```python
+# Use OpenAI-compatible APIs (Ollama, Azure, etc.)
+loader = UnifiedDocumentLoader(
+    ocr_provider='openai',
+    base_url='https://your-api.com/v1',
+    api_key='your-api-key'
 )
 ```
 

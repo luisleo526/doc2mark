@@ -35,6 +35,12 @@ class DocumentFormat(Enum):
     HTML = "html"
     XML = "xml"
     MARKDOWN = "md"
+    
+    # Image formats
+    PNG = "png"
+    JPG = "jpg"
+    JPEG = "jpeg"
+    WEBP = "webp"
 
 
 class OutputFormat(Enum):
