@@ -37,7 +37,8 @@ jobs:
     name: OCR tests (OpenAI)
     runs-on: ubuntu-latest
     needs: test
-    if: ${{ secrets.OPENAI_API_KEY != '' }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,10 +54,14 @@ jobs:
           pip install -e .[dev,ocr]
 
       - name: Run OCR-related tests
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        if: ${{ env.OPENAI_API_KEY != '' }}
         run: |
           pytest -m "requires_api_key" -q
+
+      - name: Skip OCR tests (no OPENAI_API_KEY)
+        if: ${{ env.OPENAI_API_KEY == '' }}
+        run: |
+          echo "Skipping OCR tests: OPENAI_API_KEY not set in repository secrets"
 
       - name: Upload coverage (optional)
         if: always()
