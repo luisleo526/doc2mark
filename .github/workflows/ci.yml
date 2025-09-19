@@ -24,14 +24,14 @@ jobs:
       - name: Install dependencies (core + dev)
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[all]
+          pip install -e .[all,dev]
       
       - name: Run unit tests (no OCR external API)
         env:
           # Ensure no accidental OpenAI calls in CI
           OPENAI_API_KEY: ""
         run: |
-          pytest -m "not integration and not requires_api_key" -q
+          python -m pytest -m "not integration and not requires_api_key" -q
 
   test-ocr:
     name: OCR tests (OpenAI)
@@ -56,7 +56,7 @@ jobs:
       - name: Run OCR-related tests
         if: ${{ env.OPENAI_API_KEY != '' }}
         run: |
-          pytest -m "requires_api_key" -q
+          python -m pytest -m "requires_api_key" -q
 
       - name: Skip OCR tests (no OPENAI_API_KEY)
         if: ${{ env.OPENAI_API_KEY == '' }}
