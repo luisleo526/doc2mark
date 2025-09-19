@@ -2233,11 +2233,19 @@ class XlsxLoader(BaseOfficeLoader):
 
         # Batch OCR processing if requested
         ocr_results_map = {}
+        # Store image data to avoid calling _data() twice
+        image_data_cache = {}  
+        
         if extract_images and ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
 
             all_images_info = self._collect_all_images()
+            
+            # Cache image data for reuse during sheet extraction
+            for idx, info in enumerate(all_images_info):
+                cache_key = (info['location']['sheet'], idx)
+                image_data_cache[cache_key] = info['data']
 
             if all_images_info:
                 if show_progress:
@@ -2263,6 +2271,12 @@ class XlsxLoader(BaseOfficeLoader):
                 except Exception as e:
                     logger.error(f"Batch OCR processing failed: {e}")
                     ocr_images = False  # Fall back to base64 extraction
+        elif extract_images:
+            # Even without OCR, collect and cache images to avoid double _data() calls
+            all_images_info = self._collect_all_images()
+            for idx, info in enumerate(all_images_info):
+                cache_key = (info['location']['sheet'], idx) 
+                image_data_cache[cache_key] = info['data']
 
         # Process each worksheet
         for sheet_idx, sheet_name in enumerate(self.doc.sheetnames):
@@ -2289,7 +2303,7 @@ class XlsxLoader(BaseOfficeLoader):
 
             # Extract images
             if extract_images:
-                images = self._extract_images_from_sheet(sheet, sheet_idx + 1, ocr_images, ocr_results_map)
+                images = self._extract_images_from_sheet(sheet, sheet_idx + 1, ocr_images, ocr_results_map, image_data_cache)
                 document["content"].extend(images)
 
         return document
@@ -2510,15 +2524,25 @@ class XlsxLoader(BaseOfficeLoader):
         return self._convert_table_to_markdown(table_data)
 
     def _extract_images_from_sheet(self, sheet, sheet_num: int, ocr_images: bool,
-                                   ocr_results_map: Dict[str, str] = {}) -> List[Dict[str, Any]]:
+                                   ocr_results_map: Dict[str, str] = {},
+                                   image_data_cache: Dict[tuple, bytes] = {}) -> List[Dict[str, Any]]:
         """Extract images from an Excel sheet"""
         images = []
         sheet_name = sheet.title
 
         for img_idx, image in enumerate(sheet._images):
             try:
-                # Get image data
-                image_data = image._data()
+                # Try to get cached image data first to avoid double _data() call
+                cache_key = (sheet_num, img_idx)
+                if cache_key in image_data_cache:
+                    image_data = image_data_cache[cache_key]
+                else:
+                    # Fallback to extracting if not cached (shouldn't happen)
+                    try:
+                        image_data = image._data()
+                    except Exception as e:
+                        logger.warning(f"Failed to extract image data: {e}")
+                        continue
 
                 if ocr_images:
                     # Use image content hash to find OCR result
