@@ -663,19 +663,33 @@ class BaseOfficeLoader:
             # Always use batch processing
             ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
 
-            # Map results back using image content hash (not image_id)
-            # This ensures compatibility with individual lookup methods
+            # Map results back using both hash and ID for duplicate handling
+            # This ensures compatibility with individual lookup methods while preserving duplicates
             results_map = {}
+            id_to_result = {}  # Additional map for ID-based lookup
+            
             for image_info, ocr_result in zip(images_info, ocr_results):
-                # Use hash of image data as key - this matches individual lookup
+                # Use hash of image data as primary key - this matches individual lookup
                 img_hash = hash(image_info['data'])
+                
+                # Store the OCR result
+                ocr_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
+                
+                # Store by hash (for compatibility)
+                results_map[img_hash] = ocr_text
+                
+                # Also store by ID (for handling duplicates)
+                id_to_result[image_info['id']] = ocr_text
 
-                if hasattr(ocr_result, 'text'):
-                    results_map[img_hash] = ocr_result.text
-                else:
-                    results_map[img_hash] = str(ocr_result)
+            # For XLSX fallback images, also store with special keys for duplicate handling
+            for image_info, ocr_result in zip(images_info, ocr_results):
+                if image_info.get('location', {}).get('source') == 'zip_fallback':
+                    img_idx = image_info['location']['img_idx']
+                    fallback_key = ('_fallback_ocr', img_idx)
+                    ocr_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
+                    results_map[fallback_key] = ocr_text
 
-            logger.info(f"Successfully processed {len(results_map)} images with OCR (using hash-based keys)")
+            logger.info(f"Successfully processed {len(ocr_results)} images with OCR")
             return results_map
 
         except Exception as e:
@@ -768,6 +782,7 @@ class DocxLoader(BaseOfficeLoader):
 
         # Batch OCR processing if requested
         ocr_results_map = {}
+        processed_image_hashes = set()  # Track processed images to avoid duplicates
         if extract_images and ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
@@ -802,7 +817,7 @@ class DocxLoader(BaseOfficeLoader):
         # Process document body
         for element in self._iter_block_items():
             if isinstance(element, Paragraph):
-                self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map)
+                self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map, processed_image_hashes)
             elif isinstance(element, Table):
                 table_md = self._convert_table_to_markdown(element, extract_images, ocr_images, ocr_results_map)
                 if table_md:
@@ -814,12 +829,14 @@ class DocxLoader(BaseOfficeLoader):
                 # Note: Images are now handled within the table cells, no need to extract separately
 
         # Also check for inline shapes at document level
-        if extract_images and hasattr(self.doc, 'inline_shapes'):
-            for inline_shape in self.doc.inline_shapes:
-                if hasattr(inline_shape, '_inline'):
-                    image_content = self._extract_inline_shape_image(inline_shape, ocr_images, ocr_results_map)
-                    if image_content:
-                        result["content"].append(image_content)
+        # NOTE: This is now disabled to avoid duplicate OCR results
+        # Images are already processed via paragraphs and tables
+        # if extract_images and hasattr(self.doc, 'inline_shapes'):
+        #     for inline_shape in self.doc.inline_shapes:
+        #         if hasattr(inline_shape, '_inline'):
+        #             image_content = self._extract_inline_shape_image(inline_shape, ocr_images, ocr_results_map)
+        #             if image_content:
+        #                 result["content"].append(image_content)
 
         # Extract images from headers and footers
         if extract_images:
@@ -830,14 +847,14 @@ class DocxLoader(BaseOfficeLoader):
                         header = section.header
                         for para in header.paragraphs:
                             self._process_paragraph(para, result["content"], extract_images, ocr_images,
-                                                    ocr_results_map)
+                                                    ocr_results_map, processed_image_hashes)
 
                     # Process footer
                     if hasattr(section, 'footer'):
                         footer = section.footer
                         for para in footer.paragraphs:
                             self._process_paragraph(para, result["content"], extract_images, ocr_images,
-                                                    ocr_results_map)
+                                                    ocr_results_map, processed_image_hashes)
 
             except Exception as e:
                 logger.warning(f"Failed to process headers/footers: {e}")
@@ -854,12 +871,16 @@ class DocxLoader(BaseOfficeLoader):
                 yield Table(child, self.doc)
 
     def _process_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
-                           ocr_images: bool = False, ocr_results_map: Dict[str, str] = {}):
+                           ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+                           processed_image_hashes: set = None):
         """Process a paragraph and extract text and images"""
+        if processed_image_hashes is None:
+            processed_image_hashes = set()
+            
         # Extract images from runs first
         if extract_images:
             for run in paragraph.runs:
-                image_content = self._extract_run_images(run, ocr_images, ocr_results_map)
+                image_content = self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes)
                 if image_content:
                     content.append(image_content)
 
@@ -872,9 +893,12 @@ class DocxLoader(BaseOfficeLoader):
                 "content": text
             })
 
-    def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {}) -> Optional[
-        Dict[str, str]]:
+    def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+                           processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Extract images from a run"""
+        if processed_image_hashes is None:
+            processed_image_hashes = set()
+            
         try:
             # Access the underlying XML element
             r_element = run._element
@@ -887,12 +911,14 @@ class DocxLoader(BaseOfficeLoader):
                     for drawing_child in child:
                         if drawing_child.tag.endswith('}inline'):
                             # Found an inline shape, extract the image
-                            image_data = self._extract_image_from_inline(drawing_child, ocr_images, ocr_results_map)
+                            image_data = self._extract_image_from_inline(drawing_child, ocr_images, ocr_results_map, 
+                                                                        processed_image_hashes)
                             if image_data:
                                 return image_data
                         elif drawing_child.tag.endswith('}anchor'):
                             # Found an anchored/floating shape, extract the image
-                            image_data = self._extract_image_from_anchor(drawing_child, ocr_images, ocr_results_map)
+                            image_data = self._extract_image_from_anchor(drawing_child, ocr_images, ocr_results_map,
+                                                                        processed_image_hashes)
                             if image_data:
                                 return image_data
 
@@ -902,8 +928,12 @@ class DocxLoader(BaseOfficeLoader):
         return None
 
     def _extract_image_from_inline(self, inline_element, ocr_images: bool = False,
-                                   ocr_results_map: Dict[str, str] = {}) -> Optional[Dict[str, str]]:
+                                   ocr_results_map: Dict[str, str] = {}, 
+                                   processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Extract image from an inline element"""
+        if processed_image_hashes is None:
+            processed_image_hashes = set()
+            
         try:
             # Navigate through the inline shape structure to find the blip
             for child in inline_element:
@@ -927,15 +957,19 @@ class DocxLoader(BaseOfficeLoader):
                                                     if embed_attr:
                                                         # Get image using relationship ID
                                                         return self._get_image_by_rid(embed_attr, ocr_images,
-                                                                                      ocr_results_map)
+                                                                                      ocr_results_map, processed_image_hashes)
         except Exception as e:
             logging.warning(f"Failed to extract image from inline element: {e}")
 
         return None
 
     def _extract_image_from_anchor(self, anchor_element, ocr_images: bool = False,
-                                   ocr_results_map: Dict[str, str] = {}) -> Optional[Dict[str, str]]:
+                                   ocr_results_map: Dict[str, str] = {}, 
+                                   processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Extract image from an anchor element and return formatted result"""
+        if processed_image_hashes is None:
+            processed_image_hashes = set()
+            
         try:
             # Navigate through the anchor element structure to find the blip
             for child in anchor_element:
@@ -959,24 +993,34 @@ class DocxLoader(BaseOfficeLoader):
                                                     if embed_attr:
                                                         # Get image using relationship ID
                                                         return self._get_image_by_rid(embed_attr, ocr_images,
-                                                                                      ocr_results_map)
+                                                                                      ocr_results_map, processed_image_hashes)
         except Exception as e:
             logging.warning(f"Failed to extract image from anchor element: {e}")
 
         return None
 
-    def _get_image_by_rid(self, rid: str, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {}) -> Optional[
-        Dict[str, str]]:
+    def _get_image_by_rid(self, rid: str, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+                          processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Get image data using relationship ID"""
+        if processed_image_hashes is None:
+            processed_image_hashes = set()
+            
         try:
             # Get the image part using the relationship ID
             image_part = self.doc.part.related_parts.get(rid)
             if image_part:
                 image_bytes = image_part.blob
+                
+                # Check if this image has already been processed
+                img_hash = hash(image_bytes)
+                if img_hash in processed_image_hashes:
+                    return None  # Skip already processed images
+                
+                # Mark this image as processed
+                processed_image_hashes.add(img_hash)
 
                 if ocr_images:
-                    # Use image content hash to find OCR result
-                    img_hash = hash(image_bytes)
+                    # Use image content hash to find OCR result (already calculated above)
 
                     if img_hash in ocr_results_map:
                         ocr_text = ocr_results_map[img_hash]
@@ -2243,9 +2287,17 @@ class XlsxLoader(BaseOfficeLoader):
             all_images_info = self._collect_all_images()
             
             # Cache image data for reuse during sheet extraction
-            for idx, info in enumerate(all_images_info):
-                cache_key = (info['location']['sheet'], idx)
+            # Build cache using sheet_name and img_idx from the location info
+            for info in all_images_info:
+                sheet_name = info['location']['sheet_name']
+                img_idx = info['location']['img_idx']
+                cache_key = (sheet_name, img_idx)
                 image_data_cache[cache_key] = info['data']
+                
+                # Also cache fallback images with a special key
+                if info['location'].get('source') == 'zip_fallback':
+                    fallback_key = ('_fallback', img_idx)
+                    image_data_cache[fallback_key] = info['data']
 
             if all_images_info:
                 if show_progress:
@@ -2274,10 +2326,21 @@ class XlsxLoader(BaseOfficeLoader):
         elif extract_images:
             # Even without OCR, collect and cache images to avoid double _data() calls
             all_images_info = self._collect_all_images()
-            for idx, info in enumerate(all_images_info):
-                cache_key = (info['location']['sheet'], idx) 
+            # Build cache using sheet_name and img_idx from the location info
+            for info in all_images_info:
+                sheet_name = info['location']['sheet_name']
+                img_idx = info['location']['img_idx']
+                cache_key = (sheet_name, img_idx)
                 image_data_cache[cache_key] = info['data']
+                
+                # Also cache fallback images with a special key
+                if info['location'].get('source') == 'zip_fallback':
+                    fallback_key = ('_fallback', img_idx)
+                    image_data_cache[fallback_key] = info['data']
 
+        # Track which images have been embedded in tables to avoid duplicates
+        embedded_image_hashes = set()
+        
         # Process each worksheet
         for sheet_idx, sheet_name in enumerate(self.doc.sheetnames):
             if show_progress:
@@ -2294,6 +2357,91 @@ class XlsxLoader(BaseOfficeLoader):
 
             # Extract table data with merged cell detection
             table_content = self._extract_sheet_as_table(sheet, sheet_name)
+            
+            # If we have OCR results and the table contains #VALUE!, embed OCR in the table
+            if table_content and ocr_images and ocr_results_map and "#VALUE!" in table_content:
+                # Get the first available OCR result for #VALUE! replacement
+                for info in all_images_info:
+                    if info['location']['sheet_name'] == sheet_name:
+                        img_hash = hash(info['data'])
+                        if img_hash in ocr_results_map:
+                            ocr_text = ocr_results_map[img_hash]
+                            
+                            # Convert OCR result to structured single-line text for AI agents
+                            import html
+                            import re
+                            
+                            # Remove markdown formatting to convert to pure text
+                            pure_text = ocr_text
+                            
+                            # Remove markdown bold/italic markers
+                            pure_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', pure_text)  # Remove bold **text**
+                            pure_text = re.sub(r'\*([^*]+)\*', r'\1', pure_text)      # Remove italic *text*
+                            pure_text = re.sub(r'__([^_]+)__', r'\1', pure_text)      # Remove bold __text__
+                            pure_text = re.sub(r'_([^_]+)_', r'\1', pure_text)        # Remove italic _text_
+                            
+                            # Convert headers to structured sections
+                            pure_text = re.sub(r'^#{1,6}\s+(.+)$', r'[\1]:', pure_text, flags=re.MULTILINE)
+                            
+                            # Remove code blocks markers but keep content
+                            pure_text = re.sub(r'```[^\n]*\n', '', pure_text)
+                            pure_text = re.sub(r'```', '', pure_text)
+                            pure_text = re.sub(r'`([^`]+)`', r'\1', pure_text)  # Remove inline code markers
+                            
+                            # Convert markdown lists to structured format
+                            pure_text = re.sub(r'^[\s]*[-*+]\s+(.+)$', r'• \1', pure_text, flags=re.MULTILINE)
+                            pure_text = re.sub(r'^[\s]*\d+\.\s+(.+)$', r'• \1', pure_text, flags=re.MULTILINE)
+                            
+                            # Structure the text for AI understanding
+                            # Split by common OCR sections
+                            sections = []
+                            
+                            # Check for common patterns in OCR results
+                            if "Extracted Text:" in pure_text or "[Extracted Text]:" in pure_text:
+                                # Split into logical sections
+                                lines = pure_text.split('\n')
+                                current_section = []
+                                for line in lines:
+                                    line = line.strip()
+                                    if line and (line.startswith('[') or 'Analysis:' in line or 'Summary:' in line or 'Text:' in line):
+                                        if current_section:
+                                            sections.append(' '.join(current_section))
+                                        current_section = [line]
+                                    elif line:
+                                        current_section.append(line)
+                                if current_section:
+                                    sections.append(' '.join(current_section))
+                                
+                                # Join sections with clear separators
+                                pure_text = ' || '.join(sections) if sections else pure_text
+                            else:
+                                # For simple text, just clean up line breaks
+                                pure_text = re.sub(r'\n+', ' ', pure_text)
+                            
+                            # Clean up multiple spaces and format
+                            pure_text = re.sub(r'\s+', ' ', pure_text)
+                            pure_text = re.sub(r'\|\|\s+\|\|', '||', pure_text)  # Clean up empty sections
+                            pure_text = pure_text.strip()
+                            
+                            # Escape HTML entities
+                            pure_text_escaped = html.escape(pure_text)
+                            
+                            # Create a formatted div with structured OCR result
+                            cell_content = f'''<div style="max-width: 100%; overflow-x: auto; background: #f9f9f9; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333;">
+<strong>📷 OCR Analysis:</strong> <span style="font-family: 'Consolas', monospace; color: #0066cc;">{pure_text_escaped}</span>
+</div>'''
+                            
+                            # Replace #VALUE! with the FULL OCR result
+                            table_content = table_content.replace(
+                                "#VALUE!</td>",
+                                f"{cell_content}</td>"
+                            )
+                            
+                            # Mark that we've embedded this image's OCR
+                            embedded_image_hashes.add(img_hash)
+                            logger.info(f"Replaced #VALUE! with full OCR result in sheet {sheet_name}")
+                            break
+            
             if table_content:
                 document["content"].append({
                     "type": "table",
@@ -2301,10 +2449,31 @@ class XlsxLoader(BaseOfficeLoader):
                     "page": sheet_idx + 1
                 })
 
-            # Extract images
+            # Only extract images that weren't already embedded in table cells
             if extract_images:
+                # Filter out images that were already embedded
+                filtered_images = []
                 images = self._extract_images_from_sheet(sheet, sheet_idx + 1, ocr_images, ocr_results_map, image_data_cache)
-                document["content"].extend(images)
+                
+                for img in images:
+                    # Check if this image's OCR was already embedded
+                    img_content = img.get('content', '')
+                    skip_image = False
+                    
+                    # Check if any embedded hash matches this image's content
+                    for embedded_hash in embedded_image_hashes:
+                        if embedded_hash in ocr_results_map:
+                            embedded_text = ocr_results_map[embedded_hash]
+                            # If this image's content matches an embedded one, skip it
+                            if embedded_text in img_content:
+                                skip_image = True
+                                break
+                    
+                    if not skip_image:
+                        filtered_images.append(img)
+                
+                if filtered_images:
+                    document["content"].extend(filtered_images)
 
         return document
 
@@ -2529,17 +2698,20 @@ class XlsxLoader(BaseOfficeLoader):
         """Extract images from an Excel sheet"""
         images = []
         sheet_name = sheet.title
-
+        
+        # First try standard image extraction
         for img_idx, image in enumerate(sheet._images):
             try:
                 # Try to get cached image data first to avoid double _data() call
-                cache_key = (sheet_num, img_idx)
+                cache_key = (sheet_name, img_idx)  # Use sheet_name for consistency
                 if cache_key in image_data_cache:
                     image_data = image_data_cache[cache_key]
                 else:
                     # Fallback to extracting if not cached (shouldn't happen)
                     try:
                         image_data = image._data()
+                        # Cache it now to avoid future calls
+                        image_data_cache[cache_key] = image_data
                     except Exception as e:
                         logger.warning(f"Failed to extract image data: {e}")
                         continue
@@ -2575,6 +2747,60 @@ class XlsxLoader(BaseOfficeLoader):
 
             except Exception as e:
                 logger.warning(f"Failed to extract image: {e}")
+        
+        # If no images found via standard method and this is the first sheet, check for fallback images
+        if len(images) == 0 and sheet_num == 1:
+            # Check if we have fallback images in cache
+            fallback_idx = 0
+            while True:
+                fallback_key = ('_fallback', fallback_idx)
+                if fallback_key in image_data_cache:
+                    image_data = image_data_cache[fallback_key]
+                    
+                    if ocr_images:
+                        # First try the special fallback OCR key for this specific image
+                        fallback_ocr_key = ('_fallback_ocr', fallback_idx)
+                        
+                        if fallback_ocr_key in ocr_results_map:
+                            ocr_text = ocr_results_map[fallback_ocr_key]
+                            images.append({
+                                "type": "text:image_description",
+                                "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
+                                "page": sheet_num
+                            })
+                            logger.info(f"Using OCR result for fallback image {fallback_idx}")
+                        else:
+                            # Try hash-based lookup as backup
+                            img_hash = hash(image_data)
+                            if img_hash in ocr_results_map:
+                                ocr_text = ocr_results_map[img_hash]
+                                images.append({
+                                    "type": "text:image_description",
+                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
+                                    "page": sheet_num
+                                })
+                            else:
+                                # Fallback to individual OCR
+                                logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
+                                ocr_text = self._ocr_image(image_data)
+                                images.append({
+                                    "type": "text:image_description",
+                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
+                                    "page": sheet_num
+                                })
+                    else:
+                        # Return base64 encoded image
+                        base64_data = self._extract_image_as_base64(image_data)
+                        images.append({
+                            "type": "image",
+                            "content": base64_data,
+                            "page": sheet_num
+                        })
+                    
+                    logger.info(f"Added fallback image {fallback_idx} to sheet {sheet_name}")
+                    fallback_idx += 1
+                else:
+                    break  # No more fallback images
 
         return images
 
@@ -2583,23 +2809,105 @@ class XlsxLoader(BaseOfficeLoader):
         images_info = []
         image_counter = 0
 
+        # First try standard openpyxl method
         for sheet_idx, sheet_name in enumerate(self.doc.sheetnames):
             sheet = self.doc[sheet_name]
 
-            # Extract images from sheet
-            for image in sheet._images:
+            # Extract images from sheet using standard method
+            for img_idx, image in enumerate(sheet._images):
                 try:
                     image_data = image._data()
                     image_counter += 1
                     images_info.append({
-                        'id': f'xlsx_sheet{sheet_idx + 1}_{sheet_name}_{image_counter}',
+                        'id': f'xlsx_sheet{sheet_idx + 1}_{sheet_name}_img{img_idx}',
                         'data': image_data,
-                        'location': {'sheet': sheet_idx + 1, 'sheet_name': sheet_name}
+                        'location': {'sheet': sheet_idx + 1, 'sheet_name': sheet_name, 'img_idx': img_idx}
                     })
                 except Exception as e:
                     logger.warning(f"Failed to extract image from sheet {sheet_name}: {e}")
 
+        # If no images found via standard method, try fallback ZIP extraction
+        if len(images_info) == 0:
+            logger.info("No images found via standard method, trying ZIP extraction fallback...")
+            images_info = self._extract_images_from_zip()
+
         logger.info(f"Collected {len(images_info)} images from XLSX")
+        return images_info
+    
+    def _extract_images_from_zip(self) -> List[Dict[str, Any]]:
+        """Fallback method to extract images directly from XLSX ZIP structure
+        
+        This handles edge cases where images are embedded in non-standard ways:
+        - Cell backgrounds
+        - VML drawings
+        - Legacy formats
+        """
+        images_info = []
+        
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            
+            with zipfile.ZipFile(self.file_path, 'r') as zip_file:
+                # Look for all media files
+                media_files = [f for f in zip_file.namelist() if '/media/' in f and 
+                             any(f.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp'])]
+                
+                # Try to map images to their cell locations via drawing files
+                image_to_cell_map = {}
+                drawing_files = [f for f in zip_file.namelist() if '/drawings/' in f and f.endswith('.xml')]
+                
+                for drawing_file in drawing_files:
+                    try:
+                        content = zip_file.read(drawing_file).decode('utf-8')
+                        # Parse drawing XML to find image anchors
+                        # This is a simplified extraction - full implementation would need proper namespace handling
+                        import re
+                        # Look for cell references in anchor tags
+                        # Pattern to find from cell references
+                        from_cells = re.findall(r'<xdr:from>.*?<xdr:col>(\d+)</xdr:col>.*?<xdr:row>(\d+)</xdr:row>', 
+                                               content, re.DOTALL)
+                        # Map drawing index to cell location
+                        for idx, (col, row) in enumerate(from_cells):
+                            if idx < len(media_files):
+                                # Convert to Excel cell reference (0-based to 1-based)
+                                cell_ref = f"{chr(65 + int(col))}{int(row) + 1}"  # Simple conversion for single letters
+                                image_to_cell_map[media_files[idx]] = cell_ref
+                    except Exception as e:
+                        logger.debug(f"Could not parse drawing file {drawing_file}: {e}")
+                
+                for idx, media_file in enumerate(media_files):
+                    try:
+                        image_data = zip_file.read(media_file)
+                        
+                        # Try to determine which sheet this image belongs to
+                        # For now, we'll associate with the first sheet as a fallback
+                        sheet_idx = 0
+                        sheet_name = self.doc.sheetnames[0] if self.doc.sheetnames else "Sheet1"
+                        
+                        # Get cell reference if available
+                        cell_ref = image_to_cell_map.get(media_file, None)
+                        
+                        images_info.append({
+                            'id': f'xlsx_fallback_{idx}_{media_file.split("/")[-1]}',
+                            'data': image_data,
+                            'location': {
+                                'sheet': sheet_idx + 1, 
+                                'sheet_name': sheet_name, 
+                                'img_idx': idx, 
+                                'source': 'zip_fallback',
+                                'cell_ref': cell_ref  # Add cell reference if found
+                            },
+                            'media_file': media_file  # Keep track of which media file this is
+                        })
+                        
+                        logger.info(f"Extracted image via ZIP fallback: {media_file} (cell: {cell_ref or 'unknown'})")
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {media_file}: {e}")
+                        
+        except Exception as e:
+            logger.warning(f"ZIP fallback extraction failed: {e}")
+            
         return images_info
 
 
