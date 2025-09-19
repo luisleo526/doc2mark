@@ -880,9 +880,12 @@ class DocxLoader(BaseOfficeLoader):
         # Extract images from runs first
         if extract_images:
             for run in paragraph.runs:
-                image_content = self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes)
-                if image_content:
-                    content.append(image_content)
+                image_result = self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes)
+                if image_result:
+                    if isinstance(image_result, list):
+                        content.extend(image_result)
+                    else:
+                        content.append(image_result)
 
         # Then extract text
         text = paragraph.text.strip()
@@ -894,8 +897,12 @@ class DocxLoader(BaseOfficeLoader):
             })
 
     def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
-                           processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
-        """Extract images from a run"""
+                           processed_image_hashes: set = None) -> Optional[Union[Dict[str, str], List[Dict[str, str]]]]:
+        """Extract all images from a run.
+
+        Returns a single dict if exactly one image is found, a list of dicts if multiple
+        images are found in the run, or None if no images are present.
+        """
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -904,6 +911,7 @@ class DocxLoader(BaseOfficeLoader):
             r_element = run._element
 
             # Look for drawing elements in the run
+            found_items: List[Dict[str, str]] = []
             for child in r_element:
                 # Check if this is a w:drawing element
                 if child.tag.endswith('}drawing'):
@@ -911,16 +919,20 @@ class DocxLoader(BaseOfficeLoader):
                     for drawing_child in child:
                         if drawing_child.tag.endswith('}inline'):
                             # Found an inline shape, extract the image
-                            image_data = self._extract_image_from_inline(drawing_child, ocr_images, ocr_results_map, 
-                                                                        processed_image_hashes)
+                            image_data = self._extract_image_from_inline(
+                                drawing_child, ocr_images, ocr_results_map, processed_image_hashes
+                            )
                             if image_data:
-                                return image_data
+                                found_items.append(image_data)
                         elif drawing_child.tag.endswith('}anchor'):
                             # Found an anchored/floating shape, extract the image
-                            image_data = self._extract_image_from_anchor(drawing_child, ocr_images, ocr_results_map,
-                                                                        processed_image_hashes)
+                            image_data = self._extract_image_from_anchor(
+                                drawing_child, ocr_images, ocr_results_map, processed_image_hashes
+                            )
                             if image_data:
-                                return image_data
+                                found_items.append(image_data)
+            if found_items:
+                return found_items if len(found_items) > 1 else found_items[0]
 
         except Exception as e:
             logging.warning(f"Failed to extract images from run: {e}")
@@ -2025,7 +2037,7 @@ class PptxLoader(BaseOfficeLoader):
             image = placeholder.image
             image_data = image.blob
 
-            if ocr_images and OCR_AVAILABLE:
+            if ocr_images and self.ocr:
                 # Use image content hash to find OCR result
                 img_hash = hash(image_data)
 
@@ -2064,7 +2076,7 @@ class PptxLoader(BaseOfficeLoader):
             image = shape.image
             image_data = image.blob
 
-            if ocr_images and OCR_AVAILABLE:
+            if ocr_images and self.ocr:
                 # Use image content hash to find OCR result
                 img_hash = hash(image_data)
 

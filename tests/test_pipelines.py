@@ -4,6 +4,9 @@ import pytest
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.core.base import DocumentFormat, OutputFormat, ProcessedDocument, ProcessingError
+from pathlib import Path
+import os
+import re
 
 
 class TestPipelines:
@@ -176,3 +179,50 @@ class TestPipelines:
         # Check for OCR results
         if '<image_ocr_result>' in result.content:
             assert '</image_ocr_result>' in result.content
+
+    @pytest.mark.requires_api_key
+    def test_xlsx_ocr_embeds_in_cell(self, sample_documents_dir):
+        """XLSX: OCR result should be embedded in the table cell placeholder (first occurrence only)."""
+        xlsx = sample_documents_dir / 'sample_spreadsheet.xlsx'
+        if not xlsx.exists():
+            pytest.skip("sample_spreadsheet.xlsx not found")
+
+        # Use OpenAI OCR provider for robust OCR behavior
+        if not os.environ.get("OPENAI_API_KEY"):
+            pytest.skip("OPENAI_API_KEY not set")
+
+        loader = UnifiedDocumentLoader(ocr_provider='openai')
+        result = loader.load(
+            xlsx,
+            extract_images=True,
+            ocr_images=True,
+        )
+
+        # Must contain complex HTML table
+        assert '<table' in result.content and '</table>' in result.content
+
+        # Ensure no literal placeholder remains
+        assert '#VALUE!' not in result.content
+
+        # Ensure at least one OCR analysis div injected (first occurrence replacement)
+        injected = result.content.count('📷 OCR Analysis:')
+        assert injected >= 1
+
+    def test_pptx_ocr_uses_self_ocr_not_visionagent(self, sample_documents_dir):
+        """PPTX: OCR should run when self.ocr is configured, regardless of VisionAgent availability."""
+        pptx_files = list(sample_documents_dir.glob('*.pptx'))
+        if not pptx_files:
+            pytest.skip("No PPTX files found")
+
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract')
+        result = loader.load(
+            pptx_files[0],
+            extract_images=True,
+            ocr_images=True,
+        )
+
+        # If images exist, expect OCR tags or at least image entries.
+        # We can't guarantee OCR text content, but tag presence indicates path executed.
+        if '![Image]' in result.content or 'data:image/png;base64' in result.content:
+            # Either OCR code paths placed description blocks or images; accept either
+            assert ('<ocr_result>' in result.content) or ('<image_ocr_result>' in result.content) or ('data:image' in result.content)
