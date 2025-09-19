@@ -2432,9 +2432,11 @@ class XlsxLoader(BaseOfficeLoader):
 </div>'''
                             
                             # Replace #VALUE! with the FULL OCR result
+                            # Replace only the first placeholder occurrence on this sheet
                             table_content = table_content.replace(
                                 "#VALUE!</td>",
-                                f"{cell_content}</td>"
+                                f"{cell_content}</td>",
+                                1
                             )
                             
                             # Mark that we've embedded this image's OCR
@@ -2563,7 +2565,52 @@ class XlsxLoader(BaseOfficeLoader):
             for r in range(min_row, max_row_merge + 1):
                 for c in range(min_col, max_col_merge + 1):
                     if (r, c) != (min_row, min_col):
-                        merge_map[(r, c)] = {'is_merged': True}
+                        # Keep a backlink to the origin so we can map image anchors correctly
+                        merge_map[(r, c)] = {'is_merged': True, 'origin': (min_row, min_col)}
+
+        # Detect cells containing images (based on anchor positions) so we can embed OCR in-place
+        image_origin_cells = set()
+        try:
+            from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+        except Exception:
+            coordinate_from_string = None
+            column_index_from_string = None
+
+        for _img in getattr(sheet, "_images", []):
+            row = None
+            col = None
+            anchor = getattr(_img, "anchor", None)
+            try:
+                # Anchor can be a coordinate string like 'B3'
+                if isinstance(anchor, str) and coordinate_from_string is not None:
+                    col_letter, row_num = coordinate_from_string(anchor)
+                    row = int(row_num)
+                    col = int(column_index_from_string(col_letter))
+                # Or an anchor object (OneCellAnchor/TwoCellAnchor) with 0-based indices
+                elif hasattr(anchor, "_from") and hasattr(anchor._from, "row") and hasattr(anchor._from, "col"):
+                    row = int(anchor._from.row) + 1
+                    col = int(anchor._from.col) + 1
+            except Exception:
+                row = None
+                col = None
+
+            if row is None or col is None:
+                continue
+
+            # If the anchor falls inside a merged region, use that region's origin
+            origin_row, origin_col = row, col
+            mi = merge_map.get((row, col))
+            if isinstance(mi, dict) and mi.get('is_merged') and 'origin' in mi:
+                origin_row, origin_col = mi['origin']
+            else:
+                # Search origins in merge_map
+                for _pos, _info in merge_map.items():
+                    if 'min_row' in _info:
+                        if _info['min_row'] <= row <= _info['max_row'] and _info['min_col'] <= col <= _info['max_col']:
+                            origin_row, origin_col = _info['min_row'], _info['min_col']
+                            break
+
+            image_origin_cells.add((origin_row, origin_col))
 
         # Extract data row by row
         # Start from row 1 (Excel is 1-indexed)
@@ -2581,6 +2628,9 @@ class XlsxLoader(BaseOfficeLoader):
                     else:
                         # This is the origin cell of a merge
                         value = str(merge_info['value']) if merge_info['value'] is not None else ""
+                        # If an image is anchored to this merged region's origin, mark placeholder for OCR embedding
+                        if (row_idx, col_idx) in image_origin_cells:
+                            value = "#VALUE!" if not value else f"{value} #VALUE!"
                         row_data.append(value)
 
                         # Record merge info (0-indexed for our table)
@@ -2595,6 +2645,9 @@ class XlsxLoader(BaseOfficeLoader):
                     # Regular cell - get its value
                     cell_value = sheet.cell(row=row_idx, column=col_idx).value
                     value = str(cell_value) if cell_value is not None else ""
+                    # If an image is anchored to this exact cell, mark placeholder for OCR embedding
+                    if (row_idx, col_idx) in image_origin_cells:
+                        value = "#VALUE!" if not value else f"{value} #VALUE!"
                     row_data.append(value)
 
             # Add all rows to table_data initially
