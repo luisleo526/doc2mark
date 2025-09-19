@@ -293,18 +293,38 @@ class OfficeProcessor(BaseProcessor):
             # Process each sheet
             for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
+                
+                # Find actual max column with data (not Excel's 16384 limit)
+                actual_max_col = 0
+                actual_max_row = 0
+                
+                # Check first 100 rows to find actual data extent
+                for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 100)), 1):
+                    for col_idx, cell in enumerate(row, 1):
+                        if cell.value is not None:
+                            actual_max_col = max(actual_max_col, col_idx)
+                            actual_max_row = max(actual_max_row, row_idx)
+                
+                # Check rest of rows if needed
+                if sheet.max_row > 100:
+                    for row in sheet.iter_rows(min_row=101, max_row=sheet.max_row, max_col=actual_max_col):
+                        if any(cell.value is not None for cell in row):
+                            actual_max_row = sheet.max_row
+                            break
 
-                if sheet.max_row > 0 and sheet.max_column > 0:
+                if actual_max_row > 0 and actual_max_col > 0:
                     markdown_parts.append(f"## {sheet_name}")
                     markdown_parts.append("")
 
                     # Convert sheet to markdown table
                     table_data = []
-                    for row in sheet.iter_rows(values_only=True):
+                    for row in sheet.iter_rows(min_row=1, max_row=actual_max_row, 
+                                               min_col=1, max_col=actual_max_col, 
+                                               values_only=True):
                         # Filter out completely empty rows
                         if any(cell is not None for cell in row):
                             table_data.append([str(cell) if cell is not None else "" for cell in row])
-                            total_cells += len(row)
+                            total_cells += actual_max_col
 
                     if table_data:
                         table_md = self._convert_list_to_markdown_table(table_data)

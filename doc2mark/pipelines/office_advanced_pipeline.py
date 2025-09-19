@@ -2301,6 +2301,9 @@ class XlsxLoader(BaseOfficeLoader):
             df = self.df_sheets[sheet_name]
             if df.empty:
                 return ""
+            
+            # Drop completely empty columns from DataFrame
+            df = df.dropna(axis=1, how='all')
         else:
             return ""
 
@@ -2319,7 +2322,30 @@ class XlsxLoader(BaseOfficeLoader):
         """Extract sheet data handling merged cells"""
         # Get the actual dimensions
         max_row = sheet.max_row
-        max_col = sheet.max_column
+        
+        # Find actual max column with data across ALL rows (not Excel's 16384 limit)
+        # This handles sheets with multiple tables that have different column counts
+        actual_max_col = 1
+        
+        # Check ALL rows to find the true max column with data
+        for row in sheet.iter_rows(min_row=1, max_row=max_row):
+            for idx, cell in enumerate(row, 1):
+                if cell.value is not None:
+                    actual_max_col = max(actual_max_col, idx)
+        
+        # Also check merged cells, but exclude the buggy full-width merges (A:XFD)
+        for merge_range in sheet.merged_cells.ranges:
+            # Skip merged cells that span to Excel's max column (XFD = 16384)
+            # These are typically separator rows, not real data
+            if merge_range.max_col >= 16384:
+                logger.debug(f"Skipping full-width merged cell: {merge_range}")
+                continue
+            
+            # For normal merged cells, include their extent
+            actual_max_col = max(actual_max_col, merge_range.max_col)
+        
+        max_col = actual_max_col
+        logger.debug(f"Sheet dimensions: {max_row} rows x {max_col} columns (actual used)")
 
         # Build table data with merged cell info
         table_data = []
@@ -2332,7 +2358,9 @@ class XlsxLoader(BaseOfficeLoader):
             min_row = merge_range.min_row
             min_col = merge_range.min_col
             max_row_merge = merge_range.max_row
-            max_col_merge = merge_range.max_col
+            # Limit merged cell columns to actual data bounds
+            # (Handles buggy Excel files with merges to column XFD)
+            max_col_merge = min(merge_range.max_col, max_col)
 
             # Get the value from the top-left cell
             cell_value = sheet.cell(row=min_row, column=min_col).value
@@ -2386,13 +2414,61 @@ class XlsxLoader(BaseOfficeLoader):
                     value = str(cell_value) if cell_value is not None else ""
                     row_data.append(value)
 
-            # Add the row even if it has empty cells
+            # Add all rows to table_data initially
             table_data.append(row_data)
 
+        # Filter out columns that are completely empty across ALL rows
+        # This preserves columns that have data in ANY table within the sheet
+        if table_data and len(table_data) > 1:
+            # Check which columns have ANY data across all rows
+            cols_with_data = set()
+            for row_idx, row in enumerate(table_data):
+                for col_idx, cell in enumerate(row[:max_col]):
+                    if cell and str(cell).strip():
+                        cols_with_data.add(col_idx)
+            
+            # Keep all columns that have data somewhere
+            cols_to_keep = sorted(list(cols_with_data))
+            
+            # Only filter if we're actually removing empty columns
+            if cols_to_keep and len(cols_to_keep) < max_col:
+                filtered_table_data = []
+                for row in table_data:
+                    filtered_row = [row[i] if i < len(row) else '' for i in cols_to_keep]
+                    filtered_table_data.append(filtered_row)
+                
+                # Update merged cells info for new column indices
+                filtered_merged_cells_info = []
+                col_index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(cols_to_keep)}
+                
+                for merge_info in merged_cells_info:
+                    old_col = merge_info['col']
+                    if old_col in col_index_map:
+                        # Calculate new colspan based on how many columns in the span are kept
+                        old_col_end = old_col + merge_info['colspan']
+                        kept_cols_in_span = [c for c in range(old_col, old_col_end) if c in cols_to_keep]
+                        
+                        if kept_cols_in_span:
+                            filtered_merged_cells_info.append({
+                                'row': merge_info['row'],
+                                'col': col_index_map[old_col],
+                                'rowspan': merge_info['rowspan'],
+                                'colspan': len(kept_cols_in_span)
+                            })
+                
+                table_data = filtered_table_data
+                merged_cells_info = filtered_merged_cells_info
+                actual_col_count = len(cols_to_keep)
+                logger.debug(f"Filtered table from {max_col} to {actual_col_count} columns (removed completely empty columns)")
+            else:
+                actual_col_count = max_col
+        else:
+            actual_col_count = max_col
+        
         # Debug logging
         logger.debug(f"Extracted {len(table_data)} rows with {len(merged_cells_info)} merged cells")
         if len(table_data) > 0:
-            logger.debug(f"First row: {table_data[0][:10]}...")  # Log first 10 cells of first row
+            logger.debug(f"First row: {table_data[0][:10] if len(table_data[0]) > 10 else table_data[0]}")
 
         # Create table info for complex table handling
         if merged_cells_info:
@@ -2400,7 +2476,7 @@ class XlsxLoader(BaseOfficeLoader):
                 'is_complex': True,
                 'merged_cells': merged_cells_info,
                 'row_count': len(table_data),
-                'col_count': max_col,  # Use actual column count from sheet
+                'col_count': actual_col_count,  # Use filtered column count
                 'cell_spans': {}
             }
 
@@ -2412,8 +2488,14 @@ class XlsxLoader(BaseOfficeLoader):
             # Use HTML converter for complex tables
             return self._convert_table_to_html(table_data, table_info)
         else:
+            # Filter out completely empty rows before converting to markdown
+            filtered_data = []
+            for idx, row in enumerate(table_data):
+                if idx == 0 or any(cell.strip() for cell in row if cell):  # Keep headers or non-empty rows
+                    filtered_data.append(row)
+            
             # Use standard markdown conversion
-            return self._convert_table_to_markdown(table_data)
+            return self._convert_table_to_markdown(filtered_data) if filtered_data else ""
 
     def _dataframe_to_markdown(self, df: pd.DataFrame) -> str:
         """Convert pandas DataFrame to markdown table"""
