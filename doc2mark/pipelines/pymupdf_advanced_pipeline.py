@@ -617,10 +617,14 @@ class PDFLoader:
             return ""
 
         try:
-            # Always use extract() method for consistency
-            extracted_data = table.extract()
+            # Try to extract with manual cell-by-cell extraction to avoid overlapping text issues
+            extracted_data = self._extract_table_with_dedup(table)
+            
+            # Fallback to standard extract if manual extraction fails
             if not extracted_data or not any(extracted_data):
-                return ""
+                extracted_data = table.extract()
+                if not extracted_data or not any(extracted_data):
+                    return ""
             
             # Use boundary-based analysis for better merge detection
             table_info = self._analyze_table_with_boundaries(table, extracted_data)
@@ -634,6 +638,223 @@ class PDFLoader:
             logger.warning(f"Failed to convert table to markdown: {e}")
             # Fallback to original method
             return self._convert_table_to_markdown(table)
+
+    def _extract_table_with_dedup(self, table) -> List[List]:
+        """
+        Extract table data cell-by-cell with deduplication of overlapping text spans.
+        
+        Some PDFs (especially from design software like Adobe Illustrator) have overlapping 
+        text layers, which causes garbled text extraction. For example:
+        - '3853 8/ 54 9/ 11 /4 015 405' instead of '385 / 491 / 1 405'
+        - '11 119933--112 24488' instead of '1 193-1 248'
+        
+        This method extracts text from each cell's bbox individually and deduplicates 
+        overlapping text spans by keeping the longest/most complete version.
+        
+        Returns:
+            Cleaned table data or None if extraction fails (triggers fallback)
+        """
+        try:
+            # Get the standard extraction first to know the table structure
+            standard_data = table.extract()
+            if not standard_data:
+                return []
+            
+            # Get the page object to extract text
+            if not hasattr(table, 'page'):
+                # Can't get page, fallback to standard extraction
+                return standard_data
+            
+            page = table.page
+            
+            # Check if we have rows with cell bbox info
+            if not hasattr(table, 'rows') or not table.rows:
+                # No row info available, fallback
+                return standard_data
+            
+            # Extract text cell-by-cell with deduplication
+            cleaned_data = []
+            for row_idx, table_row in enumerate(table.rows):
+                row_data = []
+                
+                # Get the standard row data
+                std_row = standard_data[row_idx] if row_idx < len(standard_data) else []
+                
+                # Get cells for this row
+                if hasattr(table_row, 'cells') and table_row.cells:
+                    for col_idx, cell_bbox in enumerate(table_row.cells):
+                        # Get the standard cell value
+                        std_value = std_row[col_idx] if col_idx < len(std_row) else None
+                        
+                        # If cell_bbox is None, it's part of a merged cell
+                        if cell_bbox is None:
+                            row_data.append(std_value)
+                        elif std_value and isinstance(std_value, str) and std_value.strip():
+                            # Extract text from this bbox and deduplicate
+                            clean_text = self._extract_text_from_bbox_dedup(page, cell_bbox)
+                            row_data.append(clean_text if clean_text else std_value)
+                        else:
+                            row_data.append(std_value)
+                else:
+                    # No cell bbox info for this row, use standard data
+                    row_data = std_row
+                
+                cleaned_data.append(row_data)
+            
+            return cleaned_data
+            
+        except Exception as e:
+            logger.debug(f"Failed to extract table with deduplication: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Return None to trigger fallback
+            return None
+    
+    def _extract_text_from_bbox_dedup(self, page, bbox: tuple) -> str:
+        """
+        Extract text from a bbox and deduplicate overlapping text spans.
+        
+        When multiple text spans overlap in the same position (common in PDFs with 
+        multiple text layers), this method keeps only the longest/most complete version.
+        
+        Args:
+            page: PyMuPDF page object
+            bbox: Bounding box tuple (x0, y0, x1, y1)
+            
+        Returns:
+            Deduplicated text string
+        """
+        try:
+            # Get text dict for this bbox region
+            text_dict = page.get_text("dict", clip=bbox)
+            
+            if not text_dict or 'blocks' not in text_dict:
+                return ""
+            
+            # Collect all text spans with their bboxes
+            all_spans = []
+            for block in text_dict['blocks']:
+                if block['type'] == 0:  # Text block
+                    for line in block['lines']:
+                        for span in line['spans']:
+                            text = span['text'].strip()
+                            if text:
+                                all_spans.append({
+                                    'text': text,
+                                    'bbox': span['bbox'],
+                                    'size': span['size']
+                                })
+            
+            if not all_spans:
+                return ""
+            
+            # Deduplicate overlapping spans - keep the longest/most complete one
+            deduplicated = self._deduplicate_spans(all_spans)
+            
+            # Join the deduplicated text
+            return ' '.join(deduplicated)
+            
+        except Exception as e:
+            logger.debug(f"Failed to extract text from bbox: {e}")
+            return ""
+    
+    def _deduplicate_spans(self, spans: List[Dict]) -> List[str]:
+        """
+        Deduplicate overlapping text spans, keeping the most complete version.
+        
+        Groups spans by vertical position (same line) and checks for horizontal overlap.
+        When spans overlap significantly (≥50% overlap), keeps only the longest text.
+        
+        This solves the problem of PDFs with multiple text layers where the same 
+        content appears multiple times at slightly different positions.
+        
+        Args:
+            spans: List of span dicts with 'text', 'bbox', 'size' keys
+            
+        Returns:
+            List of deduplicated text strings
+        """
+        if not spans:
+            return []
+        
+        # Group spans by approximate Y position (same line)
+        from collections import defaultdict
+        lines = defaultdict(list)
+        
+        for span in spans:
+            bbox = span['bbox']
+            y_pos = (bbox[1] + bbox[3]) / 2  # Middle Y
+            # Round to nearest 5 pixels to group similar Y positions
+            y_key = round(y_pos / 5) * 5
+            lines[y_key].append(span)
+        
+        # For each line, deduplicate spans
+        result_texts = []
+        for y_key in sorted(lines.keys()):
+            line_spans = lines[y_key]
+            
+            # Sort by X position
+            line_spans.sort(key=lambda s: s['bbox'][0])
+            
+            # Check for overlapping spans (same/similar X range)
+            deduped_line = []
+            i = 0
+            while i < len(line_spans):
+                current = line_spans[i]
+                current_text = current['text']
+                current_bbox = current['bbox']
+                
+                # Look ahead for overlapping spans
+                j = i + 1
+                overlapping = [current]
+                while j < len(line_spans):
+                    next_span = line_spans[j]
+                    next_bbox = next_span['bbox']
+                    
+                    # Check if bboxes overlap horizontally
+                    if self._bbox_overlaps_horizontally(current_bbox, next_bbox, threshold=0.5):
+                        overlapping.append(next_span)
+                        j += 1
+                    else:
+                        break
+                
+                # If we have overlapping spans, choose the longest text
+                if len(overlapping) > 1:
+                    # Choose the one with the longest text (most complete)
+                    best = max(overlapping, key=lambda s: len(s['text']))
+                    deduped_line.append(best['text'])
+                    logger.debug(f"Deduplicated {len(overlapping)} overlapping spans, kept: '{best['text']}'")
+                else:
+                    deduped_line.append(current_text)
+                
+                i = j if j > i else i + 1
+            
+            # Join texts from this line
+            if deduped_line:
+                result_texts.extend(deduped_line)
+        
+        return result_texts
+    
+    def _bbox_overlaps_horizontally(self, bbox1: tuple, bbox2: tuple, threshold: float = 0.5) -> bool:
+        """Check if two bboxes overlap horizontally by at least threshold ratio."""
+        x0_1, y0_1, x1_1, y1_1 = bbox1
+        x0_2, y0_2, x1_2, y1_2 = bbox2
+        
+        # Calculate horizontal overlap
+        overlap_start = max(x0_1, x0_2)
+        overlap_end = min(x1_1, x1_2)
+        
+        if overlap_end <= overlap_start:
+            return False
+        
+        overlap_width = overlap_end - overlap_start
+        min_width = min(x1_1 - x0_1, x1_2 - x0_2)
+        
+        if min_width <= 0:
+            return False
+        
+        overlap_ratio = overlap_width / min_width
+        return overlap_ratio >= threshold
 
     def _analyze_table_with_boundaries(self, table, extracted_data: List[List]) -> Dict[str, Any]:
         """Analyze table using cell boundaries if available"""
