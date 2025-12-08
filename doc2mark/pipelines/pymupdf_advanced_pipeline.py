@@ -1148,8 +1148,10 @@ class PDFLoader:
         for row_idx, row in enumerate(table_data):
             html_lines.append("<tr>")
 
-            for col_idx in range(table_info['col_count']):
-                if (row_idx, col_idx) in processed_cells:
+            col_idx = 0
+            while col_idx < table_info['col_count']:
+                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
+                    col_idx += 1
                     continue
 
                 # Get and escape cell content
@@ -1159,6 +1161,9 @@ class PDFLoader:
 
                 # Build attributes (only rowspan/colspan if needed)
                 attrs = []
+                colspan = 1
+                rowspan = 1
+
                 if (row_idx, col_idx) in table_info['cell_spans']:
                     rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
                     if rowspan > 1:
@@ -1173,6 +1178,8 @@ class PDFLoader:
                 cell_tag = "th" if row_idx == 0 else "td"
                 attrs_str = " " + " ".join(attrs) if attrs else ""
                 html_lines.append(f"<{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>")
+
+                col_idx += colspan
 
             html_lines.append("</tr>")
 
@@ -1254,8 +1261,10 @@ class PDFLoader:
         for row_idx, row in enumerate(table_data):
             html_lines.append("  <tr>")
 
-            for col_idx in range(table_info['col_count']):
-                if (row_idx, col_idx) in processed_cells:
+            col_idx = 0
+            while col_idx < table_info['col_count']:
+                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
+                    col_idx += 1
                     continue
 
                 cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
@@ -1265,6 +1274,8 @@ class PDFLoader:
                 cell_text = cell_text.replace('\n', '<br>')
 
                 cell_attrs = []
+                colspan = 1
+                rowspan = 1
                 
                 if (row_idx, col_idx) in table_info['cell_spans']:
                     rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
@@ -1285,6 +1296,8 @@ class PDFLoader:
 
                 attrs_str = " " + " ".join(cell_attrs) if cell_attrs else ""
                 html_lines.append(f'    <{cell_tag}{attrs_str} {style}>{cell_text}</{cell_tag}>')
+
+                col_idx += colspan
 
             html_lines.append("  </tr>")
 
