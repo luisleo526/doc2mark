@@ -1,11 +1,12 @@
 """OpenAI GPT-4V OCR implementation."""
 
 import base64
+import io
 import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
@@ -30,6 +31,108 @@ from doc2mark.ocr.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Supported image formats for OpenAI Vision API
+SUPPORTED_IMAGE_FORMATS = {'png', 'jpeg', 'jpg', 'gif', 'webp'}
+
+
+def detect_image_format(image_data: bytes) -> str:
+    """Detect image format from binary data using magic bytes.
+    
+    Args:
+        image_data: Raw image bytes
+        
+    Returns:
+        Image format string (e.g., 'png', 'jpeg', 'gif', 'webp', 'tiff', 'bmp', 'unknown')
+    """
+    # Check magic bytes
+    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    elif image_data[:2] == b'\xff\xd8':
+        return 'jpeg'
+    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    elif image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
+        return 'webp'
+    elif image_data[:4] in (b'II*\x00', b'MM\x00*'):
+        return 'tiff'
+    elif image_data[:2] == b'BM':
+        return 'bmp'
+    elif image_data[:4] == b'\x00\x00\x01\x00':
+        return 'ico'
+    else:
+        return 'unknown'
+
+
+def convert_image_to_supported_format(image_data: bytes) -> Tuple[bytes, str]:
+    """Convert image to a format supported by OpenAI Vision API.
+    
+    If the image is already in a supported format, returns it as-is.
+    Otherwise, converts to PNG.
+    
+    Args:
+        image_data: Raw image bytes
+        
+    Returns:
+        Tuple of (converted_image_bytes, mime_type)
+    """
+    try:
+        from PIL import Image
+        HAS_PIL = True
+    except ImportError:
+        HAS_PIL = False
+    
+    # Detect current format
+    current_format = detect_image_format(image_data)
+    
+    # Map format to MIME type
+    format_to_mime = {
+        'png': 'image/png',
+        'jpeg': 'image/jpeg',
+        'jpg': 'image/jpeg',
+        'gif': 'image/gif',
+        'webp': 'image/webp',
+    }
+    
+    # If already supported, return as-is with correct MIME type
+    if current_format in SUPPORTED_IMAGE_FORMATS:
+        mime_type = format_to_mime.get(current_format, 'image/png')
+        logger.debug(f"Image format '{current_format}' is supported, using MIME type: {mime_type}")
+        return image_data, mime_type
+    
+    # Need to convert - requires PIL
+    if not HAS_PIL:
+        logger.warning(
+            f"Image format '{current_format}' is not supported by OpenAI Vision API. "
+            f"PIL/Pillow is required for conversion. Install with: pip install Pillow"
+        )
+        # Return as PNG anyway (will likely fail at OpenAI)
+        return image_data, 'image/png'
+    
+    # Convert to PNG using PIL
+    logger.info(f"Converting image from '{current_format}' to PNG for OpenAI Vision API")
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if necessary (for formats like CMYK)
+        if img.mode in ('CMYK', 'P', 'LA', 'PA'):
+            img = img.convert('RGBA')
+        elif img.mode not in ('RGB', 'RGBA', 'L'):
+            img = img.convert('RGB')
+        
+        # Save as PNG
+        output = io.BytesIO()
+        img.save(output, format='PNG')
+        output.seek(0)
+        
+        converted_data = output.read()
+        logger.debug(f"Image converted successfully: {len(image_data)} bytes -> {len(converted_data)} bytes")
+        return converted_data, 'image/png'
+        
+    except Exception as e:
+        logger.error(f"Failed to convert image from '{current_format}' to PNG: {e}")
+        # Return original data (will likely fail at OpenAI)
+        return image_data, 'image/png'
 
 
 def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
@@ -62,16 +165,26 @@ def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
     prompt_preview = prompt_text[:200].replace('\n', ' ')
     logger.debug(f"📄 VisionAgent prompt preview: {prompt_preview}...")
 
+    # Get the image data and determine correct MIME type
+    image_base64 = data['image_data']
+    mime_type = data.get('mime_type', 'image/png')  # Default to png, should be set by caller
+    
     return ChatPromptTemplate.from_messages(
         [
             SystemMessage(content=prompt_text),
             HumanMessage(
                 content=[
+                    # deprecated
+                    # {
+                    #     "type": "image_url",
+                    #     "image_url": {
+                    #         "url": f"data:{mime_type};base64,{image_base64}"
+                    #     }
+                    # }
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{data['image_data']}"
-                        }
+                        "type": "image",
+                        "base64": image_base64,
+                        "mime_type": mime_type,
                     }
                 ]
             )
@@ -536,9 +649,12 @@ class OpenAIOCR(BaseOCR):
             # Prepare input data for VisionAgent
             input_dicts = []
             for i, image_data in enumerate(images):
-                base64_image = base64.b64encode(image_data).decode('utf-8')
+                # Convert image to supported format if needed
+                converted_data, mime_type = convert_image_to_supported_format(image_data)
+                base64_image = base64.b64encode(converted_data).decode('utf-8')
                 input_dicts.append({
                     'image_data': base64_image,
+                    'mime_type': mime_type,
                     'prompt': prompt,
                     'index': i
                 })
