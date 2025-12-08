@@ -1184,7 +1184,7 @@ class PDFLoader:
             html_lines.append("</tr>")
 
         html_lines.append("</table>")
-        return "\n".join(html_lines) + "\n"
+        return "\n".join(html_lines) + "\n\n"
     
     def _convert_table_to_markdown_grid(self, table_data: List[List], table_info: Dict) -> str:
         """Convert complex table to markdown with merge annotations as comments"""
@@ -1246,7 +1246,7 @@ class PDFLoader:
                 sep_cells = ["-" * w for w in col_widths]
                 lines.append("| " + " | ".join(sep_cells) + " |")
         
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines) + "\n\n"
     
     def _convert_table_to_styled_html(self, table_data: List[List], table_info: Dict) -> str:
         """Convert complex table to HTML with full inline styles (legacy format)"""
