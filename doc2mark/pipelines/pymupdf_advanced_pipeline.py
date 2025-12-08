@@ -1219,7 +1219,7 @@ class PDFLoader:
                     col_idx += 1
                     continue
                 
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] else ""
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
                 
                 if (row_idx, col_idx) in table_info.get('cell_spans', {}):
                     rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
