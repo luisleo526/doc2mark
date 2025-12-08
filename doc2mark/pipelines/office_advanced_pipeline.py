@@ -515,7 +515,7 @@ class BaseOfficeLoader:
                     continue
 
                 # Get and escape cell content
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) else ""
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
                 cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 cell_text = cell_text.replace('\n', '<br>')
 
@@ -587,7 +587,7 @@ class BaseOfficeLoader:
                     col_idx += 1
                     continue
                 
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) else ""
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
                 
                 # Mark merged cells with indicator
                 if (row_idx, col_idx) in table_info.get('cell_spans', {}):
@@ -634,7 +634,7 @@ class BaseOfficeLoader:
                     continue
 
                 # Get cell content
-                if col_idx < len(row):
+                if col_idx < len(row) and row[col_idx] is not None:
                     cell_text = str(row[col_idx]).strip()
                 else:
                     cell_text = ""

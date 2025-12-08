@@ -1259,6 +1259,9 @@ class PDFLoader:
                     continue
 
                 cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
+                # Escape HTML special characters first
+                cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+                # Convert newlines to <br> after escaping
                 cell_text = cell_text.replace('\n', '<br>')
 
                 cell_attrs = []
