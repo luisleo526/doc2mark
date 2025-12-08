@@ -31,13 +31,18 @@ logger = logging.getLogger(__name__)
 class OfficeProcessor(BaseProcessor):
     """Processor for modern Office formats (DOCX, XLSX, PPTX) with advanced features."""
 
-    def __init__(self, ocr: Optional[BaseOCR] = None):
+    def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None):
         """Initialize Office processor.
         
         Args:
             ocr: OCR provider for image extraction
+            table_style: Output style for complex tables:
+                - 'minimal_html': Clean HTML with only rowspan/colspan (default)
+                - 'markdown_grid': Markdown with merge annotations  
+                - 'styled_html': Full HTML with inline styles (legacy)
         """
         self.ocr = ocr
+        self.table_style = table_style
         self._docx = None
         self._openpyxl = None
         self._pptx = None
@@ -158,7 +163,8 @@ class OfficeProcessor(BaseProcessor):
                 extract_images=extract_images,
                 ocr_images=ocr_images,
                 show_progress=kwargs.get('show_progress', False),
-                ocr=self.ocr
+                ocr=self.ocr,
+                table_style=kwargs.get('table_style', self.table_style)
             )
             
             # Convert JSON data to markdown

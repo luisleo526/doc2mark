@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
@@ -11,6 +12,20 @@ import pymupdf
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Import TableStyle from office pipeline (shared enum)
+try:
+    from doc2mark.pipelines.office_advanced_pipeline import TableStyle
+except ImportError:
+    # Fallback definition if office pipeline not available
+    class TableStyle(Enum):
+        MINIMAL_HTML = "minimal_html"
+        MARKDOWN_GRID = "markdown_grid"
+        STYLED_HTML = "styled_html"
+        
+        @classmethod
+        def default(cls):
+            return cls.MINIMAL_HTML
 
 
 @dataclass
@@ -25,10 +40,18 @@ class SimpleContent:
 class PDFLoader:
     """PDF loader that extracts content in reading order and exports to various formats"""
 
-    def __init__(self, pdf_path: Union[str, Path], ocr=None):
+    def __init__(self, pdf_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None):
         self.pdf_path = Path(pdf_path)
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
+        
+        # Set table output style
+        if table_style is None:
+            self.table_style = TableStyle.default()
+        elif isinstance(table_style, str):
+            self.table_style = TableStyle(table_style)
+        else:
+            self.table_style = table_style
 
         # Log OCR configuration if available
         if self.ocr:
@@ -1102,7 +1125,124 @@ class PDFLoader:
         return "\n".join(markdown_lines) + "\n\n"
 
     def _convert_table_to_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to HTML format for better structure preservation"""
+        """Convert complex table to HTML format based on table_style setting"""
+        if not table_data:
+            return ""
+        
+        # Route to appropriate converter based on style
+        if self.table_style == TableStyle.STYLED_HTML:
+            return self._convert_table_to_styled_html(table_data, table_info)
+        elif self.table_style == TableStyle.MARKDOWN_GRID:
+            return self._convert_table_to_markdown_grid(table_data, table_info)
+        else:  # MINIMAL_HTML (default)
+            return self._convert_table_to_minimal_html(table_data, table_info)
+    
+    def _convert_table_to_minimal_html(self, table_data: List[List], table_info: Dict) -> str:
+        """Convert complex table to clean, minimal HTML without inline styles"""
+        if not table_data:
+            return ""
+
+        html_lines = ["<table>"]
+        processed_cells = set()
+
+        for row_idx, row in enumerate(table_data):
+            html_lines.append("<tr>")
+
+            for col_idx in range(table_info['col_count']):
+                if (row_idx, col_idx) in processed_cells:
+                    continue
+
+                # Get and escape cell content
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
+                cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                cell_text = cell_text.replace('\n', '<br>')
+
+                # Build attributes (only rowspan/colspan if needed)
+                attrs = []
+                if (row_idx, col_idx) in table_info['cell_spans']:
+                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
+                    if rowspan > 1:
+                        attrs.append(f'rowspan="{rowspan}"')
+                    if colspan > 1:
+                        attrs.append(f'colspan="{colspan}"')
+                    
+                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
+                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
+                            processed_cells.add((r, c))
+
+                cell_tag = "th" if row_idx == 0 else "td"
+                attrs_str = " " + " ".join(attrs) if attrs else ""
+                html_lines.append(f"<{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>")
+
+            html_lines.append("</tr>")
+
+        html_lines.append("</table>")
+        return "\n".join(html_lines) + "\n"
+    
+    def _convert_table_to_markdown_grid(self, table_data: List[List], table_info: Dict) -> str:
+        """Convert complex table to markdown with merge annotations as comments"""
+        if not table_data:
+            return ""
+        
+        lines = []
+        processed_cells = set()
+        
+        # Add merge info as a compact header comment
+        if table_info.get('cell_spans'):
+            merge_notes = []
+            for (r, c), (rowspan, colspan) in table_info['cell_spans'].items():
+                if rowspan > 1 or colspan > 1:
+                    merge_notes.append(f"R{r+1}C{c+1}:{rowspan}x{colspan}")
+            if merge_notes:
+                lines.append(f"<!-- Merged: {', '.join(merge_notes)} -->")
+        
+        # Calculate column widths (no truncation to preserve data integrity)
+        col_count = table_info['col_count']
+        col_widths = [3] * col_count
+        
+        for row in table_data:
+            for i, cell in enumerate(row[:col_count]):
+                cell_text = str(cell).strip() if cell else ""
+                col_widths[i] = max(col_widths[i], len(cell_text))
+        
+        # Build markdown table
+        for row_idx, row in enumerate(table_data):
+            row_cells = []
+            col_idx = 0
+            
+            while col_idx < col_count:
+                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info.get('cell_spans', {}):
+                    row_cells.append("↓" if any(
+                        r < row_idx and c == col_idx and (r, c) in table_info.get('cell_spans', {})
+                        for r in range(row_idx) for c in [col_idx]
+                    ) else "→")
+                    col_idx += 1
+                    continue
+                
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] else ""
+                
+                if (row_idx, col_idx) in table_info.get('cell_spans', {}):
+                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
+                    if rowspan > 1 or colspan > 1:
+                        cell_text = f"{cell_text} ⊕" if cell_text else "⊕"
+                    
+                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
+                        for c in range(col_idx, min(col_idx + colspan, col_count)):
+                            processed_cells.add((r, c))
+                
+                row_cells.append(cell_text.ljust(col_widths[col_idx]))
+                col_idx += 1
+            
+            lines.append("| " + " | ".join(row_cells) + " |")
+            
+            if row_idx == 0:
+                sep_cells = ["-" * w for w in col_widths]
+                lines.append("| " + " | ".join(sep_cells) + " |")
+        
+        return "\n".join(lines) + "\n"
+    
+    def _convert_table_to_styled_html(self, table_data: List[List], table_info: Dict) -> str:
+        """Convert complex table to HTML with full inline styles (legacy format)"""
         if not table_data:
             return ""
 
@@ -1111,60 +1251,41 @@ class PDFLoader:
 
         processed_cells = set()
 
-        # Process each row
         for row_idx, row in enumerate(table_data):
             html_lines.append("  <tr>")
 
             for col_idx in range(table_info['col_count']):
-                # Skip if this cell is part of a span
                 if (row_idx, col_idx) in processed_cells:
                     continue
 
-                # Get cell content
-                if col_idx < len(row) and row[col_idx] is not None:
-                    cell_text = str(row[col_idx]).strip()
-                else:
-                    cell_text = ""
-
-                # Convert newlines to <br>
+                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
                 cell_text = cell_text.replace('\n', '<br>')
 
-                # Determine cell attributes and style
                 cell_attrs = []
                 
-                # Check if this cell has spans
                 if (row_idx, col_idx) in table_info['cell_spans']:
                     rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-
                     if rowspan > 1:
                         cell_attrs.append(f'rowspan="{rowspan}"')
                     if colspan > 1:
                         cell_attrs.append(f'colspan="{colspan}"')
-
-                    # Mark spanned cells as processed
                     for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
                         for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
                             processed_cells.add((r, c))
 
-                # Determine if header cell (first row typically)
                 cell_tag = "th" if row_idx == 0 else "td"
                 
-                # Build style attribute
                 if cell_tag == "th":
-                    # Header cell styling
                     style = 'style="background-color: #f0f0f0; font-weight: bold; padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
                 else:
-                    # Data cell styling
                     style = 'style="padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
 
-                # Build cell HTML
                 attrs_str = " " + " ".join(cell_attrs) if cell_attrs else ""
                 html_lines.append(f'    <{cell_tag}{attrs_str} {style}>{cell_text}</{cell_tag}>')
 
             html_lines.append("  </tr>")
 
         html_lines.append("</table>")
-
         return "\n".join(html_lines) + "\n\n"
 
     def _extract_images_simple(self, page, page_num: int, ocr_images: bool = False,
@@ -1394,7 +1515,8 @@ def pdf_to_simple_json(
         extract_images: bool = True,
         ocr_images: bool = False,
         show_progress: bool = True,
-        ocr=None
+        ocr=None,
+        table_style: Union[str, TableStyle] = None
 ) -> Dict[str, Any]:
     """
     Convert PDF to simplified JSON with content in reading order
@@ -1406,6 +1528,11 @@ def pdf_to_simple_json(
         extract_images: Extract images as base64
         ocr_images: Use OCR to convert images to text descriptions (requires extract_images=True)
         show_progress: Show progress messages
+        ocr: OCR instance for image processing
+        table_style: Output style for complex tables:
+            - 'minimal_html': Clean HTML with only rowspan/colspan (default)
+            - 'markdown_grid': Markdown with merge annotations
+            - 'styled_html': Full HTML with inline styles (legacy)
     
     Returns:
         Simplified JSON data with content array containing:
@@ -1422,7 +1549,7 @@ def pdf_to_simple_json(
             * Automatic detection and labeling of merged cells
         - image - Base64-encoded images (when ocr_images=False)
     """
-    converter = PDFLoader(pdf_path, ocr=ocr)
+    converter = PDFLoader(pdf_path, ocr=ocr, table_style=table_style)
 
     try:
         json_data = converter.convert_to_json(

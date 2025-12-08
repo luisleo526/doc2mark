@@ -19,13 +19,18 @@ logger = logging.getLogger(__name__)
 class PDFProcessor(BaseProcessor):
     """Processor for PDF documents using advanced pipeline."""
 
-    def __init__(self, ocr: Optional[BaseOCR] = None):
+    def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None):
         """Initialize PDF processor.
         
         Args:
             ocr: OCR provider for image/scanned PDFs
+            table_style: Output style for complex tables:
+                - 'minimal_html': Clean HTML with only rowspan/colspan (default)
+                - 'markdown_grid': Markdown with merge annotations
+                - 'styled_html': Full HTML with inline styles (legacy)
         """
         self.ocr = ocr
+        self.table_style = table_style
 
     def can_process(self, file_path: Union[str, Path]) -> bool:
         """Check if this processor can handle the file."""
@@ -73,7 +78,8 @@ class PDFProcessor(BaseProcessor):
                 extract_images=extract_images,
                 ocr_images=ocr_images,
                 show_progress=show_progress,
-                ocr=self.ocr  # Pass the OCR instance
+                ocr=self.ocr,  # Pass the OCR instance
+                table_style=kwargs.get('table_style', self.table_style)  # Pass table style
             )
             
             # Convert to markdown using the advanced converter

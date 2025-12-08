@@ -43,7 +43,9 @@ class UnifiedDocumentLoader:
             presence_penalty: float = 0.0,
             base_url: Optional[str] = None,
             # General OCR parameters
-            default_prompt: Optional[str] = None
+            default_prompt: Optional[str] = None,
+            # Table output configuration
+            table_style: Optional[str] = None
     ):
         """Initialize the document loader with enhanced OCR configuration.
         
@@ -70,6 +72,12 @@ class UnifiedDocumentLoader:
             
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
+            
+            # Table output configuration:
+            table_style: Output style for complex tables with merged cells:
+                - 'minimal_html': Clean HTML with only rowspan/colspan (default)
+                - 'markdown_grid': Markdown with merge annotations
+                - 'styled_html': Full HTML with inline styles (legacy)
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
 
@@ -128,6 +136,10 @@ class UnifiedDocumentLoader:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"📁 Cache directory: {self.cache_dir}")
 
+        # Table output style (default: minimal_html for cleaner output)
+        self.table_style = table_style if table_style else "minimal_html"
+        logger.info(f"📊 Table style: {self.table_style}")
+
         # Registry of format processors
         self._processors: Dict[DocumentFormat, BaseProcessor] = {}
         self._initialize_processors()
@@ -147,8 +159,8 @@ class UnifiedDocumentLoader:
             from doc2mark.formats.image import ImageProcessor
 
             # Initialize processors with OCR support
-            office_processor = OfficeProcessor(ocr=self.ocr)
-            pdf_processor = PDFProcessor(ocr=self.ocr)
+            office_processor = OfficeProcessor(ocr=self.ocr, table_style=self.table_style)
+            pdf_processor = PDFProcessor(ocr=self.ocr, table_style=self.table_style)
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
             legacy_processor = LegacyProcessor(ocr=self.ocr)
