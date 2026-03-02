@@ -9,6 +9,8 @@ from typing import Dict, List, Any, Union, Optional, Tuple
 
 import pymupdf
 
+from doc2mark.utils.image_utils import detect_image_format, get_mime_type
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -131,6 +133,36 @@ class PDFLoader:
         except Exception as e:
             logger.error(f"Failed to open PDF: {e}")
             raise
+
+    def _extract_image_bytes(self, xref: int) -> Optional[Tuple[bytes, str]]:
+        """Extract image bytes with Pixmap fallback for problematic formats (e.g. JBIG2).
+
+        Args:
+            xref: Image cross-reference number
+
+        Returns:
+            Tuple of (image_bytes, extension) or None if extraction fails
+        """
+        # Primary path: extract_image (fast, preserves original format)
+        try:
+            base_image = self.doc.extract_image(xref)
+            if base_image and base_image.get("image"):
+                return base_image["image"], base_image.get("ext", "png")
+        except Exception as e:
+            logger.debug(f"extract_image failed for xref {xref}: {e}")
+
+        # Fallback: render via Pixmap (handles JBIG2, JPEG2000, etc.)
+        try:
+            pix = pymupdf.Pixmap(self.doc, xref)
+            if pix.alpha:
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            img_bytes = pix.tobytes("png")
+            logger.info(f"Used Pixmap fallback for xref {xref} ({len(img_bytes)} bytes)")
+            return img_bytes, "png"
+        except Exception as e:
+            logger.warning(f"Pixmap fallback also failed for xref {xref}: {e}")
+
+        return None
 
     def convert_to_json(self,
                         extract_images: bool = True,
@@ -257,9 +289,10 @@ class PDFLoader:
                 xref = img_info[0]
 
                 try:
-                    # Extract image
-                    base_image = self.doc.extract_image(xref)
-                    image_bytes = base_image["image"]
+                    result = self._extract_image_bytes(xref)
+                    if result is None:
+                        continue
+                    image_bytes, _ = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                     # Get image positions on page
@@ -1345,8 +1378,10 @@ class PDFLoader:
                         else:
                             # Fallback to base64 if OCR result not found
                             logger.warning(f"OCR result not found for image {xref} on page {page_num + 1}")
-                            base_image = self.doc.extract_image(xref)
-                            image_bytes = base_image["image"]
+                            result = self._extract_image_bytes(xref)
+                            if result is None:
+                                continue
+                            image_bytes, _ = result
                             base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                             image_items.append(SimpleContent(
@@ -1368,9 +1403,10 @@ class PDFLoader:
                 xref = img_info[0]
 
                 try:
-                    # Extract image
-                    base_image = self.doc.extract_image(xref)
-                    image_bytes = base_image["image"]
+                    result = self._extract_image_bytes(xref)
+                    if result is None:
+                        continue
+                    image_bytes, _ = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                     # Get image positions on page
@@ -1437,22 +1473,22 @@ class PDFLoader:
                 xref = img_info[0]
 
                 try:
-                    # Extract image
-                    base_image = self.doc.extract_image(xref)
-                    image_bytes = base_image["image"]
+                    result = self._extract_image_bytes(xref)
+                    if result is None:
+                        continue
+                    image_bytes, _ = result
 
                     # Get image positions on page
                     img_rects = page.get_image_rects(xref)
 
                     for img_rect in img_rects:
-                        # Convert image to base64
                         base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                         image_items.append(SimpleContent(
                             type="image",
                             content=base64_data,
                             page=page_num + 1,
-                            position_y=img_rect.y0  # Use y0 for top coordinate of Rect
+                            position_y=img_rect.y0
                         ))
 
                 except Exception as e:
@@ -1669,8 +1705,14 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             # Table content already includes trailing newlines
             
         elif item_type == "image":
-            # Base64 images
-            markdown_parts.append(f'![Image](data:image/png;base64,{content})')
+            # Detect actual MIME type from base64 data
+            try:
+                raw = base64.b64decode(content[:64])
+                img_fmt = detect_image_format(raw)
+                mime = get_mime_type(img_fmt)
+            except Exception:
+                mime = 'image/png'
+            markdown_parts.append(f'![Image](data:{mime};base64,{content})')
             markdown_parts.append("")  # Empty line after image
     
     # Clean up extra empty lines

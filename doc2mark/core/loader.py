@@ -194,7 +194,11 @@ class UnifiedDocumentLoader:
             
             # Image formats
             for fmt in [DocumentFormat.PNG, DocumentFormat.JPG,
-                        DocumentFormat.JPEG, DocumentFormat.WEBP]:
+                        DocumentFormat.JPEG, DocumentFormat.WEBP,
+                        DocumentFormat.TIFF, DocumentFormat.TIF,
+                        DocumentFormat.BMP, DocumentFormat.GIF,
+                        DocumentFormat.HEIC, DocumentFormat.HEIF,
+                        DocumentFormat.AVIF]:
                 self._processors[fmt] = image_processor
 
             logger.info("Using individual format processors with enhanced image extraction")

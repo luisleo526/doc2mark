@@ -10,6 +10,10 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.utils.image_utils import (
+    detect_image_format as _shared_detect_image_format,
+    convert_image_to_supported_format as _shared_convert_image_to_supported_format,
+)
 
 # LangChain imports for efficient batch processing
 try:
@@ -38,101 +42,22 @@ SUPPORTED_IMAGE_FORMATS = {'png', 'jpeg', 'jpg', 'gif', 'webp'}
 
 def detect_image_format(image_data: bytes) -> str:
     """Detect image format from binary data using magic bytes.
-    
-    Args:
-        image_data: Raw image bytes
-        
-    Returns:
-        Image format string (e.g., 'png', 'jpeg', 'gif', 'webp', 'tiff', 'bmp', 'unknown')
+
+    Delegates to the shared utility in doc2mark.utils.image_utils.
+    Kept here for backward compatibility.
     """
-    # Check magic bytes
-    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
-        return 'png'
-    elif image_data[:2] == b'\xff\xd8':
-        return 'jpeg'
-    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
-        return 'gif'
-    elif image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
-        return 'webp'
-    elif image_data[:4] in (b'II*\x00', b'MM\x00*'):
-        return 'tiff'
-    elif image_data[:2] == b'BM':
-        return 'bmp'
-    elif image_data[:4] == b'\x00\x00\x01\x00':
-        return 'ico'
-    else:
-        return 'unknown'
+    return _shared_detect_image_format(image_data)
 
 
 def convert_image_to_supported_format(image_data: bytes) -> Tuple[bytes, str]:
     """Convert image to a format supported by OpenAI Vision API.
-    
-    If the image is already in a supported format, returns it as-is.
-    Otherwise, converts to PNG.
-    
-    Args:
-        image_data: Raw image bytes
-        
-    Returns:
-        Tuple of (converted_image_bytes, mime_type)
+
+    Delegates to the shared utility in doc2mark.utils.image_utils.
+    Kept here for backward compatibility.
     """
-    try:
-        from PIL import Image
-        HAS_PIL = True
-    except ImportError:
-        HAS_PIL = False
-    
-    # Detect current format
-    current_format = detect_image_format(image_data)
-    
-    # Map format to MIME type
-    format_to_mime = {
-        'png': 'image/png',
-        'jpeg': 'image/jpeg',
-        'jpg': 'image/jpeg',
-        'gif': 'image/gif',
-        'webp': 'image/webp',
-    }
-    
-    # If already supported, return as-is with correct MIME type
-    if current_format in SUPPORTED_IMAGE_FORMATS:
-        mime_type = format_to_mime.get(current_format, 'image/png')
-        logger.debug(f"Image format '{current_format}' is supported, using MIME type: {mime_type}")
-        return image_data, mime_type
-    
-    # Need to convert - requires PIL
-    if not HAS_PIL:
-        logger.warning(
-            f"Image format '{current_format}' is not supported by OpenAI Vision API. "
-            f"PIL/Pillow is required for conversion. Install with: pip install Pillow"
-        )
-        # Return as PNG anyway (will likely fail at OpenAI)
-        return image_data, 'image/png'
-    
-    # Convert to PNG using PIL
-    logger.info(f"Converting image from '{current_format}' to PNG for OpenAI Vision API")
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        
-        # Convert to RGB if necessary (for formats like CMYK)
-        if img.mode in ('CMYK', 'P', 'LA', 'PA'):
-            img = img.convert('RGBA')
-        elif img.mode not in ('RGB', 'RGBA', 'L'):
-            img = img.convert('RGB')
-        
-        # Save as PNG
-        output = io.BytesIO()
-        img.save(output, format='PNG')
-        output.seek(0)
-        
-        converted_data = output.read()
-        logger.debug(f"Image converted successfully: {len(image_data)} bytes -> {len(converted_data)} bytes")
-        return converted_data, 'image/png'
-        
-    except Exception as e:
-        logger.error(f"Failed to convert image from '{current_format}' to PNG: {e}")
-        # Return original data (will likely fail at OpenAI)
-        return image_data, 'image/png'
+    return _shared_convert_image_to_supported_format(
+        image_data, supported_formats=SUPPORTED_IMAGE_FORMATS,
+    )
 
 
 def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":

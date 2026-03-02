@@ -15,6 +15,11 @@ from typing import List, Optional
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.utils.image_utils import (
+    detect_image_format,
+    PIL_SUPPORTED_FORMATS,
+    convert_image_to_supported_format as _convert_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +105,13 @@ class TesseractOCR(BaseOCR):
         logger.debug(f"🖼️  Processing image with Tesseract ({image_size} bytes)")
 
         try:
+            # Normalize unsupported formats (EMF, WMF, etc.) to PNG before PIL opens them
+            fmt = detect_image_format(image_data)
+            if fmt not in PIL_SUPPORTED_FORMATS and fmt != 'unknown':
+                logger.info(f"🔄 Normalizing '{fmt}' image to PNG for Tesseract")
+                image_data, _ = _convert_image(image_data, supported_formats=PIL_SUPPORTED_FORMATS)
+
             logger.debug("🔄 Converting bytes to PIL Image...")
-            # Convert bytes to PIL Image
             image = self.pil.open(io.BytesIO(image_data))
             original_mode = image.mode
             original_size = image.size

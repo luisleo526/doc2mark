@@ -3063,7 +3063,9 @@ class XlsxLoader(BaseOfficeLoader):
             with zipfile.ZipFile(self.file_path, 'r') as zip_file:
                 # Look for all media files
                 media_files = [f for f in zip_file.namelist() if '/media/' in f and 
-                             any(f.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp'])]
+                             any(f.lower().endswith(ext) for ext in
+                                 ['.png', '.jpg', '.jpeg', '.gif', '.bmp',
+                                  '.tiff', '.tif', '.emf', '.wmf'])]
                 
                 # Try to map images to their cell locations via drawing files
                 image_to_cell_map = {}

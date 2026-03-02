@@ -41,6 +41,13 @@ class DocumentFormat(Enum):
     JPG = "jpg"
     JPEG = "jpeg"
     WEBP = "webp"
+    TIFF = "tiff"
+    TIF = "tif"
+    BMP = "bmp"
+    GIF = "gif"
+    HEIC = "heic"
+    HEIF = "heif"
+    AVIF = "avif"
 
 
 class OutputFormat(Enum):
