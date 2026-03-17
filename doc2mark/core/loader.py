@@ -29,7 +29,7 @@ class UnifiedDocumentLoader:
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             cache_dir: Optional[str] = None,
-            # Enhanced OCR configuration for OpenAI
+            # Enhanced OCR configuration for OpenAI / Vertex AI
             model: str = "gpt-4.1",
             temperature: float = 0,
             max_tokens: int = 4096,
@@ -42,19 +42,22 @@ class UnifiedDocumentLoader:
             frequency_penalty: float = 0.0,
             presence_penalty: float = 0.0,
             base_url: Optional[str] = None,
+            # Vertex AI parameters
+            project: Optional[str] = None,
+            location: str = "global",
             # General OCR parameters
             default_prompt: Optional[str] = None,
             # Table output configuration
             table_style: Optional[str] = None
     ):
         """Initialize the document loader with enhanced OCR configuration.
-        
+
         Args:
             ocr_provider: OCR provider name, enum, or instance
             api_key: API key for OCR provider (OpenAI defaults to OPENAI_API_KEY env var)
             ocr_config: Basic OCR configuration (from base class)
             cache_dir: Directory for caching processed documents
-            
+
             # Enhanced OpenAI OCR Configuration:
             model: OpenAI model to use (default: gpt-4.1)
             temperature: Temperature for response generation (0.0-2.0)
@@ -63,16 +66,20 @@ class UnifiedDocumentLoader:
             prompt_template: Template name ('default', 'table_focused', 'document_focused', 'multilingual')
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
-            
+
             # Additional OpenAI parameters:
             top_p: Nucleus sampling parameter (0.0-1.0)
             frequency_penalty: Reduce word repetition (-2.0 to 2.0)
             presence_penalty: Encourage new topics (-2.0 to 2.0)
             base_url: Optional base URL for OpenAI-compatible API endpoints
-            
+
+            # Vertex AI parameters:
+            project: Google Cloud project ID (defaults to GOOGLE_CLOUD_PROJECT env var)
+            location: Google Cloud region (default: global)
+
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
-            
+
             # Table output configuration:
             table_style: Output style for complex tables with merged cells:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
@@ -121,9 +128,35 @@ class UnifiedDocumentLoader:
                 for key, value in config_summary.items():
                     logger.info(f"   {key}: {value}")
 
+            elif (isinstance(ocr_provider, str) and ocr_provider.lower() == 'vertex_ai') or \
+                    (isinstance(ocr_provider, OCRProvider) and ocr_provider == OCRProvider.VERTEX_AI):
+
+                logger.info("Using enhanced Vertex AI OCR configuration")
+
+                from doc2mark.ocr.vertex_ai import VertexAIOCR
+
+                # Default to gemini-3.1-flash-lite-preview if user didn't change model from OpenAI default
+                vertex_model = model if model != "gpt-4.1" else "gemini-3.1-flash-lite-preview"
+
+                self.ocr = VertexAIOCR(
+                    config=ocr_config,
+                    project=project,
+                    location=location,
+                    model=vertex_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    prompt_template=prompt_template,
+                    default_prompt=default_prompt,
+                )
+
+                config_summary = self.ocr.get_configuration_summary()
+                logger.info("OCR Configuration Summary:")
+                for key, value in config_summary.items():
+                    logger.info(f"   {key}: {value}")
+
             else:
                 # Use standard factory for other providers
-                logger.info(f"📦 Using standard OCR factory for provider: {ocr_provider}")
+                logger.info(f"Using standard OCR factory for provider: {ocr_provider}")
                 self.ocr = OCRFactory.create(
                     provider=ocr_provider,
                     api_key=api_key,
