@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -6,6 +7,11 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
+
+
+def _image_hash(data: bytes) -> str:
+    """Compute a stable, collision-resistant hash for image deduplication."""
+    return hashlib.sha256(data).hexdigest()
 
 
 class TableStyle(Enum):
@@ -174,7 +180,7 @@ class BaseOfficeLoader:
                                             max_row = max(max_row, r)
                                             min_col = min(min_col, c)
                                             max_col = max(max_col, c)
-                                    except:
+                                    except (IndexError, AttributeError):
                                         pass
 
                         # Extract cell content including images with OCR
@@ -817,7 +823,7 @@ class BaseOfficeLoader:
             
             for image_info, ocr_result in zip(images_info, ocr_results):
                 # Use hash of image data as primary key - this matches individual lookup
-                img_hash = hash(image_info['data'])
+                img_hash = _image_hash(image_info['data'])
                 
                 # Store the OCR result
                 ocr_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
@@ -948,7 +954,7 @@ class DocxLoader(BaseOfficeLoader):
                     base64_data = base64.b64encode(info['data']).decode('utf-8')
                     ocr_batch.append({"image_data": base64_data})
                     # Use hash of image data as key
-                    image_hashes.append(hash(info['data']))
+                    image_hashes.append(_image_hash(info['data']))
 
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader
@@ -1171,7 +1177,7 @@ class DocxLoader(BaseOfficeLoader):
                 image_bytes = image_part.blob
                 
                 # Check if this image has already been processed
-                img_hash = hash(image_bytes)
+                img_hash = _image_hash(image_bytes)
                 if img_hash in processed_image_hashes:
                     return None  # Skip already processed images
                 
@@ -1234,7 +1240,7 @@ class DocxLoader(BaseOfficeLoader):
             nonlocal image_counter
             if image_data:
                 # Use hash to identify unique images
-                img_hash = hash(image_data)
+                img_hash = _image_hash(image_data)
                 if img_hash not in seen_images:
                     seen_images.add(img_hash)
                     image_counter += 1
@@ -1491,7 +1497,7 @@ class DocxLoader(BaseOfficeLoader):
                                 if image_bytes:
                                     if ocr_images:
                                         # Use OCR to get text
-                                        img_hash = hash(image_bytes)
+                                        img_hash = _image_hash(image_bytes)
                                         if img_hash in ocr_results_map:
                                             ocr_text = ocr_results_map[img_hash]
                                             para_parts.append(f"[Image: {ocr_text}]")
@@ -1568,7 +1574,7 @@ class PptxLoader(BaseOfficeLoader):
                     base64_data = base64.b64encode(info['data']).decode('utf-8')
                     ocr_batch.append({"image_data": base64_data})
                     # Use hash of image data as key
-                    image_hashes.append(hash(info['data']))
+                    image_hashes.append(_image_hash(info['data']))
 
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader
@@ -2186,7 +2192,7 @@ class PptxLoader(BaseOfficeLoader):
 
             if ocr_images and self.ocr:
                 # Use image content hash to find OCR result
-                img_hash = hash(image_data)
+                img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
                     ocr_text = ocr_results_map[img_hash]
@@ -2225,7 +2231,7 @@ class PptxLoader(BaseOfficeLoader):
 
             if ocr_images and self.ocr:
                 # Use image content hash to find OCR result
-                img_hash = hash(image_data)
+                img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
                     ocr_text = ocr_results_map[img_hash]
@@ -2470,7 +2476,7 @@ class XlsxLoader(BaseOfficeLoader):
                     base64_data = base64.b64encode(info['data']).decode('utf-8')
                     ocr_batch.append({"image_data": base64_data})
                     # Use hash of image data as key
-                    image_hashes.append(hash(info['data']))
+                    image_hashes.append(_image_hash(info['data']))
 
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader
@@ -2522,7 +2528,7 @@ class XlsxLoader(BaseOfficeLoader):
                 # Get the first available OCR result for #VALUE! replacement
                 for info in all_images_info:
                     if info['location']['sheet_name'] == sheet_name:
-                        img_hash = hash(info['data'])
+                        img_hash = _image_hash(info['data'])
                         if img_hash in ocr_results_map:
                             ocr_text = ocr_results_map[img_hash]
                             
@@ -2930,7 +2936,7 @@ class XlsxLoader(BaseOfficeLoader):
 
                 if ocr_images:
                     # Use image content hash to find OCR result
-                    img_hash = hash(image_data)
+                    img_hash = _image_hash(image_data)
 
                     if img_hash in ocr_results_map:
                         ocr_text = ocr_results_map[img_hash]
@@ -2983,7 +2989,7 @@ class XlsxLoader(BaseOfficeLoader):
                             logger.info(f"Using OCR result for fallback image {fallback_idx}")
                         else:
                             # Try hash-based lookup as backup
-                            img_hash = hash(image_data)
+                            img_hash = _image_hash(image_data)
                             if img_hash in ocr_results_map:
                                 ocr_text = ocr_results_map[img_hash]
                                 images.append({

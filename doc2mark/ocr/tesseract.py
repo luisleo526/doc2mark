@@ -4,13 +4,6 @@ import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-try:
-    # Try to import LangChain components for Tesseract (if a LangChain wrapper exists)
-    from langchain_community.document_loaders import PyTesseractLoader
-
-    LANGCHAIN_TESSERACT_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_TESSERACT_AVAILABLE = False
 from typing import List, Optional
 
 from doc2mark.core.base import OCRError
