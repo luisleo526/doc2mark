@@ -21,7 +21,7 @@ from doc2mark.core.base import (
 # Main imports
 from doc2mark.core.loader import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory
-from doc2mark.pipelines.office_advanced_pipeline import TableStyle
+from doc2mark.core.table import TableStyle
 
 __all__ = [
     # Main class

@@ -19,6 +19,7 @@ from doc2mark.core.mime_mapper import (
     detect_format_from_file,
     check_mime_support
 )
+from doc2mark.core.table import TableStyle, TableRenderer
 
 __all__ = [
     # Main loader
@@ -27,6 +28,7 @@ __all__ = [
     # Enums
     'DocumentFormat',
     'OutputFormat',
+    'TableStyle',
 
     # Data classes
     'DocumentMetadata',
@@ -35,12 +37,15 @@ __all__ = [
     # Base classes
     'BaseProcessor',
 
+    # Table rendering
+    'TableRenderer',
+
     # Exceptions
     'ProcessingError',
     'UnsupportedFormatError',
     'OCRError',
     'ConversionError',
-    
+
     # MIME Type Mapping
     'MimeTypeMapper',
     'get_default_mapper',
