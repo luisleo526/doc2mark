@@ -1,6 +1,41 @@
 """Utility modules for doc2mark."""
 
-# Placeholder for utilities
-# Will be populated with markdown and table utilities
+from doc2mark.utils.image_utils import (
+    detect_image_format,
+    convert_image_to_supported_format,
+    normalize_image_to_png,
+    get_mime_type,
+    FORMAT_PNG,
+    FORMAT_JPEG,
+    FORMAT_GIF,
+    FORMAT_WEBP,
+    FORMAT_TIFF,
+    FORMAT_BMP,
+    FORMAT_ICO,
+    FORMAT_EMF,
+    FORMAT_WMF,
+    FORMAT_UNKNOWN,
+    PIL_SUPPORTED_FORMATS,
+    VECTOR_FORMATS,
+    FORMAT_TO_MIME,
+)
 
-__all__ = []
+__all__ = [
+    'detect_image_format',
+    'convert_image_to_supported_format',
+    'normalize_image_to_png',
+    'get_mime_type',
+    'FORMAT_PNG',
+    'FORMAT_JPEG',
+    'FORMAT_GIF',
+    'FORMAT_WEBP',
+    'FORMAT_TIFF',
+    'FORMAT_BMP',
+    'FORMAT_ICO',
+    'FORMAT_EMF',
+    'FORMAT_WMF',
+    'FORMAT_UNKNOWN',
+    'PIL_SUPPORTED_FORMATS',
+    'VECTOR_FORMATS',
+    'FORMAT_TO_MIME',
+]

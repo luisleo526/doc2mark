@@ -60,17 +60,24 @@ dependencies = [
 
 [project.optional-dependencies]
 ocr = [
-    "openai==2.2.0",
-    "langchain>=1.1.0",
+    "openai>=2.0.0",
+    "langchain>=1.2.0",
     "langchain-openai>=1.1.0",
     "pytesseract>=0.3.10",
+]
+heif = [
+    "pillow-heif>=0.16.0",
 ]
 mime = [
     "python-magic>=0.4.27",
     "python-magic-bin>=0.4.14; sys_platform == 'win32'",
 ]
+vertex_ai = [
+    "langchain-google-genai>=2.0.0",
+    "langchain>=1.2.0",
+]
 all = [
-    "doc2mark[ocr,mime]",
+    "doc2mark[ocr,heif,mime,vertex_ai]",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -208,7 +215,7 @@ disable = [
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.4.3"
 tag_format = "v$version"
 version_files = [
     "doc2mark/__init__.py:__version__",

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 class OCRProvider(Enum):
     """Available OCR providers."""
     OPENAI = "openai"
+    VERTEX_AI = "vertex_ai"
     TESSERACT = "tesseract"
 
 

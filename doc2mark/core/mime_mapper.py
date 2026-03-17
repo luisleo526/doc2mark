@@ -60,6 +60,13 @@ class MimeTypeMapper:
         'image/jpeg': DocumentFormat.JPG,
         'image/jpg': DocumentFormat.JPG,
         'image/webp': DocumentFormat.WEBP,
+        'image/tiff': DocumentFormat.TIFF,
+        'image/bmp': DocumentFormat.BMP,
+        'image/x-ms-bmp': DocumentFormat.BMP,
+        'image/gif': DocumentFormat.GIF,
+        'image/heic': DocumentFormat.HEIC,
+        'image/heif': DocumentFormat.HEIF,
+        'image/avif': DocumentFormat.AVIF,
     }
     
     # Reverse mapping: DocumentFormat to primary MIME types
@@ -85,6 +92,13 @@ class MimeTypeMapper:
         DocumentFormat.JPG: 'image/jpeg',
         DocumentFormat.JPEG: 'image/jpeg',
         DocumentFormat.WEBP: 'image/webp',
+        DocumentFormat.TIFF: 'image/tiff',
+        DocumentFormat.TIF: 'image/tiff',
+        DocumentFormat.BMP: 'image/bmp',
+        DocumentFormat.GIF: 'image/gif',
+        DocumentFormat.HEIC: 'image/heic',
+        DocumentFormat.HEIF: 'image/heif',
+        DocumentFormat.AVIF: 'image/avif',
     }
     
     # Alternative MIME types for each format
@@ -99,6 +113,10 @@ class MimeTypeMapper:
         DocumentFormat.MARKDOWN: {'text/x-markdown', 'text/plain'},
         DocumentFormat.JPG: {'image/jpg'},
         DocumentFormat.RTF: {'text/rtf'},
+        DocumentFormat.BMP: {'image/x-ms-bmp'},
+        DocumentFormat.HEIC: {'image/x-heic'},
+        DocumentFormat.HEIF: {'image/x-heif'},
+        DocumentFormat.AVIF: {'image/x-avif'},
     }
     
     def __init__(self):
@@ -138,6 +156,13 @@ class MimeTypeMapper:
             '.md': 'text/markdown',
             '.markdown': 'text/markdown',
             '.webp': 'image/webp',
+            '.tiff': 'image/tiff',
+            '.tif': 'image/tiff',
+            '.bmp': 'image/bmp',
+            '.gif': 'image/gif',
+            '.heic': 'image/heic',
+            '.heif': 'image/heif',
+            '.avif': 'image/avif',
             '.csv': 'text/csv',  # Explicitly set CSV to avoid Windows mimetypes issues
             '.tsv': 'text/tab-separated-values',
         }
@@ -396,6 +421,18 @@ class MimeTypeMapper:
                 return DocumentFormat.JPG
             elif 'webp' in normalized:
                 return DocumentFormat.WEBP
+            elif 'tiff' in normalized or 'tif' in normalized:
+                return DocumentFormat.TIFF
+            elif 'bmp' in normalized:
+                return DocumentFormat.BMP
+            elif 'gif' in normalized:
+                return DocumentFormat.GIF
+            elif 'heic' in normalized:
+                return DocumentFormat.HEIC
+            elif 'heif' in normalized:
+                return DocumentFormat.HEIF
+            elif 'avif' in normalized:
+                return DocumentFormat.AVIF
             # Default to PNG for unknown images
             return DocumentFormat.PNG
         elif normalized.startswith('application/'):

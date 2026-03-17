@@ -16,12 +16,31 @@ from doc2mark.core.base import (
     ProcessingError
 )
 from doc2mark.ocr.base import BaseOCR
-
 logger = logging.getLogger(__name__)
+
+_heif_registered = False
+
+
+def _ensure_heif_support():
+    """Register pillow-heif opener once, if the package is installed."""
+    global _heif_registered
+    if _heif_registered:
+        return
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+        _heif_registered = True
+        logger.debug("pillow-heif registered successfully")
+    except ImportError:
+        _heif_registered = True  # don't retry
+        logger.debug("pillow-heif not installed — HEIC/HEIF support unavailable")
+    except Exception as e:
+        _heif_registered = True  # don't retry
+        logger.warning("pillow-heif found but failed to initialize — HEIC/HEIF support unavailable: %s", e)
 
 
 class ImageProcessor(BaseProcessor):
-    """Processor for image files (PNG, JPG, JPEG, WEBP)."""
+    """Processor for image files (PNG, JPG, JPEG, WEBP, TIFF, BMP, GIF, HEIC, AVIF)."""
     
     def __init__(self, ocr: Optional[BaseOCR] = None):
         """Initialize image processor with optional OCR support.
@@ -30,6 +49,7 @@ class ImageProcessor(BaseProcessor):
             ocr: OCR instance for text extraction from images
         """
         self.ocr = ocr
+        _ensure_heif_support()
         logger.info("Initialized ImageProcessor")
     
     def can_process(self, file_path: Union[str, Path]) -> bool:
@@ -44,8 +64,11 @@ class ImageProcessor(BaseProcessor):
         file_path = Path(file_path)
         extension = file_path.suffix.lower().lstrip('.')
         
-        # List of supported image extensions
-        supported_extensions = {'png', 'jpg', 'jpeg', 'webp'}
+        supported_extensions = {
+            'png', 'jpg', 'jpeg', 'webp',
+            'tiff', 'tif', 'bmp', 'gif',
+            'heic', 'heif', 'avif',
+        }
         
         return extension in supported_extensions
     

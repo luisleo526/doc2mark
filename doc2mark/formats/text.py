@@ -108,7 +108,10 @@ class TextProcessor(BaseProcessor):
                 sample = f.read(1024)
                 f.seek(0)
                 sniffer = csv.Sniffer()
-                delimiter = sniffer.sniff(sample).delimiter
+                try:
+                    delimiter = sniffer.sniff(sample).delimiter
+                except csv.Error:
+                    delimiter = ','
 
                 # Read CSV
                 reader = csv.reader(f, delimiter=delimiter)

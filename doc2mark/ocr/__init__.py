@@ -12,6 +12,13 @@ from doc2mark.ocr.base import (
 from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
 from doc2mark.ocr.tesseract import TesseractOCR
 
+# Vertex AI provider (optional - requires langchain-google-genai)
+try:
+    from doc2mark.ocr.vertex_ai import VertexAIOCR, VertexAIVisionAgent
+except ImportError:
+    VertexAIOCR = None
+    VertexAIVisionAgent = None
+
 __all__ = [
     # Enums
     'OCRProvider',
@@ -29,7 +36,9 @@ __all__ = [
     # Providers
     'OpenAIOCR',
     'TesseractOCR',
+    'VertexAIOCR',
 
     # Vision agents
     'VisionAgent',
+    'VertexAIVisionAgent',
 ]
