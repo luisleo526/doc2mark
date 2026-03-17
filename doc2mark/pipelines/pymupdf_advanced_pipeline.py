@@ -3,31 +3,15 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
 import pymupdf
 
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
+from doc2mark.core.table import TableStyle, TableRenderer
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Import TableStyle from office pipeline (shared enum)
-try:
-    from doc2mark.pipelines.office_advanced_pipeline import TableStyle
-except ImportError:
-    # Fallback definition if office pipeline not available
-    class TableStyle(Enum):
-        MINIMAL_HTML = "minimal_html"
-        MARKDOWN_GRID = "markdown_grid"
-        STYLED_HTML = "styled_html"
-        
-        @classmethod
-        def default(cls):
-            return cls.MINIMAL_HTML
 
 
 @dataclass
@@ -694,15 +678,22 @@ class PDFLoader:
             # Use boundary-based analysis for better merge detection
             table_info = self._analyze_table_with_boundaries(table, extracted_data)
             
-            if table_info['is_complex']:
-                return self._convert_table_to_html(extracted_data, table_info)
-            else:
-                return self._convert_table_to_simple_markdown(extracted_data, table_info)
+            renderer = TableRenderer(self.table_style)
+            return renderer.render(extracted_data, table_info)
 
         except Exception as e:
             logger.warning(f"Failed to convert table to markdown: {e}")
-            # Fallback to original method
-            return self._convert_table_to_markdown(table)
+            # Fallback: extract and render as simple markdown
+            try:
+                data = table.extract()
+                if data:
+                    col_count = max(len(r) for r in data) if data else 0
+                    info = {'is_complex': False, 'merged_cells': [], 'row_count': len(data), 'col_count': col_count, 'cell_spans': {}}
+                    renderer = TableRenderer(self.table_style)
+                    return renderer._render_simple_markdown(data, info)
+            except Exception:
+                pass
+            return ""
 
     def _extract_table_with_dedup(self, table) -> List[List]:
         """
@@ -943,70 +934,72 @@ class PDFLoader:
             merge_info = self._detect_merges_from_boundaries(boundaries, normalized)
             return merge_info
         else:
-            # Fallback to pattern-based detection
+            # Fallback to pattern-based detection with conservative heuristics
+            # to reduce false positives on legitimately sparse tables
             cell_spans = {}
             merged_cells = []
             is_complex = False
-            
+
+            # Pre-compute column emptiness ratio to avoid treating sparse columns as merges
+            col_empty_count = [0] * col_count
+            for r in range(row_count):
+                for c in range(col_count):
+                    if self._is_cell_empty(normalized[r][c]):
+                        col_empty_count[c] += 1
+            col_mostly_empty = [count > row_count * 0.5 for count in col_empty_count]
+
             # Track cells that are part of a horizontal merge to avoid false rowspan detection
             cells_in_colspan = set()
-            
-            # First pass: detect colspans
+
+            # First pass: detect colspans (only when trailing empty cells are NOT in a mostly-empty column)
             for row_idx in range(row_count):
                 for col_idx in range(col_count):
                     cell = normalized[row_idx][col_idx]
-                    
-                    # Skip None/empty cells
                     if cell is None or self._is_cell_empty(cell):
                         continue
-                    
-                    # Calculate colspan for this cell
+
                     colspan = 1
                     for check_col in range(col_idx + 1, col_count):
-                        if check_col < len(normalized[row_idx]) and self._is_cell_empty(normalized[row_idx][check_col]):
+                        if (check_col < len(normalized[row_idx]) and
+                                self._is_cell_empty(normalized[row_idx][check_col]) and
+                                not col_mostly_empty[check_col]):
                             colspan += 1
-                            # Mark these cells as part of a colspan
                             cells_in_colspan.add((row_idx, check_col))
                         else:
                             break
-                    
+
                     if colspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (1, colspan)  # rowspan=1 for now
+                        cell_spans[(row_idx, col_idx)] = (1, colspan)
                         is_complex = True
-            
+
             # Second pass: detect rowspans (only for cells not part of a colspan)
             for row_idx in range(row_count):
                 for col_idx in range(col_count):
                     cell = normalized[row_idx][col_idx]
-                    
-                    # Skip if this cell is part of a colspan
                     if (row_idx, col_idx) in cells_in_colspan:
                         continue
-                    
-                    # Skip None/empty cells
                     if cell is None or self._is_cell_empty(cell):
                         continue
-                    
-                    # Skip if we already detected a colspan for this cell
                     if (row_idx, col_idx) in cell_spans:
                         continue
-                    
-                    # Calculate rowspan
+                    # Skip if this column is mostly empty (sparse data, not merges)
+                    if col_mostly_empty[col_idx]:
+                        continue
+
                     rowspan = 1
                     for check_row in range(row_idx + 1, row_count):
-                        # Check if the cell below is empty AND not part of a colspan
-                        if (check_row < len(normalized) and 
-                            col_idx < len(normalized[check_row]) and 
-                            self._is_cell_empty(normalized[check_row][col_idx]) and
-                            (check_row, col_idx) not in cells_in_colspan):
+                        if (check_row < len(normalized) and
+                                col_idx < len(normalized[check_row]) and
+                                self._is_cell_empty(normalized[check_row][col_idx]) and
+                                (check_row, col_idx) not in cells_in_colspan):
                             rowspan += 1
                         else:
                             break
-                    
+
                     if rowspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (rowspan, 1)  # colspan=1
+                        cell_spans[(row_idx, col_idx)] = (rowspan, 1)
                         is_complex = True
-            
+
             # Build merged cells list
             for (row_idx, col_idx), (rowspan, colspan) in cell_spans.items():
                 merged_cells.append({
@@ -1016,7 +1009,7 @@ class PDFLoader:
                     'colspan': colspan,
                     'content': str(normalized[row_idx][col_idx])
                 })
-            
+
             return {
                 'is_complex': is_complex,
                 'merged_cells': merged_cells,
@@ -1085,9 +1078,14 @@ class PDFLoader:
                     'content': normalized_data[row][col] if row < len(normalized_data) and col < len(normalized_data[row]) else ""
                 })
         
+        row_count = len(normalized_data)
+        col_count = max(len(r) for r in normalized_data) if normalized_data else 0
         return {
+            'is_complex': len(merged_cells) > 0,
             'cell_spans': cell_spans,
-            'merged_cells': merged_cells
+            'merged_cells': merged_cells,
+            'row_count': row_count,
+            'col_count': col_count
         }
 
     def _bboxes_overlap_significantly(self, bbox1: tuple, bbox2: tuple, threshold: float = 0.8) -> bool:
@@ -1128,223 +1126,6 @@ class PDFLoader:
         if cell_str in empty_patterns:
             return True
         return False
-
-    def _convert_table_to_simple_markdown(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert simple table to markdown format"""
-        if not table_data:
-            return ""
-
-        markdown_lines = []
-        col_count = table_info['col_count']
-
-        # Process each row
-        for row_idx, row in enumerate(table_data):
-            row_cells = []
-
-            for col_idx in range(col_count):
-                # Get cell content
-                if col_idx < len(row) and row[col_idx] is not None:
-                    cell_text = str(row[col_idx]).strip()
-                else:
-                    cell_text = ""
-
-                # Handle line breaks
-                cell_text = "<br>".join(cell_text.split('\n'))
-                # Escape pipe characters
-                cell_text = cell_text.replace("|", "\\|")
-
-                row_cells.append(cell_text)
-
-            # Create table row
-            row_text = "| " + " | ".join(row_cells) + " |"
-            markdown_lines.append(row_text)
-
-            # Add separator after first row
-            if row_idx == 0:
-                separator = "|" + "|".join([" --- " for _ in range(col_count)]) + "|"
-                markdown_lines.append(separator)
-
-        return "\n".join(markdown_lines) + "\n\n"
-
-    def _convert_table_to_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to HTML format based on table_style setting"""
-        if not table_data:
-            return ""
-        
-        # Route to appropriate converter based on style
-        if self.table_style == TableStyle.STYLED_HTML:
-            return self._convert_table_to_styled_html(table_data, table_info)
-        elif self.table_style == TableStyle.MARKDOWN_GRID:
-            return self._convert_table_to_markdown_grid(table_data, table_info)
-        else:  # MINIMAL_HTML (default)
-            return self._convert_table_to_minimal_html(table_data, table_info)
-    
-    def _convert_table_to_minimal_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to clean, minimal HTML without inline styles"""
-        if not table_data:
-            return ""
-
-        html_lines = ["<table>"]
-        processed_cells = set()
-
-        for row_idx, row in enumerate(table_data):
-            html_lines.append("<tr>")
-
-            col_idx = 0
-            while col_idx < table_info['col_count']:
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
-                    col_idx += 1
-                    continue
-
-                # Get and escape cell content
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
-                cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                cell_text = cell_text.replace('\n', '<br>')
-
-                # Build attributes (only rowspan/colspan if needed)
-                attrs = []
-                colspan = 1
-                rowspan = 1
-
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    if rowspan > 1:
-                        attrs.append(f'rowspan="{rowspan}"')
-                    if colspan > 1:
-                        attrs.append(f'colspan="{colspan}"')
-                    
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            processed_cells.add((r, c))
-
-                cell_tag = "th" if row_idx == 0 else "td"
-                attrs_str = " " + " ".join(attrs) if attrs else ""
-                html_lines.append(f"<{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>")
-
-                col_idx += colspan
-
-            html_lines.append("</tr>")
-
-        html_lines.append("</table>")
-        return "\n".join(html_lines) + "\n\n"
-    
-    def _convert_table_to_markdown_grid(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to markdown with merge annotations as comments"""
-        if not table_data:
-            return ""
-        
-        lines = []
-        processed_cells = set()
-        
-        # Add merge info as a compact header comment
-        if table_info.get('cell_spans'):
-            merge_notes = []
-            for (r, c), (rowspan, colspan) in table_info['cell_spans'].items():
-                if rowspan > 1 or colspan > 1:
-                    merge_notes.append(f"R{r+1}C{c+1}:{rowspan}x{colspan}")
-            if merge_notes:
-                lines.append(f"<!-- Merged: {', '.join(merge_notes)} -->")
-        
-        # Calculate column widths (no truncation to preserve data integrity)
-        col_count = table_info['col_count']
-        col_widths = [3] * col_count
-        
-        for row in table_data:
-            for i, cell in enumerate(row[:col_count]):
-                cell_text = str(cell).strip() if cell else ""
-                col_widths[i] = max(col_widths[i], len(cell_text))
-        
-        # Build markdown table
-        for row_idx, row in enumerate(table_data):
-            row_cells = []
-            col_idx = 0
-            
-            while col_idx < col_count:
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info.get('cell_spans', {}):
-                    row_cells.append("↓" if any(
-                        r < row_idx and c == col_idx and (r, c) in table_info.get('cell_spans', {})
-                        for r in range(row_idx) for c in [col_idx]
-                    ) else "→")
-                    col_idx += 1
-                    continue
-                
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
-                
-                if (row_idx, col_idx) in table_info.get('cell_spans', {}):
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    if rowspan > 1 or colspan > 1:
-                        cell_text = f"{cell_text} ⊕" if cell_text else "⊕"
-                    
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, col_count)):
-                            processed_cells.add((r, c))
-                
-                row_cells.append(cell_text.ljust(col_widths[col_idx]))
-                col_idx += 1
-            
-            lines.append("| " + " | ".join(row_cells) + " |")
-            
-            if row_idx == 0:
-                sep_cells = ["-" * w for w in col_widths]
-                lines.append("| " + " | ".join(sep_cells) + " |")
-        
-        return "\n".join(lines) + "\n\n"
-    
-    def _convert_table_to_styled_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to HTML with full inline styles (legacy format)"""
-        if not table_data:
-            return ""
-
-        html_lines = ["<!-- Complex table converted to HTML for better structure preservation -->"]
-        html_lines.append('<table border="1" style="border-collapse: collapse; width: 100%;">')
-
-        processed_cells = set()
-
-        for row_idx, row in enumerate(table_data):
-            html_lines.append("  <tr>")
-
-            col_idx = 0
-            while col_idx < table_info['col_count']:
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
-                    col_idx += 1
-                    continue
-
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
-                # Escape HTML special characters first
-                cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
-                # Convert newlines to <br> after escaping
-                cell_text = cell_text.replace('\n', '<br>')
-
-                cell_attrs = []
-                colspan = 1
-                rowspan = 1
-                
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    if rowspan > 1:
-                        cell_attrs.append(f'rowspan="{rowspan}"')
-                    if colspan > 1:
-                        cell_attrs.append(f'colspan="{colspan}"')
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            processed_cells.add((r, c))
-
-                cell_tag = "th" if row_idx == 0 else "td"
-                
-                if cell_tag == "th":
-                    style = 'style="background-color: #f0f0f0; font-weight: bold; padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
-                else:
-                    style = 'style="padding: 8px; text-align: left; vertical-align: top; border: 1px solid #ddd"'
-
-                attrs_str = " " + " ".join(cell_attrs) if cell_attrs else ""
-                html_lines.append(f'    <{cell_tag}{attrs_str} {style}>{cell_text}</{cell_tag}>')
-
-                col_idx += colspan
-
-            html_lines.append("  </tr>")
-
-        html_lines.append("</table>")
-        return "\n".join(html_lines) + "\n\n"
 
     def _extract_images_simple(self, page, page_num: int, ocr_images: bool = False,
                                ocr_results_map: Dict[tuple, str] = None) -> List[SimpleContent]:

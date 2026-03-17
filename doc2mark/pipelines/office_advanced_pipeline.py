@@ -14,15 +14,7 @@ def _image_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-class TableStyle(Enum):
-    """Table output style options for complex tables with merged cells"""
-    MINIMAL_HTML = "minimal_html"      # Clean HTML with only rowspan/colspan, no inline styles
-    MARKDOWN_GRID = "markdown_grid"    # Extended markdown with merge annotations
-    STYLED_HTML = "styled_html"        # Full HTML with inline styles (legacy)
-    
-    @classmethod
-    def default(cls):
-        return cls.MINIMAL_HTML
+from doc2mark.core.table import TableStyle, TableRenderer
 
 # Office document libraries
 try:
@@ -63,8 +55,6 @@ except ImportError:
     OCR_AVAILABLE = False
     logging.warning("OCR functionality not available. Install VisionAgent to enable OCR.")
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -113,7 +103,7 @@ class BaseOfficeLoader:
 
     def _convert_table_to_markdown(self, table_data: Union[List[List[str]], Any],
                                    extract_images: bool = True, ocr_images: bool = False,
-                                   ocr_results_map: Dict[str, str] = {}) -> str:
+                                   ocr_results_map: Optional[Dict[str, str]] = None) -> str:
         """Convert table data to markdown format with complex structure support
         
         This enhanced version handles:
@@ -128,6 +118,8 @@ class BaseOfficeLoader:
         - PPTX: Merged cells have empty strings '' in non-origin cells, with gridSpan/vMerge properties
         - XLSX: Merged cells have None in non-origin cells, with explicit merged_cells.ranges
         """
+        if ocr_results_map is None:
+            ocr_results_map = {}
         # Handle different table input types
         if hasattr(table_data, 'rows'):  # DOCX Table object
             rows_data = []
@@ -141,88 +133,143 @@ class BaseOfficeLoader:
 
             # Initialize a 2D array to track cell content and merged status
             table_array = [[None for _ in range(num_cols)] for _ in range(num_rows)]
-            cell_map = {}  # Maps cell objects to their content and span info
             processed_positions = set()
 
-            # Process each cell by coordinates
-            for row_idx in range(num_rows):
-                logger.debug(f"\nProcessing row {row_idx}:")
-                for col_idx in range(num_cols):
-                    if (row_idx, col_idx) in processed_positions:
-                        logger.debug(f"  Cell ({row_idx}, {col_idx}): Already processed (part of merge)")
+            # O(nm) merge detection using XML attributes (gridSpan, vMerge)
+            # instead of O(n^2*m^2) brute-force cell ID comparison
+            for row_idx, row_obj in enumerate(table_data.rows):
+                col_idx = 0
+                for tc in row_obj._tr.findall(qn('w:tc')):
+                    if col_idx >= num_cols:
+                        break
+
+                    # Read colspan from gridSpan attribute
+                    tc_pr = tc.find(qn('w:tcPr'))
+                    colspan = 1
+                    if tc_pr is not None:
+                        grid_span = tc_pr.find(qn('w:gridSpan'))
+                        if grid_span is not None:
+                            colspan = int(grid_span.get(qn('w:val'), 1))
+
+                    # Read vMerge to detect rowspan continuation
+                    is_vmerge_continue = False
+                    if tc_pr is not None:
+                        v_merge = tc_pr.find(qn('w:vMerge'))
+                        if v_merge is not None:
+                            # vMerge with val="restart" starts a new vertical merge
+                            # vMerge without val (or val="continue") continues from above
+                            val = v_merge.get(qn('w:val'), '')
+                            is_vmerge_continue = (val != 'restart')
+
+                    if is_vmerge_continue:
+                        # This cell is a continuation of a vertical merge from above
+                        for c in range(col_idx, min(col_idx + colspan, num_cols)):
+                            table_array[row_idx][c] = ""
+                            processed_positions.add((row_idx, c))
+                        col_idx += colspan
                         continue
 
-                    try:
-                        # Access cell by coordinates
-                        cell = table_data.cell(row_idx, col_idx)
-                        cell_id = id(cell._tc) if hasattr(cell, '_tc') else id(cell)
+                    if (row_idx, col_idx) in processed_positions:
+                        col_idx += colspan
+                        continue
 
-                        # Get the actual span of this cell by checking adjacent cells
-                        min_row, min_col = row_idx, col_idx
-                        max_row, max_col = row_idx, col_idx
+                    # Extract cell content
+                    cell = table_data.cell(row_idx, col_idx)
+                    cell_text = self._extract_cell_content_with_images(
+                        cell, extract_images, ocr_images, ocr_results_map
+                    )
 
-                        # Find the full extent of this merged cell by checking all directions
-                        # We need to find the rectangle that encompasses all positions with the same cell ID
+                    table_array[row_idx][col_idx] = cell_text
 
-                        # First, find all positions that share this cell ID
-                        cell_positions = [(row_idx, col_idx)]
+                    # Mark spanned columns
+                    for c in range(col_idx, min(col_idx + colspan, num_cols)):
+                        processed_positions.add((row_idx, c))
+                        if c != col_idx:
+                            table_array[row_idx][c] = ""
 
-                        # Check all remaining positions in the table
-                        for r in range(num_rows):
-                            for c in range(num_cols):
-                                if (r, c) != (row_idx, col_idx) and (r, c) not in processed_positions:
-                                    try:
-                                        test_cell = table_data.cell(r, c)
-                                        test_id = id(test_cell._tc) if hasattr(test_cell, '_tc') else id(test_cell)
-                                        if test_id == cell_id:
-                                            cell_positions.append((r, c))
-                                            min_row = min(min_row, r)
-                                            max_row = max(max_row, r)
-                                            min_col = min(min_col, c)
-                                            max_col = max(max_col, c)
-                                    except (IndexError, AttributeError):
-                                        pass
+                    col_idx += colspan
 
-                        # Extract cell content including images with OCR
-                        cell_text = self._extract_cell_content_with_images(
-                            cell, extract_images, ocr_images, ocr_results_map
-                        )
+            # Second pass: calculate rowspans from vMerge="restart" cells
+            for col_idx in range(num_cols):
+                row_idx = 0
+                while row_idx < num_rows:
+                    tc = table_data.rows[row_idx]._tr.findall(qn('w:tc'))
+                    # Find the tc element for this col_idx by counting gridSpans
+                    current_col = 0
+                    target_tc = None
+                    for t in tc:
+                        tc_pr = t.find(qn('w:tcPr'))
+                        gs = 1
+                        if tc_pr is not None:
+                            gs_el = tc_pr.find(qn('w:gridSpan'))
+                            if gs_el is not None:
+                                gs = int(gs_el.get(qn('w:val'), 1))
+                        if current_col <= col_idx < current_col + gs:
+                            target_tc = t
+                            break
+                        current_col += gs
 
-                        logger.debug(
-                            f"  Cell ({row_idx}, {col_idx}): '{cell_text[:30]}...' spans to ({max_row}, {max_col})")
+                    if target_tc is not None:
+                        tc_pr = target_tc.find(qn('w:tcPr'))
+                        v_merge = tc_pr.find(qn('w:vMerge')) if tc_pr is not None else None
+                        if v_merge is not None and v_merge.get(qn('w:val'), '') == 'restart':
+                            # Count how many rows this spans
+                            rowspan = 1
+                            for check_row in range(row_idx + 1, num_rows):
+                                if table_array[check_row][col_idx] == "" and (check_row, col_idx) in processed_positions:
+                                    # Verify it's actually a vMerge continuation, not just empty
+                                    check_tcs = table_data.rows[check_row]._tr.findall(qn('w:tc'))
+                                    cc = 0
+                                    check_tc = None
+                                    for t in check_tcs:
+                                        tp = t.find(qn('w:tcPr'))
+                                        gs = 1
+                                        if tp is not None:
+                                            gs_el = tp.find(qn('w:gridSpan'))
+                                            if gs_el is not None:
+                                                gs = int(gs_el.get(qn('w:val'), 1))
+                                        if cc <= col_idx < cc + gs:
+                                            check_tc = t
+                                            break
+                                        cc += gs
+                                    if check_tc is not None:
+                                        cp = check_tc.find(qn('w:tcPr'))
+                                        vm = cp.find(qn('w:vMerge')) if cp is not None else None
+                                        if vm is not None and vm.get(qn('w:val'), '') != 'restart':
+                                            rowspan += 1
+                                        else:
+                                            break
+                                    else:
+                                        break
+                                else:
+                                    break
 
-                        # Place text in the array
-                        table_array[min_row][min_col] = cell_text
+                            # Also get colspan for this cell
+                            gs_el = tc_pr.find(qn('w:gridSpan')) if tc_pr is not None else None
+                            colspan = int(gs_el.get(qn('w:val'), 1)) if gs_el is not None else 1
 
-                        # Mark all positions covered by this cell
-                        for r in range(min_row, max_row + 1):
-                            for c in range(min_col, max_col + 1):
-                                processed_positions.add((r, c))
-                                if (r, c) != (min_row, min_col):
-                                    table_array[r][c] = ""  # Empty string for merged areas
-                                    logger.debug(f"    Marking ({r}, {c}) as empty (part of merge)")
+                            if rowspan > 1 or colspan > 1:
+                                merged_cells_info.append({
+                                    'row': row_idx,
+                                    'col': col_idx,
+                                    'rowspan': rowspan,
+                                    'colspan': colspan
+                                })
+                            row_idx += rowspan
+                            continue
+                        elif v_merge is None:
+                            # No vMerge at all - check if it has a colspan
+                            gs_el = tc_pr.find(qn('w:gridSpan')) if tc_pr is not None else None
+                            colspan = int(gs_el.get(qn('w:val'), 1)) if gs_el is not None else 1
+                            if colspan > 1:
+                                merged_cells_info.append({
+                                    'row': row_idx,
+                                    'col': col_idx,
+                                    'rowspan': 1,
+                                    'colspan': colspan
+                                })
 
-                        # Record merge info if this is a merged cell
-                        rowspan = max_row - min_row + 1
-                        colspan = max_col - min_col + 1
-                        if rowspan > 1 or colspan > 1:
-                            merged_cells_info.append({
-                                'row': min_row,
-                                'col': min_col,
-                                'rowspan': rowspan,
-                                'colspan': colspan
-                            })
-                            logger.debug(
-                                f"Merged cell at ({min_row}, {min_col}): {rowspan}x{colspan} - '{cell_text[:30]}...'")
-
-                    except Exception as e:
-                        logger.warning(f"Error processing cell at ({row_idx}, {col_idx}): {e}")
-                        table_array[row_idx][col_idx] = ""
-
-            # Log the final table array for debugging
-            logger.debug("\nFinal table array:")
-            for i, row in enumerate(table_array):
-                logger.debug(f"  Row {i}: {[cell[:20] + '...' if cell and len(cell) > 20 else cell for cell in row]}")
+                    row_idx += 1
 
             # Convert array to list format
             for row in table_array:
@@ -231,35 +278,22 @@ class BaseOfficeLoader:
             table_data = rows_data
             is_complex = len(merged_cells_info) > 0
 
-            logger.info(f"DOCX Table: Detected {len(merged_cells_info)} merged cells, complex={is_complex}")
+            logger.debug(f"DOCX Table: Detected {len(merged_cells_info)} merged cells, complex={is_complex}")
 
-            # If complex, create table info for HTML conversion
-            if is_complex:
-                table_info = {
-                    'is_complex': True,
-                    'merged_cells': merged_cells_info,
-                    'row_count': num_rows,
-                    'col_count': num_cols,
-                    'cell_spans': {}
-                }
+            # Build table_info and render
+            table_info = {
+                'is_complex': is_complex,
+                'merged_cells': merged_cells_info,
+                'row_count': num_rows,
+                'col_count': num_cols,
+                'cell_spans': {}
+            }
+            for merge_info in merged_cells_info:
+                key = (merge_info['row'], merge_info['col'])
+                table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
 
-                # Add span info
-                for merge_info in merged_cells_info:
-                    key = (merge_info['row'], merge_info['col'])
-                    table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
-
-                return self._convert_table_to_html(table_data, table_info)
-            else:
-                # For DOCX tables without merges, use simple markdown directly
-                # Don't call _analyze_table_structure which might misinterpret empty cells
-                table_info = {
-                    'is_complex': False,
-                    'merged_cells': [],
-                    'row_count': num_rows,
-                    'col_count': num_cols,
-                    'cell_spans': {}
-                }
-                return self._convert_table_to_simple_markdown(table_data, table_info)
+            renderer = TableRenderer(self.table_style)
+            return renderer.render(table_data, table_info)
         else:
             # For non-DOCX tables (e.g., from PPTX or XLSX), still analyze structure
             is_complex = False
@@ -270,11 +304,9 @@ class BaseOfficeLoader:
         # Only analyze table structure for non-DOCX tables
         table_info = self._analyze_table_structure(table_data)
 
-        # If table is complex, use HTML format
-        if is_complex or table_info['is_complex']:
-            return self._convert_table_to_html(table_data, table_info)
-        else:
-            return self._convert_table_to_simple_markdown(table_data, table_info)
+        # Render using shared TableRenderer
+        renderer = TableRenderer(self.table_style)
+        return renderer.render(table_data, table_info)
 
     def _analyze_table_structure(self, table_data: List[List]) -> Dict[str, Any]:
         """Analyze table structure to detect merged cells and complexity
@@ -419,293 +451,6 @@ class BaseOfficeLoader:
                 break
 
         return rowspan, colspan
-
-    def _convert_table_to_simple_markdown(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert simple table to markdown format with span annotations"""
-        if not table_data:
-            return ""
-
-        markdown_lines = []
-        processed_cells = set()  # Track cells that are part of spans
-
-        # Add table complexity note if needed
-        if table_info['merged_cells']:
-            markdown_lines.append("<!-- Table contains merged cells (marked with *) -->")
-
-        # Build markdown table
-        for row_idx, row in enumerate(table_data):
-            row_cells = []
-
-            for col_idx in range(table_info['col_count']):
-                # Skip if this cell is part of a span
-                if (row_idx, col_idx) in processed_cells:
-                    continue
-
-                # Get cell content
-                if col_idx < len(row):
-                    cell_text = str(row[col_idx]).strip()
-                else:
-                    cell_text = ""
-
-                # Replace newlines with <br> tags
-                cell_text = "<br>".join(cell_text.split('\n'))
-                # Escape pipe characters
-                cell_text = cell_text.replace("|", "\\|")
-
-                # Check if this cell has spans
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-
-                    # Mark spanned cells as processed
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            if r != row_idx or c != col_idx:
-                                processed_cells.add((r, c))
-
-                    # Add span indicator
-                    if rowspan > 1 or colspan > 1:
-                        span_note = f"*[{rowspan}x{colspan}]*"
-                        cell_text = f"{cell_text} {span_note}" if cell_text else span_note
-
-                # For cells that span multiple columns, repeat the content
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    _, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    for _ in range(colspan):
-                        row_cells.append(cell_text)
-                else:
-                    row_cells.append(cell_text)
-
-            # Ensure row has correct number of columns
-            while len(row_cells) < table_info['col_count']:
-                row_cells.append("")
-
-            # Create table row
-            row_text = "| " + " | ".join(row_cells[:table_info['col_count']]) + " |"
-            markdown_lines.append(row_text)
-
-            # Add separator after first row
-            if row_idx == 0:
-                separator = "|" + "|".join([" --- " for _ in range(table_info['col_count'])]) + "|"
-                markdown_lines.append(separator)
-
-        return "\n".join(markdown_lines) + "\n\n"
-
-    def _convert_table_to_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to HTML format based on table_style setting"""
-        if not table_data:
-            return ""
-        
-        # Route to appropriate converter based on style
-        if self.table_style == TableStyle.STYLED_HTML:
-            return self._convert_table_to_styled_html(table_data, table_info)
-        elif self.table_style == TableStyle.MARKDOWN_GRID:
-            return self._convert_table_to_markdown_grid(table_data, table_info)
-        else:  # MINIMAL_HTML (default)
-            return self._convert_table_to_minimal_html(table_data, table_info)
-    
-    def _convert_table_to_minimal_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to clean, minimal HTML without inline styles"""
-        if not table_data:
-            return ""
-
-        html_lines = ["<table>"]
-        processed_cells = set()
-
-        for row_idx, row in enumerate(table_data):
-            html_lines.append("<tr>")
-
-            col_idx = 0
-            while col_idx < table_info['col_count']:
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
-                    col_idx += 1
-                    continue
-
-                # Get and escape cell content
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
-                cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                cell_text = cell_text.replace('\n', '<br>')
-
-                # Build attributes (only rowspan/colspan if needed)
-                attrs = []
-                colspan = 1
-                rowspan = 1
-
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    if rowspan > 1:
-                        attrs.append(f'rowspan="{rowspan}"')
-                    if colspan > 1:
-                        attrs.append(f'colspan="{colspan}"')
-                    
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            processed_cells.add((r, c))
-
-                cell_tag = "th" if row_idx == 0 else "td"
-                attrs_str = " " + " ".join(attrs) if attrs else ""
-                html_lines.append(f"<{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>")
-
-                col_idx += colspan
-
-            html_lines.append("</tr>")
-
-        html_lines.append("</table>")
-        return "\n".join(html_lines) + "\n\n"
-    
-    def _convert_table_to_markdown_grid(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to markdown with merge annotations as comments"""
-        if not table_data:
-            return ""
-        
-        lines = []
-        processed_cells = set()
-        
-        # Add merge info as a compact header comment
-        if table_info.get('cell_spans'):
-            merge_notes = []
-            for (r, c), (rowspan, colspan) in table_info['cell_spans'].items():
-                if rowspan > 1 or colspan > 1:
-                    merge_notes.append(f"R{r+1}C{c+1}:{rowspan}x{colspan}")
-            if merge_notes:
-                lines.append(f"<!-- Merged: {', '.join(merge_notes)} -->")
-        
-        # Calculate column widths (no truncation to preserve data integrity)
-        col_count = table_info['col_count']
-        col_widths = [3] * col_count  # minimum width
-        
-        for row in table_data:
-            for i, cell in enumerate(row[:col_count]):
-                cell_text = str(cell).strip() if cell else ""
-                col_widths[i] = max(col_widths[i], len(cell_text))
-        
-        # Build markdown table
-        for row_idx, row in enumerate(table_data):
-            row_cells = []
-            col_idx = 0
-            
-            while col_idx < col_count:
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info.get('cell_spans', {}):
-                    # Cell consumed by span - use empty placeholder
-                    row_cells.append("↓" if any(
-                        r < row_idx and c == col_idx and (r, c) in table_info.get('cell_spans', {})
-                        for r in range(row_idx) for c in [col_idx]
-                    ) else "→")
-                    col_idx += 1
-                    continue
-                
-                cell_text = str(row[col_idx]).strip() if col_idx < len(row) and row[col_idx] is not None else ""
-                
-                # Mark merged cells with indicator
-                if (row_idx, col_idx) in table_info.get('cell_spans', {}):
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-                    if rowspan > 1 or colspan > 1:
-                        cell_text = f"{cell_text} ⊕" if cell_text else "⊕"
-                    
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, col_count)):
-                            processed_cells.add((r, c))
-                
-                row_cells.append(cell_text.ljust(col_widths[col_idx]))
-                col_idx += 1
-            
-            lines.append("| " + " | ".join(row_cells) + " |")
-            
-            # Add separator after header
-            if row_idx == 0:
-                sep_cells = ["-" * w for w in col_widths]
-                lines.append("| " + " | ".join(sep_cells) + " |")
-        
-        return "\n".join(lines) + "\n\n"
-    
-    def _convert_table_to_styled_html(self, table_data: List[List], table_info: Dict) -> str:
-        """Convert complex table to HTML with full inline styles (legacy format)"""
-        if not table_data:
-            return ""
-
-        html_lines = ["<!-- Complex table converted to HTML for better structure preservation -->"]
-        html_lines.append('<table border="1" style="border-collapse: collapse; width: 100%;">')
-
-        processed_cells = set()
-
-        # Process each row
-        for row_idx, row in enumerate(table_data):
-            html_lines.append("  <tr>")
-
-            col_idx = 0
-            while col_idx < table_info['col_count']:
-                # Skip if this cell is part of a vertical span from a previous row
-                if (row_idx, col_idx) in processed_cells and (row_idx, col_idx) not in table_info['cell_spans']:
-                    # This cell is consumed by a rowspan from above, skip it
-                    col_idx += 1
-                    continue
-
-                # Get cell content
-                if col_idx < len(row) and row[col_idx] is not None:
-                    cell_text = str(row[col_idx]).strip()
-                else:
-                    cell_text = ""
-
-                # Convert newlines to <br> for HTML
-                cell_text = cell_text.replace('\n', '<br>')
-
-                # Escape HTML special characters
-                cell_text = cell_text.replace('&', '&amp;')
-                cell_text = cell_text.replace('<', '&lt;')
-                cell_text = cell_text.replace('>', '&gt;')
-                cell_text = cell_text.replace('"', '&quot;')
-
-                # But restore <br> tags we just added
-                cell_text = cell_text.replace('&lt;br&gt;', '<br>')
-
-                # Determine cell attributes
-                cell_attrs = []
-                cell_style = []
-                colspan = 1
-                rowspan = 1
-
-                # Check if this cell has spans
-                if (row_idx, col_idx) in table_info['cell_spans']:
-                    rowspan, colspan = table_info['cell_spans'][(row_idx, col_idx)]
-
-                    if rowspan > 1:
-                        cell_attrs.append(f'rowspan="{rowspan}"')
-                    if colspan > 1:
-                        cell_attrs.append(f'colspan="{colspan}"')
-
-                    # Mark spanned cells as processed
-                    for r in range(row_idx, min(row_idx + rowspan, table_info['row_count'])):
-                        for c in range(col_idx, min(col_idx + colspan, table_info['col_count'])):
-                            processed_cells.add((r, c))
-
-                # Determine if header cell (first row typically)
-                cell_tag = "th" if row_idx == 0 else "td"
-
-                # Add some basic styling
-                if cell_tag == "th":
-                    cell_style.append("background-color: #f0f0f0")
-                    cell_style.append("font-weight: bold")
-
-                cell_style.append("padding: 8px")
-                cell_style.append("text-align: left")
-                cell_style.append("vertical-align: top")
-                cell_style.append("border: 1px solid #ddd")
-
-                # Build style attribute
-                if cell_style:
-                    cell_attrs.append(f'style="{"; ".join(cell_style)}"')
-
-                # Build cell HTML
-                attrs_str = " " + " ".join(cell_attrs) if cell_attrs else ""
-                html_lines.append(f'    <{cell_tag}{attrs_str}>{cell_text}</{cell_tag}>')
-
-                # Skip columns covered by colspan
-                col_idx += colspan
-
-            html_lines.append("  </tr>")
-
-        html_lines.append("</table>")
-
-        return "\n".join(html_lines) + "\n\n"
 
     def _extract_image_as_base64(self, image_data: bytes, image_format: str = 'png') -> str:
         """Convert image bytes to base64 string"""
@@ -1461,7 +1206,7 @@ class DocxLoader(BaseOfficeLoader):
                     content.append(image_content)
 
     def _extract_cell_content_with_images(self, cell, extract_images: bool = True,
-                                          ocr_images: bool = False, ocr_results_map: Dict[str, str] = {}) -> str:
+                                          ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None) -> str:
         """Extract complete cell content including text and images (with OCR if enabled)
         
         Args:
@@ -1473,6 +1218,8 @@ class DocxLoader(BaseOfficeLoader):
         Returns:
             Combined cell content as string
         """
+        if ocr_results_map is None:
+            ocr_results_map = {}
         cell_parts = []
 
         # Process each paragraph in the cell
@@ -2171,8 +1918,9 @@ class PptxLoader(BaseOfficeLoader):
                 key = (merge_info['row'], merge_info['col'])
                 table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
 
-            # Use HTML converter for PowerPoint tables
-            html_table = self._convert_table_to_html(table_data, table_info)
+            # Use shared TableRenderer for PowerPoint tables
+            renderer = TableRenderer(self.table_style)
+            html_table = renderer._render_html(table_data, table_info)
 
             return {
                 "type": "table",
@@ -2886,8 +2634,9 @@ class XlsxLoader(BaseOfficeLoader):
                 key = (merge_info['row'], merge_info['col'])
                 table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
 
-            # Use HTML converter for complex tables
-            return self._convert_table_to_html(table_data, table_info)
+            # Use shared TableRenderer for complex tables
+            renderer = TableRenderer(self.table_style)
+            return renderer._render_html(table_data, table_info)
         else:
             # Filter out completely empty rows before converting to markdown
             filtered_data = []
@@ -2911,12 +2660,16 @@ class XlsxLoader(BaseOfficeLoader):
         return self._convert_table_to_markdown(table_data)
 
     def _extract_images_from_sheet(self, sheet, sheet_num: int, ocr_images: bool,
-                                   ocr_results_map: Dict[str, str] = {},
-                                   image_data_cache: Dict[tuple, bytes] = {}) -> List[Dict[str, Any]]:
+                                   ocr_results_map: Optional[Dict[str, str]] = None,
+                                   image_data_cache: Optional[Dict[tuple, bytes]] = None) -> List[Dict[str, Any]]:
         """Extract images from an Excel sheet"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
+        if image_data_cache is None:
+            image_data_cache = {}
         images = []
         sheet_name = sheet.title
-        
+
         # First try standard image extraction
         for img_idx, image in enumerate(sheet._images):
             try:
