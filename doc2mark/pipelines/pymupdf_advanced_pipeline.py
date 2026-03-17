@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Union, Optional, Tuple
 import pymupdf
 
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
-from doc2mark.core.table import TableStyle, TableRenderer
+from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
 logger = logging.getLogger(__name__)
 
@@ -417,10 +417,10 @@ class PDFLoader:
                     img_rects = page.get_image_rects(xref)
                     for img_rect in img_rects:
                         image_bboxes.append((img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1))
-                except:
-                    pass
-        except:
-            pass
+                except Exception as e:
+                    logger.debug(f"Failed to get image rects: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to get image bboxes: {e}")
         return image_bboxes
 
     def _is_near_image_or_table(self, bbox: tuple, image_bboxes: List[tuple], table_bboxes: List[tuple],
@@ -676,10 +676,10 @@ class PDFLoader:
                     return ""
             
             # Use boundary-based analysis for better merge detection
-            table_info = self._analyze_table_with_boundaries(table, extracted_data)
-            
+            table_data = self._analyze_table_with_boundaries(table, extracted_data)
+
             renderer = TableRenderer(self.table_style)
-            return renderer.render(extracted_data, table_info)
+            return renderer.render(table_data)
 
         except Exception as e:
             logger.warning(f"Failed to convert table to markdown: {e}")
@@ -687,10 +687,9 @@ class PDFLoader:
             try:
                 data = table.extract()
                 if data:
-                    col_count = max(len(r) for r in data) if data else 0
-                    info = {'is_complex': False, 'merged_cells': [], 'row_count': len(data), 'col_count': col_count, 'cell_spans': {}}
+                    table_data = TableData.from_2d_array(data)
                     renderer = TableRenderer(self.table_style)
-                    return renderer._render_simple_markdown(data, info)
+                    return renderer.render(table_data)
             except Exception:
                 pass
             return ""
@@ -912,10 +911,10 @@ class PDFLoader:
         overlap_ratio = overlap_width / min_width
         return overlap_ratio >= threshold
 
-    def _analyze_table_with_boundaries(self, table, extracted_data: List[List]) -> Dict[str, Any]:
-        """Analyze table using cell boundaries if available"""
+    def _analyze_table_with_boundaries(self, table, extracted_data: List[List]) -> TableData:
+        """Analyze table using cell boundaries if available. Returns TableData."""
         if not extracted_data:
-            return {'is_complex': False, 'merged_cells': [], 'row_count': 0, 'col_count': 0, 'cell_spans': {}}
+            return TableData.empty()
 
         row_count = len(extracted_data)
         col_count = max(len(row) for row in extracted_data) if extracted_data else 0
@@ -932,7 +931,7 @@ class PDFLoader:
         if boundaries:
             # Use boundary-based detection
             merge_info = self._detect_merges_from_boundaries(boundaries, normalized)
-            return merge_info
+            return TableData.from_raw(normalized, merge_info)
         else:
             # Fallback to pattern-based detection with conservative heuristics
             # to reduce false positives on legitimately sparse tables
@@ -1010,13 +1009,10 @@ class PDFLoader:
                     'content': str(normalized[row_idx][col_idx])
                 })
 
-            return {
+            return TableData.from_raw(normalized, {
                 'is_complex': is_complex,
-                'merged_cells': merged_cells,
-                'row_count': row_count,
-                'col_count': col_count,
-                'cell_spans': cell_spans
-            }
+                'cell_spans': cell_spans,
+            })
 
     def _get_cell_boundaries(self, table) -> List[Dict]:
         """Extract cell boundary information from table if available"""
@@ -1032,8 +1028,8 @@ class PDFLoader:
                             'row': cell[5],
                             'col': cell[6]
                         })
-        except:
-            pass
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.debug(f"Failed to get cell boundaries: {e}")
         return boundaries
 
     def _detect_merges_from_boundaries(self, boundaries: List[Dict], normalized_data: List[List]) -> Dict:

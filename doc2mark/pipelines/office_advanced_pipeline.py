@@ -14,7 +14,7 @@ def _image_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-from doc2mark.core.table import TableStyle, TableRenderer
+from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
 # Office document libraries
 try:
@@ -280,20 +280,18 @@ class BaseOfficeLoader:
 
             logger.debug(f"DOCX Table: Detected {len(merged_cells_info)} merged cells, complex={is_complex}")
 
-            # Build table_info and render
-            table_info = {
-                'is_complex': is_complex,
-                'merged_cells': merged_cells_info,
-                'row_count': num_rows,
-                'col_count': num_cols,
-                'cell_spans': {}
-            }
+            # Build cell_spans and render via TableData
+            cell_spans = {}
             for merge_info in merged_cells_info:
                 key = (merge_info['row'], merge_info['col'])
-                table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
+                cell_spans[key] = (merge_info['rowspan'], merge_info['colspan'])
 
+            table_obj = TableData.from_raw(table_data, {
+                'is_complex': is_complex,
+                'cell_spans': cell_spans,
+            })
             renderer = TableRenderer(self.table_style)
-            return renderer.render(table_data, table_info)
+            return renderer.render(table_obj)
         else:
             # For non-DOCX tables (e.g., from PPTX or XLSX), still analyze structure
             is_complex = False
@@ -302,27 +300,27 @@ class BaseOfficeLoader:
             return ""
 
         # Only analyze table structure for non-DOCX tables
-        table_info = self._analyze_table_structure(table_data)
+        table_obj = self._analyze_table_structure(table_data)
 
         # Render using shared TableRenderer
         renderer = TableRenderer(self.table_style)
-        return renderer.render(table_data, table_info)
+        return renderer.render(table_obj)
 
-    def _analyze_table_structure(self, table_data: List[List]) -> Dict[str, Any]:
-        """Analyze table structure to detect merged cells and complexity
-        
+    def _analyze_table_structure(self, table_data: List[List]) -> TableData:
+        """Analyze table structure to detect merged cells and complexity.
+        Returns TableData.
+
         This method is used for non-DOCX tables (PPTX and XLSX) where we need to detect merges
         based on empty cells. DOCX tables handle merges differently using cell object IDs.
         """
         if not table_data:
-            return {'is_complex': False, 'merged_cells': [], 'row_count': 0, 'col_count': 0, 'cell_spans': {}}
+            return TableData.empty()
 
         row_count = len(table_data)
         col_count = max(len(row) for row in table_data) if table_data else 0
 
         # Initialize analysis structures
         cell_spans = {}
-        merged_cells = []
         is_complex = False
 
         # Create a normalized table (all rows same length)
@@ -340,29 +338,18 @@ class BaseOfficeLoader:
                     # Check if this is part of a merged cell
                     span_info = self._detect_cell_span(normalized, row_idx, col_idx)
                     if span_info:
-                        merged_cells.append(span_info)
                         is_complex = True
                 else:
                     # Check if this cell spans multiple rows/cols
                     rowspan, colspan = self._calculate_cell_span(normalized, row_idx, col_idx, str(cell))
                     if rowspan > 1 or colspan > 1:
                         cell_spans[(row_idx, col_idx)] = (rowspan, colspan)
-                        merged_cells.append({
-                            'row': row_idx,
-                            'col': col_idx,
-                            'rowspan': rowspan,
-                            'colspan': colspan,
-                            'content': str(cell)
-                        })
                         is_complex = True
 
-        return {
+        return TableData.from_raw(normalized, {
             'is_complex': is_complex,
-            'merged_cells': merged_cells,
-            'row_count': row_count,
-            'col_count': col_count,
-            'cell_spans': cell_spans
-        }
+            'cell_spans': cell_spans,
+        })
 
     def _detect_cell_span(self, table: List[List], row: int, col: int) -> Optional[Dict]:
         """Detect if an empty cell is part of a span from another cell
@@ -1124,8 +1111,8 @@ class DocxLoader(BaseOfficeLoader):
                         image_part = rel.target_part
                         if hasattr(image_part, 'blob'):
                             add_unique_image(image_part.blob, {'type': 'relationship', 'rel_id': rel_id})
-                    except:
-                        pass
+                    except (AttributeError, KeyError) as e:
+                        logger.debug(f"Failed to extract image from relationship: {e}")
         except Exception as e:
             logger.warning(f"Failed to extract images from relationships: {e}")
 
@@ -1366,8 +1353,8 @@ class PptxLoader(BaseOfficeLoader):
                             'data': image_data,
                             'location': {'slide': slide_idx + 1, 'type': 'placeholder'}
                         })
-                    except:
-                        pass
+                    except (AttributeError, ValueError) as e:
+                        logger.debug(f"Failed to extract placeholder image: {e}")
 
             # Check all shapes
             for shape_idx, shape in enumerate(slide.shapes):
@@ -1380,8 +1367,8 @@ class PptxLoader(BaseOfficeLoader):
                             'data': image_data,
                             'location': {'slide': slide_idx + 1, 'type': 'shape', 'shape_idx': shape_idx}
                         })
-                    except:
-                        pass
+                    except (AttributeError, ValueError) as e:
+                        logger.debug(f"Failed to extract shape image: {e}")
 
                 # Check grouped shapes
                 if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
@@ -1413,10 +1400,10 @@ class PptxLoader(BaseOfficeLoader):
                             'data': image_data,
                             'location': {'slide': slide_num, 'type': 'grouped'}
                         })
-                    except:
-                        pass
-        except:
-            pass
+                    except (AttributeError, ValueError) as e:
+                        logger.debug(f"Failed to extract grouped image: {e}")
+        except (AttributeError, TypeError) as e:
+            logger.debug(f"Failed to iterate group shapes: {e}")
 
         return images
 
@@ -1593,7 +1580,8 @@ class PptxLoader(BaseOfficeLoader):
                 if len(full_text) <= 5:
                     logger.debug(f"    Found short text in placeholder: '{full_text}' (type: {ph_type})")
 
-            except:
+            except (AttributeError, IndexError) as e:
+                logger.debug(f"Failed to classify placeholder: {e}")
                 # Fallback classification
                 text_type = self._classify_text_type(full_text, "")
 
@@ -1905,22 +1893,18 @@ class PptxLoader(BaseOfficeLoader):
         # For PowerPoint tables, we'll always use HTML format for better structure preservation
         if table_data:
             # Create table info for HTML conversion
-            table_info = {
-                'is_complex': True,  # Always treat PowerPoint tables as complex
-                'merged_cells': merged_cells_info,
-                'row_count': num_rows,
-                'col_count': num_cols,
-                'cell_spans': {}
-            }
-
-            # Add span info
+            # Build cell_spans and render via TableData
+            cell_spans = {}
             for merge_info in merged_cells_info:
                 key = (merge_info['row'], merge_info['col'])
-                table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
+                cell_spans[key] = (merge_info['rowspan'], merge_info['colspan'])
 
-            # Use shared TableRenderer for PowerPoint tables
+            table_obj = TableData.from_raw(table_data, {
+                'is_complex': True,  # Always treat PowerPoint tables as complex
+                'cell_spans': cell_spans,
+            })
             renderer = TableRenderer(self.table_style)
-            html_table = renderer._render_html(table_data, table_info)
+            html_table = renderer._render_html(table_obj)
 
             return {
                 "type": "table",
@@ -2034,8 +2018,8 @@ class PptxLoader(BaseOfficeLoader):
                                 "type": "text:caption",
                                 "content": f"Chart: {title_text}"
                             })
-                    except:
-                        pass
+                    except (AttributeError, ValueError) as e:
+                        logger.debug(f"Failed to extract chart title: {e}")
 
                 # Axis titles
                 try:
@@ -2046,8 +2030,8 @@ class PptxLoader(BaseOfficeLoader):
                                 "type": "text:caption",
                                 "content": f"X-axis: {axis_text}"
                             })
-                except:
-                    pass
+                except (AttributeError, ValueError) as e:
+                    logger.debug(f"Failed to extract x-axis title: {e}")
 
                 try:
                     if hasattr(chart, 'value_axis') and chart.value_axis.has_title:
@@ -2057,8 +2041,8 @@ class PptxLoader(BaseOfficeLoader):
                                 "type": "text:caption",
                                 "content": f"Y-axis: {axis_text}"
                             })
-                except:
-                    pass
+                except (AttributeError, ValueError) as e:
+                    logger.debug(f"Failed to extract y-axis title: {e}")
 
             # 3. SmartArt text (often in grouped shapes)
             # SmartArt is typically a group shape with specific properties
@@ -2147,8 +2131,8 @@ class PptxLoader(BaseOfficeLoader):
                                         "page": slide_num
                                     })
                                     logger.debug(f"  Found master text: '{master_text}' (type: {ph_type})")
-                            except:
-                                pass
+                            except (AttributeError, IndexError) as e:
+                                logger.debug(f"Failed to extract master text: {e}")
 
             except Exception as e:
                 logger.warning(f"Error extracting master text: {e}")
@@ -2621,22 +2605,17 @@ class XlsxLoader(BaseOfficeLoader):
 
         # Create table info for complex table handling
         if merged_cells_info:
-            table_info = {
-                'is_complex': True,
-                'merged_cells': merged_cells_info,
-                'row_count': len(table_data),
-                'col_count': actual_col_count,  # Use filtered column count
-                'cell_spans': {}
-            }
-
-            # Add span info
+            cell_spans = {}
             for merge_info in merged_cells_info:
                 key = (merge_info['row'], merge_info['col'])
-                table_info['cell_spans'][key] = (merge_info['rowspan'], merge_info['colspan'])
+                cell_spans[key] = (merge_info['rowspan'], merge_info['colspan'])
 
-            # Use shared TableRenderer for complex tables
+            table_obj = TableData.from_raw(table_data, {
+                'is_complex': True,
+                'cell_spans': cell_spans,
+            })
             renderer = TableRenderer(self.table_style)
-            return renderer._render_html(table_data, table_info)
+            return renderer._render_html(table_obj)
         else:
             # Filter out completely empty rows before converting to markdown
             filtered_data = []

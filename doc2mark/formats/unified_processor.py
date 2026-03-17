@@ -228,8 +228,8 @@ class UnifiedProcessor(BaseProcessor):
             # Clean up converted file
             try:
                 converted_path.unlink()
-            except:
-                pass
+            except OSError as e:
+                logger.debug(f"Failed to clean up converted file: {e}")
 
             # Extract images
             images = self._extract_images_from_json(json_data)
@@ -469,7 +469,8 @@ class UnifiedProcessor(BaseProcessor):
         try:
             from doc2mark.pipelines import office_to_markdown
             return office_to_markdown(json_data)
-        except:
+        except (ImportError, Exception) as e:
+            logger.debug(f"Failed to use office_to_markdown, using fallback: {e}")
             # Fallback implementation
             markdown_parts = []
 
@@ -540,7 +541,8 @@ class UnifiedProcessor(BaseProcessor):
                 else:
                     from doc2mark.pipelines import office_to_markdown
                     return office_to_markdown(json_data)
-            except:
+            except (ImportError, Exception) as e:
+                logger.debug(f"Failed to use pipeline markdown converter: {e}")
                 return self._json_to_markdown(json_data)
 
         elif output_format == OutputFormat.JSON:
@@ -572,5 +574,6 @@ class UnifiedProcessor(BaseProcessor):
                 else:
                     from doc2mark.pipelines import office_to_markdown
                     return office_to_markdown(json_data)
-            except:
+            except (ImportError, Exception) as e:
+                logger.debug(f"Failed to use pipeline markdown converter: {e}")
                 return self._json_to_markdown(json_data)

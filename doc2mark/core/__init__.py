@@ -19,7 +19,7 @@ from doc2mark.core.mime_mapper import (
     detect_format_from_file,
     check_mime_support
 )
-from doc2mark.core.table import TableStyle, TableRenderer
+from doc2mark.core.table import TableStyle, TableRenderer, Cell, TableData
 
 __all__ = [
     # Main loader
@@ -39,6 +39,8 @@ __all__ = [
 
     # Table rendering
     'TableRenderer',
+    'Cell',
+    'TableData',
 
     # Exceptions
     'ProcessingError',
