@@ -3,7 +3,7 @@
 import base64
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
@@ -116,16 +116,30 @@ class VertexAIVisionAgent:
             text = str(content)
         return text.replace("```", "`")
 
-    def invoke(self, input_dict: Dict[str, str]) -> str:
-        """Process single image."""
+    @staticmethod
+    def _extract_usage(msg) -> Dict[str, Any]:
+        """Extract token usage metadata from a LangChain AIMessage."""
+        usage = getattr(msg, 'usage_metadata', None)
+        return dict(usage) if usage else {}
+
+    def invoke(self, input_dict: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+        """Process single image.
+
+        Returns:
+            Tuple of (processed text, token usage dict)
+        """
         if not self._chain:
             raise RuntimeError("langchain-google-genai not available")
 
         result = self._chain.invoke(input_dict)
-        return self._extract_text(result.content)
+        return self._extract_text(result.content), self._extract_usage(result)
 
-    def batch_invoke(self, input_dicts: List[Dict[str, str]]) -> List[str]:
-        """Process multiple images using LangChain batch processing."""
+    def batch_invoke(self, input_dicts: List[Dict[str, str]]) -> List[Tuple[str, Dict[str, Any]]]:
+        """Process multiple images using LangChain batch processing.
+
+        Returns:
+            List of (processed text, token usage dict) tuples
+        """
         if not self._chain:
             raise RuntimeError("langchain-google-genai not available")
 
@@ -136,7 +150,7 @@ class VertexAIVisionAgent:
 
         logger.info("Gemini batch processing complete")
 
-        return [self._extract_text(res[1].content) for res in sorted_results]
+        return [(self._extract_text(res[1].content), self._extract_usage(res[1])) for res in sorted_results]
 
 
 class VertexAIOCR(BaseOCR):
@@ -324,7 +338,7 @@ class VertexAIOCR(BaseOCR):
             batch_results = self._vision_agent.batch_invoke(input_dicts)
 
             results = []
-            for i, text_result in enumerate(batch_results):
+            for i, (text_result, token_usage) in enumerate(batch_results):
                 image_size = len(images[i])
                 results.append(
                     OCRResult(
@@ -344,6 +358,7 @@ class VertexAIOCR(BaseOCR):
                             "image_size_bytes": image_size,
                             "batch_index": i,
                             "content_type": kwargs.get("content_type"),
+                            "token_usage": token_usage,
                         },
                     )
                 )

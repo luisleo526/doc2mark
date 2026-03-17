@@ -6,7 +6,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
@@ -172,35 +172,48 @@ class VisionAgent:
             self._llm = ChatOpenAI(**llm_kwargs)
             self._chain = RunnableLambda(prepare_prompt) | self._llm
 
-    def invoke(self, input_dict: Dict[str, str]) -> str:
-        """Process single image using LangChain."""
+    @staticmethod
+    def _extract_usage(msg) -> Dict[str, Any]:
+        """Extract token usage metadata from a LangChain AIMessage."""
+        usage = getattr(msg, 'usage_metadata', None)
+        return dict(usage) if usage else {}
+
+    def invoke(self, input_dict: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
+        """Process single image using LangChain.
+
+        Returns:
+            Tuple of (processed text, token usage dict)
+        """
         if not self._chain:
             raise RuntimeError("LangChain not available")
 
         result = self._chain.invoke(input_dict)
-        # Replace triple backticks with single backtick in the output
         processed_content = result.content.replace('```', '`') if result.content else result.content
-        return processed_content
+        return processed_content, self._extract_usage(result)
 
-    def batch_invoke(self, input_dicts: List[Dict[str, str]]) -> List[str]:
+    def batch_invoke(self, input_dicts: List[Dict[str, str]]) -> List[Tuple[str, Dict[str, Any]]]:
         """
         Process multiple images using LangChain's efficient batch processing.
-        
-        This uses the same approach as the original ocr_agent.py for optimal performance.
+
+        Returns:
+            List of (processed text, token usage dict) tuples
         """
         if not self._chain:
             raise RuntimeError("LangChain not available")
 
         logger.info(f"🚀 Starting LangChain batch processing of {len(input_dicts)} images")
 
-        # Use LangChain's batch_as_completed for efficient processing
-        results = self._chain.batch_as_completed(input_dicts)  # Returns (index, result) tuples
+        results = self._chain.batch_as_completed(input_dicts)
         sorted_results = sorted(results, key=lambda x: x[0])
 
         logger.info(f"✅ LangChain batch processing complete")
 
-        # Replace triple backticks with single backtick in each output
-        return [res[1].content.replace('```', '`') if res[1].content else res[1].content for res in sorted_results]
+        output = []
+        for res in sorted_results:
+            msg = res[1]
+            text = msg.content.replace('```', '`') if msg.content else msg.content
+            output.append((text, self._extract_usage(msg)))
+        return output
 
 
 class OpenAIOCR(BaseOCR):
@@ -590,7 +603,7 @@ class OpenAIOCR(BaseOCR):
 
             # Convert to OCRResult objects
             results = []
-            for i, text_result in enumerate(batch_results):
+            for i, (text_result, token_usage) in enumerate(batch_results):
                 image_size = len(images[i])
                 results.append(OCRResult(
                     text=text_result,
@@ -606,7 +619,8 @@ class OpenAIOCR(BaseOCR):
                         "image_size_bytes": image_size,
                         "batch_index": i,
                         "content_type": kwargs.get('content_type'),
-                        "model_kwargs": self.model_kwargs
+                        "model_kwargs": self.model_kwargs,
+                        "token_usage": token_usage
                     }
                 ))
 

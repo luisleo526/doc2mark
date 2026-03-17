@@ -13,6 +13,7 @@ Turn any document into clean Markdown -- in one line.
 - Preserves complex tables (merged cells, rowspan/colspan)
 - One unified API + CLI for single files or entire directories
 - Batch processing with parallel execution
+- Per-call token usage tracking for OpenAI and Vertex AI providers
 
 ## Install
 
@@ -202,6 +203,22 @@ loader = UnifiedDocumentLoader(
     # table_style="markdown_grid",  # markdown with merge annotations
     # table_style="styled_html",    # full HTML with inline styles
 )
+```
+
+### Token usage tracking
+
+When using OpenAI or Vertex AI, each OCR result includes token usage in its metadata:
+
+```python
+from doc2mark import UnifiedDocumentLoader
+
+loader = UnifiedDocumentLoader(ocr_provider="openai")
+result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
+
+# Token usage per OCR call is in result metadata
+usage = result.metadata.get("token_usage", {})
+print(usage)
+# {"input_tokens": 1234, "output_tokens": 567, "total_tokens": 1801}
 ```
 
 ## CLI

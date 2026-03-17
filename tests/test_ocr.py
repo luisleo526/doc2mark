@@ -36,8 +36,8 @@ class TestOCRMocked:
         mock_response = MagicMock()
         mock_response.content = "Mocked OCR text from image"
 
-        # Mock the agent's batch_invoke method
-        mock_agent.batch_invoke.return_value = ["Mocked OCR text from image"]
+        # Mock the agent's batch_invoke method (returns list of (text, usage) tuples)
+        mock_agent.batch_invoke.return_value = [("Mocked OCR text from image", {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150})]
         mock_vision_agent.return_value = mock_agent
 
         # Test with a dummy image using batch_process_images
