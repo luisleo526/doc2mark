@@ -113,6 +113,10 @@ class MimeTypeMapper:
         DocumentFormat.MARKDOWN: {'text/x-markdown', 'text/plain'},
         DocumentFormat.JPG: {'image/jpg'},
         DocumentFormat.RTF: {'text/rtf'},
+        DocumentFormat.BMP: {'image/x-ms-bmp'},
+        DocumentFormat.HEIC: {'image/x-heic'},
+        DocumentFormat.HEIF: {'image/x-heif'},
+        DocumentFormat.AVIF: {'image/x-avif'},
     }
     
     def __init__(self):

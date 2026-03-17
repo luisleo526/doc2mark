@@ -97,11 +97,12 @@ def detect_image_format(image_data: bytes) -> str:
     # WMF: Aldus placeable metafile header
     if image_data[:4] == b'\xd7\xcd\xc6\x9a':
         return FORMAT_WMF
-    # WMF: standard header (type 1 or 2, header size 9)
+    # WMF: standard header (type 1 or 2, header size 9, version 0x0100 or 0x0300)
     if len(image_data) >= 6:
         wmf_type = int.from_bytes(image_data[:2], 'little')
         wmf_header_size = int.from_bytes(image_data[2:4], 'little')
-        if wmf_type in (1, 2) and wmf_header_size == 9:
+        wmf_version = int.from_bytes(image_data[4:6], 'little')
+        if wmf_type in (1, 2) and wmf_header_size == 9 and wmf_version in (0x0100, 0x0300):
             return FORMAT_WMF
 
     return FORMAT_UNKNOWN
@@ -233,7 +234,7 @@ def convert_image_to_supported_format(
             "Returning original bytes — downstream processing may fail.",
             current_format.upper(),
         )
-        return image_data, 'image/png'
+        return image_data, get_mime_type(current_format)
 
     # Raster formats — use PIL
     try:
@@ -245,4 +246,4 @@ def convert_image_to_supported_format(
         return converted, 'image/png'
     except (ImportError, ValueError) as e:
         logger.warning("Image conversion failed: %s. Returning original bytes.", e)
-        return image_data, 'image/png'
+        return image_data, get_mime_type(current_format)

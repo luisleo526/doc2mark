@@ -37,6 +37,7 @@ class SimpleContent:
     content: str  # markdown text, markdown table, or base64 data
     page: int
     position_y: float  # For sorting
+    mime_type: Optional[str] = None  # MIME type for image content
 
 
 class PDFLoader:
@@ -134,20 +135,24 @@ class PDFLoader:
             logger.error(f"Failed to open PDF: {e}")
             raise
 
-    def _extract_image_bytes(self, xref: int) -> Optional[Tuple[bytes, str]]:
+    def _extract_image_bytes(self, xref: int) -> Optional[Tuple[bytes, str, str]]:
         """Extract image bytes with Pixmap fallback for problematic formats (e.g. JBIG2).
 
         Args:
             xref: Image cross-reference number
 
         Returns:
-            Tuple of (image_bytes, extension) or None if extraction fails
+            Tuple of (image_bytes, extension, mime_type) or None if extraction fails
         """
         # Primary path: extract_image (fast, preserves original format)
         try:
             base_image = self.doc.extract_image(xref)
             if base_image and base_image.get("image"):
-                return base_image["image"], base_image.get("ext", "png")
+                image_bytes = base_image["image"]
+                ext = base_image.get("ext", "png")
+                fmt = detect_image_format(image_bytes)
+                mime = get_mime_type(fmt)
+                return image_bytes, ext, mime
         except Exception as e:
             logger.debug(f"extract_image failed for xref {xref}: {e}")
 
@@ -158,7 +163,7 @@ class PDFLoader:
                 pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
             img_bytes = pix.tobytes("png")
             logger.info(f"Used Pixmap fallback for xref {xref} ({len(img_bytes)} bytes)")
-            return img_bytes, "png"
+            return img_bytes, "png", "image/png"
         except Exception as e:
             logger.warning(f"Pixmap fallback also failed for xref {xref}: {e}")
 
@@ -292,7 +297,7 @@ class PDFLoader:
                     result = self._extract_image_bytes(xref)
                     if result is None:
                         continue
-                    image_bytes, _ = result
+                    image_bytes, _, mime = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                     # Get image positions on page
@@ -303,6 +308,7 @@ class PDFLoader:
                             "page_num": page_num,
                             "xref": xref,
                             "base64": base64_data,
+                            "mime_type": mime,
                             "position": (img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1)
                         })
 
@@ -348,10 +354,13 @@ class PDFLoader:
                     "content": item.content  # markdown table
                 })
             elif item.type == "image":
-                simple_content.append({
+                entry = {
                     "type": "image",
                     "content": item.content  # base64 data
-                })
+                }
+                if item.mime_type:
+                    entry["mime_type"] = item.mime_type
+                simple_content.append(entry)
 
         return simple_content
 
@@ -1381,14 +1390,15 @@ class PDFLoader:
                             result = self._extract_image_bytes(xref)
                             if result is None:
                                 continue
-                            image_bytes, _ = result
+                            image_bytes, _, mime = result
                             base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                             image_items.append(SimpleContent(
                                 type="image",
                                 content=base64_data,
                                 page=page_num + 1,
-                                position_y=img_rect.y0
+                                position_y=img_rect.y0,
+                                mime_type=mime
                             ))
 
                 except Exception as e:
@@ -1406,7 +1416,7 @@ class PDFLoader:
                     result = self._extract_image_bytes(xref)
                     if result is None:
                         continue
-                    image_bytes, _ = result
+                    image_bytes, _, _mime = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
                     # Get image positions on page
@@ -1476,7 +1486,7 @@ class PDFLoader:
                     result = self._extract_image_bytes(xref)
                     if result is None:
                         continue
-                    image_bytes, _ = result
+                    image_bytes, _, mime = result
 
                     # Get image positions on page
                     img_rects = page.get_image_rects(xref)
@@ -1488,7 +1498,8 @@ class PDFLoader:
                             type="image",
                             content=base64_data,
                             page=page_num + 1,
-                            position_y=img_rect.y0
+                            position_y=img_rect.y0,
+                            mime_type=mime
                         ))
 
                 except Exception as e:
@@ -1705,13 +1716,7 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             # Table content already includes trailing newlines
             
         elif item_type == "image":
-            # Detect actual MIME type from base64 data
-            try:
-                raw = base64.b64decode(content[:64])
-                img_fmt = detect_image_format(raw)
-                mime = get_mime_type(img_fmt)
-            except Exception:
-                mime = 'image/png'
+            mime = item.get("mime_type") or 'image/png'
             markdown_parts.append(f'![Image](data:{mime};base64,{content})')
             markdown_parts.append("")  # Empty line after image
     
