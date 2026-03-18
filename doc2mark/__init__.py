@@ -22,6 +22,7 @@ from doc2mark.core.base import (
 from doc2mark.core.loader import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory
 from doc2mark.core.table import TableStyle
+from doc2mark.core.chunker import Chunk, ChunkingConfig, chunk_content
 
 __all__ = [
     # Main class
@@ -46,6 +47,11 @@ __all__ = [
 
     # Factory
     'OCRFactory',
+
+    # Chunking
+    'Chunk',
+    'ChunkingConfig',
+    'chunk_content',
 
     # Convenience functions
     'load',

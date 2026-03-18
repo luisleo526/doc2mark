@@ -256,11 +256,120 @@ class PDFLoader:
             # Add page content to document
             document["content"].extend(page_content)
 
+        # Post-process: detect and tag repeated headers/footers
+        self._detect_repeated_content(document)
+
         return document
+
+    def _detect_repeated_content(self, document: Dict[str, Any]) -> None:
+        """Detect repeated headers/footers across pages and retype them.
+
+        Items appearing on >50% of pages at the top or bottom of pages
+        are retyped to 'text:header' or 'text:footer'. Only applies to
+        documents with more than 3 pages to avoid false positives.
+
+        Modifies document["content"] in place.
+        """
+        total_pages = document.get("pages", 0)
+        if total_pages <= 3:
+            return
+
+        content = document.get("content", [])
+        if not content:
+            return
+
+        # Get page heights for zone calculation
+        page_heights = {}
+        for page_num in range(len(self.doc)):
+            try:
+                page_heights[page_num + 1] = self.doc.load_page(page_num).rect.height
+            except Exception:
+                page_heights[page_num + 1] = 800  # fallback
+
+        # Build frequency map: (normalized_text, zone) -> set of pages
+        from collections import defaultdict
+        freq_map = defaultdict(set)
+
+        for item in content:
+            if not item.get("type", "").startswith("text:"):
+                continue
+            page = item.get("page")
+            pos_y = item.get("position_y")
+            if page is None or pos_y is None:
+                continue
+
+            page_height = page_heights.get(page, 800)
+            if page_height <= 0:
+                continue
+
+            y_pct = pos_y / page_height
+            if y_pct < 0.12:
+                zone = "header"
+            elif y_pct > 0.88:
+                zone = "footer"
+            else:
+                continue
+
+            # Normalize: strip whitespace, remove standalone page numbers
+            text = item.get("content", "").strip()
+            normalized = re.sub(r'^\d+$', '', text).strip()
+            normalized = re.sub(r'^[Pp]age\s+\d+$', '', normalized).strip()
+            if not normalized:
+                # Pure page number — mark directly
+                zone_key = ("__page_number__", zone)
+            else:
+                zone_key = (normalized, zone)
+
+            freq_map[zone_key].add(page)
+
+        # Identify repeated content (appears on >50% of pages)
+        threshold = total_pages * 0.5
+        repeated = set()
+        for key, pages in freq_map.items():
+            if len(pages) >= threshold:
+                repeated.add(key)
+
+        if not repeated:
+            return
+
+        # Retype matching items
+        for item in content:
+            if not item.get("type", "").startswith("text:"):
+                continue
+            if item["type"] in ("text:header", "text:footer"):
+                continue  # already tagged
+
+            page = item.get("page")
+            pos_y = item.get("position_y")
+            if page is None or pos_y is None:
+                continue
+
+            page_height = page_heights.get(page, 800)
+            if page_height <= 0:
+                continue
+
+            y_pct = pos_y / page_height
+            if y_pct < 0.12:
+                zone = "header"
+            elif y_pct > 0.88:
+                zone = "footer"
+            else:
+                continue
+
+            text = item.get("content", "").strip()
+            normalized = re.sub(r'^\d+$', '', text).strip()
+            normalized = re.sub(r'^[Pp]age\s+\d+$', '', normalized).strip()
+            if not normalized:
+                zone_key = ("__page_number__", zone)
+            else:
+                zone_key = (normalized, zone)
+
+            if zone_key in repeated:
+                item["type"] = f"text:{zone}"
 
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect all images from all pages for batch processing
-        
+
         Returns:
             List of dictionaries containing image info:
             - page_num: Page number (0-indexed)
@@ -330,17 +439,23 @@ class PDFLoader:
             if item.type.startswith("text:"):
                 simple_content.append({
                     "type": item.type,
-                    "content": item.content
+                    "content": item.content,
+                    "page": item.page,
+                    "position_y": item.position_y
                 })
             elif item.type == "table":
                 simple_content.append({
                     "type": "table",
-                    "content": item.content  # markdown table
+                    "content": item.content,  # markdown table
+                    "page": item.page,
+                    "position_y": item.position_y
                 })
             elif item.type == "image":
                 entry = {
                     "type": "image",
-                    "content": item.content  # base64 data
+                    "content": item.content,  # base64 data
+                    "page": item.page,
+                    "position_y": item.position_y
                 }
                 if item.mime_type:
                     entry["mime_type"] = item.mime_type
@@ -513,23 +628,37 @@ class PDFLoader:
         # Determine text type based on characteristics
         text_type = "text:normal"  # Default
 
-        # Check if it's a caption (various criteria)
-        if is_caption_pattern or \
-                (self._is_near_image_or_table(block["bbox"], image_bboxes, table_bboxes) and
-                 (len(total_text) < 150 or block_max_size < avg_font_size)):
-            text_type = "text:caption"
-        # Check if it's a title (very large font on first few pages)
-        elif page_num <= 1 and block_max_size >= max_font_size * 0.85 and len(total_text) < 200 and line_count <= 3:
-            text_type = "text:title"
-        # Check if it's a section header (various criteria)
-        elif (len(total_text) < 100 and line_count <= 2) and \
-                (block_max_size > avg_font_size * 1.2 or
-                 (is_bold and block_max_size > avg_font_size * 1.05) or
-                 is_all_caps):
-            text_type = "text:section"
-        # Check if it's a list (majority of lines have list pattern)
-        elif has_list_pattern and (list_line_count >= line_count * 0.5 or line_count == 1):
-            text_type = "text:list"
+        # Check if it's a footnote (small text at bottom of page with numeric marker)
+        try:
+            page_height = self.doc.load_page(page_num - 1).rect.height if page_num >= 1 else 0
+            if page_height > 0:
+                block_y_pct = block["bbox"][1] / page_height
+                if (block_y_pct > 0.85
+                        and block_max_size < avg_font_size * 0.9
+                        and re.match(r'^[\d\*\u2020\u2021\u00a7]+[\.\)\s]', total_text.strip())):
+                    text_type = "text:footnote"
+        except (IndexError, AttributeError):
+            pass
+
+        # Only run further classification if not already classified as footnote
+        if text_type == "text:normal":
+            # Check if it's a caption (various criteria)
+            if is_caption_pattern or \
+                    (self._is_near_image_or_table(block["bbox"], image_bboxes, table_bboxes) and
+                     (len(total_text) < 150 or block_max_size < avg_font_size)):
+                text_type = "text:caption"
+            # Check if it's a title (very large font on first few pages)
+            elif page_num <= 1 and block_max_size >= max_font_size * 0.85 and len(total_text) < 200 and line_count <= 3:
+                text_type = "text:title"
+            # Check if it's a section header (various criteria)
+            elif (len(total_text) < 100 and line_count <= 2) and \
+                    (block_max_size > avg_font_size * 1.2 or
+                     (is_bold and block_max_size > avg_font_size * 1.05) or
+                     is_all_caps):
+                text_type = "text:section"
+            # Check if it's a list (majority of lines have list pattern)
+            elif has_list_pattern and (list_line_count >= line_count * 0.5 or line_count == 1):
+                text_type = "text:list"
 
         # Generate markdown
         markdown_text = self._convert_block_to_markdown(block)
@@ -1441,12 +1570,17 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
         # Skip empty content
         if not content or not content.strip():
             continue
-            
+
+        # Skip repeated headers/footers (tagged by _detect_repeated_content)
+        if item_type in ("text:header", "text:footer"):
+            continue
+
         # Add page separator if needed (but not at the beginning)
         if 'page' in item and item['page'] != current_page:
             if current_page is not None and markdown_parts:
                 # Only add page break if we have content and it's not the first page
-                pass  # Don't add page numbers in markdown for cleaner output
+                markdown_parts.append("")
+                markdown_parts.append(f"<!-- page {item['page']} -->")
             current_page = item['page']
         
         if item_type == "text:title":
@@ -1492,6 +1626,16 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             markdown_parts.append(content)
             # Table content already includes trailing newlines
             
+        elif item_type == "text:footnote":
+            # Format as markdown footnote definition if it matches N. pattern
+            footnote_text = content.strip()
+            m = re.match(r'^(\d+)[\.\)\s]+(.+)', footnote_text)
+            if m:
+                markdown_parts.append(f"[^{m.group(1)}]: {m.group(2)}")
+            else:
+                markdown_parts.append(footnote_text)
+            markdown_parts.append("")
+
         elif item_type == "image":
             mime = item.get("mime_type") or 'image/png'
             markdown_parts.append(f'![Image](data:{mime};base64,{content})')

@@ -101,6 +101,20 @@ class ProcessedDocument:
     sections: Optional[List[Dict[str, Any]]] = None
     json_content: Optional[List[Dict[str, Any]]] = None  # For UnifiedMarkdownLoader compatibility
 
+    def get_chunks(self, config=None):
+        """Split document into section-aware chunks for RAG.
+
+        Args:
+            config: Optional ``ChunkingConfig``.  Uses defaults when ``None``.
+
+        Returns:
+            List of ``Chunk`` objects.
+        """
+        from doc2mark.core.chunker import chunk_content, ChunkingConfig, Chunk
+        if not self.json_content:
+            return [Chunk(content=self.content, chunk_index=0)]
+        return chunk_content(self.json_content, config)
+
     @property
     def markdown(self) -> str:
         """Get content as markdown."""

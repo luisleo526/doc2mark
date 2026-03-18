@@ -20,6 +20,7 @@ from doc2mark.core.mime_mapper import (
     check_mime_support
 )
 from doc2mark.core.table import TableStyle, TableRenderer, Cell, TableData
+from doc2mark.core.chunker import Chunk, ChunkingConfig, chunk_content
 
 __all__ = [
     # Main loader
@@ -47,6 +48,11 @@ __all__ = [
     'UnsupportedFormatError',
     'OCRError',
     'ConversionError',
+
+    # Chunking
+    'Chunk',
+    'ChunkingConfig',
+    'chunk_content',
 
     # MIME Type Mapping
     'MimeTypeMapper',

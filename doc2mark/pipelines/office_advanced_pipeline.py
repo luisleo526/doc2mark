@@ -699,19 +699,37 @@ class DocxLoader(BaseOfficeLoader):
                     logger.error(f"Batch OCR processing failed: {e}")
                     ocr_images = False  # Fall back to base64 extraction
 
-        # Process document body
+        # Process document body with page break tracking
+        page_num = 1
         for element in self._iter_block_items():
             if isinstance(element, Paragraph):
+                # Detect page breaks before this paragraph
+                try:
+                    for run_el in element._element.findall(qn('w:r')):
+                        br = run_el.find(qn('w:br'))
+                        if br is not None and br.get(qn('w:type')) == 'page':
+                            page_num += 1
+                            break
+                except (AttributeError, TypeError):
+                    pass
+
+                prev_len = len(result["content"])
                 self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map, processed_image_hashes)
+                # Tag newly added items with page number
+                for i in range(prev_len, len(result["content"])):
+                    result["content"][i]["page"] = page_num
             elif isinstance(element, Table):
                 table_md = self._convert_table_to_markdown(element, extract_images, ocr_images, ocr_results_map)
                 if table_md:
                     result["content"].append({
                         "type": "table",
-                        "content": table_md
+                        "content": table_md,
+                        "page": page_num
                     })
 
                 # Note: Images are now handled within the table cells, no need to extract separately
+
+        result["pages"] = page_num
 
         # Also check for inline shapes at document level
         # NOTE: This is now disabled to avoid duplicate OCR results
@@ -723,26 +741,53 @@ class DocxLoader(BaseOfficeLoader):
         #             if image_content:
         #                 result["content"].append(image_content)
 
-        # Extract images from headers and footers
-        if extract_images:
-            try:
-                for section_idx, section in enumerate(self.doc.sections):
-                    # Process header
-                    if hasattr(section, 'header'):
-                        header = section.header
-                        for para in header.paragraphs:
-                            self._process_paragraph(para, result["content"], extract_images, ocr_images,
-                                                    ocr_results_map, processed_image_hashes)
+        # Extract headers and footers (tagged separately so they can be excluded from main content)
+        try:
+            for section_idx, section in enumerate(self.doc.sections):
+                # Process header
+                if hasattr(section, 'header'):
+                    header = section.header
+                    header_items = []
+                    for para in header.paragraphs:
+                        self._process_paragraph(para, header_items, extract_images, ocr_images,
+                                                ocr_results_map, processed_image_hashes)
+                    for item in header_items:
+                        if item.get("type", "").startswith("text:"):
+                            item["type"] = "text:header"
+                        result["content"].append(item)
 
-                    # Process footer
-                    if hasattr(section, 'footer'):
-                        footer = section.footer
-                        for para in footer.paragraphs:
-                            self._process_paragraph(para, result["content"], extract_images, ocr_images,
-                                                    ocr_results_map, processed_image_hashes)
+                # Process footer
+                if hasattr(section, 'footer'):
+                    footer = section.footer
+                    footer_items = []
+                    for para in footer.paragraphs:
+                        self._process_paragraph(para, footer_items, extract_images, ocr_images,
+                                                ocr_results_map, processed_image_hashes)
+                    for item in footer_items:
+                        if item.get("type", "").startswith("text:"):
+                            item["type"] = "text:footer"
+                        result["content"].append(item)
 
-            except Exception as e:
-                logger.warning(f"Failed to process headers/footers: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to process headers/footers: {e}")
+
+        # Extract footnotes and endnotes
+        try:
+            footnotes = self._load_footnotes()
+            for note_id, note_text in sorted(footnotes.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+                result["content"].append({
+                    "type": "text:footnote",
+                    "content": f"[^{note_id}]: {note_text}",
+                    "page": page_num,  # footnotes at end of doc
+                })
+        except Exception as e:
+            logger.debug(f"Failed to extract footnotes: {e}")
+
+        # Inject footnote reference markers into body text
+        try:
+            self._inject_footnote_refs(result["content"])
+        except Exception as e:
+            logger.debug(f"Failed to inject footnote references: {e}")
 
         return result
 
@@ -754,6 +799,71 @@ class DocxLoader(BaseOfficeLoader):
                 yield Paragraph(child, self.doc)
             elif isinstance(child, docx.oxml.table.CT_Tbl):
                 yield Table(child, self.doc)
+
+    def _load_footnotes(self) -> Dict[str, str]:
+        """Extract footnotes and endnotes from the DOCX ZIP.
+
+        python-docx has no native API for footnotes, so we parse the raw XML
+        from ``word/footnotes.xml`` and ``word/endnotes.xml`` directly.
+
+        Returns:
+            Mapping of note id -> text content.
+        """
+        import zipfile
+        from lxml import etree
+
+        notes: Dict[str, str] = {}
+        nsmap = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+        try:
+            with zipfile.ZipFile(str(self.file_path), "r") as zf:
+                for xml_path in ("word/footnotes.xml", "word/endnotes.xml"):
+                    if xml_path not in zf.namelist():
+                        continue
+                    tree = etree.parse(zf.open(xml_path))
+                    root = tree.getroot()
+                    # Footnotes use <w:footnote>, endnotes use <w:endnote>
+                    tag_local = "footnote" if "footnote" in xml_path else "endnote"
+                    for note_el in root.findall(f"w:{tag_local}", nsmap):
+                        note_id = note_el.get(f"{{{nsmap['w']}}}id", "")
+                        # Skip separator/continuation notes (id 0 and -1)
+                        if note_id in ("0", "-1"):
+                            continue
+                        # Collect all paragraph text
+                        paragraphs = note_el.findall(".//w:p", nsmap)
+                        texts = []
+                        for p in paragraphs:
+                            runs = p.findall(".//w:r/w:t", nsmap)
+                            texts.append("".join(r.text or "" for r in runs))
+                        note_text = " ".join(t for t in texts if t.strip())
+                        if note_text.strip():
+                            notes[note_id] = note_text.strip()
+        except (zipfile.BadZipFile, etree.XMLSyntaxError, KeyError) as e:
+            logger.debug(f"Could not parse footnotes XML: {e}")
+
+        return notes
+
+    def _inject_footnote_refs(self, content: List[Dict[str, Any]]) -> None:
+        """Scan body text items for footnote/endnote reference elements and
+        append ``[^N]`` markers to the content text.
+
+        This modifies items in place.
+        """
+        for item in content:
+            if not item.get("type", "").startswith("text:"):
+                continue
+            if item["type"] in ("text:header", "text:footer", "text:footnote"):
+                continue
+            # We cannot easily map run-level references to exact text
+            # positions without re-parsing the paragraph XML.  Instead,
+            # we append all note references found in matching paragraphs
+            # at the end of the item text.  This is acceptable for RAG
+            # because the reference marker and the surrounding text end
+            # up in the same chunk.
+            # Note: The actual XML scanning is done for paragraphs that
+            # were already processed, but we don't have direct XML access
+            # from the content dict.  This is a best-effort pass.
+            pass  # Reference injection handled by _process_paragraph_with_refs below
 
     def _process_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
                            ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
@@ -775,6 +885,25 @@ class DocxLoader(BaseOfficeLoader):
         # Then extract text
         text = paragraph.text.strip()
         if text:
+            # Detect footnote/endnote references in paragraph XML
+            try:
+                refs = []
+                for run_el in paragraph._element.findall(qn('w:r')):
+                    fn_ref = run_el.find(qn('w:footnoteReference'))
+                    if fn_ref is not None:
+                        ref_id = fn_ref.get(qn('w:id'), '')
+                        if ref_id and ref_id not in ('0', '-1'):
+                            refs.append(ref_id)
+                    en_ref = run_el.find(qn('w:endnoteReference'))
+                    if en_ref is not None:
+                        ref_id = en_ref.get(qn('w:id'), '')
+                        if ref_id and ref_id not in ('0', '-1'):
+                            refs.append(ref_id)
+                if refs:
+                    text = text + " " + " ".join(f"[^{r}]" for r in refs)
+            except (AttributeError, TypeError):
+                pass
+
             text_type = self._classify_text_type(text, paragraph.style.name if paragraph.style else "")
             content.append({
                 "type": text_type,
@@ -2963,8 +3092,26 @@ def office_to_json(
 def office_to_markdown(json_data: Dict[str, Any]) -> str:
     """Convert Office JSON data to markdown string"""
     markdown_parts = []
+    current_page = None
+
+    # Determine marker label from filename
+    filename = json_data.get("filename", "")
+    if filename.lower().endswith(".pptx"):
+        page_label = "slide"
+    elif filename.lower().endswith(".xlsx"):
+        page_label = "sheet"
+    else:
+        page_label = "page"
 
     for item in json_data["content"]:
+        # Add page/slide/sheet separator if needed
+        if "page" in item and item["page"] != current_page:
+            if markdown_parts:
+                markdown_parts.append("")
+            markdown_parts.append(f"<!-- {page_label} {item['page']} -->")
+            markdown_parts.append("")
+            current_page = item["page"]
+
         if item["type"] == "text:title":
             # Add titles with H1 formatting and extra spacing
             markdown_parts.append(f"# {item['content']}\n")
@@ -2997,5 +3144,7 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
         elif item["type"] == "image":
             # Include image as markdown with base64 data URL
             markdown_parts.append(f'![Image](data:image/png;base64,{item["content"]})\n')
+        elif item["type"] == "text:footnote":
+            markdown_parts.append(f"{item['content']}\n")
 
     return "\n".join(markdown_parts)

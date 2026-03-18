@@ -108,8 +108,9 @@ class OfficeProcessor(BaseProcessor):
         file_size = file_path.stat().st_size
 
         # Use advanced pipeline if available
+        json_content = None
         if ADVANCED_PIPELINE_AVAILABLE:
-            content, metadata, images = self._process_with_advanced_pipeline(file_path, **kwargs)
+            content, metadata, images, json_content = self._process_with_advanced_pipeline(file_path, **kwargs)
         else:
             # Fallback to basic processing
             if extension == 'docx':
@@ -143,20 +144,21 @@ class OfficeProcessor(BaseProcessor):
         return ProcessedDocument(
             content=content,
             metadata=doc_metadata,
-            images=images
+            images=images,
+            json_content=json_content
         )
 
     def _process_with_advanced_pipeline(
-        self, 
-        file_path: Path, 
+        self,
+        file_path: Path,
         **kwargs
-    ) -> Tuple[str, dict, List[Dict[str, Any]]]:
+    ) -> Tuple[str, dict, List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
         """Process document using advanced pipeline with all features."""
         try:
             # Configure options
             extract_images = kwargs.get('extract_images', False)
             ocr_images = extract_images and self.ocr is not None
-            
+
             # Use the advanced pipeline
             json_data = UniversalOfficeLoader.load(
                 file_path,
@@ -166,46 +168,21 @@ class OfficeProcessor(BaseProcessor):
                 ocr=self.ocr,
                 table_style=kwargs.get('table_style', self.table_style)
             )
-            
-            # Convert JSON data to markdown
-            markdown_parts = []
+
+            # Use office_to_markdown for content (includes page/slide/sheet markers)
+            from doc2mark.pipelines.office_advanced_pipeline import office_to_markdown
+            content = office_to_markdown(json_data)
+
+            # Extract images from json_data
             images = []
-            
             for item in json_data["content"]:
-                if item["type"] == "text:title":
-                    markdown_parts.append(f"# {item['content']}\n")
-                elif item["type"] == "text:section":
-                    markdown_parts.append(f"## {item['content']}\n")
-                elif item["type"] == "text:list":
-                    markdown_parts.append(f"{item['content']}\n")
-                elif item["type"] == "text:caption":
-                    markdown_parts.append(f"*{item['content']}*\n")
-                elif item["type"] == "text:normal":
-                    markdown_parts.append(f"{item['content']}\n")
-                elif item["type"] == "text:image_description":
-                    # Handle OCR results
-                    ocr_text = item['content']
-                    if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
-                        ocr_text = ocr_text[18:-19]  # Remove tags
-                    
-                    # Format OCR result in XML tags within markdown code block
-                    markdown_parts.append("```xml")
-                    markdown_parts.append("<ocr_result>")
-                    markdown_parts.append(ocr_text)
-                    markdown_parts.append("</ocr_result>")
-                    markdown_parts.append("```\n")
-                elif item["type"] == "table":
-                    # Tables already include proper formatting (markdown or HTML)
-                    markdown_parts.append(item["content"])
-                elif item["type"] == "image":
-                    # Store image data
+                if item["type"] == "image":
                     images.append({
                         'data': base64.b64decode(item["content"]),
                         'page': item.get('page', 1)
                     })
-                    markdown_parts.append(f"![Image {len(images)}]\n")
-            
-            content = '\n'.join(markdown_parts)
+
+            json_content = json_data.get('content', [])
             
             # Build metadata
             metadata = {
@@ -224,18 +201,21 @@ class OfficeProcessor(BaseProcessor):
                 slide_count = content.count('Slide ')
                 metadata['slide_count'] = max(slide_count, 1)
             
-            return content, metadata, images
-            
+            return content, metadata, images, json_content
+
         except Exception as e:
             logger.warning(f"Advanced pipeline processing failed: {e}, falling back to basic processing")
             # Fallback to basic processing
             extension = file_path.suffix.lower().lstrip('.')
             if extension == 'docx':
-                return self._process_docx_basic(file_path, **kwargs)
+                c, m, i = self._process_docx_basic(file_path, **kwargs)
+                return c, m, i, None
             elif extension == 'xlsx':
-                return self._process_xlsx_basic(file_path, **kwargs)
+                c, m, i = self._process_xlsx_basic(file_path, **kwargs)
+                return c, m, i, None
             elif extension == 'pptx':
-                return self._process_pptx_basic(file_path, **kwargs)
+                c, m, i = self._process_pptx_basic(file_path, **kwargs)
+                return c, m, i, None
             else:
                 raise ProcessingError(f"Unsupported Office format: {extension}")
 
