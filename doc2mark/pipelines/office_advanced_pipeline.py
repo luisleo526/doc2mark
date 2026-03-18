@@ -701,15 +701,47 @@ class DocxLoader(BaseOfficeLoader):
 
         # Process document body with page break tracking
         page_num = 1
+        _skip_next_rendered_break = False  # after a section break, skip the next lastRenderedPageBreak
         for element in self._iter_block_items():
             if isinstance(element, Paragraph):
-                # Detect page breaks before this paragraph
+                # Detect page breaks before this paragraph (at most one increment)
                 try:
+                    has_break = False
                     for run_el in element._element.findall(qn('w:r')):
+                        # Explicit page break: <w:br w:type="page"/>
                         br = run_el.find(qn('w:br'))
                         if br is not None and br.get(qn('w:type')) == 'page':
-                            page_num += 1
+                            has_break = True
                             break
+                        # Rendered page break: <w:lastRenderedPageBreak/>
+                        if run_el.find(qn('w:lastRenderedPageBreak')) is not None:
+                            if _skip_next_rendered_break:
+                                _skip_next_rendered_break = False
+                            else:
+                                has_break = True
+                            break
+                    # Section break in paragraph properties: <w:pPr><w:sectPr>
+                    # sectPr means this paragraph ENDS the section; the NEXT
+                    # paragraph starts a new page.
+                    if not has_break:
+                        ppr = element._element.find(qn('w:pPr'))
+                        if ppr is not None:
+                            sect_pr = ppr.find(qn('w:sectPr'))
+                            if sect_pr is not None:
+                                sect_type_el = sect_pr.find(qn('w:type'))
+                                sect_type = sect_type_el.get(qn('w:val'), 'nextPage') if sect_type_el is not None else 'nextPage'
+                                if sect_type in ('nextPage', 'oddPage', 'evenPage'):
+                                    # Process current paragraph on current page,
+                                    # then increment for the next paragraph.
+                                    prev_len = len(result["content"])
+                                    self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map, processed_image_hashes)
+                                    for i in range(prev_len, len(result["content"])):
+                                        result["content"][i]["page"] = page_num
+                                    page_num += 1
+                                    _skip_next_rendered_break = True
+                                    continue  # skip the normal processing below
+                    if has_break:
+                        page_num += 1
                 except (AttributeError, TypeError):
                     pass
 
@@ -822,13 +854,15 @@ class DocxLoader(BaseOfficeLoader):
                         continue
                     tree = etree.parse(zf.open(xml_path))
                     root = tree.getroot()
-                    # Footnotes use <w:footnote>, endnotes use <w:endnote>
-                    tag_local = "footnote" if "footnote" in xml_path else "endnote"
+                    is_endnote = "endnote" in xml_path
+                    tag_local = "endnote" if is_endnote else "footnote"
                     for note_el in root.findall(f"w:{tag_local}", nsmap):
                         note_id = note_el.get(f"{{{nsmap['w']}}}id", "")
                         # Skip separator/continuation notes (id 0 and -1)
                         if note_id in ("0", "-1"):
                             continue
+                        # Prefix endnote ids to avoid collision with footnotes
+                        key = f"en{note_id}" if is_endnote else note_id
                         # Collect all paragraph text
                         paragraphs = note_el.findall(".//w:p", nsmap)
                         texts = []
@@ -837,7 +871,7 @@ class DocxLoader(BaseOfficeLoader):
                             texts.append("".join(r.text or "" for r in runs))
                         note_text = " ".join(t for t in texts if t.strip())
                         if note_text.strip():
-                            notes[note_id] = note_text.strip()
+                            notes[key] = note_text.strip()
         except (zipfile.BadZipFile, etree.XMLSyntaxError, KeyError) as e:
             logger.debug(f"Could not parse footnotes XML: {e}")
 
@@ -898,7 +932,7 @@ class DocxLoader(BaseOfficeLoader):
                     if en_ref is not None:
                         ref_id = en_ref.get(qn('w:id'), '')
                         if ref_id and ref_id not in ('0', '-1'):
-                            refs.append(ref_id)
+                            refs.append(f"en{ref_id}")
                 if refs:
                     text = text + " " + " ".join(f"[^{r}]" for r in refs)
             except (AttributeError, TypeError):

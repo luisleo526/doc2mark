@@ -629,8 +629,9 @@ class PDFLoader:
         text_type = "text:normal"  # Default
 
         # Check if it's a footnote (small text at bottom of page with numeric marker)
+        # page_num is 0-indexed here
         try:
-            page_height = self.doc.load_page(page_num - 1).rect.height if page_num >= 1 else 0
+            page_height = self.doc.load_page(page_num).rect.height if page_num >= 0 else 0
             if page_height > 0:
                 block_y_pct = block["bbox"][1] / page_height
                 if (block_y_pct > 0.85

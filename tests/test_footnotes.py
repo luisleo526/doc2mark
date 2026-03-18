@@ -89,7 +89,7 @@ class TestDocxFootnoteLoader:
         assert notes["2"] == "Second footnote text."
 
     def test_endnotes_parsed(self, tmp_path):
-        """Endnotes XML should also be parsed."""
+        """Endnotes XML should also be parsed with 'en' prefix."""
         endnotes_xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -104,8 +104,8 @@ class TestDocxFootnoteLoader:
         loader.file_path = docx_path
         notes = loader._load_footnotes()
 
-        assert "1" in notes
-        assert notes["1"] == "An endnote."
+        assert "en1" in notes
+        assert notes["en1"] == "An endnote."
 
     def test_no_footnotes_xml(self, tmp_path):
         """DOCX without footnotes.xml should return empty dict (no crash)."""
