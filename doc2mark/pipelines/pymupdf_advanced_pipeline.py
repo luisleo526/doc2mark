@@ -624,6 +624,8 @@ class PDFLoader:
         ]
 
         is_caption_pattern = any(re.match(pattern, total_text, re.IGNORECASE) for pattern in caption_patterns)
+        is_explicit_heading = self._is_explicit_heading_text(total_text)
+        is_heading_candidate = self._is_probable_heading_text(total_text)
 
         # Determine text type based on characteristics
         text_type = "text:normal"  # Default
@@ -649,11 +651,13 @@ class PDFLoader:
                      (len(total_text) < 150 or block_max_size < avg_font_size)):
                 text_type = "text:caption"
             # Check if it's a title (very large font on first few pages)
-            elif page_num <= 1 and block_max_size >= max_font_size * 0.85 and len(total_text) < 200 and line_count <= 3:
+            elif (page_num == 0 and is_heading_candidate and block_max_size >= max_font_size * 0.85
+                  and len(total_text) < 200 and line_count <= 3):
                 text_type = "text:title"
             # Check if it's a section header (various criteria)
-            elif (len(total_text) < 100 and line_count <= 2) and \
-                    (block_max_size > avg_font_size * 1.2 or
+            elif is_heading_candidate and (len(total_text) < 100 and line_count <= 2) and \
+                    (is_explicit_heading or
+                     block_max_size > avg_font_size * 1.2 or
                      (is_bold and block_max_size > avg_font_size * 1.05) or
                      is_all_caps):
                 text_type = "text:section"
@@ -670,6 +674,38 @@ class PDFLoader:
                 f"Classified as {text_type}: '{total_text[:50]}...' (size: {block_max_size:.1f}, avg: {avg_font_size:.1f})")
 
         return markdown_text, text_type
+
+    def _normalized_heading_text(self, text: str) -> str:
+        return re.sub(r'\s+', ' ', (text or '')).strip()
+
+    def _is_explicit_heading_text(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        explicit_heading_patterns = [
+            r'^第[一二三四五六七八九十百千\d]+[條章节章節篇]',
+            r'^(附錄|附件|附表|Appendix|Chapter|Section)\b',
+        ]
+        return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in explicit_heading_patterns)
+
+    def _is_probable_heading_text(self, text: str) -> bool:
+        """Return True for text that has structural heading shape, not just larger font."""
+        normalized = self._normalized_heading_text(text)
+        if not normalized:
+            return False
+        if self._is_explicit_heading_text(normalized):
+            return True
+
+        # Legal/contract PDFs often continue body text across pages. These fragments
+        # may be large at the page top, but they are not document headings.
+        if re.search(r'[。！？!?；;，,、]', normalized):
+            return False
+        if re.match(r'^[\(（][一二三四五六七八九十百千\d]+[\)）]', normalized):
+            return False
+        if re.match(r'^[□■☑☐]', normalized):
+            return False
+        if re.match(r'^\d+[.)、．]', normalized):
+            return False
+
+        return len(normalized) <= 80
 
     def _convert_block_to_markdown(self, block: Dict[str, Any]) -> str:
         """Convert a text block to markdown format"""
@@ -719,13 +755,13 @@ class PDFLoader:
                     # Letter list (a., b., etc.) - convert to bullet
                     markdown_line = re.sub(r'^[a-zA-Z][\.\)]\s+', '- ', line_text)
             # Detect headers based on size
-            elif line_size > avg_size * 1.5:
+            elif line_size > avg_size * 1.5 and self._is_probable_heading_text(line_text):
                 # Large text -> H1
                 markdown_line = f"# {line_text}"
-            elif line_size > avg_size * 1.3:
+            elif line_size > avg_size * 1.3 and self._is_probable_heading_text(line_text):
                 # Medium large text -> H2
                 markdown_line = f"## {line_text}"
-            elif line_size > avg_size * 1.15:
+            elif line_size > avg_size * 1.15 and self._is_probable_heading_text(line_text):
                 # Slightly larger text -> H3
                 markdown_line = f"### {line_text}"
             else:
