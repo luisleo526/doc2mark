@@ -145,3 +145,66 @@ def test_short_unmarked_heading_can_use_font_size_signal():
 
     assert text_type == "text:section"
     assert markdown.strip() == "履約管理"
+
+
+def test_numbered_headings_can_use_font_size_signal():
+    for heading in [
+        "1. Introduction",
+        "1) Scope",
+        "1.1 Background",
+        "(1) Scope",
+        "1.目的",
+    ]:
+        markdown, text_type = classify(
+            make_block([(heading, 12.1)]),
+            page_num=1,
+            avg_font_size=10.0,
+            max_font_size=14.0,
+        )
+
+        assert text_type == "text:section"
+        assert markdown.strip() == heading
+
+
+def test_chinese_structured_headings_can_use_font_size_signal():
+    for heading in [
+        "一、總則",
+        "（一）服務範圍",
+    ]:
+        markdown, text_type = classify(
+            make_block([(heading, 12.1)]),
+            page_num=1,
+            avg_font_size=10.0,
+            max_font_size=14.0,
+        )
+
+        assert text_type == "text:section"
+        assert markdown.strip() == heading
+
+
+def test_short_heading_with_comma_can_use_font_size_signal():
+    block = make_block([("Revenue, Costs and Margin", 12.1)])
+
+    markdown, text_type = classify(
+        block,
+        page_num=1,
+        avg_font_size=10.0,
+        max_font_size=14.0,
+    )
+
+    assert text_type == "text:section"
+    assert markdown.strip() == "Revenue, Costs and Margin"
+
+
+def test_numbered_list_without_heading_layout_remains_list():
+    block = make_block([("1. regular list item", 10.0)])
+
+    markdown, text_type = classify(
+        block,
+        page_num=1,
+        avg_font_size=10.0,
+        max_font_size=14.0,
+    )
+
+    assert text_type == "text:list"
+    assert markdown.strip() == "1. regular list item"

@@ -620,7 +620,7 @@ class PDFLoader:
         caption_patterns = [
             r'^(Figure|Fig\.?|Table|Tbl\.?|Chart|Graph|Image|Plate|Scheme)\s*\d*[\.:)]?',
             r'^(Source|Note|Notes)[\.:)]',
-            r'^\d+\.\d+[\.:)]?',  # Numbered captions like "1.1:" or "2.3."
+            r'^\d+\.\d+[\.:)]',  # Numbered captions like "1.1:" or "2.3."
         ]
 
         is_caption_pattern = any(re.match(pattern, total_text, re.IGNORECASE) for pattern in caption_patterns)
@@ -666,7 +666,10 @@ class PDFLoader:
                 text_type = "text:list"
 
         # Generate markdown
-        markdown_text = self._convert_block_to_markdown(block)
+        markdown_text = self._convert_block_to_markdown(
+            block,
+            preserve_structured_headings=text_type in ("text:title", "text:section")
+        )
 
         # Debug logging for classification
         if text_type != "text:normal":
@@ -681,10 +684,49 @@ class PDFLoader:
     def _is_explicit_heading_text(self, text: str) -> bool:
         normalized = self._normalized_heading_text(text)
         explicit_heading_patterns = [
-            r'^第[一二三四五六七八九十百千\d]+[條章节章節篇]',
-            r'^(附錄|附件|附表|Appendix|Chapter|Section)\b',
+            r'^第\s*[一二三四五六七八九十百千\d]+\s*[條章节章節篇]',
+            r'^(附錄|附件|附表)\s*[A-Za-z\d一二三四五六七八九十百千]*',
+            r'^(Appendix|Chapter|Section)\b',
         ]
         return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in explicit_heading_patterns)
+
+    def _is_structured_heading_text(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        structured_heading_patterns = [
+            r'^\d+(?:\.\d+)+\s+\S',  # 1.1 Background
+            r'^\d+[\.)、．]\s*\S',  # 1. Introduction / 1) Scope / 1.目的
+            r'^[\(（]\d+[\)）]\s*\S',  # (1) Scope / （1）目的
+            r'^[一二三四五六七八九十百千]+[、．\.]\s*\S',  # 一、總則
+            r'^[\(（][一二三四五六七八九十百千]+[\)）]\s*\S',  # （一）服務範圍
+        ]
+        return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in structured_heading_patterns)
+
+    def _looks_like_body_text(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        if not normalized:
+            return False
+
+        if re.match(r'^[□■☑☐]', normalized):
+            return True
+
+        if re.search(r'[。！？!?；;]', normalized):
+            return True
+
+        if normalized.endswith(('，', ',', '、', '；', ';')):
+            return True
+
+        chinese_separator_count = normalized.count('、') + normalized.count('，')
+        if chinese_separator_count >= 2:
+            return True
+
+        starts_with_numbered_clause = (
+                re.match(r'^\d+[.)、．]', normalized)
+                or re.match(r'^[\(（][一二三四五六七八九十百千\d]+[\)）]', normalized)
+        )
+        if starts_with_numbered_clause and len(normalized) > 45:
+            return True
+
+        return False
 
     def _is_probable_heading_text(self, text: str) -> bool:
         """Return True for text that has structural heading shape, not just larger font."""
@@ -694,20 +736,15 @@ class PDFLoader:
         if self._is_explicit_heading_text(normalized):
             return True
 
-        # Legal/contract PDFs often continue body text across pages. These fragments
-        # may be large at the page top, but they are not document headings.
-        if re.search(r'[。！？!?；;，,、]', normalized):
+        if self._looks_like_body_text(normalized):
             return False
-        if re.match(r'^[\(（][一二三四五六七八九十百千\d]+[\)）]', normalized):
-            return False
-        if re.match(r'^[□■☑☐]', normalized):
-            return False
-        if re.match(r'^\d+[.)、．]', normalized):
-            return False
+
+        if self._is_structured_heading_text(normalized):
+            return len(normalized) <= 80
 
         return len(normalized) <= 80
 
-    def _convert_block_to_markdown(self, block: Dict[str, Any]) -> str:
+    def _convert_block_to_markdown(self, block: Dict[str, Any], preserve_structured_headings: bool = False) -> str:
         """Convert a text block to markdown format"""
         lines = []
 
@@ -741,7 +778,11 @@ class PDFLoader:
                 r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
                 line_text)
             
-            if list_match:
+            if (preserve_structured_headings
+                    and self._is_structured_heading_text(line_text)
+                    and self._is_probable_heading_text(line_text)):
+                markdown_line = line_text
+            elif list_match:
                 # Handle list items without applying text formatting
                 marker = list_match.group(1)
                 if marker in '•\u2022\u25CF\u25AA\u25A0' or marker == '-' or marker == '*':
