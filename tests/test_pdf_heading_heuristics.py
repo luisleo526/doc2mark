@@ -208,3 +208,50 @@ def test_numbered_list_without_heading_layout_remains_list():
 
     assert text_type == "text:list"
     assert markdown.strip() == "1. regular list item"
+
+
+def test_formal_chinese_chapter_heading_with_multiple_separators_is_section():
+    block = make_block([("陸、推動組織、資源需求及計畫管理", 12.1)])
+
+    markdown, text_type = classify(
+        block,
+        page_num=1,
+        avg_font_size=10.0,
+        max_font_size=14.0,
+    )
+
+    assert text_type == "text:section"
+    assert markdown.strip() == "陸、推動組織、資源需求及計畫管理"
+
+
+def test_real_world_body_fragments_with_chinese_commas_are_not_headings():
+    for text in [
+        "發展方案(106 至114 年)」(DIGI+方案)，並在奠基於5+2 產業創新基",
+        "隨著人工智慧與新興技術發展，多份報告均指出生成式AI 的出",
+        "日本總務省於2022 年8 月12 日發布《2022 年ICT 網際安全綜",
+        "並推動國內政府機關與民間企業通過國際資安標準驗證(如ISO",
+        "各CI 主管機關落實防護基準執行控制措施、辦理資安治理成熟",
+    ]:
+        markdown, text_type = classify(
+            make_block([(text, 12.1)]),
+            page_num=1,
+            avg_font_size=10.0,
+            max_font_size=14.0,
+        )
+
+        assert text_type == "text:normal"
+        assert not markdown.lstrip().startswith("#")
+
+
+def test_numbered_body_clause_with_chinese_comma_remains_list_not_heading():
+    text = "5. 針對CI 的重要作業系統，規劃推動建置資訊安全管理制度"
+
+    markdown, text_type = classify(
+        make_block([(text, 12.1)]),
+        page_num=1,
+        avg_font_size=10.0,
+        max_font_size=14.0,
+    )
+
+    assert text_type == "text:list"
+    assert not markdown.lstrip().startswith("#")

@@ -21,6 +21,7 @@ from doc2mark.core.base import (
 # Main imports
 from doc2mark.core.loader import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory
+from doc2mark.ocr.cache import OCRCache, MemoryOCRCache, NoOpOCRCache
 from doc2mark.core.table import TableStyle
 from doc2mark.core.chunker import Chunk, ChunkingConfig, chunk_content
 
@@ -38,6 +39,7 @@ __all__ = [
     'ProcessedDocument',
     'DocumentMetadata',
     'OCRConfig',
+    'OCRCache',
 
     # Exceptions
     'ProcessingError',
@@ -47,6 +49,10 @@ __all__ = [
 
     # Factory
     'OCRFactory',
+
+    # OCR cache
+    'MemoryOCRCache',
+    'NoOpOCRCache',
 
     # Chunking
     'Chunk',
@@ -69,6 +75,7 @@ def load(
         ocr_images=False,
         ocr_provider='openai',
         api_key=None,
+        ocr_cache=None,
         **kwargs
 ):
     """
@@ -85,6 +92,7 @@ def load(
             - False: Keep images as base64 data in output
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
+        ocr_cache: Optional request-scoped OCR cache handler
         **kwargs: Additional options
         
     Returns:
@@ -102,7 +110,8 @@ def load(
     """
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
-        api_key=api_key
+        api_key=api_key,
+        ocr_cache=ocr_cache
     )
     return loader.load(
         file_path,
@@ -120,6 +129,7 @@ def document_to_markdown(
         ocr_images=False,
         ocr_provider='openai',
         api_key=None,
+        ocr_cache=None,
         show_progress=True,
         **kwargs
 ):
@@ -137,6 +147,7 @@ def document_to_markdown(
             - False: Keep images as base64 data in output
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
+        ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         **kwargs: Additional options
         
@@ -147,7 +158,8 @@ def document_to_markdown(
 
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
-        api_key=api_key
+        api_key=api_key,
+        ocr_cache=ocr_cache
     )
 
     # Process document
@@ -179,6 +191,7 @@ def batch_convert_to_markdown(
         recursive=True,
         ocr_provider='openai',
         api_key=None,
+        ocr_cache=None,
         show_progress=True,
         **kwargs
 ):
@@ -197,6 +210,7 @@ def batch_convert_to_markdown(
         recursive: Whether to process subdirectories
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
+        ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         **kwargs: Additional options
         
@@ -205,7 +219,8 @@ def batch_convert_to_markdown(
     """
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
-        api_key=api_key
+        api_key=api_key,
+        ocr_cache=ocr_cache
     )
 
     return loader.batch_process(
@@ -230,6 +245,7 @@ def batch_process_documents(
         recursive=True,
         ocr_provider='openai',
         api_key=None,
+        ocr_cache=None,
         show_progress=True,
         save_files=True,
         **kwargs
@@ -250,6 +266,7 @@ def batch_process_documents(
         recursive: Whether to process subdirectories
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
+        ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         save_files: Whether to save output files
         **kwargs: Additional options
@@ -259,7 +276,8 @@ def batch_process_documents(
     """
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
-        api_key=api_key
+        api_key=api_key,
+        ocr_cache=ocr_cache
     )
 
     return loader.batch_process(
@@ -283,6 +301,7 @@ def batch_process_files(
         ocr_images=False,
         ocr_provider='openai',
         api_key=None,
+        ocr_cache=None,
         show_progress=True,
         save_files=True,
         **kwargs
@@ -302,6 +321,7 @@ def batch_process_files(
             - False: Keep images as base64 data in output
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
+        ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         save_files: Whether to save output files
         **kwargs: Additional options
@@ -321,7 +341,8 @@ def batch_process_files(
     """
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
-        api_key=api_key
+        api_key=api_key,
+        ocr_cache=ocr_cache
     )
 
     return loader.batch_process_files(

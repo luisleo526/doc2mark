@@ -15,6 +15,7 @@ from doc2mark.core.base import (
     UnsupportedFormatError
 )
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider
+from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class UnifiedDocumentLoader:
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             cache_dir: Optional[str] = None,
+            ocr_cache: Optional[OCRCache] = None,
             # Enhanced OCR configuration for OpenAI / Vertex AI
             model: str = "gpt-4.1",
             temperature: float = 0,
@@ -57,6 +59,7 @@ class UnifiedDocumentLoader:
             api_key: API key for OCR provider (OpenAI defaults to OPENAI_API_KEY env var)
             ocr_config: Basic OCR configuration (from base class)
             cache_dir: Directory for caching processed documents
+            ocr_cache: Optional request-scoped OCR cache handler
 
             # Enhanced OpenAI OCR Configuration:
             model: OpenAI model to use (default: gpt-4.1)
@@ -162,6 +165,14 @@ class UnifiedDocumentLoader:
                     api_key=api_key,
                     config=ocr_config
                 )
+
+        self.ocr_cache = ocr_cache
+        if self.ocr_cache is not None:
+            if isinstance(self.ocr, CachedOCR):
+                self.ocr.cache = self.ocr_cache
+            else:
+                self.ocr = CachedOCR(self.ocr, self.ocr_cache)
+            logger.info(f"🧠 OCR cache enabled: {type(self.ocr_cache).__name__}")
 
         # Cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -867,7 +878,8 @@ class UnifiedDocumentLoader:
             self,
             provider: Union[str, OCRProvider, BaseOCR],
             api_key: Optional[str] = None,
-            config: Optional[OCRConfig] = None
+            config: Optional[OCRConfig] = None,
+            ocr_cache: Optional[OCRCache] = None
     ):
         """Change OCR provider.
         
@@ -875,6 +887,7 @@ class UnifiedDocumentLoader:
             provider: New OCR provider
             api_key: API key for provider
             config: OCR configuration
+            ocr_cache: Optional OCR cache handler. Reuses existing handler when omitted.
         """
         if isinstance(provider, BaseOCR):
             self.ocr = provider
@@ -884,6 +897,17 @@ class UnifiedDocumentLoader:
                 api_key=api_key,
                 config=config
             )
+
+        if ocr_cache is not None:
+            self.ocr_cache = ocr_cache
+        elif not hasattr(self, "ocr_cache"):
+            self.ocr_cache = None
+
+        if self.ocr_cache is not None:
+            if isinstance(self.ocr, CachedOCR):
+                self.ocr.cache = self.ocr_cache
+            else:
+                self.ocr = CachedOCR(self.ocr, self.ocr_cache)
 
         # Reinitialize processors with new OCR
         self._initialize_processors()

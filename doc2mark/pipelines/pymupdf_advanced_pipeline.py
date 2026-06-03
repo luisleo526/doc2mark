@@ -694,9 +694,11 @@ class PDFLoader:
         normalized = self._normalized_heading_text(text)
         structured_heading_patterns = [
             r'^\d+(?:\.\d+)+\s+\S',  # 1.1 Background
+            r'^\d+(?:-\d+)+\s+\S',  # 4-1-1 Work item
             r'^\d+[\.)、．]\s*\S',  # 1. Introduction / 1) Scope / 1.目的
             r'^[\(（]\d+[\)）]\s*\S',  # (1) Scope / （1）目的
             r'^[一二三四五六七八九十百千]+[、．\.]\s*\S',  # 一、總則
+            r'^[壹貳參肆伍陸柒捌玖拾]+[、．\.]\s*\S',  # 壹、緣起
             r'^[\(（][一二三四五六七八九十百千]+[\)）]\s*\S',  # （一）服務範圍
         ]
         return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in structured_heading_patterns)
@@ -715,7 +717,20 @@ class PDFLoader:
         if normalized.endswith(('，', ',', '、', '；', ';')):
             return True
 
-        chinese_separator_count = normalized.count('、') + normalized.count('，')
+        structured_marker_match = re.match(
+            r'^(\d+(?:[\.-]\d+)*[\.)、．]?|[一二三四五六七八九十百千壹貳參肆伍陸柒捌玖拾]+[、．\.]|'
+            r'[\(（][一二三四五六七八九十百千\d]+[\)）])\s*',
+            normalized,
+        )
+        text_after_marker = normalized[structured_marker_match.end():] if structured_marker_match else normalized
+
+        if '，' in text_after_marker and len(normalized) > 24:
+            return True
+
+        if '：' in text_after_marker and len(normalized) > 30:
+            return True
+
+        chinese_separator_count = text_after_marker.count('、') + text_after_marker.count('，')
         if chinese_separator_count >= 2:
             return True
 
@@ -723,7 +738,7 @@ class PDFLoader:
                 re.match(r'^\d+[.)、．]', normalized)
                 or re.match(r'^[\(（][一二三四五六七八九十百千\d]+[\)）]', normalized)
         )
-        if starts_with_numbered_clause and len(normalized) > 45:
+        if starts_with_numbered_clause and len(normalized) > 36:
             return True
 
         return False
@@ -741,6 +756,11 @@ class PDFLoader:
 
         if self._is_structured_heading_text(normalized):
             return len(normalized) <= 80
+
+        # CJK body lines are often extracted as short visual fragments. Keep plain
+        # CJK headings conservative; structured headings are handled above.
+        if re.search(r'[\u4e00-\u9fff]', normalized):
+            return len(normalized) <= 24
 
         return len(normalized) <= 80
 

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch, MagicMock
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRResult
+from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache
 
 
 class TestOCRMocked:
@@ -61,6 +62,40 @@ class TestOCRMocked:
         # Check OCR provider
         from doc2mark.ocr.tesseract import TesseractOCR
         assert isinstance(loader.ocr, TesseractOCR)
+
+    def test_loader_does_not_wrap_ocr_without_cache(self):
+        """OCR cache is explicit opt-in."""
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract')
+
+        from doc2mark.ocr.tesseract import TesseractOCR
+        assert isinstance(loader.ocr, TesseractOCR)
+        assert not isinstance(loader.ocr, CachedOCR)
+
+    def test_loader_wraps_ocr_when_cache_is_provided(self):
+        """Loader should wrap the configured OCR provider with CachedOCR."""
+        cache = MemoryOCRCache(ttl_seconds=60)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
+        assert loader.ocr.validate_api_key() is True
+
+        summary = loader.get_ocr_configuration()
+        assert summary["provider"] == "TesseractOCR"
+
+    def test_set_ocr_provider_reuses_or_replaces_cache_handler(self):
+        """set_ocr_provider should preserve the loader cache unless a new one is supplied."""
+        original_cache = MemoryOCRCache(ttl_seconds=60)
+        replacement_cache = MemoryOCRCache(ttl_seconds=120)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=original_cache)
+
+        loader.set_ocr_provider('tesseract')
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is original_cache
+
+        loader.set_ocr_provider('tesseract', ocr_cache=replacement_cache)
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is replacement_cache
 
 
 @pytest.mark.integration

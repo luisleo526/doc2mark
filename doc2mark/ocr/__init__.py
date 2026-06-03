@@ -7,6 +7,7 @@ from doc2mark.ocr.base import (
     BaseOCR,
     OCRFactory
 )
+from doc2mark.ocr.cache import OCRCache, MemoryOCRCache, NoOpOCRCache, CachedOCR
 
 # Import and register providers
 from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
@@ -29,9 +30,15 @@ __all__ = [
 
     # Base classes
     'BaseOCR',
+    'OCRCache',
 
     # Factory
     'OCRFactory',
+
+    # Cache
+    'MemoryOCRCache',
+    'NoOpOCRCache',
+    'CachedOCR',
 
     # Providers
     'OpenAIOCR',
