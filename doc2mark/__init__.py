@@ -21,7 +21,13 @@ from doc2mark.core.base import (
 # Main imports
 from doc2mark.core.loader import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory
-from doc2mark.ocr.cache import OCRCache, MemoryOCRCache, NoOpOCRCache
+from doc2mark.ocr.cache import (
+    OCRCache,
+    MemoryOCRCache,
+    NoOpOCRCache,
+    RedisOCRCache,
+    create_ocr_cache,
+)
 from doc2mark.core.table import TableStyle
 from doc2mark.core.chunker import Chunk, ChunkingConfig, chunk_content
 
@@ -53,6 +59,8 @@ __all__ = [
     # OCR cache
     'MemoryOCRCache',
     'NoOpOCRCache',
+    'RedisOCRCache',
+    'create_ocr_cache',
 
     # Chunking
     'Chunk',

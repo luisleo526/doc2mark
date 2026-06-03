@@ -1,13 +1,27 @@
 """Tests for OCR functionality."""
 
 import os
+import sys
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRResult
-from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache
+from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache, RedisOCRCache, create_ocr_cache
+
+
+class LoaderFakeRedis:
+    def ping(self):
+        return True
+
+
+def install_loader_fake_redis(monkeypatch):
+    client = LoaderFakeRedis()
+    fake_module = SimpleNamespace(from_url=lambda redis_url: client)
+    monkeypatch.setitem(sys.modules, "redis", fake_module)
+    return client
 
 
 class TestOCRMocked:
@@ -82,6 +96,26 @@ class TestOCRMocked:
 
         summary = loader.get_ocr_configuration()
         assert summary["provider"] == "TesseractOCR"
+
+    def test_loader_wraps_ocr_when_factory_cache_is_provided(self):
+        """Factory-created caches should be passed through unchanged."""
+        cache = create_ocr_cache("memory", ttl_seconds=60)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
+
+    def test_loader_wraps_ocr_when_redis_cache_is_provided(self, monkeypatch):
+        """RedisOCRCache should only be used as a prebuilt cache handler by the loader."""
+        install_loader_fake_redis(monkeypatch)
+        cache = create_ocr_cache("redis", redis_url="redis://localhost/0", key_prefix="loader")
+
+        assert isinstance(cache, RedisOCRCache)
+
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
 
     def test_set_ocr_provider_reuses_or_replaces_cache_handler(self):
         """set_ocr_provider should preserve the loader cache unless a new one is supplied."""
