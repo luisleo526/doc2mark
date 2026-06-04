@@ -131,6 +131,50 @@ class TestOCRMocked:
         assert isinstance(loader.ocr, CachedOCR)
         assert loader.ocr.cache is replacement_cache
 
+    @patch('doc2mark.ocr.openai.VisionAgent')
+    def test_set_ocr_provider_preserves_openai_enhanced_config_when_attaching_cache(self, mock_vision_agent):
+        """Attaching a cache through set_ocr_provider must not reset OpenAI model settings."""
+        mock_vision_agent.return_value = MagicMock()
+        original_cache = MemoryOCRCache(ttl_seconds=60)
+        loader = UnifiedDocumentLoader(
+            ocr_provider='openai',
+            api_key='test-key-123',
+            model='gpt-4o-mini',
+            temperature=0.25,
+            max_tokens=1234,
+            prompt_template='table_focused',
+            base_url='https://example.test/v1',
+            ocr_cache=original_cache,
+        )
+        replacement_cache = MemoryOCRCache(ttl_seconds=120)
+
+        loader.set_ocr_provider('openai', ocr_cache=replacement_cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is replacement_cache
+        wrapped = loader.ocr.wrapped
+        assert wrapped.model == 'gpt-4o-mini'
+        assert wrapped.temperature == 0.25
+        assert wrapped.max_tokens == 1234
+        assert wrapped.prompt_template.value == 'table_focused'
+        assert wrapped.base_url == 'https://example.test/v1'
+        assert wrapped.api_key == 'test-key-123'
+
+    def test_set_ocr_provider_preserves_embedded_cached_ocr_backend(self):
+        """A supplied CachedOCR keeps its embedded cache unless an explicit cache is provided."""
+        from doc2mark.ocr.tesseract import TesseractOCR
+
+        stale_cache = MemoryOCRCache(ttl_seconds=60)
+        embedded_cache = MemoryOCRCache(ttl_seconds=120)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=stale_cache)
+        supplied = CachedOCR(TesseractOCR(), embedded_cache)
+
+        loader.set_ocr_provider(supplied)
+
+        assert loader.ocr is supplied
+        assert loader.ocr.cache is embedded_cache
+        assert loader.ocr_cache is embedded_cache
+
 
 @pytest.mark.integration
 @pytest.mark.skipif(

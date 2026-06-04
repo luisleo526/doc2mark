@@ -54,6 +54,7 @@ class PDFLoader:
         self.pdf_path = Path(pdf_path)
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
+        self._first_text_page_num = None
         
         # Set table output style
         if table_style is None:
@@ -390,6 +391,35 @@ class PDFLoader:
             if zone_key in repeated:
                 item["type"] = f"text:{zone}"
 
+    def _get_first_text_page_num(self) -> int:
+        """Return the first page index containing non-empty text, falling back to 0."""
+        cached = getattr(self, "_first_text_page_num", None)
+        if cached is not None:
+            return cached
+
+        doc = getattr(self, "doc", None)
+        if doc is None:
+            return 0
+
+        try:
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
+                for block in text_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            if span.get("text", "").strip():
+                                self._first_text_page_num = page_num
+                                return page_num
+        except Exception as e:
+            logger.debug(f"Failed to detect first text page, defaulting to page 0: {e}")
+            return 0
+
+        self._first_text_page_num = 0
+        return 0
+
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect all images from all pages for batch processing
 
@@ -644,6 +674,12 @@ class PDFLoader:
         ]
 
         is_caption_pattern = any(re.match(pattern, total_text, re.IGNORECASE) for pattern in caption_patterns)
+        normalized_total_text = self._normalized_heading_text(total_text)
+        structured_total_match = self._structured_heading_match(normalized_total_text)
+        is_bare_structured_heading = (
+            structured_total_match is not None
+            and structured_total_match.end() == len(normalized_total_text)
+        )
         heading_features = self._build_heading_features(
             total_text,
             line_count=line_count,
@@ -679,12 +715,12 @@ class PDFLoader:
         # Only run further classification if not already classified as footnote
         if text_type == "text:normal":
             # Check if it's a caption (various criteria)
-            if is_caption_pattern or \
+            if (is_caption_pattern and not is_bare_structured_heading) or \
                     (self._is_near_image_or_table(block["bbox"], image_bboxes, table_bboxes) and
                      (len(total_text) < 150 or block_max_size < avg_font_size)):
                 text_type = "text:caption"
             # Check if it's a title (very large font on first few pages)
-            elif (page_num == 0
+            elif (page_num == self._get_first_text_page_num()
                   and is_heading_candidate
                   and self._has_title_layout_signal(heading_features)
                   and heading_features.length < 120
@@ -738,9 +774,20 @@ class PDFLoader:
         ]
         for pattern in structured_heading_patterns:
             match = re.match(pattern, normalized, re.IGNORECASE)
-            if match:
+            if match and self._has_structured_marker_boundary(normalized, match):
                 return match
         return None
+
+    def _has_structured_marker_boundary(self, normalized: str, match) -> bool:
+        """Avoid treating decimal/version prefixes as outline markers."""
+        if match.end() >= len(normalized):
+            return True
+        next_char = normalized[match.end()]
+        if next_char.isspace():
+            return True
+        if re.match(r'[\u4e00-\u9fff]', next_char):
+            return True
+        return not next_char.isascii() or not next_char.isalnum()
 
     def _has_list_marker(self, text: str) -> bool:
         normalized = self._normalized_heading_text(text)
@@ -748,7 +795,7 @@ class PDFLoader:
             return False
         if re.match(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', normalized):
             return True
-        if re.match(r'^(?:\d+|[a-zA-Z])[\.\)]\s*', normalized):
+        if re.match(r'^(?:\d+|[a-zA-Z])[\.\)]\s+', normalized):
             return True
         return self._structured_heading_match(normalized) is not None
 
@@ -761,7 +808,7 @@ class PDFLoader:
         match = self._structured_heading_match(normalized)
         if not match:
             return False
-        return bool(normalized[match.end():].strip())
+        return match.end() == len(normalized) or bool(normalized[match.end():].strip())
 
     def _build_heading_features(
         self,

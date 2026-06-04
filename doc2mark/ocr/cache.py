@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -18,11 +19,12 @@ from doc2mark.ocr.base import BaseOCR, OCRResult
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = "ocr-cache-v2"
+CACHE_SCHEMA_VERSION = "ocr-cache-v3"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v1"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
+_ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
 _STAT_COUNTERS = (
     "hits",
     "misses",
@@ -54,7 +56,12 @@ def _normalize_result(result: Any) -> OCRResult:
     return OCRResult(text=str(result))
 
 
-def _stable_value(value: Any) -> Any:
+def _type_identity(value: Any) -> str:
+    cls = value.__class__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _stable_value(value: Any, *, strict: bool = False) -> Any:
     """Convert values into JSON-stable, non-secret cache key components."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -66,20 +73,40 @@ def _stable_value(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
-        return _stable_value(asdict(value))
+        return _stable_value(asdict(value), strict=strict)
     if isinstance(value, dict):
         normalized = {}
         for key, item in value.items():
             key_str = str(key)
             if key_str.lower() in _SENSITIVE_KEYS:
                 continue
-            normalized[key_str] = _stable_value(item)
+            normalized[key_str] = _stable_value(item, strict=strict)
         return {key: normalized[key] for key in sorted(normalized)}
     if isinstance(value, set):
-        return sorted(_stable_value(item) for item in value)
+        return sorted(_stable_value(item, strict=strict) for item in value)
     if isinstance(value, (list, tuple)):
-        return [_stable_value(item) for item in value]
-    return repr(value)
+        return [_stable_value(item, strict=strict) for item in value]
+
+    repr_value = repr(value)
+    if _ADDRESS_REPR_PATTERN.search(repr_value):
+        if strict:
+            raise TypeError(
+                f"Cannot build a stable OCR cache key from {_type_identity(value)}; "
+                "provide JSON-stable model/config values instead."
+            )
+        return {"type": _type_identity(value)}
+    return {"type": _type_identity(value), "repr": repr_value}
+
+
+def _api_key_hash(provider: Any) -> Optional[str]:
+    api_key = getattr(provider, "api_key", None)
+    if not api_key:
+        return None
+    if isinstance(api_key, bytes):
+        api_key_bytes = api_key
+    else:
+        api_key_bytes = str(api_key).encode("utf-8")
+    return hashlib.sha256(api_key_bytes).hexdigest()
 
 
 def _prompt_hash(prompt: Any) -> Optional[str]:
@@ -100,17 +127,18 @@ def build_ocr_cache_key(
         "schema": cache_version,
         "image_sha256": hashlib.sha256(image).hexdigest(),
         "provider": f"{provider.__class__.__module__}.{provider.__class__.__qualname__}",
-        "config": _stable_value(getattr(provider, "config", None)),
-        "model": _stable_value(getattr(provider, "model", None)),
-        "temperature": _stable_value(getattr(provider, "temperature", None)),
-        "max_tokens": _stable_value(getattr(provider, "max_tokens", None)),
-        "prompt_template": _stable_value(getattr(provider, "prompt_template", None)),
+        "api_key_sha256": _api_key_hash(provider),
+        "config": _stable_value(getattr(provider, "config", None), strict=True),
+        "model": _stable_value(getattr(provider, "model", None), strict=True),
+        "temperature": _stable_value(getattr(provider, "temperature", None), strict=True),
+        "max_tokens": _stable_value(getattr(provider, "max_tokens", None), strict=True),
+        "prompt_template": _stable_value(getattr(provider, "prompt_template", None), strict=True),
         "default_prompt_sha256": _prompt_hash(getattr(provider, "default_prompt", None)),
-        "model_kwargs": _stable_value(getattr(provider, "model_kwargs", None)),
-        "base_url": _stable_value(getattr(provider, "base_url", None)),
-        "project": _stable_value(getattr(provider, "project", None)),
-        "location": _stable_value(getattr(provider, "location", None)),
-        "call_kwargs": _stable_value(kwargs or {}),
+        "model_kwargs": _stable_value(getattr(provider, "model_kwargs", None), strict=True),
+        "base_url": _stable_value(getattr(provider, "base_url", None), strict=True),
+        "project": _stable_value(getattr(provider, "project", None), strict=True),
+        "location": _stable_value(getattr(provider, "location", None), strict=True),
+        "call_kwargs": _stable_value(kwargs or {}, strict=True),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -770,7 +798,12 @@ class CachedOCR(BaseOCR):
         return getattr(self.wrapped, "requires_api_key", True)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.wrapped, name)
+        if name == "wrapped":
+            raise AttributeError(name)
+        wrapped = self.__dict__.get("wrapped")
+        if wrapped is None:
+            raise AttributeError(name)
+        return getattr(wrapped, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in {"wrapped", "cache", "cache_version"} or name.startswith("_"):
@@ -829,6 +862,11 @@ class CachedOCR(BaseOCR):
         if miss_images:
             provider_results = self.wrapped.batch_process_images(miss_images, **kwargs)
             if len(provider_results) != len(miss_images):
+                for key, provider_result in zip(miss_keys, provider_results):
+                    normalized = _normalize_result(provider_result)
+                    self.cache.set(key, normalized)
+                    for position in miss_positions[key]:
+                        results[position] = _copy_result(normalized)
                 raise RuntimeError("OCR provider returned a different number of results than requested")
 
             for key, provider_result in zip(miss_keys, provider_results):

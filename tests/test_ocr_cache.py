@@ -13,6 +13,7 @@ from doc2mark.ocr import RedisOCRCache as OCRPackageRedisOCRCache
 from doc2mark.ocr import create_ocr_cache as ocr_package_create_ocr_cache
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
 from doc2mark.ocr.cache import (
+    CACHE_SCHEMA_VERSION,
     OCR_CACHE_VALUE_SCHEMA_VERSION,
     CachedOCR,
     MemoryOCRCache,
@@ -366,6 +367,48 @@ def test_cache_key_includes_provider_backend_identity():
     assert project_a_key != project_b_key
 
 
+def test_cache_key_schema_and_api_key_identity_are_credential_scoped():
+    provider = FakeOCR()
+    image = b"same-image"
+
+    provider.api_key = "tenant-a-secret"
+    tenant_a_key = build_ocr_cache_key(provider, image)
+
+    provider.api_key = "tenant-b-secret"
+    tenant_b_key = build_ocr_cache_key(provider, image)
+
+    assert CACHE_SCHEMA_VERSION == "ocr-cache-v3"
+    assert tenant_a_key != tenant_b_key
+    assert "tenant-a-secret" not in tenant_a_key
+    assert "tenant-b-secret" not in tenant_b_key
+
+
+def test_cache_key_rejects_address_based_unstable_values():
+    class CustomClient:
+        pass
+
+    provider = FakeOCR()
+    provider.model_kwargs = {"client": CustomClient()}
+
+    with pytest.raises(TypeError, match="stable OCR cache key"):
+        build_ocr_cache_key(provider, b"image")
+
+
+def test_cache_value_serialization_does_not_embed_object_addresses():
+    class CustomClient:
+        pass
+
+    payload = _serialize_ocr_cache_entry(
+        OCRResult(text="cached", metadata={"client": CustomClient()}),
+        created_at=1000,
+        expires_at=1060,
+    )
+
+    assert "0x" not in payload
+    entry = _deserialize_ocr_cache_entry(payload)
+    assert entry.result.metadata["client"]["type"].endswith("CustomClient")
+
+
 def test_redis_constructor_imports_lazily_and_pings(monkeypatch):
     client = install_fake_redis(monkeypatch)
 
@@ -630,6 +673,35 @@ def test_cached_ocr_does_not_cache_provider_failures():
 
     assert cache.stats()["entries"] == 0
     assert cache.get("anything") is None
+
+
+def test_cached_ocr_caches_aligned_prefix_on_count_mismatch():
+    class ShortResultOCR(FakeOCR):
+        def batch_process_images(self, images, **kwargs):
+            self.calls.append(list(images))
+            return [OCRResult(text="first")]
+
+    provider = ShortResultOCR()
+    cache = MemoryOCRCache(ttl_seconds=60)
+    ocr = CachedOCR(provider, cache)
+
+    with pytest.raises(RuntimeError, match="different number of results"):
+        ocr.batch_process_images([b"first", b"second"], language="en")
+
+    first_key = build_ocr_cache_key(provider, b"first", kwargs={"language": "en"})
+    second_key = build_ocr_cache_key(provider, b"second", kwargs={"language": "en"})
+    assert cache.get(first_key).text == "first"
+    assert cache.get(second_key) is None
+
+
+def test_cached_ocr_getattr_does_not_recurse_without_wrapped():
+    ocr = CachedOCR.__new__(CachedOCR)
+
+    with pytest.raises(AttributeError):
+        getattr(ocr, "wrapped")
+
+    with pytest.raises(AttributeError):
+        getattr(ocr, "model")
 
 
 def test_cached_ocr_process_image_uses_cache():
