@@ -15,6 +15,7 @@ from doc2mark.core.base import (
     UnsupportedFormatError
 )
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider
+from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class UnifiedDocumentLoader:
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             cache_dir: Optional[str] = None,
+            ocr_cache: Optional[OCRCache] = None,
             # Enhanced OCR configuration for OpenAI / Vertex AI
             model: str = "gpt-4.1",
             temperature: float = 0,
@@ -57,6 +59,7 @@ class UnifiedDocumentLoader:
             api_key: API key for OCR provider (OpenAI defaults to OPENAI_API_KEY env var)
             ocr_config: Basic OCR configuration (from base class)
             cache_dir: Directory for caching processed documents
+            ocr_cache: Optional request-scoped OCR cache handler
 
             # Enhanced OpenAI OCR Configuration:
             model: OpenAI model to use (default: gpt-4.1)
@@ -88,80 +91,27 @@ class UnifiedDocumentLoader:
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
 
-        # Initialize OCR with enhanced configuration
-        if isinstance(ocr_provider, BaseOCR):
-            self.ocr = ocr_provider
-            logger.info(f"✓ Using provided OCR instance: {type(ocr_provider).__name__}")
-        else:
-            logger.info(f"🤖 Initializing OCR provider: {ocr_provider}")
-
-            # For OpenAI provider, use enhanced configuration
-            if (isinstance(ocr_provider, str) and ocr_provider.lower() == 'openai') or \
-                    (isinstance(ocr_provider, OCRProvider) and ocr_provider == OCRProvider.OPENAI):
-
-                logger.info("🔧 Using enhanced OpenAI OCR configuration")
-
-                # Import OpenAI OCR specifically to use enhanced constructor
-                from doc2mark.ocr.openai import OpenAIOCR
-
-                self.ocr = OpenAIOCR(
-                    api_key=api_key,
-                    config=ocr_config,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    max_workers=max_workers,
-                    prompt_template=prompt_template,
-                    timeout=timeout,
-                    max_retries=max_retries,
-                    default_prompt=default_prompt,
-                    base_url=base_url,
-                    # Additional OpenAI parameters
-                    top_p=top_p,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty
-                )
-
-                # Log the configuration being used
-                config_summary = self.ocr.get_configuration_summary()
-                logger.info("📋 OCR Configuration Summary:")
-                for key, value in config_summary.items():
-                    logger.info(f"   {key}: {value}")
-
-            elif (isinstance(ocr_provider, str) and ocr_provider.lower() == 'vertex_ai') or \
-                    (isinstance(ocr_provider, OCRProvider) and ocr_provider == OCRProvider.VERTEX_AI):
-
-                logger.info("Using enhanced Vertex AI OCR configuration")
-
-                from doc2mark.ocr.vertex_ai import VertexAIOCR
-
-                # Default to gemini-3.1-flash-lite-preview if user didn't change model from OpenAI default
-                vertex_model = model if model != "gpt-4.1" else "gemini-3.1-flash-lite-preview"
-
-                self.ocr = VertexAIOCR(
-                    config=ocr_config,
-                    project=project,
-                    location=location,
-                    model=vertex_model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    prompt_template=prompt_template,
-                    default_prompt=default_prompt,
-                )
-
-                config_summary = self.ocr.get_configuration_summary()
-                logger.info("OCR Configuration Summary:")
-                for key, value in config_summary.items():
-                    logger.info(f"   {key}: {value}")
-
-            else:
-                # Use standard factory for other providers
-                logger.info(f"Using standard OCR factory for provider: {ocr_provider}")
-                self.ocr = OCRFactory.create(
-                    provider=ocr_provider,
-                    api_key=api_key,
-                    config=ocr_config
-                )
+        self.ocr_cache = None
+        self.ocr = self._create_ocr_provider(
+            ocr_provider=ocr_provider,
+            api_key=api_key,
+            ocr_config=ocr_config,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_workers=max_workers,
+            prompt_template=prompt_template,
+            timeout=timeout,
+            max_retries=max_retries,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            base_url=base_url,
+            project=project,
+            location=location,
+            default_prompt=default_prompt,
+        )
+        self._apply_ocr_cache(ocr_cache)
 
         # Cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -178,6 +128,147 @@ class UnifiedDocumentLoader:
         self._initialize_processors()
 
         logger.info("✅ UnifiedDocumentLoader initialized successfully")
+
+    @staticmethod
+    def _is_ocr_provider(provider: Union[str, OCRProvider], target: OCRProvider) -> bool:
+        if isinstance(provider, OCRProvider):
+            return provider == target
+        if isinstance(provider, str):
+            return provider.lower() == target.value
+        return False
+
+    @staticmethod
+    def _unwrap_ocr(ocr: BaseOCR) -> BaseOCR:
+        return ocr.wrapped if isinstance(ocr, CachedOCR) else ocr
+
+    def _create_ocr_provider(
+            self,
+            ocr_provider: Union[str, OCRProvider, BaseOCR],
+            api_key: Optional[str] = None,
+            ocr_config: Optional[OCRConfig] = None,
+            model: str = "gpt-4.1",
+            temperature: float = 0,
+            max_tokens: int = 4096,
+            max_workers: int = 5,
+            prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
+            timeout: int = 30,
+            max_retries: int = 3,
+            top_p: float = 1.0,
+            frequency_penalty: float = 0.0,
+            presence_penalty: float = 0.0,
+            base_url: Optional[str] = None,
+            project: Optional[str] = None,
+            location: str = "global",
+            default_prompt: Optional[str] = None,
+            model_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> BaseOCR:
+        """Create an OCR provider using the same enhanced path everywhere."""
+        if isinstance(ocr_provider, BaseOCR):
+            logger.info(f"✓ Using provided OCR instance: {type(ocr_provider).__name__}")
+            return ocr_provider
+
+        logger.info(f"🤖 Initializing OCR provider: {ocr_provider}")
+        extra_model_kwargs = dict(model_kwargs or {})
+
+        if self._is_ocr_provider(ocr_provider, OCRProvider.OPENAI):
+            logger.info("🔧 Using enhanced OpenAI OCR configuration")
+            from doc2mark.ocr.openai import OpenAIOCR
+
+            extra_model_kwargs.setdefault("top_p", top_p)
+            extra_model_kwargs.setdefault("frequency_penalty", frequency_penalty)
+            extra_model_kwargs.setdefault("presence_penalty", presence_penalty)
+
+            ocr = OpenAIOCR(
+                api_key=api_key,
+                config=ocr_config,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_workers=max_workers,
+                prompt_template=prompt_template,
+                timeout=timeout,
+                max_retries=max_retries,
+                default_prompt=default_prompt,
+                base_url=base_url,
+                **extra_model_kwargs,
+            )
+            self._log_ocr_configuration(ocr, title="📋 OCR Configuration Summary:")
+            return ocr
+
+        if self._is_ocr_provider(ocr_provider, OCRProvider.VERTEX_AI):
+            logger.info("Using enhanced Vertex AI OCR configuration")
+            from doc2mark.ocr.vertex_ai import VertexAIOCR
+
+            vertex_model = model if model != "gpt-4.1" else "gemini-3.1-flash-lite-preview"
+            ocr = VertexAIOCR(
+                api_key=api_key,
+                config=ocr_config,
+                project=project,
+                location=location,
+                model=vertex_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                prompt_template=prompt_template,
+                default_prompt=default_prompt,
+                **extra_model_kwargs,
+            )
+            self._log_ocr_configuration(ocr, title="OCR Configuration Summary:")
+            return ocr
+
+        logger.info(f"Using standard OCR factory for provider: {ocr_provider}")
+        return OCRFactory.create(
+            provider=ocr_provider,
+            api_key=api_key,
+            config=ocr_config
+        )
+
+    @staticmethod
+    def _log_ocr_configuration(ocr: BaseOCR, title: str):
+        if hasattr(ocr, 'get_configuration_summary'):
+            config_summary = ocr.get_configuration_summary()
+            logger.info(title)
+            for key, value in config_summary.items():
+                logger.info(f"   {key}: {value}")
+
+    def _apply_ocr_cache(self, ocr_cache: Optional[OCRCache] = None):
+        """Apply an explicit cache, preserve embedded cache, or reuse loader cache."""
+        if ocr_cache is not None:
+            self.ocr_cache = ocr_cache
+            if isinstance(self.ocr, CachedOCR):
+                self.ocr.cache = ocr_cache
+            else:
+                self.ocr = CachedOCR(self.ocr, ocr_cache)
+            logger.info(f"🧠 OCR cache enabled: {type(self.ocr_cache).__name__}")
+            return
+
+        if isinstance(self.ocr, CachedOCR):
+            self.ocr_cache = self.ocr.cache
+            logger.info(f"🧠 OCR cache enabled: {type(self.ocr_cache).__name__}")
+            return
+
+        if self.ocr_cache is not None:
+            self.ocr = CachedOCR(self.ocr, self.ocr_cache)
+            logger.info(f"🧠 OCR cache enabled: {type(self.ocr_cache).__name__}")
+
+    def _current_ocr_constructor_options(self) -> Dict[str, Any]:
+        """Read current provider settings so set_ocr_provider does not downgrade OCR config."""
+        current = self._unwrap_ocr(self.ocr)
+        return {
+            "api_key": getattr(current, "api_key", None),
+            "ocr_config": getattr(current, "config", None),
+            "model": getattr(current, "model", "gpt-4.1"),
+            "temperature": getattr(current, "temperature", 0),
+            "max_tokens": getattr(current, "max_tokens", 4096),
+            "max_workers": getattr(current, "max_workers", 5),
+            "prompt_template": getattr(current, "prompt_template", PromptTemplate.DEFAULT),
+            "timeout": getattr(current, "timeout", 30),
+            "max_retries": getattr(current, "max_retries", 3),
+            "base_url": getattr(current, "base_url", None),
+            "project": getattr(current, "project", None),
+            "location": getattr(current, "location", "global"),
+            "default_prompt": getattr(current, "default_prompt", None),
+            "model_kwargs": dict(getattr(current, "model_kwargs", {}) or {}),
+        }
 
     def _initialize_processors(self):
         """Initialize all format processors."""
@@ -867,7 +958,8 @@ class UnifiedDocumentLoader:
             self,
             provider: Union[str, OCRProvider, BaseOCR],
             api_key: Optional[str] = None,
-            config: Optional[OCRConfig] = None
+            config: Optional[OCRConfig] = None,
+            ocr_cache: Optional[OCRCache] = None
     ):
         """Change OCR provider.
         
@@ -875,15 +967,25 @@ class UnifiedDocumentLoader:
             provider: New OCR provider
             api_key: API key for provider
             config: OCR configuration
+            ocr_cache: Optional OCR cache handler. Reuses existing handler when omitted.
         """
+        preserved_options = self._current_ocr_constructor_options()
+        if api_key is not None:
+            preserved_options["api_key"] = api_key
+        if config is not None:
+            preserved_options["ocr_config"] = config
+
         if isinstance(provider, BaseOCR):
             self.ocr = provider
         else:
-            self.ocr = OCRFactory.create(
-                provider=provider,
-                api_key=api_key,
-                config=config
+            self.ocr = self._create_ocr_provider(
+                ocr_provider=provider,
+                **preserved_options,
             )
+
+        if not hasattr(self, "ocr_cache"):
+            self.ocr_cache = None
+        self._apply_ocr_cache(ocr_cache)
 
         # Reinitialize processors with new OCR
         self._initialize_processors()

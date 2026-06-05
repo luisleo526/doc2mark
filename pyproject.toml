@@ -77,8 +77,11 @@ vertex_ai = [
     "langchain-google-genai>=2.0.0",
     "langchain>=1.2.0",
 ]
+redis = [
+    "redis>=5.0.0",
+]
 all = [
-    "doc2mark[ocr,heif,mime,vertex_ai]",
+    "doc2mark[ocr,heif,mime,vertex_ai,redis]",
 ]
 dev = [
     "pytest>=7.0.0",

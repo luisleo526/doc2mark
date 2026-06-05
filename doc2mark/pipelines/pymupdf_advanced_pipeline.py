@@ -24,6 +24,29 @@ class SimpleContent:
     mime_type: Optional[str] = None  # MIME type for image content
 
 
+@dataclass(frozen=True)
+class _HeadingFeatures:
+    normalized: str
+    length: int
+    line_count: int
+    size_ratio: float
+    max_size_ratio: float
+    is_bold: bool
+    is_all_caps: bool
+    has_list_pattern: bool
+    list_line_count: int
+    is_explicit_marker: bool
+    is_structured_marker: bool
+    text_after_marker: str
+    has_cjk: bool
+    has_checkbox_marker: bool
+    has_sentence_punctuation: bool
+    has_trailing_continuation: bool
+    separator_count: int
+    has_form_field_shape: bool
+    has_long_clause_shape: bool
+
+
 class PDFLoader:
     """PDF loader that extracts content in reading order and exports to various formats"""
 
@@ -31,6 +54,7 @@ class PDFLoader:
         self.pdf_path = Path(pdf_path)
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
+        self._first_text_page_num = None
         
         # Set table output style
         if table_style is None:
@@ -367,6 +391,35 @@ class PDFLoader:
             if zone_key in repeated:
                 item["type"] = f"text:{zone}"
 
+    def _get_first_text_page_num(self) -> int:
+        """Return the first page index containing non-empty text, falling back to 0."""
+        cached = getattr(self, "_first_text_page_num", None)
+        if cached is not None:
+            return cached
+
+        doc = getattr(self, "doc", None)
+        if doc is None:
+            return 0
+
+        try:
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
+                for block in text_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            if span.get("text", "").strip():
+                                self._first_text_page_num = page_num
+                                return page_num
+        except Exception as e:
+            logger.debug(f"Failed to detect first text page, defaulting to page 0: {e}")
+            return 0
+
+        self._first_text_page_num = 0
+        return 0
+
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect all images from all pages for batch processing
 
@@ -607,10 +660,7 @@ class PDFLoader:
                 if not line_text.isupper() or not any(c.isalpha() for c in line_text):
                     is_all_caps = False
 
-                # Check for list patterns (expanded set of markers)
-                if re.match(
-                        r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
-                        line_text.strip()):
+                if self._has_list_marker(line_text.strip()):
                     has_list_pattern = True
                     list_line_count += 1
 
@@ -620,10 +670,31 @@ class PDFLoader:
         caption_patterns = [
             r'^(Figure|Fig\.?|Table|Tbl\.?|Chart|Graph|Image|Plate|Scheme)\s*\d*[\.:)]?',
             r'^(Source|Note|Notes)[\.:)]',
-            r'^\d+\.\d+[\.:)]?',  # Numbered captions like "1.1:" or "2.3."
+            r'^\d+\.\d+[\.:)]',  # Numbered captions like "1.1:" or "2.3."
         ]
 
         is_caption_pattern = any(re.match(pattern, total_text, re.IGNORECASE) for pattern in caption_patterns)
+        normalized_total_text = self._normalized_heading_text(total_text)
+        structured_total_match = self._structured_heading_match(normalized_total_text)
+        is_bare_structured_heading = (
+            structured_total_match is not None
+            and structured_total_match.end() == len(normalized_total_text)
+        )
+        heading_features = self._build_heading_features(
+            total_text,
+            line_count=line_count,
+            block_max_size=block_max_size,
+            avg_font_size=avg_font_size,
+            max_font_size=max_font_size,
+            is_bold=is_bold,
+            is_all_caps=is_all_caps,
+            has_list_pattern=has_list_pattern,
+            list_line_count=list_line_count,
+        )
+        is_heading_candidate = self._is_probable_heading_features(
+            heading_features,
+            require_layout_signal=True,
+        )
 
         # Determine text type based on characteristics
         text_type = "text:normal"  # Default
@@ -644,25 +715,30 @@ class PDFLoader:
         # Only run further classification if not already classified as footnote
         if text_type == "text:normal":
             # Check if it's a caption (various criteria)
-            if is_caption_pattern or \
+            if (is_caption_pattern and not is_bare_structured_heading) or \
                     (self._is_near_image_or_table(block["bbox"], image_bboxes, table_bboxes) and
                      (len(total_text) < 150 or block_max_size < avg_font_size)):
                 text_type = "text:caption"
             # Check if it's a title (very large font on first few pages)
-            elif page_num <= 1 and block_max_size >= max_font_size * 0.85 and len(total_text) < 200 and line_count <= 3:
+            elif (page_num == self._get_first_text_page_num()
+                  and is_heading_candidate
+                  and self._has_title_layout_signal(heading_features)
+                  and heading_features.length < 120
+                  and line_count <= 2):
                 text_type = "text:title"
             # Check if it's a section header (various criteria)
-            elif (len(total_text) < 100 and line_count <= 2) and \
-                    (block_max_size > avg_font_size * 1.2 or
-                     (is_bold and block_max_size > avg_font_size * 1.05) or
-                     is_all_caps):
+            elif is_heading_candidate and heading_features.length < 100 and line_count <= 2:
                 text_type = "text:section"
             # Check if it's a list (majority of lines have list pattern)
             elif has_list_pattern and (list_line_count >= line_count * 0.5 or line_count == 1):
                 text_type = "text:list"
 
         # Generate markdown
-        markdown_text = self._convert_block_to_markdown(block)
+        markdown_text = self._convert_block_to_markdown(
+            block,
+            preserve_structured_headings=text_type in ("text:title", "text:section"),
+            allow_heading_formatting=text_type in ("text:title", "text:section"),
+        )
 
         # Debug logging for classification
         if text_type != "text:normal":
@@ -671,7 +747,198 @@ class PDFLoader:
 
         return markdown_text, text_type
 
-    def _convert_block_to_markdown(self, block: Dict[str, Any]) -> str:
+    def _normalized_heading_text(self, text: str) -> str:
+        return re.sub(r'\s+', ' ', (text or '')).strip()
+
+    def _explicit_heading_match(self, normalized: str):
+        explicit_heading_patterns = [
+            r'^第\s*[一二三四五六七八九十百千\d]+\s*[條章节章節篇]',
+            r'^(附錄|附件|附表)\s*[A-Za-z\d一二三四五六七八九十百千]*',
+            r'^(Appendix|Chapter|Section)\b',
+        ]
+        for pattern in explicit_heading_patterns:
+            match = re.match(pattern, normalized, re.IGNORECASE)
+            if match:
+                return match
+        return None
+
+    def _structured_heading_match(self, normalized: str):
+        structured_heading_patterns = [
+            r'^\d+(?:\.\d+)+',
+            r'^\d+(?:-\d+)+',
+            r'^\d+[\.)、．]',
+            r'^[\(（]\d+[\)）]',
+            r'^[一二三四五六七八九十百千]+[、．\.]',
+            r'^[壹貳參肆伍陸柒捌玖拾]+[、．\.]',
+            r'^[\(（][一二三四五六七八九十百千]+[\)）]',
+        ]
+        for pattern in structured_heading_patterns:
+            match = re.match(pattern, normalized, re.IGNORECASE)
+            if match and self._has_structured_marker_boundary(normalized, match):
+                return match
+        return None
+
+    def _has_structured_marker_boundary(self, normalized: str, match) -> bool:
+        """Avoid treating decimal/version prefixes as outline markers."""
+        if match.end() >= len(normalized):
+            return True
+        next_char = normalized[match.end()]
+        if next_char.isspace():
+            return True
+        if re.match(r'[\u4e00-\u9fff]', next_char):
+            return True
+        return not next_char.isascii() or not next_char.isalnum()
+
+    def _has_list_marker(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        if not normalized:
+            return False
+        if re.match(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', normalized):
+            return True
+        if re.match(r'^(?:\d+|[a-zA-Z])[\.\)]\s+', normalized):
+            return True
+        return self._structured_heading_match(normalized) is not None
+
+    def _is_explicit_heading_text(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        return self._explicit_heading_match(normalized) is not None
+
+    def _is_structured_heading_text(self, text: str) -> bool:
+        normalized = self._normalized_heading_text(text)
+        match = self._structured_heading_match(normalized)
+        if not match:
+            return False
+        return match.end() == len(normalized) or bool(normalized[match.end():].strip())
+
+    def _build_heading_features(
+        self,
+        text: str,
+        *,
+        line_count: int = 1,
+        block_max_size: float = 0.0,
+        avg_font_size: float = 0.0,
+        max_font_size: float = 0.0,
+        is_bold: bool = False,
+        is_all_caps: bool = False,
+        has_list_pattern: bool = False,
+        list_line_count: int = 0,
+    ) -> _HeadingFeatures:
+        normalized = self._normalized_heading_text(text)
+        explicit_match = self._explicit_heading_match(normalized)
+        structured_match = self._structured_heading_match(normalized)
+        marker_match = explicit_match or structured_match
+        text_after_marker = normalized[marker_match.end():].strip() if marker_match else normalized
+        separator_count = sum(normalized.count(separator) for separator in (',', '，', '、', ':', '：'))
+        size_ratio = block_max_size / avg_font_size if avg_font_size > 0 else 1.0
+        max_size_ratio = block_max_size / max_font_size if max_font_size > 0 else 1.0
+        has_structured_marker = structured_match is not None and bool(text_after_marker)
+        has_long_clause_shape = (
+            has_structured_marker
+            and len(normalized) > 32
+            and any(separator in text_after_marker for separator in (',', '，', '、', ':', '：'))
+        )
+
+        return _HeadingFeatures(
+            normalized=normalized,
+            length=len(normalized),
+            line_count=line_count,
+            size_ratio=size_ratio,
+            max_size_ratio=max_size_ratio,
+            is_bold=is_bold,
+            is_all_caps=is_all_caps,
+            has_list_pattern=has_list_pattern,
+            list_line_count=list_line_count,
+            is_explicit_marker=explicit_match is not None,
+            is_structured_marker=has_structured_marker,
+            text_after_marker=text_after_marker,
+            has_cjk=bool(re.search(r'[\u4e00-\u9fff]', normalized)),
+            has_checkbox_marker=bool(re.match(r'^[□■☑☐]', normalized)),
+            has_sentence_punctuation=bool(re.search(r'[。！？!?；;]', normalized) or normalized.endswith('.')),
+            has_trailing_continuation=normalized.endswith(('，', ',', '、', '；', ';')),
+            separator_count=separator_count,
+            has_form_field_shape=bool(re.search(r'_{3,}|\.{4,}|…{2,}', normalized)),
+            has_long_clause_shape=has_long_clause_shape,
+        )
+
+    def _has_heading_layout_signal(self, features: _HeadingFeatures) -> bool:
+        return (
+            features.size_ratio >= 1.2
+            or (features.is_bold and features.size_ratio >= 1.05)
+            or features.is_all_caps
+        )
+
+    def _has_title_layout_signal(self, features: _HeadingFeatures) -> bool:
+        return (
+            features.max_size_ratio >= 0.85
+            and (features.size_ratio >= 1.15 or features.is_bold or features.is_all_caps)
+        )
+
+    def _has_hard_body_shape(self, features: _HeadingFeatures) -> bool:
+        return (
+            features.has_checkbox_marker
+            or features.has_form_field_shape
+            or features.has_sentence_punctuation
+            or features.has_trailing_continuation
+            or features.length > 120
+        )
+
+    def _has_soft_body_shape(self, features: _HeadingFeatures) -> bool:
+        if any(separator in features.text_after_marker for separator in (',', '，')) and features.length > 24:
+            return True
+        if any(separator in features.text_after_marker for separator in (':', '：')) and features.length > 30:
+            return True
+        if features.separator_count >= 3:
+            return True
+        if features.separator_count >= 2 and not features.is_structured_marker and features.length > 36:
+            return True
+        return features.has_long_clause_shape
+
+    def _is_probable_heading_features(
+        self,
+        features: _HeadingFeatures,
+        *,
+        require_layout_signal: bool = False,
+    ) -> bool:
+        if not features.normalized:
+            return False
+        if features.line_count > 2:
+            return False
+        if self._has_hard_body_shape(features):
+            return False
+
+        has_layout_signal = self._has_heading_layout_signal(features)
+        has_soft_body_shape = self._has_soft_body_shape(features)
+
+        if features.is_explicit_marker:
+            return features.length <= 80 and not (has_soft_body_shape and features.length > 60)
+
+        if require_layout_signal and not has_layout_signal:
+            return False
+
+        if features.is_structured_marker:
+            if features.has_long_clause_shape:
+                return False
+            if has_soft_body_shape and not has_layout_signal:
+                return False
+            return features.length <= 80
+
+        if has_soft_body_shape:
+            return False
+
+        length_limit = 24 if features.has_cjk else 80
+        return features.length <= length_limit
+
+    def _is_probable_heading_text(self, text: str) -> bool:
+        """Return True for short structural heading shapes without body blockers."""
+        features = self._build_heading_features(text)
+        return self._is_probable_heading_features(features, require_layout_signal=False)
+
+    def _convert_block_to_markdown(
+        self,
+        block: Dict[str, Any],
+        preserve_structured_headings: bool = False,
+        allow_heading_formatting: bool = False,
+    ) -> str:
         """Convert a text block to markdown format"""
         lines = []
 
@@ -705,7 +972,11 @@ class PDFLoader:
                 r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
                 line_text)
             
-            if list_match:
+            if (preserve_structured_headings
+                    and self._is_structured_heading_text(line_text)
+                    and self._is_probable_heading_text(line_text)):
+                markdown_line = line_text
+            elif list_match:
                 # Handle list items without applying text formatting
                 marker = list_match.group(1)
                 if marker in '•\u2022\u25CF\u25AA\u25A0' or marker == '-' or marker == '*':
@@ -719,13 +990,13 @@ class PDFLoader:
                     # Letter list (a., b., etc.) - convert to bullet
                     markdown_line = re.sub(r'^[a-zA-Z][\.\)]\s+', '- ', line_text)
             # Detect headers based on size
-            elif line_size > avg_size * 1.5:
+            elif allow_heading_formatting and line_size > avg_size * 1.5 and self._is_probable_heading_text(line_text):
                 # Large text -> H1
                 markdown_line = f"# {line_text}"
-            elif line_size > avg_size * 1.3:
+            elif allow_heading_formatting and line_size > avg_size * 1.3 and self._is_probable_heading_text(line_text):
                 # Medium large text -> H2
                 markdown_line = f"## {line_text}"
-            elif line_size > avg_size * 1.15:
+            elif allow_heading_formatting and line_size > avg_size * 1.15 and self._is_probable_heading_text(line_text):
                 # Slightly larger text -> H3
                 markdown_line = f"### {line_text}"
             else:

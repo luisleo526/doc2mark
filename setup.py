@@ -56,8 +56,12 @@ setup(
         "ocr": [
             "pytesseract>=0.3.10",  # Tesseract OCR
         ],
+        "redis": [
+            "redis>=5.0.0",
+        ],
         "all": [
             "pytesseract>=0.3.10",
+            "redis>=5.0.0",
             "pyyaml>=6.0",  # For markdown frontmatter
         ]
     },

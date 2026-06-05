@@ -1,12 +1,27 @@
 """Tests for OCR functionality."""
 
 import os
+import sys
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRProvider, OCRResult
+from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache, RedisOCRCache, create_ocr_cache
+
+
+class LoaderFakeRedis:
+    def ping(self):
+        return True
+
+
+def install_loader_fake_redis(monkeypatch):
+    client = LoaderFakeRedis()
+    fake_module = SimpleNamespace(from_url=lambda redis_url: client)
+    monkeypatch.setitem(sys.modules, "redis", fake_module)
+    return client
 
 
 class TestOCRMocked:
@@ -61,6 +76,104 @@ class TestOCRMocked:
         # Check OCR provider
         from doc2mark.ocr.tesseract import TesseractOCR
         assert isinstance(loader.ocr, TesseractOCR)
+
+    def test_loader_does_not_wrap_ocr_without_cache(self):
+        """OCR cache is explicit opt-in."""
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract')
+
+        from doc2mark.ocr.tesseract import TesseractOCR
+        assert isinstance(loader.ocr, TesseractOCR)
+        assert not isinstance(loader.ocr, CachedOCR)
+
+    def test_loader_wraps_ocr_when_cache_is_provided(self):
+        """Loader should wrap the configured OCR provider with CachedOCR."""
+        cache = MemoryOCRCache(ttl_seconds=60)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
+        assert loader.ocr.validate_api_key() is True
+
+        summary = loader.get_ocr_configuration()
+        assert summary["provider"] == "TesseractOCR"
+
+    def test_loader_wraps_ocr_when_factory_cache_is_provided(self):
+        """Factory-created caches should be passed through unchanged."""
+        cache = create_ocr_cache("memory", ttl_seconds=60)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
+
+    def test_loader_wraps_ocr_when_redis_cache_is_provided(self, monkeypatch):
+        """RedisOCRCache should only be used as a prebuilt cache handler by the loader."""
+        install_loader_fake_redis(monkeypatch)
+        cache = create_ocr_cache("redis", redis_url="redis://localhost/0", key_prefix="loader")
+
+        assert isinstance(cache, RedisOCRCache)
+
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is cache
+
+    def test_set_ocr_provider_reuses_or_replaces_cache_handler(self):
+        """set_ocr_provider should preserve the loader cache unless a new one is supplied."""
+        original_cache = MemoryOCRCache(ttl_seconds=60)
+        replacement_cache = MemoryOCRCache(ttl_seconds=120)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=original_cache)
+
+        loader.set_ocr_provider('tesseract')
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is original_cache
+
+        loader.set_ocr_provider('tesseract', ocr_cache=replacement_cache)
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is replacement_cache
+
+    @patch('doc2mark.ocr.openai.VisionAgent')
+    def test_set_ocr_provider_preserves_openai_enhanced_config_when_attaching_cache(self, mock_vision_agent):
+        """Attaching a cache through set_ocr_provider must not reset OpenAI model settings."""
+        mock_vision_agent.return_value = MagicMock()
+        original_cache = MemoryOCRCache(ttl_seconds=60)
+        loader = UnifiedDocumentLoader(
+            ocr_provider='openai',
+            api_key='test-key-123',
+            model='gpt-4o-mini',
+            temperature=0.25,
+            max_tokens=1234,
+            prompt_template='table_focused',
+            base_url='https://example.test/v1',
+            ocr_cache=original_cache,
+        )
+        replacement_cache = MemoryOCRCache(ttl_seconds=120)
+
+        loader.set_ocr_provider('openai', ocr_cache=replacement_cache)
+
+        assert isinstance(loader.ocr, CachedOCR)
+        assert loader.ocr.cache is replacement_cache
+        wrapped = loader.ocr.wrapped
+        assert wrapped.model == 'gpt-4o-mini'
+        assert wrapped.temperature == 0.25
+        assert wrapped.max_tokens == 1234
+        assert wrapped.prompt_template.value == 'table_focused'
+        assert wrapped.base_url == 'https://example.test/v1'
+        assert wrapped.api_key == 'test-key-123'
+
+    def test_set_ocr_provider_preserves_embedded_cached_ocr_backend(self):
+        """A supplied CachedOCR keeps its embedded cache unless an explicit cache is provided."""
+        from doc2mark.ocr.tesseract import TesseractOCR
+
+        stale_cache = MemoryOCRCache(ttl_seconds=60)
+        embedded_cache = MemoryOCRCache(ttl_seconds=120)
+        loader = UnifiedDocumentLoader(ocr_provider='tesseract', ocr_cache=stale_cache)
+        supplied = CachedOCR(TesseractOCR(), embedded_cache)
+
+        loader.set_ocr_provider(supplied)
+
+        assert loader.ocr is supplied
+        assert loader.ocr.cache is embedded_cache
+        assert loader.ocr_cache is embedded_cache
 
 
 @pytest.mark.integration
