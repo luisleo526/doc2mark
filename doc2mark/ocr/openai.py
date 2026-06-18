@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory, resolve_max_concurrency
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -131,7 +131,8 @@ class VisionAgent:
             model: str = "gpt-4.1",
             temperature: float = 0,
             max_tokens: int = 4096,
-            base_url: Optional[str] = None
+            base_url: Optional[str] = None,
+            max_concurrency: Optional[int] = None
     ):
         """Initialize the vision agent.
         
@@ -147,6 +148,7 @@ class VisionAgent:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.base_url = base_url or os.environ.get('OPENAI_BASE_URL')
+        self.max_concurrency = max_concurrency
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")
@@ -201,9 +203,13 @@ class VisionAgent:
         if not self._chain:
             raise RuntimeError("LangChain not available")
 
-        logger.info(f"🚀 Starting LangChain batch processing of {len(input_dicts)} images")
+        logger.info(
+            f"🚀 Starting LangChain batch processing of {len(input_dicts)} images "
+            f"(max_concurrency={self.max_concurrency or 'default'})"
+        )
 
-        results = self._chain.batch_as_completed(input_dicts)
+        _cfg = {"max_concurrency": self.max_concurrency} if self.max_concurrency else None
+        results = self._chain.batch_as_completed(input_dicts, config=_cfg)
         sorted_results = sorted(results, key=lambda x: x[0])
 
         logger.info(f"✅ LangChain batch processing complete")
@@ -320,7 +326,10 @@ class OpenAIOCR(BaseOCR):
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                base_url=self.base_url
+                base_url=self.base_url,
+                max_concurrency=resolve_max_concurrency(
+                    self.config.max_concurrency if self.config else None
+                )
             )
         except Exception as e:
             logger.error(f"❌ Failed to initialize VisionAgent: {e}")
@@ -425,7 +434,10 @@ class OpenAIOCR(BaseOCR):
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                base_url=self.base_url
+                base_url=self.base_url,
+                max_concurrency=resolve_max_concurrency(
+                    self.config.max_concurrency if self.config else None
+                )
             )
         except Exception as e:
             logger.error(f"❌ Failed to reinitialize VisionAgent: {e}")

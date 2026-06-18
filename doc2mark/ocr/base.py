@@ -1,9 +1,31 @@
 """Base OCR interface for doc2mark."""
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
+
+
+def resolve_max_concurrency(config_value: Optional[int] = None) -> Optional[int]:
+    """Resolve the LLM-OCR batch concurrency cap.
+
+    Precedence: explicit ``config_value`` > ``OCR_MAX_CONCURRENCY`` env var > ``None``.
+    ``None`` means "use the LangChain default" (a CPU-tied thread pool, typically ~12),
+    preserving the pre-0.5.2 behaviour. A positive int caps how many image OCR calls run
+    concurrently in ``batch_as_completed`` — raise it to keep large scanned documents
+    within an SLA (e.g. 32 ≈ a few-thousand-page doc in minutes).
+    """
+    if config_value is not None:
+        return config_value
+    env = os.getenv("OCR_MAX_CONCURRENCY")
+    if env:
+        try:
+            value = int(env)
+            return value if value > 0 else None
+        except ValueError:
+            return None
+    return None
 
 
 class OCRProvider(Enum):
@@ -32,6 +54,10 @@ class OCRConfig:
     max_retries: int = 3
     timeout: int = 30
     extra: Optional[Dict[str, Any]] = None
+    # Max concurrent image OCR calls for LLM providers (vertex_ai/openai) in
+    # batch_as_completed. None = LangChain default (~CPU-tied). Falls back to the
+    # OCR_MAX_CONCURRENCY env var when None. Raise for large scanned docs.
+    max_concurrency: Optional[int] = None
 
 
 class BaseOCR(ABC):

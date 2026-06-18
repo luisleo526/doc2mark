@@ -6,7 +6,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from doc2mark.core.base import OCRError
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory, resolve_max_concurrency
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -73,12 +73,14 @@ class VertexAIVisionAgent:
         model: str = "gemini-3.1-flash-lite-preview",
         temperature: float = 0,
         max_tokens: int = 4096,
+        max_concurrency: Optional[int] = None,
     ):
         self.project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_concurrency = max_concurrency
 
         if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
             logger.warning("langchain-google-genai not available")
@@ -143,9 +145,13 @@ class VertexAIVisionAgent:
         if not self._chain:
             raise RuntimeError("langchain-google-genai not available")
 
-        logger.info(f"Starting Gemini batch processing of {len(input_dicts)} images")
+        logger.info(
+            f"Starting Gemini batch processing of {len(input_dicts)} images "
+            f"(max_concurrency={self.max_concurrency or 'default'})"
+        )
 
-        results = self._chain.batch_as_completed(input_dicts)
+        _cfg = {"max_concurrency": self.max_concurrency} if self.max_concurrency else None
+        results = self._chain.batch_as_completed(input_dicts, config=_cfg)
         sorted_results = sorted(results, key=lambda x: x[0])
 
         logger.info("Gemini batch processing complete")
@@ -234,6 +240,9 @@ class VertexAIOCR(BaseOCR):
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                max_concurrency=resolve_max_concurrency(
+                    self.config.max_concurrency if self.config else None
+                ),
             )
         except Exception as e:
             logger.error(f"Failed to initialize Vertex AI VisionAgent: {e}")
