@@ -11,6 +11,18 @@ import pymupdf
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
+# --- Image-dominant page OCR strategy ---------------------------------------
+# Some PDFs (scanned documents, slide decks exported as pictures) carry their
+# content as full-page raster images with little or no text layer. OCR'ing each
+# embedded image individually fragments the content and wastes calls on
+# decorative logos/icons. For such pages we render the whole page once and OCR
+# that single image instead. Heuristic thresholds (general, not file-specific):
+_PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
+_PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
+_IMAGE_PAGE_TEXT_LIMIT = 200    # a page with more native text than this has a usable text layer
+_IMAGE_PAGE_COVERAGE = 0.55     # images must cover >= this fraction of the page
+_TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
+
 logger = logging.getLogger(__name__)
 
 
@@ -417,34 +429,78 @@ class PDFLoader:
         self._first_text_page_num = 0
         return 0
 
-    def _collect_all_images(self) -> List[Dict[str, Any]]:
-        """Collect all images from all pages for batch processing
+    def _page_image_coverage(self, page) -> float:
+        """Fraction of the page area covered by raster images (capped at 1.0)."""
+        page_area = abs(page.rect.width * page.rect.height) or 1.0
+        covered = 0.0
+        for img_info in page.get_images(full=True):
+            for rect in page.get_image_rects(img_info[0]):
+                covered += abs(rect.width * rect.height)
+        return min(covered / page_area, 1.0)
 
-        Returns:
-            List of dictionaries containing image info:
-            - page_num: Page number (0-indexed)
-            - xref: Image cross-reference
-            - base64: Base64-encoded image data
-            - position: (x0, y0, x1, y1) tuple
+    def _is_image_dominant_page(self, page) -> bool:
+        """True when a page is essentially a picture: little/no native text but
+        images covering most of it (scanned pages, slide decks exported as
+        images). Such pages are OCR'd as a single rendered image rather than per
+        embedded image, giving coherent content and skipping decorative noise."""
+        if len(page.get_text().strip()) > _IMAGE_PAGE_TEXT_LIMIT:
+            return False
+        return self._page_image_coverage(page) >= _IMAGE_PAGE_COVERAGE
+
+    def _render_page_png(self, page) -> bytes:
+        """Rasterize a whole page to PNG bytes for page-level OCR."""
+        return page.get_pixmap(dpi=_PAGE_RENDER_DPI).tobytes("png")
+
+    def _is_decorative_image(self, rect, page) -> bool:
+        """True for tiny images (logos/icons/bullets) not worth an OCR call."""
+        return (abs(rect.width) < _TINY_IMAGE_FRACTION * page.rect.width
+                and abs(rect.height) < _TINY_IMAGE_FRACTION * page.rect.height)
+
+    def _collect_all_images(self) -> List[Dict[str, Any]]:
+        """Collect images for batch OCR.
+
+        Image-dominant pages contribute ONE whole-page render (xref
+        ``_PAGE_RENDER_XREF``); other pages contribute their embedded images,
+        skipping decorative thumbnails. Each entry has page_num, xref, base64,
+        mime_type, position, and (for renders) is_page_render=True.
         """
         all_images = []
 
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
-            image_list = page.get_images(full=True)
 
-            for img_info in image_list:
+            # Whole-page OCR for scanned/image-only pages.
+            if self.ocr is not None and self._is_image_dominant_page(page):
+                try:
+                    png = self._render_page_png(page)
+                    all_images.append({
+                        "page_num": page_num,
+                        "xref": _PAGE_RENDER_XREF,
+                        "base64": base64.b64encode(png).decode('utf-8'),
+                        "mime_type": "image/png",
+                        "is_page_render": True,
+                        "position": (0.0, 0.0, page.rect.width, page.rect.height),
+                    })
+                    continue
+                except Exception as e:
+                    logger.warning(f"Page render failed on page {page_num + 1}: {e}; "
+                                   f"falling back to per-image OCR")
+
+            for img_info in page.get_images(full=True):
                 xref = img_info[0]
 
                 try:
+                    img_rects = page.get_image_rects(xref)
+                    # Skip decorative thumbnails before paying for extraction/OCR.
+                    img_rects = [r for r in img_rects if not self._is_decorative_image(r, page)]
+                    if not img_rects:
+                        continue
+
                     result = self._extract_image_bytes(xref)
                     if result is None:
                         continue
                     image_bytes, _, mime = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
-
-                    # Get image positions on page
-                    img_rects = page.get_image_rects(xref)
 
                     for img_rect in img_rects:
                         all_images.append({
@@ -464,6 +520,22 @@ class PDFLoader:
                       ocr_results_map: Dict[tuple, str] = None) -> List[Dict[str, Any]]:
         """Process a single page and extract content in reading order"""
         page = self.doc.load_page(page_num)
+
+        # Image-dominant page OCR'd as a whole: emit the page transcription as a
+        # single block and skip per-element (table/text/image) extraction.
+        if ocr_images and ocr_results_map:
+            render_text = ocr_results_map.get((page_num, _PAGE_RENDER_XREF))
+            if render_text is not None:
+                render_text = render_text.strip()
+                if not render_text:
+                    return []
+                return [{
+                    "type": "text:image_description",
+                    "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
+                    "page": page_num + 1,
+                    "position_y": 0.0,
+                }]
+
         content_items = []
 
         # Extract tables first (to avoid duplicating their text in text blocks)
@@ -1549,10 +1621,15 @@ class PDFLoader:
                     img_rects = page.get_image_rects(xref)
 
                     for img_rect in img_rects:
+                        # Decorative thumbnails were skipped during collection.
+                        if self._is_decorative_image(img_rect, page):
+                            continue
                         # Check if we have OCR result for this image
                         key = (page_num, xref)
                         if key in ocr_results_map:
-                            ocr_text = ocr_results_map[key]
+                            ocr_text = (ocr_results_map[key] or "").strip()
+                            if not ocr_text:
+                                continue  # skip images that OCR'd to nothing
                             image_items.append(SimpleContent(
                                 type="text:image_description",
                                 content=f"<image_ocr_result>{ocr_text}</image_ocr_result>",

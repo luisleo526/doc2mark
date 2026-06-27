@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as clean HTML using ``colspan``/``rowspan`` for merged cells (which the flat
   ``headers``/``rows`` and markdown cannot represent). ``OCRPage.to_markdown()``
   prefers it.
+- **Page-level OCR for image-dominant PDFs.** Scanned pages and slide decks
+  exported as pictures (little/no text layer, images covering the page) are now
+  rendered and OCR'd once per page instead of per embedded image — coherent
+  per-page content, far fewer API calls, and decorative logos/icons skipped.
 - **`OCR` facade.** New ergonomic entry point: `OCR("openai")` with `.read()`
   and `.read_one()` methods, replacing direct provider construction.
 - **`Task` enum.** Replaces the eight free-form `PromptTemplate` variants with
@@ -54,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the structured output controls instead.
 
 ### Fixed
+- **Structured OCR no longer silently loses content.** When a model can read an
+  image but cannot fill the json_schema (some weaker/preview models return an
+  empty ``OCRPage`` on dense or non-Latin images), the OpenAI and Vertex/Gemini
+  providers now recover by re-OCR'ing those images in free-form mode.
 - Repaired the release pipeline: `.bumpversion.cfg` no longer targets a
   non-existent `pyproject.toml` version line that aborted every release.
 - Forward `OCRConfig` timeout/`max_retries` to the LLM clients (were inert).
