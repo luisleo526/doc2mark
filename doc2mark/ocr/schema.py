@@ -16,6 +16,7 @@ that OpenAI strict mode (which requires all properties to be present) is
 satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 """
 
+import re
 from typing import List, Optional, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -536,6 +537,21 @@ class Interpretation(BaseModel):
             "'screenshot' document_type may pair 'described' with withheld text."
         ),
     )
+    page_markdown: Optional[str] = Field(
+        default=None,
+        description=(
+            "Clean, structured Markdown rendering of this WHOLE-PAGE image render — filled "
+            "ONLY when explicitly instructed (image-strategy slide/scan pages); leave null "
+            "otherwise. When filled it MUST: (a) cover EVERY word, number and CJK character "
+            "from raw.text verbatim — drop nothing, paraphrase nothing, translate nothing; "
+            "(b) add structure — '## ' for the page title, '### ' for sub-sections, numbered/"
+            "bulleted lists for cards, 'A → B → C' arrow chains for process/flow diagrams; "
+            "(c) for any table/grid region write a short '[see table]' placeholder (the "
+            "authoritative HTML is in raw.tables) rather than re-transcribing it. It "
+            "RE-LAYOUTS the text already in raw.text into a readable document; it never "
+            "adds or removes content."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -556,6 +572,31 @@ class OCRPage(BaseModel):
         parts: List[str] = []
         raw = self.raw
         interp = self.interpretation
+
+        # Synthesis fast-path: a structured page_markdown rendering REPLACES the flat
+        # raw.text dump for whole-page image renders — BUT only when it verifiably
+        # covers the verbatim text (this rendered string is the BM42 feed; the OCRPage
+        # object is discarded downstream). Authoritative table HTML is appended for
+        # spans, and any uncovered verbatim line is preserved in a hidden tail so BM42
+        # keeps every token. If it under-covers (paraphrase/truncation), fall through
+        # to the standard verbatim rendering — never worse than today.
+        md = (interp.page_markdown or "").strip() if interp is not None else ""
+        if md:
+            table_text = " ".join((t.html or t.markdown or "") for t in raw.tables)
+            covered, missing = _coverage(raw.text, md + "\n" + table_text)
+            if covered >= _SYNTH_COVERAGE_MIN:
+                out = [md]
+                for table in raw.tables:
+                    if table.html:
+                        out.append(table.html.strip())
+                    elif table.markdown:
+                        out.append(table.markdown.strip())
+                    elif table.headers or table.rows:
+                        out.append(_render_table(table))
+                if missing:
+                    out.append("<!-- raw-verbatim-tail\n" + "\n".join(missing) + "\n-->")
+                return "\n\n".join(p for p in out if p)
+
         # Title anchor: its verbatim copy is already in raw.text, so only prepend
         # when raw.text does not already start with it (avoid duplicating tokens).
         if interp is not None and interp.page_title:
@@ -692,6 +733,29 @@ def _norm_ws(s: str) -> str:
     same tokens in the same order) without flagging pure re-spacing.
     """
     return " ".join((s or "").split())
+
+
+# Use the synthesized page_markdown for display when it covers at least this fraction
+# of raw.text's tokens; the verbatim-tail carries the residual so BM42 stays complete.
+# Below this floor the render likely summarized away content -> fall back to raw.text.
+_SYNTH_COVERAGE_MIN = 0.85
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.,%$/+\-]*|[一-鿿぀-ヿ]{2,}")
+
+
+def _coverage(raw_text: str, rendered: str):
+    """Fraction of raw_text's content TOKENS that appear in ``rendered``, plus the
+    sorted list of tokens that do NOT. Token-based (not line-based) so short CJK
+    labels — most of a slide's content — are actually checked. A token is a Latin/
+    numeric word or a CJK/Kana run of >=2 chars. Used by to_markdown() to gate the
+    synthesized page_markdown against verbatim loss and to build the hidden
+    verbatim-tail (BM42 keeps every token even if page_markdown drops one)."""
+    r = _norm_ws(rendered)
+    toks = [t for t in _TOKEN_RE.findall(raw_text or "") if len(t) >= 2]
+    if not toks:
+        return 1.0, []
+    missing = [t for t in toks if t not in r]
+    return 1 - len(missing) / len(toks), sorted(set(missing))
 
 
 def router_invariants(page: "OCRPage") -> List[str]:

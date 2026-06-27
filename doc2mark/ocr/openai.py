@@ -21,6 +21,7 @@ from doc2mark.ocr.base import (
     resolve_max_concurrency,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
+    _SYNTHESIS_MARKDOWN_INSTRUCTION,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 
@@ -776,12 +777,14 @@ class OpenAIOCR(BaseOCR):
             tasks: Optional[List[Union[str, Task]]],
             language: Optional[str],
             detail: str,
+            synthesis_markdown: bool = False,
     ) -> List[str]:
         """Build a per-image structured prompt list from TASK_PROMPTS.
 
         Per-image ``tasks`` win over the single ``task``/config.task. The
-        existing language-instruction mechanism is appended unchanged, and a
-        raw-mode instruction is appended when ``detail == "raw"``.
+        existing language-instruction mechanism is appended unchanged, a
+        raw-mode instruction is appended when ``detail == "raw"``, and the
+        page-markdown synthesis instruction when ``synthesis_markdown`` is set.
         """
         if tasks is not None:
             if len(tasks) != n_images:
@@ -800,6 +803,8 @@ class OpenAIOCR(BaseOCR):
             base = add_language_instruction(base, lang)
             if detail == "raw":
                 base = base + _RAW_DETAIL_INSTRUCTION
+            if synthesis_markdown:
+                base = base + _SYNTHESIS_MARKDOWN_INSTRUCTION
             prompts.append(base)
         return prompts
 
@@ -883,8 +888,10 @@ class OpenAIOCR(BaseOCR):
         try:
             # Build the per-image prompts. Structured output selects schema-aligned
             # TASK_PROMPTS; the legacy path keeps the verbose template builder.
+            synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
             if structured:
-                prompts = self._resolve_task_prompts(len(images), task, tasks, language, detail)
+                prompts = self._resolve_task_prompts(
+                    len(images), task, tasks, language, detail, synthesis_markdown=synthesis_markdown)
             else:
                 legacy_kwargs = dict(kwargs)
                 if language is not None:
@@ -945,6 +952,9 @@ class OpenAIOCR(BaseOCR):
         ``(text, token_usage)`` tuples (``document=None``).
         """
         on_parse_error = self.config.on_parse_error if self.config else "raw_text"
+        # page_markdown is an image-strategy-only synthesis; null it everywhere else so
+        # to_markdown() stays byte-identical for normal docs / embedded-figure OCR.
+        synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
         results: List[OCRResult] = []
 
         for i, item in enumerate(batch_results):
@@ -967,6 +977,8 @@ class OpenAIOCR(BaseOCR):
                         content = content.replace('```', '`')
                     page = OCRPage(raw=RawExtraction(text=content), interpretation=None)
 
+                if not synthesis_markdown and page.interpretation is not None:
+                    page.interpretation.page_markdown = None
                 results.append(OCRResult(
                     text=page.to_markdown(),
                     confidence=(page.interpretation.self_confidence if page.interpretation else None),

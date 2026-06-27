@@ -180,6 +180,28 @@ _CONTEXT_PDF_INSTRUCTION = (
     "image, and respond in the document's own language."
 )
 
+# Appended (image-strategy whole-page renders only) so the model ALSO emits a clean,
+# structured Markdown rendering of the page in interpretation.page_markdown — turning
+# a flat OCR dump into a readable document, WITHOUT losing any verbatim text.
+_SYNTHESIS_MARKDOWN_INSTRUCTION = (
+    "\n\nALSO fill interpretation.page_markdown — a clean, well-structured Markdown "
+    "rendering of THIS whole page (for a human reader and a RAG index):\n"
+    "1. COVERAGE (critical): every word, number and character you put in raw.text MUST "
+    "also appear in page_markdown — drop nothing, paraphrase nothing, translate nothing. "
+    "You are RE-LAYING-OUT the same text into a document, not summarizing it. Include "
+    "EVERY visible label: card sub-bullets, the small labels inside each diagram node, "
+    "legend entries, axis ticks, footnotes — render them as nested bullets if needed. "
+    "Completeness beats brevity.\n"
+    "2. STRUCTURE: '## ' for the page/slide title; '### ' for sub-sections; numbered or "
+    "bulleted lists for cards / bullet groups (keep each card's body text under its "
+    "heading); render a process or flow diagram as an arrow chain 'A → B → C' and list "
+    "each node's inner labels beneath it; follow natural reading order (top-to-bottom, "
+    "left-to-right).\n"
+    "3. TABLES: for any table/grid region write ONLY a short '[see table]' placeholder — "
+    "the authoritative HTML table is already in raw.tables; do not re-transcribe it here.\n"
+    "4. Leave page_markdown null ONLY for a blank page."
+)
+
 
 @dataclass
 class OCRConfig:

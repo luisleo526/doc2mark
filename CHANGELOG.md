@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Meaningful Markdown for image-heavy pages.** Image-strategy pages (slide
+  decks / scans) now emit a structured `interpretation.page_markdown` synthesis
+  in the same OCR call — `##` headings, numbered cards, `A → B → C` flow chains —
+  used as the rendered display body instead of the flat OCR dump. A verbatim
+  coverage guard keeps it BM42-safe: it is only used when it covers the raw text's
+  tokens, any residual tokens are carried in a hidden tail, and it falls back to
+  the verbatim raw dump if the synthesis under-covers. Gated strictly to the
+  image strategy, so ordinary text/table/data documents are byte-identical (their
+  faithful rule-based output is untouched). On the image-deck benchmark the
+  meaningfulness judge rose 3.0 → 4.0 with no regression on any other document.
+- **Extraction eval harness** (`eval/extraction_harness.py`) scoring every
+  document on the three requirements — body-text preservation, complex-table
+  structure (col/row spans, span-expanded cell match), and meaningfulness (LLM
+  judge) — so extraction changes are validated system-wide, not fit to one file.
 - **Structured OCR output.** The OCR layer now returns an `OCRPage` (on
   `OCRResult.document`) with a hard boundary between `raw` (verbatim
   transcription, tables, key/value fields) and `interpretation` (summary,

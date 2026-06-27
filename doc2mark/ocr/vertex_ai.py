@@ -18,6 +18,7 @@ from doc2mark.ocr.base import (
     resolve_max_concurrency,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
+    _SYNTHESIS_MARKDOWN_INSTRUCTION,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 from doc2mark.utils.image_utils import (
@@ -494,6 +495,8 @@ class VertexAIOCR(BaseOCR):
             base = add_language_instruction(base, language)
             if detail == "raw":
                 base = base + _RAW_DETAIL_NOTE
+            if kwargs.get("synthesis_markdown"):
+                base = base + _SYNTHESIS_MARKDOWN_INSTRUCTION
             prompts.append(base)
         return prompts
 
@@ -673,6 +676,10 @@ class VertexAIOCR(BaseOCR):
             if isinstance(page, OCRPage):
                 if detail == "raw":
                     page.interpretation = None
+                # page_markdown is image-strategy-only; null it elsewhere so to_markdown
+                # stays byte-identical for normal docs / embedded-figure OCR.
+                if not kwargs.get("synthesis_markdown") and page.interpretation is not None:
+                    page.interpretation.page_markdown = None
                 text = page.to_markdown() or page.raw.text
                 confidence = (
                     page.interpretation.self_confidence if page.interpretation else None

@@ -218,3 +218,35 @@ class TestNestedSchema:
         assert "*Layered architecture*" in md
         assert "- App --> Core" in md
         assert "**Section outline**" in md
+
+
+class TestPageMarkdownSynthesis:
+    """page_markdown display-swap with the verbatim coverage guard (BM42-safe)."""
+
+    def test_faithful_page_markdown_is_used(self):
+        raw = RawExtraction(text="第一步\n第二步\n第三步\n第四步\n第五步")
+        it = Interpretation(page_markdown="## 流程\n\n第一步 → 第二步 → 第三步 → 第四步 → 第五步")
+        md = OCRPage(raw=raw, interpretation=it).to_markdown()
+        assert md.startswith("## 流程")
+        assert "第一步" in md and "第五步" in md
+
+    def test_undercover_falls_back_to_raw(self):
+        raw = RawExtraction(text="alpha one\nbravo two\ncharlie three\ndelta four\necho five")
+        it = Interpretation(page_markdown="## Summary\n\nA short summary, nothing else.")
+        md = OCRPage(raw=raw, interpretation=it).to_markdown()
+        assert not md.startswith("## Summary")              # rejected
+        assert all(t in md for t in ["alpha", "charlie", "echo"])  # raw verbatim preserved
+
+    def test_high_cover_uses_md_and_tail_keeps_dropped_token(self):
+        toks = [f"item{i}" for i in range(10)]
+        raw = RawExtraction(text="\n".join(toks))
+        it = Interpretation(page_markdown="## List\n\n" + " ".join(toks[:9]))  # drops item9 (90% cover)
+        md = OCRPage(raw=raw, interpretation=it).to_markdown()
+        assert md.startswith("## List")
+        assert "item9" in md                                # carried in the verbatim tail
+        assert "raw-verbatim-tail" in md
+
+    def test_none_page_markdown_uses_standard_render(self):
+        raw = RawExtraction(text="a line of ordinary body text here")
+        md = OCRPage(raw=raw, interpretation=Interpretation()).to_markdown()
+        assert md.startswith("a line of ordinary")

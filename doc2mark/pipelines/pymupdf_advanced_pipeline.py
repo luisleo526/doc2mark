@@ -274,6 +274,13 @@ class PDFLoader:
                         if any(context_pdfs):
                             kwargs['context_pdfs'] = context_pdfs
 
+                        # Image strategy (whole-page renders): ask the model to ALSO
+                        # synthesize structured page_markdown, so the rendered output is
+                        # a readable document instead of a flat OCR dump. Text-strategy
+                        # batches (embedded figures) carry no page render -> never set.
+                        if any(info.get("is_page_render") for info in all_images_info):
+                            kwargs['synthesis_markdown'] = True
+
                         # Always use batch processing for efficiency
                         logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
                         ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
