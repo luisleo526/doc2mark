@@ -101,8 +101,15 @@ class Table(BaseModel):
     html: str = Field(
         default="",
         description=(
-            "Clean, valid HTML for this table using <table>/<tr>/<th>/<td>, with "
-            "colspan and rowspan for merged cells. No CSS, classes, or inline styles."
+            "Clean, valid HTML for this table using <table>/<tr>/<th>/<td>. Preserve "
+            "the FULL grid: emit ONE <tr> per visual row and one cell per column — "
+            "NEVER flatten a multi-row table into a single row or a single header. "
+            "Use colspan for a cell that spans columns (e.g. a group header above "
+            "several columns) and rowspan for a cell that spans rows (e.g. a row "
+            "label covering several rows). Keep the top-left corner cell (often "
+            "empty) when the table has both row and column headers; first-column "
+            "labels are <th> cells. Cell text is verbatim. No CSS, classes, ids, or "
+            "inline styles."
         ),
     )
     # Rendered markdown fallback for simple (non-merged) tables.
