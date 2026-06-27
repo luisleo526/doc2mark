@@ -37,6 +37,9 @@ class DocumentFormat(Enum):
     XML = "xml"
     MARKDOWN = "md"
     
+    # Email formats
+    EML = "eml"
+
     # Image formats
     PNG = "png"
     JPG = "jpg"
