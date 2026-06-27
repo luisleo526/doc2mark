@@ -1,23 +1,27 @@
 """Command line interface for doc2mark."""
 
-import argparse
-import sys
-import os
-import logging
-from pathlib import Path
 from datetime import datetime
-import json
+from pathlib import Path
+import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
+import json
+import logging
+import sys
 
 from doc2mark import UnifiedDocumentLoader
+from doc2mark.ocr.base import OCRConfig
 
 
-def setup_logging(log_file=None, verbose=False):
+def setup_logging(log_file=None, verbose=False, quiet=False):
     """Set up logging configuration."""
-    level = logging.DEBUG if verbose else logging.INFO
+    if verbose:
+        level = logging.DEBUG
+    elif quiet:
+        level = logging.ERROR
+    else:
+        level = logging.WARNING
     
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers = [logging.StreamHandler(sys.stderr)]
     if log_file:
         handlers.append(logging.FileHandler(log_file))
     
@@ -27,6 +31,11 @@ def setup_logging(log_file=None, verbose=False):
         handlers=handlers
     )
     return logging.getLogger(__name__)
+
+
+def document_json_payload(result):
+    """Return the canonical JSON payload for CLI output."""
+    return result.to_dict()
 
 
 def filter_files(files, exclude_patterns=None, max_files=None, sort_by="name"):
@@ -88,7 +97,8 @@ def process_single_file(file_path, loader_config, processing_config):
         # Create loader with config
         loader = UnifiedDocumentLoader(
             ocr_provider=loader_config['ocr_provider'],
-            api_key=loader_config['api_key']
+            api_key=loader_config['api_key'],
+            ocr_config=loader_config.get('ocr_config')
         )
         
         # Process with retry logic
@@ -99,7 +109,7 @@ def process_single_file(file_path, loader_config, processing_config):
             try:
                 result = loader.load(
                     file_path=file_path,
-                    output_format=processing_config['format'],
+                    output_format=processing_config['load_format'],
                     extract_images=processing_config['extract_images'],
                     ocr_images=processing_config['ocr_images']
                 )
@@ -137,7 +147,8 @@ Examples:
   doc2mark /path/to/docs/ -o /path/to/output/     # Process directory
   
   # OCR options
-  doc2mark file.pdf --ocr openai                  # Use OpenAI GPT-4V OCR
+  doc2mark file.pdf --ocr openai --ocr-images     # Use OpenAI GPT-4V OCR
+  doc2mark file.pdf --ocr vertex_ai --ocr-images  # Use Vertex AI / Gemini OCR
   doc2mark file.pdf --ocr tesseract --ocr-lang deu  # German Tesseract OCR
   doc2mark file.pdf --ocr none                    # Disable OCR
   doc2mark file.pdf --no-extract-images           # Skip image extraction
@@ -177,9 +188,9 @@ Supported formats:
     ocr_group = parser.add_argument_group('OCR options')
     ocr_group.add_argument(
         "--ocr",
-        choices=["openai", "tesseract", "none"],
-        default="openai",
-        help="OCR provider to use (default: openai, use 'none' to disable OCR)"
+        choices=["openai", "vertex_ai", "tesseract", "none"],
+        default="none",
+        help="OCR provider to use (default: none)"
     )
     
     ocr_group.add_argument(
@@ -196,8 +207,8 @@ Supported formats:
     ocr_group.add_argument(
         "--extract-images",
         action="store_true",
-        default=True,
-        help="Extract images from documents (default: True)"
+        default=False,
+        help="Extract images from documents (default: False)"
     )
     
     ocr_group.add_argument(
@@ -210,8 +221,8 @@ Supported formats:
     ocr_group.add_argument(
         "--ocr-images",
         action="store_true",
-        default=True,
-        help="OCR images in documents (default: True)"
+        default=False,
+        help="OCR images in documents (default: False)"
     )
     
     ocr_group.add_argument(
@@ -351,7 +362,7 @@ Supported formats:
     args = parser.parse_args()
 
     # Set up logging
-    logger = setup_logging(args.log_file, args.verbose)
+    logger = setup_logging(args.log_file, args.verbose, args.quiet)
     
     # Validate input
     input_path = Path(args.input_path)
@@ -364,17 +375,21 @@ Supported formats:
     
     # Handle OCR provider
     ocr_provider = None if args.ocr == "none" else args.ocr
+    if args.ocr_images and ocr_provider is None:
+        parser.error("--ocr-images requires --ocr openai, --ocr vertex_ai, or --ocr tesseract")
+    if args.ocr_images:
+        args.extract_images = True
+
+    ocr_config = OCRConfig(language=args.ocr_lang) if args.ocr == "tesseract" else None
+    load_format = "markdown" if args.format in {"json", "both"} else args.format
 
     try:
         # Initialize loader
         loader = UnifiedDocumentLoader(
             ocr_provider=ocr_provider,
-            api_key=args.api_key
+            api_key=args.api_key,
+            ocr_config=ocr_config
         )
-        
-        # Set Tesseract language if using Tesseract
-        if args.ocr == "tesseract" and hasattr(loader, 'ocr_processor'):
-            loader.ocr_processor.lang = args.ocr_lang
 
         if input_path.is_file():
             # Process single file
@@ -389,7 +404,7 @@ Supported formats:
                 try:
                     result = loader.load(
                         file_path=input_path,
-                        output_format=args.format,
+                        output_format=load_format,
                         extract_images=args.extract_images,
                         ocr_images=args.ocr_images
                     )
@@ -421,7 +436,7 @@ Supported formats:
                 elif args.format == "json":
                     output_file = output_path.with_suffix('.json')
                     with open(output_file, 'w', encoding=args.encoding) as f:
-                        json.dump(result.json_content, f, ensure_ascii=False, indent=2)
+                        json.dump(document_json_payload(result), f, ensure_ascii=False, indent=2)
                     if not args.quiet:
                         print(f"Output saved to: {output_file}")
                 elif args.format == "both":
@@ -433,15 +448,14 @@ Supported formats:
                         f.write(result.content)
 
                     with open(json_file, 'w', encoding=args.encoding) as f:
-                        json.dump(result.json_content, f, ensure_ascii=False, indent=2)
+                        json.dump(document_json_payload(result), f, ensure_ascii=False, indent=2)
 
                     if not args.quiet:
                         print(f"Output saved to: {md_file} and {json_file}")
             else:
                 # Print to stdout
                 if args.format == "json":
-                    import json
-                    print(json.dumps(result.json_content, ensure_ascii=False, indent=2))
+                    print(json.dumps(document_json_payload(result), ensure_ascii=False, indent=2))
                 else:
                     # Show preview for markdown
                     content = result.content
@@ -476,11 +490,13 @@ Supported formats:
             # Prepare configs for parallel processing
             loader_config = {
                 'ocr_provider': ocr_provider,
-                'api_key': args.api_key
+                'api_key': args.api_key,
+                'ocr_config': ocr_config,
             }
             
             processing_config = {
                 'format': args.format,
+                'load_format': load_format,
                 'extract_images': args.extract_images,
                 'ocr_images': args.ocr_images,
                 'max_length': args.max_length,
@@ -539,7 +555,7 @@ Supported formats:
                             try:
                                 result = loader.load(
                                     file_path=file_path,
-                                    output_format=args.format,
+                                    output_format=load_format,
                                     extract_images=args.extract_images,
                                     ocr_images=args.ocr_images
                                 )
@@ -592,7 +608,7 @@ Supported formats:
                     elif args.format == "json":
                         out_file = output_path / f"{rel_path}.json"
                         with open(out_file, 'w', encoding=args.encoding) as f:
-                            json.dump(doc.json_content, f, ensure_ascii=False, indent=2)
+                            json.dump(document_json_payload(doc), f, ensure_ascii=False, indent=2)
                     elif args.format == "both":
                         md_file = output_path / f"{rel_path}.md"
                         json_file = output_path / f"{rel_path}.json"
@@ -601,7 +617,7 @@ Supported formats:
                             f.write(doc.content)
                         
                         with open(json_file, 'w', encoding=args.encoding) as f:
-                            json.dump(doc.json_content, f, ensure_ascii=False, indent=2)
+                            json.dump(document_json_payload(doc), f, ensure_ascii=False, indent=2)
                 
                 if not args.quiet:
                     print(f"\nProcessed {len(results)} files to: {output_path}")

@@ -4,9 +4,15 @@ A Python package that unifies document processing across multiple formats
 with advanced AI-powered OCR capabilities.
 """
 
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 __version__ = "0.5.2"
 __author__ = "Hao Liang Wen"
 __email__ = "luisleo52655@gmail.com"
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from doc2mark.core.base import (
     DocumentFormat,
@@ -77,15 +83,15 @@ __all__ = [
 
 # Convenience functions
 def load(
-        file_path,
-        output_format=OutputFormat.MARKDOWN,
-        extract_images=False,
-        ocr_images=False,
-        ocr_provider='openai',
-        api_key=None,
-        ocr_cache=None,
-        **kwargs
-):
+        file_path: Union[str, Path],
+        output_format: Union[str, OutputFormat] = OutputFormat.MARKDOWN,
+        extract_images: bool = False,
+        ocr_images: bool = False,
+        ocr_provider: Union[str, OCRProvider] = 'openai',
+        api_key: Optional[str] = None,
+        ocr_cache: Optional[OCRCache] = None,
+        **kwargs: Any
+) -> ProcessedDocument:
     """
     Quick load function for single documents.
     
@@ -131,16 +137,16 @@ def load(
 
 
 def document_to_markdown(
-        file_path,
-        output_path=None,
-        extract_images=False,
-        ocr_images=False,
-        ocr_provider='openai',
-        api_key=None,
-        ocr_cache=None,
-        show_progress=True,
-        **kwargs
-):
+        file_path: Union[str, Path],
+        output_path: Optional[Union[str, Path]] = None,
+        extract_images: bool = False,
+        ocr_images: bool = False,
+        ocr_provider: Union[str, OCRProvider] = 'openai',
+        api_key: Optional[str] = None,
+        ocr_cache: Optional[OCRCache] = None,
+        show_progress: bool = True,
+        **kwargs: Any
+) -> str:
     """
     Convert any supported document to Markdown (backward compatibility function).
     
@@ -162,8 +168,6 @@ def document_to_markdown(
     Returns:
         Markdown string
     """
-    from pathlib import Path
-
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
@@ -192,17 +196,17 @@ def document_to_markdown(
 
 
 def batch_convert_to_markdown(
-        input_dir,
-        output_dir=None,
-        extract_images=False,
-        ocr_images=False,
-        recursive=True,
-        ocr_provider='openai',
-        api_key=None,
-        ocr_cache=None,
-        show_progress=True,
-        **kwargs
-):
+        input_dir: Union[str, Path],
+        output_dir: Optional[Union[str, Path]] = None,
+        extract_images: bool = False,
+        ocr_images: bool = False,
+        recursive: bool = True,
+        ocr_provider: Union[str, OCRProvider] = 'openai',
+        api_key: Optional[str] = None,
+        ocr_cache: Optional[OCRCache] = None,
+        show_progress: bool = True,
+        **kwargs: Any
+) -> Dict[str, Dict[str, Any]]:
     """
     Batch convert documents to Markdown (backward compatibility function).
     
@@ -245,19 +249,19 @@ def batch_convert_to_markdown(
 
 
 def batch_process_documents(
-        input_dir,
-        output_dir=None,
-        output_format=OutputFormat.MARKDOWN,
-        extract_images=False,
-        ocr_images=False,
-        recursive=True,
-        ocr_provider='openai',
-        api_key=None,
-        ocr_cache=None,
-        show_progress=True,
-        save_files=True,
-        **kwargs
-):
+        input_dir: Union[str, Path],
+        output_dir: Optional[Union[str, Path]] = None,
+        output_format: Union[str, OutputFormat] = OutputFormat.MARKDOWN,
+        extract_images: bool = False,
+        ocr_images: bool = False,
+        recursive: bool = True,
+        ocr_provider: Union[str, OCRProvider] = 'openai',
+        api_key: Optional[str] = None,
+        ocr_cache: Optional[OCRCache] = None,
+        show_progress: bool = True,
+        save_files: bool = True,
+        **kwargs: Any
+) -> Dict[str, Dict[str, Any]]:
     """
     Advanced batch processing with full configuration options.
     
@@ -302,18 +306,18 @@ def batch_process_documents(
 
 
 def batch_process_files(
-        file_paths,
-        output_dir=None,
-        output_format=OutputFormat.MARKDOWN,
-        extract_images=False,
-        ocr_images=False,
-        ocr_provider='openai',
-        api_key=None,
-        ocr_cache=None,
-        show_progress=True,
-        save_files=True,
-        **kwargs
-):
+        file_paths: List[Union[str, Path]],
+        output_dir: Optional[Union[str, Path]] = None,
+        output_format: Union[str, OutputFormat] = OutputFormat.MARKDOWN,
+        extract_images: bool = False,
+        ocr_images: bool = False,
+        ocr_provider: Union[str, OCRProvider] = 'openai',
+        api_key: Optional[str] = None,
+        ocr_cache: Optional[OCRCache] = None,
+        show_progress: bool = True,
+        save_files: bool = True,
+        **kwargs: Any
+) -> Dict[str, Dict[str, Any]]:
     """
     Batch process a specific list of files.
     

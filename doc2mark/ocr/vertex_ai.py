@@ -74,6 +74,8 @@ class VertexAIVisionAgent:
         temperature: float = 0,
         max_tokens: int = 4096,
         max_concurrency: Optional[int] = None,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
     ):
         self.project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location
@@ -81,6 +83,8 @@ class VertexAIVisionAgent:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_concurrency = max_concurrency
+        self.timeout = timeout
+        self.max_retries = max_retries
 
         if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
             logger.warning("langchain-google-genai not available")
@@ -98,6 +102,12 @@ class VertexAIVisionAgent:
             }
             if self.project:
                 llm_kwargs["project"] = self.project
+
+            # Forward resilience knobs when explicitly set
+            if self.timeout is not None:
+                llm_kwargs["timeout"] = self.timeout
+            if self.max_retries is not None:
+                llm_kwargs["max_retries"] = self.max_retries
 
             self._llm = ChatGoogleGenerativeAI(**llm_kwargs)
             self._chain = RunnableLambda(_prepare_prompt) | self._llm
@@ -173,6 +183,8 @@ class VertexAIOCR(BaseOCR):
         max_tokens: int = 4096,
         default_prompt: Optional[str] = None,
         prompt_template: Optional[Union[str, PromptTemplate]] = None,
+        timeout: int = 30,
+        max_retries: int = 3,
         **kwargs,
     ):
         """Initialize Vertex AI OCR provider.
@@ -187,6 +199,8 @@ class VertexAIOCR(BaseOCR):
             max_tokens: Maximum tokens in response
             default_prompt: Custom default prompt to use
             prompt_template: Template name from PROMPTS dict
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retries for failed requests
             **kwargs: Additional model parameters
         """
         super().__init__(api_key, config)
@@ -196,6 +210,8 @@ class VertexAIOCR(BaseOCR):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.model_kwargs = kwargs
 
         self.config = config or OCRConfig()
@@ -218,7 +234,8 @@ class VertexAIOCR(BaseOCR):
         else:
             self.default_prompt = DEFAULT_OCR_PROMPT
 
-        # Initialize vision agent
+        # Initialize vision agent lazily so non-OCR processing can still run
+        # without Vertex AI extras or credentials.
         self._vision_agent = None
 
         logger.info(f"Initializing Vertex AI OCR:")
@@ -227,10 +244,21 @@ class VertexAIOCR(BaseOCR):
         logger.info(f"   - Location: {self.location}")
         logger.info(f"   - Prompt template: {self.prompt_template.value}")
 
+        logger.info("Vertex AI VisionAgent will initialize on first OCR request")
+
+    def validate_api_key(self) -> bool:
+        """Vertex AI uses Google Cloud ADC, not an API key."""
+        return LANGCHAIN_GOOGLE_GENAI_AVAILABLE
+
+    def _ensure_vision_agent(self) -> VertexAIVisionAgent:
+        """Initialize the Vertex AI vision agent only when OCR is requested."""
+        if self._vision_agent:
+            return self._vision_agent
+
         if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
             raise ImportError(
                 "langchain-google-genai is required for Vertex AI OCR. "
-                "Install it with: pip install langchain-google-genai"
+                "Install it with: pip install doc2mark[vertex_ai]"
             )
 
         try:
@@ -243,17 +271,13 @@ class VertexAIOCR(BaseOCR):
                 max_concurrency=resolve_max_concurrency(
                     self.config.max_concurrency if self.config else None
                 ),
+                timeout=self.timeout,
+                max_retries=self.max_retries,
             )
         except Exception as e:
             logger.error(f"Failed to initialize Vertex AI VisionAgent: {e}")
-            raise RuntimeError(f"Failed to initialize Vertex AI VisionAgent: {str(e)}")
-
-    def validate_api_key(self) -> bool:
-        """Vertex AI uses Google Cloud ADC, not an API key."""
-        if self._vision_agent:
-            logger.info("Vertex AI configured via Application Default Credentials")
-            return True
-        return False
+            raise RuntimeError(f"Failed to initialize Vertex AI VisionAgent: {str(e)}") from e
+        return self._vision_agent
 
     def get_available_prompts(self) -> Dict[str, str]:
         """Get available prompt templates."""
@@ -316,8 +340,7 @@ class VertexAIOCR(BaseOCR):
         if total_images == 0:
             return []
 
-        if not self._vision_agent:
-            raise RuntimeError("Vertex AI VisionAgent is required but not initialized")
+        self._ensure_vision_agent()
 
         return self._batch_process_with_vision_agent(images, **kwargs)
 
@@ -381,7 +404,7 @@ class VertexAIOCR(BaseOCR):
 
         except Exception as e:
             logger.error(f"Vertex AI batch processing failed: {e}")
-            raise OCRError(f"Failed to process images with Vertex AI: {str(e)}")
+            raise OCRError(f"Failed to process images with Vertex AI: {str(e)}") from e
 
     def get_configuration_summary(self) -> Dict:
         """Get current configuration summary."""

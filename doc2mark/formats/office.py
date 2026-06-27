@@ -157,7 +157,7 @@ class OfficeProcessor(BaseProcessor):
         try:
             # Configure options
             extract_images = kwargs.get('extract_images', False)
-            ocr_images = extract_images and self.ocr is not None
+            ocr_images = kwargs.get('ocr_images', False) and extract_images and self.ocr is not None
 
             # Use the advanced pipeline
             json_data = UniversalOfficeLoader.load(

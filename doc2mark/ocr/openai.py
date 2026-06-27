@@ -132,16 +132,20 @@ class VisionAgent:
             temperature: float = 0,
             max_tokens: int = 4096,
             base_url: Optional[str] = None,
-            max_concurrency: Optional[int] = None
+            max_concurrency: Optional[int] = None,
+            timeout: Optional[int] = None,
+            max_retries: Optional[int] = None,
     ):
         """Initialize the vision agent.
-        
+
         Args:
             api_key: OpenAI API key
             model: Model to use for OCR (default: gpt-4.1)
             temperature: Temperature for response generation
             max_tokens: Maximum tokens in response
             base_url: Optional base URL for OpenAI-compatible API endpoints
+            timeout: Request timeout in seconds (forwarded to ChatOpenAI)
+            max_retries: Maximum number of retries for failed requests
         """
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY')
         self.model = model
@@ -149,6 +153,8 @@ class VisionAgent:
         self.max_tokens = max_tokens
         self.base_url = base_url or os.environ.get('OPENAI_BASE_URL')
         self.max_concurrency = max_concurrency
+        self.timeout = timeout
+        self.max_retries = max_retries
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")
@@ -164,13 +170,19 @@ class VisionAgent:
                 "model": model,
                 "api_key": self.api_key,
                 "temperature": temperature,
-                "max_tokens": max_tokens
+                "max_tokens": max_tokens,
             }
-            
+
+            # Forward resilience knobs when explicitly set
+            if self.timeout is not None:
+                llm_kwargs["timeout"] = self.timeout
+            if self.max_retries is not None:
+                llm_kwargs["max_retries"] = self.max_retries
+
             # Add base_url if provided
             if self.base_url:
                 llm_kwargs["base_url"] = self.base_url
-            
+
             self._llm = ChatOpenAI(**llm_kwargs)
             self._chain = RunnableLambda(prepare_prompt) | self._llm
 
@@ -292,8 +304,6 @@ class OpenAIOCR(BaseOCR):
         else:
             self.default_prompt = DEFAULT_OCR_PROMPT
 
-        # Initialize clients
-        self._client = None
         self._vision_agent = None
 
         logger.info(f"🤖 Initializing OpenAI OCR with comprehensive configuration:")
@@ -305,45 +315,13 @@ class OpenAIOCR(BaseOCR):
         logger.info(f"   - LangChain enabled: True (required)")
 
         if not api_key:
-            logger.warning("⚠️  No OpenAI API key provided - OCR will fail unless key is set later")
+            logger.debug("No OpenAI API key configured; OCR calls will fail unless a key is set later")
         else:
-            logger.debug(f"✓ OpenAI API key configured (length: {len(api_key)} chars)")
+            logger.debug("OpenAI API key configured")
 
-        # Initialize VisionAgent for efficient batch processing
-        if not LANGCHAIN_AVAILABLE:
-            logger.error("❌ LangChain is required but not available")
-            raise ImportError(
-                "LangChain is required for OpenAI OCR. "
-                "Install it with: pip install langchain langchain-openai"
-            )
-
-        logger.info("🔗 Initializing LangChain VisionAgent for batch processing")
-        if self.base_url:
-            logger.info(f"🌐 Using custom base URL: {self.base_url}")
-        try:
-            self._vision_agent = VisionAgent(
-                api_key=api_key,
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                base_url=self.base_url,
-                max_concurrency=resolve_max_concurrency(
-                    self.config.max_concurrency if self.config else None
-                )
-            )
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize VisionAgent: {e}")
-            raise RuntimeError(f"Failed to initialize LangChain VisionAgent: {str(e)}")
-
-    @property
-    def client(self):
-        """Lazy load OpenAI client."""
-        if self._client is None:
-            logger.debug("🔌 Loading OpenAI client...")
-            # OpenAI client is no longer needed as we use LangChain
-            logger.warning("⚠️  Direct OpenAI client is deprecated - use LangChain instead")
-            self._client = None
-        return self._client
+        # Initialize VisionAgent lazily. This keeps text-only processing usable
+        # without OCR extras or OPENAI_API_KEY.
+        logger.info("🔗 LangChain VisionAgent will initialize on first OCR request")
 
     def validate_api_key(self) -> bool:
         """Validate OpenAI API key."""
@@ -352,13 +330,46 @@ class OpenAIOCR(BaseOCR):
             return False
 
         logger.info("🔐 Validating OpenAI API key...")
-        # We validate through LangChain instead
+        return True
+
+    def _ensure_vision_agent(self) -> VisionAgent:
+        """Initialize the LangChain vision agent only when OCR is requested."""
         if self._vision_agent:
-            logger.info("✓ API key configured for LangChain")
-            return True
-        else:
-            logger.error("❌ VisionAgent not initialized")
-            return False
+            return self._vision_agent
+
+        if not LANGCHAIN_AVAILABLE:
+            logger.error("❌ LangChain is required but not available")
+            raise ImportError(
+                "LangChain is required for OpenAI OCR. "
+                "Install it with: pip install doc2mark[ocr]"
+            )
+
+        if not self.api_key:
+            raise RuntimeError(
+                "OpenAI OCR requires an API key. Set OPENAI_API_KEY, pass api_key, "
+                "or disable OCR with ocr_provider=None / --ocr none."
+            )
+
+        logger.info("🔗 Initializing LangChain VisionAgent for batch processing")
+        if self.base_url:
+            logger.info(f"🌐 Using custom base URL: {self.base_url}")
+        try:
+            self._vision_agent = VisionAgent(
+                api_key=self.api_key,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                base_url=self.base_url,
+                max_concurrency=resolve_max_concurrency(
+                    self.config.max_concurrency if self.config else None
+                ),
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize VisionAgent: {e}")
+            raise RuntimeError(f"Failed to initialize LangChain VisionAgent: {str(e)}") from e
+        return self._vision_agent
 
     def get_available_prompts(self) -> Dict[str, str]:
         """Get available prompt templates.
@@ -424,24 +435,8 @@ class OpenAIOCR(BaseOCR):
             self.model_kwargs.update(kwargs)
             logger.info(f"⚙️ Updated model kwargs: {list(kwargs.keys())}")
 
-        # Reinitialize vision agent
-        logger.info("🔄 Reinitializing VisionAgent with new configuration...")
-        if self.base_url:
-            logger.info(f"🌐 Using custom base URL: {self.base_url}")
-        try:
-            self._vision_agent = VisionAgent(
-                api_key=self.api_key,
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                base_url=self.base_url,
-                max_concurrency=resolve_max_concurrency(
-                    self.config.max_concurrency if self.config else None
-                )
-            )
-        except Exception as e:
-            logger.error(f"❌ Failed to reinitialize VisionAgent: {e}")
-            raise RuntimeError(f"Failed to reinitialize LangChain VisionAgent: {str(e)}")
+        self._vision_agent = None
+        logger.info("VisionAgent configuration updated; it will reinitialize on the next OCR request")
 
     def _save_image_locally(self, image_data: bytes, **kwargs) -> OCRResult:
         """Save image locally and return file:// URL.
@@ -503,7 +498,7 @@ class OpenAIOCR(BaseOCR):
             logger.error(f"❌ Failed to save image locally: {e}")
             logger.error(f"   Target directory: {kwargs.get('local_image_dir', './images')}")
             logger.error(f"   Image size: {image_size} bytes")
-            raise OCRError(f"Failed to save image locally: {str(e)}")
+            raise OCRError(f"Failed to save image locally: {str(e)}") from e
 
     def _build_prompt(self, **kwargs) -> str:
         """Build prompt for GPT-4V based on configuration and kwargs.
@@ -582,10 +577,7 @@ class OpenAIOCR(BaseOCR):
             logger.info("💾 Saving images locally instead of performing OCR")
             return self._batch_save_images_locally(images, **kwargs)
 
-        # Always use VisionAgent with LangChain
-        if not self._vision_agent:
-            logger.error("❌ VisionAgent not initialized - cannot process images")
-            raise RuntimeError("LangChain VisionAgent is required but not initialized")
+        self._ensure_vision_agent()
 
         logger.info("🔗 Using LangChain VisionAgent for batch processing")
         return self._batch_process_with_vision_agent(images, **kwargs)
@@ -643,7 +635,7 @@ class OpenAIOCR(BaseOCR):
 
         except Exception as e:
             logger.error(f"❌ VisionAgent batch processing failed: {e}")
-            raise OCRError(f"Failed to process images with LangChain: {str(e)}")
+            raise OCRError(f"Failed to process images with LangChain: {str(e)}") from e
 
     def _batch_save_images_locally(self, images: List[bytes], **kwargs) -> List[OCRResult]:
         """Batch save images locally."""

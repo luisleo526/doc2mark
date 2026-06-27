@@ -1,5 +1,7 @@
 """Main UnifiedDocumentLoader implementation."""
 
+import base64
+import hashlib
 import json
 import logging
 import time
@@ -8,6 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
+    DocumentMetadata,
     DocumentFormat,
     OutputFormat,
     ProcessedDocument,
@@ -26,7 +29,7 @@ class UnifiedDocumentLoader:
 
     def __init__(
             self,
-            ocr_provider: Union[str, OCRProvider, BaseOCR] = 'openai',
+            ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]] = 'openai',
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             cache_dir: Optional[str] = None,
@@ -66,7 +69,9 @@ class UnifiedDocumentLoader:
             temperature: Temperature for response generation (0.0-2.0)
             max_tokens: Maximum tokens in response (1-4096)
             max_workers: Maximum concurrent workers for batch processing
-            prompt_template: Template name ('default', 'table_focused', 'document_focused', 'multilingual')
+            prompt_template: Template name (see PromptTemplate enum for the full list, e.g.
+                'default', 'table_focused', 'document_focused', 'multilingual',
+                'form_focused', 'receipt_focused', 'handwriting_focused', 'code_focused')
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
 
@@ -138,12 +143,14 @@ class UnifiedDocumentLoader:
         return False
 
     @staticmethod
-    def _unwrap_ocr(ocr: BaseOCR) -> BaseOCR:
+    def _unwrap_ocr(ocr: Optional[BaseOCR]) -> Optional[BaseOCR]:
+        if ocr is None:
+            return None
         return ocr.wrapped if isinstance(ocr, CachedOCR) else ocr
 
     def _create_ocr_provider(
             self,
-            ocr_provider: Union[str, OCRProvider, BaseOCR],
+            ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]],
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             model: str = "gpt-4.1",
@@ -161,8 +168,12 @@ class UnifiedDocumentLoader:
             location: str = "global",
             default_prompt: Optional[str] = None,
             model_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> BaseOCR:
+    ) -> Optional[BaseOCR]:
         """Create an OCR provider using the same enhanced path everywhere."""
+        if ocr_provider is None or (isinstance(ocr_provider, str) and ocr_provider.lower() in {"none", "disabled"}):
+            logger.info("OCR provider disabled")
+            return None
+
         if isinstance(ocr_provider, BaseOCR):
             logger.info(f"✓ Using provided OCR instance: {type(ocr_provider).__name__}")
             return ocr_provider
@@ -232,6 +243,12 @@ class UnifiedDocumentLoader:
 
     def _apply_ocr_cache(self, ocr_cache: Optional[OCRCache] = None):
         """Apply an explicit cache, preserve embedded cache, or reuse loader cache."""
+        if self.ocr is None:
+            if ocr_cache is not None:
+                self.ocr_cache = ocr_cache
+                logger.info(f"OCR cache configured for later use: {type(self.ocr_cache).__name__}")
+            return
+
         if ocr_cache is not None:
             self.ocr_cache = ocr_cache
             if isinstance(self.ocr, CachedOCR):
@@ -253,6 +270,23 @@ class UnifiedDocumentLoader:
     def _current_ocr_constructor_options(self) -> Dict[str, Any]:
         """Read current provider settings so set_ocr_provider does not downgrade OCR config."""
         current = self._unwrap_ocr(self.ocr)
+        if current is None:
+            return {
+                "api_key": None,
+                "ocr_config": None,
+                "model": "gpt-4.1",
+                "temperature": 0,
+                "max_tokens": 4096,
+                "max_workers": 5,
+                "prompt_template": PromptTemplate.DEFAULT,
+                "timeout": 30,
+                "max_retries": 3,
+                "base_url": None,
+                "project": None,
+                "location": "global",
+                "default_prompt": None,
+                "model_kwargs": {},
+            }
         return {
             "api_key": getattr(current, "api_key", None),
             "ocr_config": getattr(current, "config", None),
@@ -341,7 +375,20 @@ class UnifiedDocumentLoader:
 
         except ImportError as e:
             logger.error(f"Failed to import required processors: {e}")
-            raise ImportError(f"Required format processors not available: {str(e)}")
+            raise ImportError(f"Required format processors not available: {str(e)}") from e
+
+    @staticmethod
+    def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
+        """Normalize string output format names to OutputFormat enum values."""
+        if isinstance(output_format, OutputFormat):
+            return output_format
+        if isinstance(output_format, str):
+            try:
+                return OutputFormat(output_format.lower())
+            except ValueError as e:
+                valid = ", ".join(fmt.value for fmt in OutputFormat)
+                raise ValueError(f"Unsupported output format: {output_format}. Expected one of: {valid}") from e
+        raise TypeError(f"Unsupported output format type: {type(output_format).__name__}")
 
     def load(
             self,
@@ -383,6 +430,7 @@ class UnifiedDocumentLoader:
             update_ocr_configuration() method.
         """
         file_path = Path(file_path)
+        output_format = self._normalize_output_format(output_format)
 
         # Validate file exists
         if not file_path.exists():
@@ -397,10 +445,21 @@ class UnifiedDocumentLoader:
 
         # Check cache
         if self.cache_dir:
-            cached = self._get_cached(file_path, output_format)
+            cache_options = {
+                "output_format": output_format.value,
+                "extract_images": extract_images,
+                "ocr_images": ocr_images,
+                "encoding": encoding,
+                "delimiter": delimiter,
+                "table_style": self.table_style,
+                "ocr_provider": type(self._unwrap_ocr(self.ocr)).__name__ if self.ocr else None,
+            }
+            cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
                 return cached
+        else:
+            cache_options = {}
 
         # Process document
         processor = self._processors[doc_format]
@@ -427,7 +486,7 @@ class UnifiedDocumentLoader:
                 # Map common parameters
                 if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
                     processor_kwargs['extract_images'] = extract_images
-                    # Note: These processors don't support all parameters
+                    processor_kwargs['ocr_images'] = ocr_images
                 elif processor.__class__.__name__ == 'PDFProcessor':
                     processor_kwargs['extract_images'] = extract_images
                     processor_kwargs['use_ocr'] = ocr_images
@@ -450,31 +509,23 @@ class UnifiedDocumentLoader:
                     # Convert content to requested format
                     if output_format == OutputFormat.JSON:
                         # Create JSON structure
-                        json_data = {
-                            "filename": result.metadata.filename,
-                            "format": result.metadata.format.value,
-                            "content": [{"type": "text:normal", "content": result.content}],
-                            "metadata": {
-                                "size_bytes": result.metadata.size_bytes,
-                                "page_count": result.metadata.page_count,
-                                "word_count": result.metadata.word_count
-                            }
-                        }
+                        json_data = result.to_dict()
                         result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
-                        result.json_content = json_data.get('content', [])
+                        if result.json_content is None:
+                            result.json_content = [{"type": "text:normal", "content": json_data.get("content", "")}]
                     elif output_format == OutputFormat.TEXT:
                         # Convert to plain text
                         result.content = result.text
 
             # Cache result
             if self.cache_dir:
-                self._cache_result(file_path, output_format, result)
+                self._cache_result(file_path, output_format, result, cache_options)
 
             return result
 
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
-            raise ProcessingError(f"Processing failed: {str(e)}")
+            raise ProcessingError(f"Processing failed: {str(e)}") from e
 
     def load_directory(
             self,
@@ -497,6 +548,7 @@ class UnifiedDocumentLoader:
             List of processed documents
         """
         directory = Path(directory)
+        output_format = self._normalize_output_format(output_format)
         if not directory.is_dir():
             raise ValueError(f"Not a directory: {directory}")
 
@@ -563,6 +615,7 @@ class UnifiedDocumentLoader:
         """
         input_dir = Path(input_dir)
         output_dir = Path(output_dir) if output_dir else input_dir
+        output_format = self._normalize_output_format(output_format)
 
         if not input_dir.exists():
             raise FileNotFoundError(f"Directory not found: {input_dir}")
@@ -722,6 +775,7 @@ class UnifiedDocumentLoader:
             return {}
 
         file_paths = [Path(p) for p in file_paths]
+        output_format = self._normalize_output_format(output_format)
         total_files = len(file_paths)
         results = {}
         processed_count = 0
@@ -822,9 +876,8 @@ class UnifiedDocumentLoader:
         elif output_format == OutputFormat.JSON:
             # Save JSON
             json_path = output_path.with_suffix('.json')
-            import json
             with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result.json_content, f, ensure_ascii=False, indent=2)
+                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
             output_files.append(str(json_path))
 
         # Save images if extracted
@@ -905,7 +958,8 @@ class UnifiedDocumentLoader:
     def _get_cached(
             self,
             file_path: Path,
-            output_format: OutputFormat
+            output_format: OutputFormat,
+            options: Optional[Dict[str, Any]] = None
     ) -> Optional[ProcessedDocument]:
         """Get cached result if available.
         
@@ -916,15 +970,27 @@ class UnifiedDocumentLoader:
         Returns:
             Cached document or None
         """
-        # Implementation depends on caching strategy
-        # This is a placeholder
-        return None
+        if not self.cache_dir:
+            return None
+
+        cache_file = self._cache_file_path(file_path, output_format, options or {})
+        if not cache_file.exists():
+            return None
+
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return self._document_from_cache_dict(payload["document"])
+        except Exception as e:
+            logger.warning(f"Failed to read cache for {file_path}: {e}")
+            return None
 
     def _cache_result(
             self,
             file_path: Path,
             output_format: OutputFormat,
-            result: ProcessedDocument
+            result: ProcessedDocument,
+            options: Optional[Dict[str, Any]] = None
     ):
         """Cache processing result.
         
@@ -933,9 +999,89 @@ class UnifiedDocumentLoader:
             output_format: Output format
             result: Processing result
         """
-        # Implementation depends on caching strategy
-        # This is a placeholder
-        pass
+        if not self.cache_dir:
+            return
+
+        cache_file = self._cache_file_path(file_path, output_format, options or {})
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "doc2mark-document-cache-v1",
+            "source": str(file_path.resolve()),
+            "output_format": output_format.value,
+            "document": self._document_to_cache_dict(result),
+        }
+        tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            tmp_file.replace(cache_file)
+        except Exception as e:
+            logger.warning(f"Failed to write cache for {file_path}: {e}")
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cache_file_path(self, file_path: Path, output_format: OutputFormat, options: Dict[str, Any]) -> Path:
+        stat = file_path.stat()
+        key_payload = {
+            "path": str(file_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "output_format": output_format.value,
+            "options": self._json_cache_safe(options),
+        }
+        cache_key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{cache_key}.json"
+
+    @classmethod
+    def _json_cache_safe(cls, value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"__bytes__": base64.b64encode(value).decode("ascii")}
+        if isinstance(value, (DocumentFormat, OutputFormat, OCRProvider, PromptTemplate)):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): cls._json_cache_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_cache_safe(item) for item in value]
+        return value
+
+    @classmethod
+    def _restore_cache_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            if set(value.keys()) == {"__bytes__"}:
+                return base64.b64decode(value["__bytes__"].encode("ascii"))
+            return {key: cls._restore_cache_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._restore_cache_value(item) for item in value]
+        return value
+
+    @classmethod
+    def _document_to_cache_dict(cls, result: ProcessedDocument) -> Dict[str, Any]:
+        return {
+            "content": result.content,
+            "metadata": cls._json_cache_safe(result.metadata.__dict__),
+            "images": cls._json_cache_safe(result.images),
+            "tables": cls._json_cache_safe(result.tables),
+            "sections": cls._json_cache_safe(result.sections),
+            "json_content": cls._json_cache_safe(result.json_content),
+        }
+
+    @classmethod
+    def _document_from_cache_dict(cls, payload: Dict[str, Any]) -> ProcessedDocument:
+        metadata_dict = cls._restore_cache_value(payload["metadata"])
+        metadata_dict["format"] = DocumentFormat(metadata_dict["format"])
+        metadata = DocumentMetadata(**metadata_dict)
+        return ProcessedDocument(
+            content=payload["content"],
+            metadata=metadata,
+            images=cls._restore_cache_value(payload.get("images")),
+            tables=cls._restore_cache_value(payload.get("tables")),
+            sections=cls._restore_cache_value(payload.get("sections")),
+            json_content=cls._restore_cache_value(payload.get("json_content")),
+        )
 
     @property
     def supported_formats(self) -> List[str]:
@@ -952,11 +1098,13 @@ class UnifiedDocumentLoader:
         Returns:
             True if OCR is properly configured
         """
+        if self.ocr is None:
+            return False
         return self.ocr.validate_api_key()
 
     def set_ocr_provider(
             self,
-            provider: Union[str, OCRProvider, BaseOCR],
+            provider: Optional[Union[str, OCRProvider, BaseOCR]],
             api_key: Optional[str] = None,
             config: Optional[OCRConfig] = None,
             ocr_cache: Optional[OCRCache] = None
@@ -975,7 +1123,9 @@ class UnifiedDocumentLoader:
         if config is not None:
             preserved_options["ocr_config"] = config
 
-        if isinstance(provider, BaseOCR):
+        if provider is None or (isinstance(provider, str) and provider.lower() in {"none", "disabled"}):
+            self.ocr = None
+        elif isinstance(provider, BaseOCR):
             self.ocr = provider
         else:
             self.ocr = self._create_ocr_provider(
@@ -996,6 +1146,13 @@ class UnifiedDocumentLoader:
         Returns:
             Dictionary with OCR configuration details
         """
+        if self.ocr is None:
+            return {
+                "provider": None,
+                "enabled": False,
+                "api_key_configured": False,
+                "config": None,
+            }
         if hasattr(self.ocr, 'get_configuration_summary'):
             return self.ocr.get_configuration_summary()
         else:
@@ -1022,6 +1179,10 @@ class UnifiedDocumentLoader:
             - max_retries: int
         """
         logger.info("🔧 Updating OCR configuration...")
+
+        if self.ocr is None:
+            logger.warning("OCR provider is disabled; no configuration was updated")
+            return
 
         if hasattr(self.ocr, 'update_model_config'):
             # Extract model configuration parameters
@@ -1064,6 +1225,8 @@ class UnifiedDocumentLoader:
         Returns:
             Dictionary of template names and descriptions
         """
+        if self.ocr is None:
+            return {}
         if hasattr(self.ocr, 'get_available_prompts'):
             return self.ocr.get_available_prompts()
         else:
@@ -1076,6 +1239,17 @@ class UnifiedDocumentLoader:
             Dictionary with validation results
         """
         logger.info("🔐 Validating OCR setup...")
+
+        if self.ocr is None:
+            return {
+                "provider": None,
+                "enabled": False,
+                "api_key_configured": False,
+                "api_key_valid": False,
+                "configuration": self.get_ocr_configuration(),
+                "available_templates": {},
+                "errors": [],
+            }
 
         validation_results = {
             "provider": type(self.ocr).__name__,
