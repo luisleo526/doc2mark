@@ -579,39 +579,46 @@ class PDFLoader:
 
     def _process_page(self, page_num: int, extract_images: bool = True, ocr_images: bool = False,
                       ocr_results_map: Dict[tuple, str] = None) -> List[Dict[str, Any]]:
-        """Process a single page and extract content in reading order"""
+        """Process a single page, routed by the high-level OCR strategy.
+
+        The page's image-occupancy ratio (decided in _collect_all_images via
+        _is_image_dominant_page) selects the strategy:
+
+        - IMAGE-authoritative (a whole-page render exists): emit ONLY the OCR
+          transcription. The sparse text layer on such a page is chrome
+          (logo / footer / page number) that the whole-page OCR already
+          captures, so emitting the text layer too would just duplicate it and
+          add junk header/footer mini-tables.
+        - TEXT-authoritative: emit the deterministic text/table layer (preserved
+          verbatim for the BM42 RAG flow) plus per-image OCR for embedded figures.
+        """
         page = self.doc.load_page(page_num)
 
-        content_items = []
+        # --- IMAGE-authoritative strategy: the whole-page OCR IS the content. ---
+        if (ocr_images and ocr_results_map is not None
+                and (page_num, _PAGE_RENDER_XREF) in ocr_results_map):
+            render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
+            if not render_text:
+                return []
+            return [{
+                "type": "text:image_description",
+                "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
+                "page": page_num + 1,
+                "position_y": 0.0,
+            }]
 
-        # 1. RULE-BASED layer — authoritative, emitted verbatim (BM42 invariant).
-        # Extract tables first (to avoid duplicating their text in text blocks)
+        # --- TEXT-authoritative strategy: rule-based text/tables + per-image OCR. ---
+        content_items = []
         table_items, table_bboxes = self._extract_tables_as_markdown(page, page_num)
         content_items.extend(table_items)
-
-        # Extract text blocks (excluding areas covered by tables)
         text_items = self._extract_text_as_markdown(page, page_num, table_bboxes)
         content_items.extend(text_items)
+        if extract_images:
+            content_items.extend(self._extract_images_simple(
+                page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map))
 
-        # Did THIS page produce a whole-page render? (image-dominant path in
-        # _collect_all_images). On rendered pages there are no per-(page,xref)
-        # results, so calling _extract_images_simple would hit the missing-key
-        # fallback and dump raw base64 — skip per-image extraction entirely.
-        page_was_rendered = bool(
-            ocr_images and ocr_results_map is not None
-            and (page_num, _PAGE_RENDER_XREF) in ocr_results_map
-        )
-
-        # 2. Per-image augments ONLY when the page was NOT whole-rendered.
-        if extract_images and not page_was_rendered:
-            image_items = self._extract_images_simple(page, page_num, ocr_images=ocr_images,
-                                                      ocr_results_map=ocr_results_map)
-            content_items.extend(image_items)
-
-        # Sort by vertical position to maintain reading order
         content_items.sort(key=lambda x: x.position_y)
 
-        # Convert to simple format
         simple_content = []
         for item in content_items:
             if item.type.startswith("text:"):
@@ -638,19 +645,6 @@ class PDFLoader:
                 if item.mime_type:
                     entry["mime_type"] = item.mime_type
                 simple_content.append(entry)
-
-        # 3. AUGMENT: append the whole-page OCR transcription AFTER the rule-based
-        #    content, never replacing it. Use a large FINITE sentinel position (NOT
-        #    inf -> invalid JSON) so it sorts last within the page.
-        if page_was_rendered:
-            render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
-            if render_text:
-                simple_content.append({
-                    "type": "text:image_description",
-                    "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
-                    "page": page_num + 1,
-                    "position_y": float(page.rect.height) + 1.0e6,
-                })
 
         return simple_content
 

@@ -522,15 +522,17 @@ class TestPipelineAlignment:
 #         no raw base64 image, finite position_y
 # ===================================================================
 
-class TestInvariant1Preservation:
-    """Design section 9.8: rule-based text preserved, OCR augments, valid JSON."""
+class TestImageDominantStrategy:
+    """Image-occupancy strategy route: an image-dominant page is OCR-authoritative
+    (its sparse text layer is chrome the OCR already captures, so it is NOT
+    duplicated). Text-bearing pages keep the rule-based layer (BM42) — tested
+    elsewhere."""
 
-    def test_scanned_page_output_shape(self, tmp_path):
-        """An image-dominant page with a text layer must:
-        - contain verbatim rule-based text blocks
-        - contain a trailing <image_ocr_result> block
-        - contain NO type:'image' raw-base64 entry
-        - have every position_y finite and JSON-serializable
+    def test_image_dominant_page_is_ocr_only(self, tmp_path):
+        """An image-dominant page emits ONLY the OCR transcription:
+        - a single <image_ocr_result> block (no duplicated chrome text layer)
+        - NO type:'image' raw-base64 entry
+        - every position_y finite and JSON-serializable
         """
         from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
 
@@ -543,41 +545,21 @@ class TestInvariant1Preservation:
             extract_images=True, ocr_images=True, show_progress=False,
         )
         content = result["content"]
-        assert len(content) > 0, "content must not be empty"
-
         types = [c["type"] for c in content]
 
-        # Rule-based text should still be present (the text layer was not replaced).
-        has_rule_text = any(
-            t.startswith("text:") and t != "text:image_description" for t in types
-        )
-        # The page has "RuleText-0" inserted, so we expect at least one rule-based
-        # text block.  After the design change, the early-return is removed and
-        # rule-based extractors always run.
-        assert has_rule_text, "rule-based text blocks must be preserved"
-
-        # OCR augment should be present.
-        has_ocr = any(t == "text:image_description" for t in types)
-        assert has_ocr, "OCR augmentation block (image_ocr_result) must be present"
-
-        # Verify the OCR block contains the wrapper tags.
-        ocr_blocks = [c for c in content if c["type"] == "text:image_description"]
-        for block in ocr_blocks:
-            assert "<image_ocr_result>" in block["content"]
-            assert "</image_ocr_result>" in block["content"]
-
-        # NO raw type:'image' entries (the raw-base64 dump must not appear).
+        # OCR is the authoritative content; no duplicated rule-based text/chrome.
+        assert any(t == "text:image_description" for t in types), "OCR block must be present"
+        assert not any(t.startswith("text:") and t != "text:image_description" for t in types), \
+            "chrome text layer must NOT be duplicated on an image-dominant page"
         assert "image" not in types, "raw base64 image entries must not appear"
 
-        # Every position_y must be finite and JSON-serializable.
-        for item in content:
-            y = item["position_y"]
-            assert math.isfinite(y), f"position_y must be finite, got {y}"
+        ocr_blocks = [c for c in content if c["type"] == "text:image_description"]
+        assert ocr_blocks and all("<image_ocr_result>" in b["content"] for b in ocr_blocks)
 
-        # Round-trip through JSON to confirm serializability.
+        for item in content:
+            assert math.isfinite(item["position_y"]), f"position_y must be finite, got {item['position_y']}"
         serialized = json.dumps(content)
-        assert "Infinity" not in serialized
-        assert "NaN" not in serialized
+        assert "Infinity" not in serialized and "NaN" not in serialized
 
 
 # ===================================================================

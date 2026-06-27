@@ -148,7 +148,10 @@ def _item_to_markdown(item: Dict[str, Any], config: ChunkingConfig) -> str:
     if t == "image":
         return f"![Image](data:image/png;base64,{c})"
     if t == "text:image_description":
-        return f"```\n<ocr_result>\n{c}\n</ocr_result>\n```"
+        # OCR'd-image text: strip the internal <image_ocr_result> provenance wrapper
+        # and emit clean text — no code-fence / <ocr_result> noise — so the export
+        # is readable and RAG-clean.
+        return c.replace("<image_ocr_result>", "").replace("</image_ocr_result>", "").strip()
     # Skip header/footer items (deduped content)
     if t in ("text:header", "text:footer"):
         return ""

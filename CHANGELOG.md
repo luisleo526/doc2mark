@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the structured output controls instead.
 
 ### Fixed
+- **Cleaner OCR export for image-heavy PDFs (no duplication, no marker noise).**
+  Image-dominant pages are now *OCR-authoritative* — the whole-page OCR is the
+  content, routed by the page's image-occupancy ratio. The sparse text-layer
+  chrome (logo / footer / page numbers) is no longer emitted alongside it (it
+  duplicated the OCR 2-3× and produced junk header/footer mini-tables).
+  Text-bearing pages still keep the deterministic text/table layer (BM42). The
+  internal ``<ocr_result>`` code-fence wrapper around OCR'd image text was also
+  removed from the Markdown export — OCR text is emitted clean.
 - **Dense structured OCR no longer truncates or aborts the whole batch.** The
   default `max_tokens` was raised 4096 → 8192 (a dense page's structured JSON
   exceeded 4096 tokens, and the resulting truncation error aborted OCR for the
