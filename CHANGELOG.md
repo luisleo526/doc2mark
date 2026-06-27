@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exported as pictures (little/no text layer, images covering the page) are now
   rendered and OCR'd once per page instead of per embedded image — coherent
   per-page content, far fewer API calls, and decorative logos/icons skipped.
+- **Self-routing image OCR (job-router).** The default OCR prompt now classifies
+  each image and applies a type-specific policy instead of blind verbatim
+  transcription: most images are transcribed verbatim; a product UI mockup with
+  illustrative sample data — triple-gated by app chrome + sample-data signature +
+  marketing/module-intro context — describes the demonstrated capabilities and
+  withholds the fake records; charts/diagrams/infographics keep all printed text
+  and describe the trend/structure. New schema: `document_type` widened to 16
+  values, `Interpretation.content_fidelity`, `Table.illustrative`/`row_count`,
+  `KeyValue.illustrative`. A `router_invariants()` firewall guarantees real
+  printed values are never withheld except on a high-confidence `screenshot`
+  (BM42-safe); the free-form fallback path stays verbatim-only. When unsure, the
+  router always transcribes verbatim.
 - **Neighbor-page PDF context for OCR.** When OCR'ing content on PDF page *k*,
   doc2mark can attach a small PDF of pages *{k-1, k, k+1}* as context (Gemini
   inline PDF part) to anchor terminology and language, improving consistency.

@@ -107,6 +107,14 @@ class Table(BaseModel):
     )
     # Rendered markdown fallback for simple (non-merged) tables.
     markdown: str = ""
+    # Provenance: True if these are demo/sample values (a screenshot/mockup region),
+    # not real data. Indexers should down-weight or skip illustrative rows.
+    illustrative: bool = False
+    row_count: Optional[int] = Field(
+        default=None,
+        description="For a header-only illustrative table, the number of sample rows "
+                    "that were intentionally not transcribed.",
+    )
 
     @field_validator("html")
     @classmethod
@@ -120,6 +128,7 @@ class KeyValue(BaseModel):
     """A label/value pair, e.g. for forms and receipts."""
     label: str = ""
     value: str = ""
+    illustrative: bool = False  # True for demo/sample values (screenshot/mockup region)
 
 
 class RawExtraction(BaseModel):
@@ -146,8 +155,9 @@ class RawExtraction(BaseModel):
 class Interpretation(BaseModel):
     """The model's reading of the page. Never mixed into ``raw``."""
     document_type: Literal[
-        "document", "table", "form", "receipt", "handwriting",
-        "code", "chart", "photo", "mixed", "blank", "other",
+        "document", "table", "form", "receipt", "handwriting", "code",
+        "chart", "photo", "screenshot", "diagram", "infographic",
+        "logo", "stamp", "mixed", "blank", "other",
     ] = "other"
     summary: str = Field(
         default="",
@@ -167,6 +177,15 @@ class Interpretation(BaseModel):
         description="The model's own 0..1 confidence estimate.",
     )
     legibility: Literal["high", "medium", "low"] = "high"
+    content_fidelity: Literal["verbatim", "described", "caption", "skipped", "mixed"] = Field(
+        default="verbatim",
+        description=(
+            "Which extraction policy the router applied. 'verbatim' = all printed text "
+            "transcribed; 'described'/'caption' = some printed values intentionally "
+            "withheld (meaning is in this interpretation); 'skipped' = blank. Only a "
+            "'screenshot' document_type may pair 'described' with withheld text."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -215,6 +234,43 @@ def _render_table(table: Table) -> str:
     return "\n".join(lines)
 
 
+def router_invariants(page: "OCRPage") -> List[str]:
+    """Return the router firewall violations for a structured page (empty = OK).
+
+    Protects the BM42 invariant: real printed values are never withheld (marked
+    ``illustrative``) except on a high-confidence ``screenshot`` page. Intended as
+    a CI/eval assertion over recorded structured outputs.
+    """
+    violations: List[str] = []
+    raw = page.raw
+    interp = page.interpretation
+    has_illustrative = (
+        any(t.illustrative for t in raw.tables) or any(f.illustrative for f in raw.fields)
+    )
+    dtype = interp.document_type if interp else None
+    fidelity = interp.content_fidelity if interp else "verbatim"
+
+    # 1. Withheld/illustrative data may appear ONLY on a screenshot.
+    if has_illustrative and dtype != "screenshot":
+        violations.append(
+            f"illustrative content on document_type={dtype!r}; only 'screenshot' may withhold values"
+        )
+    # 2. A withholding screenshot must be high-confidence and legible.
+    if dtype == "screenshot" and has_illustrative and interp is not None:
+        if interp.self_confidence < 0.7 or interp.legibility != "high":
+            violations.append(
+                "screenshot withheld values with self_confidence<0.7 or legibility!='high' "
+                "(should have fallen back to verbatim)"
+            )
+    # 3. described/caption must carry meaning in the interpretation.
+    if fidelity in ("described", "caption") and (interp is None or not interp.summary.strip()):
+        violations.append(f"content_fidelity={fidelity!r} but interpretation.summary is empty")
+    # 4. skipped implies an empty raw layer.
+    if fidelity == "skipped" and (raw.text.strip() or raw.tables or raw.fields):
+        violations.append("content_fidelity='skipped' but raw is not empty")
+    return violations
+
+
 __all__ = [
     "Table",
     "KeyValue",
@@ -222,4 +278,5 @@ __all__ = [
     "Interpretation",
     "OCRPage",
     "sanitize_table_html",
+    "router_invariants",
 ]

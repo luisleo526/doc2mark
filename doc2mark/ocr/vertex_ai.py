@@ -17,6 +17,7 @@ from doc2mark.ocr.base import (
     TASK_PROMPTS,
     resolve_max_concurrency,
     _CONTEXT_PDF_INSTRUCTION,
+    _ROUTER_CONFIDENCE_CLAUSE,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 from doc2mark.utils.image_utils import (
@@ -70,7 +71,10 @@ def _prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
         {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
     ]
     if context_pdf:
-        content.append({"type": "text", "text": _CONTEXT_PDF_INSTRUCTION})
+        content.append({
+            "type": "text",
+            "text": _CONTEXT_PDF_INSTRUCTION + "\n\n" + _ROUTER_CONFIDENCE_CLAUSE,
+        })
         content.append({
             "type": "media",
             "mime_type": "application/pdf",

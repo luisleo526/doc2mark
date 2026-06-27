@@ -66,8 +66,57 @@ _RAW_DISCIPLINE = (
     "view. Put label/value pairs in raw.fields. Never mix commentary into raw.text — "
     "put analysis only in the interpretation fields."
 )
+
+# --- Self-routing AUTO prompt (image job-router) -----------------------------
+# Classify-then-act: most images are transcribed verbatim; only a product UI
+# mockup with illustrative data (triple-gated) may withhold its sample values,
+# and chart/diagram/infographic keep all printed text while describing the
+# trend/structure in interpretation. Embeds _RAW_DISCIPLINE as the VERBATIM body.
+# (Phase 1: photo/logo/stamp/mixed ride VERBATIM; screenshot is the only route
+#  that may withhold printed values.)
+_ROUTER_PREAMBLE = (
+    "First CLASSIFY this image into exactly ONE type, then APPLY that type's policy "
+    "in this same response. Do not write your reasoning; just produce the result.\n\n"
+    "MASTER RULE (overrides everything below): Transcribe EVERY legible printed "
+    "character into raw.text verbatim, in the original language. Only ONE type — "
+    "\"screenshot\" — may omit printed values, and ONLY when ALL THREE hold: "
+    "(a) the image is a product/app/dashboard UI with toolbar/nav/tabs/buttons, AND "
+    "(b) its data is clearly ILLUSTRATIVE (round or sequential names, evenly spaced "
+    "dates, round/repeated amounts, identical repeated %/progress bars, \"Sample\"/\"Demo\"), "
+    "AND (c) the neighbor-context indicates a product, marketing, or feature/module "
+    "introduction. If any one is missing, transcribe verbatim instead. When unsure, "
+    "ALWAYS transcribe verbatim — a dropped real table is unrecoverable.\n\n"
+    "POLICIES:\n"
+    "- VERBATIM (default — document, table, form, receipt, handwriting, code, photo, "
+    "logo, stamp, mixed, other): " + _RAW_DISCIPLINE + "\n"
+    "- SCREENSHOT (only when triple-gated above): write only stable text — module/screen "
+    "name, section/nav/field/column LABELS, buttons, and the capability message. Leave "
+    "raw.tables header-only (column labels + row_count, illustrative=true, no sample "
+    "rows); put what the product DOES in interpretation. Set content_fidelity=\"described\".\n"
+    "- DESCRIBE (chart, diagram, infographic): keep ALL printed text verbatim (titles, "
+    "axis/legend/node/edge labels, printed numbers); never invent or pixel-estimate "
+    "values; put the trend/structure/message in interpretation. content_fidelity=\"described\".\n"
+    "- SKIP (blank): leave raw empty; content_fidelity=\"skipped\".\n\n"
+    "Record the chosen type in interpretation.document_type. A type other than "
+    "\"screenshot\" may NEVER omit printed text. A ruled grid of irregular, varied-precision, "
+    "or internally-consistent (subtotals that sum) numbers is a REAL table → transcribe it "
+    "(table), regardless of any surrounding app chrome. Monospace code/terminal is \"code\" "
+    "→ transcribe, never \"screenshot\"."
+)
+
+# Appended (after _CONTEXT_PDF_INSTRUCTION) by the providers when a neighbor-page
+# PDF context is attached: read neighbors only to judge host-document purpose, and
+# gate every non-verbatim policy behind confidence + legibility.
+_ROUTER_CONFIDENCE_CLAUSE = (
+    "Use the attached neighbor pages ONLY to judge the host document's purpose "
+    "(e.g. marketing/module-intro vs financial report) and for terminology; never "
+    "transcribe them. The describe and screenshot policies may be used ONLY when your "
+    "self_confidence >= 0.7 AND legibility is \"high\". Otherwise, and whenever context "
+    "is absent or conflicting, use VERBATIM."
+)
+
 TASK_PROMPTS: Dict["Task", str] = {
-    Task.AUTO: _RAW_DISCIPLINE,
+    Task.AUTO: _ROUTER_PREAMBLE,
     Task.DOCUMENT: (
         "This is a text document. " + _RAW_DISCIPLINE +
         " Preserve headings, lists, and reading order."
