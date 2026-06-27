@@ -38,14 +38,26 @@ def _make_pdf(tmp_path):
     return str(path)
 
 
+def _make_image_doc(tmp_path):
+    """A mostly-image document (every page a full-page picture) -> image strategy."""
+    doc = fitz.open()
+    for color in ("navy", "darkgreen", "maroon"):
+        p = doc.new_page(width=600, height=800)
+        p.insert_image(p.rect, stream=_png((1200, 1600), color))
+    path = tmp_path / "image_doc.pdf"
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
 class _StubOCR:
     config = None
 
 
-def test_image_dominant_detection(tmp_path):
-    p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
-    assert p._is_image_dominant_page(p.doc.load_page(0)) is True
-    assert p._is_image_dominant_page(p.doc.load_page(1)) is False
+def test_document_strategy_route(tmp_path):
+    # mostly-image doc -> "image"; mixed/mostly-text doc -> "text"
+    assert PDFLoader(_make_image_doc(tmp_path), ocr=_StubOCR())._document_image_strategy() == "image"
+    assert PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())._document_image_strategy() == "text"
 
 
 def test_decorative_image_filter(tmp_path):
@@ -57,12 +69,22 @@ def test_decorative_image_filter(tmp_path):
     assert p._is_decorative_image(big, page) is False
 
 
-def test_collect_renders_image_pages_and_skips_tiny(tmp_path):
-    p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
+def test_image_doc_renders_every_page(tmp_path):
+    # image-strategy document: every page rendered once as a whole image.
+    p = PDFLoader(_make_image_doc(tmp_path), ocr=_StubOCR())
     work = p._collect_all_images()
     renders = {w["page_num"] for w in work if w.get("is_page_render")}
-    assert 0 in renders                       # image-dominant page rendered once
-    assert all(w["page_num"] != 2 for w in work)  # tiny decorative image skipped
+    assert renders == {0, 1, 2}
+
+
+def test_text_doc_collects_embedded_skips_tiny(tmp_path):
+    # text-strategy document (mixed/mostly-text): no whole-page renders; embedded
+    # figures collected for per-image OCR, tiny decorative image skipped.
+    p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
+    work = p._collect_all_images()
+    assert not any(w.get("is_page_render") for w in work)   # no whole-doc OCR
+    assert any(w["page_num"] == 0 for w in work)            # full image collected
+    assert all(w["page_num"] != 2 for w in work)            # tiny decorative skipped
 
 
 def test_process_page_emits_render_transcription(tmp_path):

@@ -22,6 +22,7 @@ _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
 _IMAGE_PAGE_TEXT_LIMIT = 200    # a page with more native text than this has a usable text layer
 _IMAGE_PAGE_COVERAGE = 0.55     # images must cover >= this fraction of the page
+_DOC_IMAGE_RATIO_THRESHOLD = 0.5  # mean per-page image coverage >= this => whole-doc OCR strategy
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------
@@ -82,6 +83,7 @@ class PDFLoader:
         self._window_pdf_cache: "OrderedDict[int, Optional[str]]" = OrderedDict()
         cfg = getattr(self.ocr, "config", None)
         self._context_tier = int(getattr(cfg, "context_pages", 0) or 0) if (self.ocr and cfg) else 0
+        self._doc_strategy: Optional[str] = None  # lazy: "image" | "text" (document-level route)
 
         # Set table output style
         if table_style is None:
@@ -466,14 +468,30 @@ class PDFLoader:
                 covered += abs(rect.width * rect.height)
         return min(covered / page_area, 1.0)
 
-    def _is_image_dominant_page(self, page) -> bool:
-        """True when a page is essentially a picture: little/no native text but
-        images covering most of it (scanned pages, slide decks exported as
-        images). Such pages are OCR'd as a single rendered image rather than per
-        embedded image, giving coherent content and skipping decorative noise."""
-        if len(page.get_text().strip()) > _IMAGE_PAGE_TEXT_LIMIT:
-            return False
-        return self._page_image_coverage(page) >= _IMAGE_PAGE_COVERAGE
+    def _document_image_strategy(self) -> str:
+        """High-level DOCUMENT route by mean per-page image-occupancy ratio.
+
+        - "image": the document is mostly pictures (slide deck / scanned doc).
+          Every page is rendered and OCR'd as a whole image (with neighbor-page
+          context when enabled). The OCR is authoritative for the entire doc.
+        - "text": mostly a text document. The deterministic rule-based layer
+          (complex tables + text, preserved verbatim for BM42 RAG) is
+          authoritative, and embedded figures are OCR'd individually.
+
+        Decided once per document (cached); a uniform strategy avoids mixing
+        OCR-only and rule-based pages within one document.
+        """
+        if self._doc_strategy is not None:
+            return self._doc_strategy
+        n = len(self.doc) if self.doc is not None else 0
+        if n == 0:
+            self._doc_strategy = "text"
+            return self._doc_strategy
+        total = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n))
+        mean_cov = total / n
+        self._doc_strategy = "image" if mean_cov >= _DOC_IMAGE_RATIO_THRESHOLD else "text"
+        logger.info(f"📑 Document OCR strategy: {self._doc_strategy} (mean image coverage {mean_cov:.2f})")
+        return self._doc_strategy
 
     def _render_page_png(self, page) -> bytes:
         """Rasterize a whole page to PNG bytes for page-level OCR."""
@@ -523,11 +541,15 @@ class PDFLoader:
         """
         all_images = []
 
+        # Document-level route: when the doc is mostly pictures, OCR EVERY page
+        # as a whole image; otherwise OCR only the embedded figures per page.
+        doc_image_strategy = self.ocr is not None and self._document_image_strategy() == "image"
+
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
 
-            # Whole-page OCR for scanned/image-only pages.
-            if self.ocr is not None and self._is_image_dominant_page(page):
+            # Whole-page OCR for the image-strategy document (every page rendered).
+            if doc_image_strategy:
                 try:
                     png = self._render_page_png(page)
                     ctx = self._build_window_pdf(page_num) if self._context_tier >= 1 else None
@@ -581,8 +603,8 @@ class PDFLoader:
                       ocr_results_map: Dict[tuple, str] = None) -> List[Dict[str, Any]]:
         """Process a single page, routed by the high-level OCR strategy.
 
-        The page's image-occupancy ratio (decided in _collect_all_images via
-        _is_image_dominant_page) selects the strategy:
+        The document-level route (_document_image_strategy, applied in
+        _collect_all_images) selects the strategy:
 
         - IMAGE-authoritative (a whole-page render exists): emit ONLY the OCR
           transcription. The sparse text layer on such a page is chrome
