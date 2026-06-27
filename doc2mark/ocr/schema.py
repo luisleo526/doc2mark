@@ -676,17 +676,30 @@ def _render_table(table: Table) -> str:
     return "\n".join(lines)
 
 
+def _norm_ws(s: str) -> str:
+    """Collapse all whitespace runs to single spaces for verbatim-substring checks.
+
+    A model echoing a multi-line label naturally renders the line breaks as spaces
+    (and may join a stacked list), so an exact substring test raises false BM42
+    alarms. Normalizing whitespace on both sides keeps the check meaningful (the
+    same tokens in the same order) without flagging pure re-spacing.
+    """
+    return " ".join((s or "").split())
+
+
 def router_invariants(page: "OCRPage") -> List[str]:
     """Return the router firewall violations for a structured page (empty = OK).
 
     Protects the BM42 invariant: real printed values are never withheld (marked
-    ``illustrative``) except on a high-confidence ``screenshot`` page. Intended as
+    ``illustrative``) except on a high-confidence ``screenshot`` page. Verbatim
+    substring checks are whitespace-normalized (see :func:`_norm_ws`). Intended as
     a CI/eval assertion over recorded structured outputs.
     """
     violations: List[str] = []
     raw = page.raw
     interp = page.interpretation
-    text = raw.text or ""
+    text_n = _norm_ws(raw.text or "")
+    headings_n = {_norm_ws(h) for h in raw.headings}
     figs = interp.figures if interp else []
     has_illustrative = (
         any(t.illustrative for t in raw.tables)
@@ -716,7 +729,8 @@ def router_invariants(page: "OCRPage") -> List[str]:
     if fidelity == "skipped" and (raw.text.strip() or raw.tables or raw.fields):
         violations.append("content_fidelity='skipped' but raw is not empty")
     # 5. primary_date must be selected from the verbatim raw.dates list, not invented.
-    if interp is not None and interp.primary_date and interp.primary_date not in raw.dates:
+    if (interp is not None and interp.primary_date
+            and _norm_ws(interp.primary_date) not in {_norm_ws(d) for d in raw.dates}):
         violations.append(
             "interpretation.primary_date not present in raw.dates (must be selected from them)"
         )
@@ -730,13 +744,13 @@ def router_invariants(page: "OCRPage") -> List[str]:
         verbatim: List[str] = [fig.title, fig.x_axis, fig.y_axis, *fig.labels]
         for p in fig.data_points:
             verbatim += [p.label, p.value, p.series]
-        node_labels = {n.label for n in fig.nodes if n.label}
+        node_labels = {_norm_ws(n.label) for n in fig.nodes if n.label}
         for n in fig.nodes:
             verbatim.append(n.label)
         for e in fig.edges:
             verbatim += [e.from_label, e.to_label, e.label]
         for s in verbatim:
-            if s and s not in text:
+            if s and _norm_ws(s) not in text_n:
                 violations.append(f"figures[{i}] verbatim string {s!r} not found in raw.text")
         # 6a. data_points must not be a list of value-less shells.
         if fig.data_points and not any((p.value or "").strip() for p in fig.data_points):
@@ -747,7 +761,7 @@ def router_invariants(page: "OCRPage") -> List[str]:
         # 6b. every edge endpoint must reference an existing node label.
         for e in fig.edges:
             for endpoint in (e.from_label, e.to_label):
-                if endpoint and endpoint not in node_labels:
+                if endpoint and _norm_ws(endpoint) not in node_labels:
                     violations.append(
                         f"figures[{i}] edge endpoint {endpoint!r} matches no DiagramNode.label"
                     )
@@ -759,7 +773,7 @@ def router_invariants(page: "OCRPage") -> List[str]:
     # 7. SECTIONS — heading provenance + body-paragraph bloat guard.
     sections = interp.sections
     for sec in sections:
-        if sec.heading and sec.heading not in raw.headings:
+        if sec.heading and _norm_ws(sec.heading) not in headings_n:
             violations.append(f"sections heading {sec.heading!r} not present in raw.headings")
     if len(sections) > len(raw.headings) + 2:   # tolerance for minor over-segmentation
         violations.append(
@@ -769,14 +783,14 @@ def router_invariants(page: "OCRPage") -> List[str]:
 
     # 8. TYPED ENTITIES — every name is a verbatim substring of raw.text.
     for ent in interp.typed_entities:
-        if ent.name and ent.name not in text:
+        if ent.name and _norm_ws(ent.name) not in text_n:
             violations.append(f"typed_entities name {ent.name!r} not found in raw.text")
 
     # 9. RELATIONS — subject and object must be substrings of raw.text
     #    (predicate and evidence are paraphrase — NOT checked).
     for rel in interp.relations:
         for part_name, part in (("subject", rel.subject), ("object", rel.object)):
-            if part and part not in text:
+            if part and _norm_ws(part) not in text_n:
                 violations.append(f"relations {part_name} {part!r} not found in raw.text")
 
     return violations
