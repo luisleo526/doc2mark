@@ -3175,16 +3175,12 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             # Add normal text with paragraph spacing
             markdown_parts.append(f"{item['content']}\n")
         elif item["type"] == "text:image_description":
-            # Handle OCR results with XML tags
+            # OCR'd-image text — strip the internal provenance wrapper and emit
+            # clean text (no code-fence / <ocr_result> noise).
             ocr_text = item['content']
             if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
-                ocr_text = ocr_text[18:-19]  # Remove tags
-            
-            markdown_parts.append("```")
-            markdown_parts.append("<ocr_result>")
-            markdown_parts.append(ocr_text)
-            markdown_parts.append("</ocr_result>")
-            markdown_parts.append("```\n")
+                ocr_text = ocr_text[18:-19]
+            markdown_parts.append(ocr_text.strip() + "\n")
         elif item["type"] == "table":
             # Tables already have proper spacing
             markdown_parts.append(item["content"])

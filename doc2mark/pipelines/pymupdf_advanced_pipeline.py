@@ -2013,16 +2013,13 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             markdown_parts.append("")  # Empty line after caption
             
         elif item_type == "text:image_description":
-            # Handle OCR results with XML tags in code blocks
+            # OCR'd-image text — strip the internal provenance wrapper and emit
+            # clean text (no code-fence / <ocr_result> noise) for a readable,
+            # RAG-clean export.
             ocr_text = content
             if ocr_text.startswith('<image_ocr_result>') and ocr_text.endswith('</image_ocr_result>'):
-                ocr_text = ocr_text[18:-19]  # Remove tags
-            
-            markdown_parts.append("```")
-            markdown_parts.append("<ocr_result>")
-            markdown_parts.append(ocr_text)
-            markdown_parts.append("</ocr_result>")
-            markdown_parts.append("```")
+                ocr_text = ocr_text[18:-19]
+            markdown_parts.append(ocr_text.strip())
             markdown_parts.append("")  # Empty line after OCR result
             
         elif item_type == "table":
