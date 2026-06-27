@@ -6,6 +6,7 @@ for use across OCR providers and document processing pipelines.
 
 import io
 import logging
+import os
 from typing import Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,63 @@ def normalize_image_to_png(image_data: bytes) -> bytes:
         raise ValueError(f"Failed to convert image to PNG: {e}")
 
 
+def downscale_image(image_data: bytes, max_dim: int) -> bytes:
+    """Resize an image so its longest side is at most *max_dim* pixels.
+
+    The aspect ratio is preserved and the image is only ever shrunk, never
+    enlarged.  If the image is already within bounds, or if Pillow cannot
+    open the data, the **original bytes** are returned unchanged.
+
+    Args:
+        image_data: Raw image bytes (any format Pillow can open).
+        max_dim: Maximum allowed size (in pixels) for the longest side.
+
+    Returns:
+        Re-encoded PNG bytes when downscaling was applied, or the original
+        *image_data* bytes otherwise.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.debug("Pillow not available; skipping downscale")
+        return image_data
+
+    try:
+        img = Image.open(io.BytesIO(image_data))
+    except Exception:
+        logger.debug("Cannot open image for downscaling; returning original bytes")
+        return image_data
+
+    width, height = img.size
+    longest = max(width, height)
+    if longest <= max_dim:
+        return image_data
+
+    scale = max_dim / longest
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+
+    # Ensure at least 1px on each side
+    new_width = max(new_width, 1)
+    new_height = max(new_height, 1)
+
+    if img.mode in ('CMYK', 'P', 'LA', 'PA'):
+        img = img.convert('RGBA')
+    elif img.mode not in ('RGB', 'RGBA', 'L'):
+        img = img.convert('RGB')
+
+    img = img.resize((new_width, new_height), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    logger.debug(
+        "Downscaled image from %dx%d to %dx%d (max_dim=%d)",
+        width, height, new_width, new_height, max_dim,
+    )
+    return buf.read()
+
+
 def _try_convert_vector_image(image_data: bytes, format_str: str) -> Optional[bytes]:
     """Attempt to convert EMF/WMF to PNG using available libraries.
 
@@ -194,16 +252,25 @@ def _try_convert_vector_image(image_data: bytes, format_str: str) -> Optional[by
 def convert_image_to_supported_format(
     image_data: bytes,
     supported_formats: Optional[Set[str]] = None,
+    max_dim: Optional[int] = None,
 ) -> Tuple[bytes, str]:
     """Convert image to a supported format, returning (bytes, mime_type).
 
     If the image is already in a supported format, returns it as-is.
     Otherwise, attempts conversion to PNG.
 
+    Optional downscaling can be applied to reduce Vision-API token cost.
+    Downscaling is activated when *max_dim* is given **or** the environment
+    variable ``OCR_MAX_IMAGE_DIM`` is set to a positive integer.  An
+    explicit *max_dim* argument takes precedence over the env var.  By
+    default no downscaling is performed (backward-compatible).
+
     Args:
         image_data: Raw image bytes
         supported_formats: Set of accepted format strings.
             Defaults to {'png', 'jpeg', 'jpg', 'gif', 'webp'} (OpenAI Vision API).
+        max_dim: If set, downscale the image so its longest side is at most
+            this many pixels before returning.
 
     Returns:
         Tuple of (converted_image_bytes, mime_type)
@@ -211,11 +278,31 @@ def convert_image_to_supported_format(
     if supported_formats is None:
         supported_formats = {'png', 'jpeg', 'jpg', 'gif', 'webp'}
 
+    # Resolve effective max_dim: explicit arg > env var > None (off)
+    effective_max_dim = max_dim
+    if effective_max_dim is None:
+        env_val = os.environ.get('OCR_MAX_IMAGE_DIM')
+        if env_val is not None:
+            try:
+                parsed = int(env_val)
+                if parsed > 0:
+                    effective_max_dim = parsed
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid OCR_MAX_IMAGE_DIM=%r (must be a positive int)",
+                    env_val,
+                )
+
     current_format = detect_image_format(image_data)
 
     if current_format in supported_formats:
         mime_type = get_mime_type(current_format)
         logger.debug("Image format '%s' is already supported", current_format)
+        if effective_max_dim is not None:
+            image_data = downscale_image(image_data, effective_max_dim)
+            # Downscaling re-encodes as PNG; update mime if changed
+            if detect_image_format(image_data) == FORMAT_PNG:
+                mime_type = 'image/png'
         return image_data, mime_type
 
     logger.info("Converting image from '%s' to PNG", current_format)
@@ -228,6 +315,8 @@ def convert_image_to_supported_format(
                 "Vector image converted: %d bytes -> %d bytes",
                 len(image_data), len(converted),
             )
+            if effective_max_dim is not None:
+                converted = downscale_image(converted, effective_max_dim)
             return converted, 'image/png'
         logger.warning(
             "Cannot convert %s image. Install wand (ImageMagick) for support. "
@@ -243,6 +332,8 @@ def convert_image_to_supported_format(
             "Image converted: %d bytes -> %d bytes",
             len(image_data), len(converted),
         )
+        if effective_max_dim is not None:
+            converted = downscale_image(converted, effective_max_dim)
         return converted, 'image/png'
     except (ImportError, ValueError) as e:
         logger.warning("Image conversion failed: %s. Returning original bytes.", e)
