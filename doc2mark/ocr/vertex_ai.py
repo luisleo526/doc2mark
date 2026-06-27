@@ -472,6 +472,58 @@ class VertexAIOCR(BaseOCR):
             prompts.append(base)
         return prompts
 
+    @staticmethod
+    def _is_empty_structured(result: OCRResult) -> bool:
+        """A structured result with no usable content (some models/images cannot
+        fill the json_schema and return an empty OCRPage)."""
+        if result.text and result.text.strip():
+            return False
+        doc = result.document
+        if doc is None:
+            return True
+        raw = doc.raw
+        return not (raw.text.strip() or raw.tables or raw.fields)
+
+    def _recover_empty_structured(
+        self, results: List[OCRResult], images: List[bytes], **kwargs
+    ) -> List[OCRResult]:
+        """Re-OCR empty structured results in free-form mode so content is never
+        lost when a model can read the image but cannot fill the schema."""
+        empty_idx = [i for i, r in enumerate(results) if self._is_empty_structured(r)]
+        if not empty_idx:
+            return results
+
+        logger.warning(
+            f"Structured OCR returned empty for {len(empty_idx)}/{len(results)} image(s); "
+            f"recovering with free-form OCR"
+        )
+        # Drop per-image task selectors (sub-batch differs in size) and force legacy.
+        fk = {k: v for k, v in kwargs.items() if k not in ("structured", "tasks", "task")}
+        fk["structured"] = False
+        recovered = self._batch_process_with_vision_agent(
+            [images[i] for i in empty_idx], **fk
+        )
+
+        for j, i in enumerate(empty_idx):
+            text = (recovered[j].text or "").strip()
+            if not text:
+                continue
+            doc = results[i].document
+            if doc is not None:
+                doc.raw.text = text
+            else:
+                doc = OCRPage(raw=RawExtraction(text=text))
+            meta = dict(results[i].metadata or {})
+            meta["structured_fallback"] = "free_form"
+            results[i] = OCRResult(
+                text=text,
+                confidence=results[i].confidence,
+                language=results[i].language,
+                metadata=meta,
+                document=doc,
+            )
+        return results
+
     def _batch_process_with_vision_agent(
         self, images: List[bytes], **kwargs
     ) -> List[OCRResult]:
@@ -507,7 +559,8 @@ class VertexAIOCR(BaseOCR):
             )
 
             if structured:
-                return self._build_structured_results(batch_results, images, **kwargs)
+                results = self._build_structured_results(batch_results, images, **kwargs)
+                return self._recover_empty_structured(results, images, **kwargs)
 
             return self._build_legacy_results(batch_results, images, **kwargs)
 

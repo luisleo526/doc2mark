@@ -760,6 +760,64 @@ class OpenAIOCR(BaseOCR):
             prompts.append(base)
         return prompts
 
+    @staticmethod
+    def _is_empty_structured(result: OCRResult) -> bool:
+        """A structured result with no usable content (some models/images cannot
+        fill the json_schema and return an empty OCRPage)."""
+        if result.text and result.text.strip():
+            return False
+        doc = result.document
+        if doc is None:
+            return True
+        raw = doc.raw
+        return not (raw.text.strip() or raw.tables or raw.fields)
+
+    def _recover_empty_structured(
+            self,
+            results: List[OCRResult],
+            images: List[bytes],
+            *,
+            language: Optional[str] = None,
+            **kwargs,
+    ) -> List[OCRResult]:
+        """Re-OCR empty structured results in free-form mode so content is never
+        lost when a model can read the image but cannot fill the schema."""
+        empty_idx = [i for i, r in enumerate(results) if self._is_empty_structured(r)]
+        if not empty_idx:
+            return results
+
+        logger.warning(
+            f"⚠️  Structured OCR returned empty for {len(empty_idx)}/{len(results)} "
+            f"image(s); recovering with free-form OCR"
+        )
+        self._ensure_vision_agent(structured=False)
+        try:
+            recovered = self._batch_process_with_vision_agent(
+                [images[i] for i in empty_idx], structured=False, language=language, **kwargs
+            )
+        finally:
+            self._ensure_vision_agent(structured=True)
+
+        for j, i in enumerate(empty_idx):
+            text = (recovered[j].text or "").strip()
+            if not text:
+                continue
+            doc = results[i].document
+            if doc is not None:
+                doc.raw.text = text
+            else:
+                doc = OCRPage(raw=RawExtraction(text=text))
+            meta = dict(results[i].metadata or {})
+            meta["structured_fallback"] = "free_form"
+            results[i] = OCRResult(
+                text=text,
+                confidence=results[i].confidence,
+                language=results[i].language,
+                metadata=meta,
+                document=doc,
+            )
+        return results
+
     def _batch_process_with_vision_agent(
             self,
             images: List[bytes],
@@ -801,6 +859,8 @@ class OpenAIOCR(BaseOCR):
             batch_results = self._vision_agent.batch_invoke(input_dicts)
 
             results = self._results_from_batch(images, batch_results, language, kwargs)
+            if structured:
+                results = self._recover_empty_structured(results, images, language=language, **kwargs)
 
             successful = len([r for r in results if r.text])
             logger.info(f"✅ VisionAgent batch complete: {successful}/{len(images)} successful")
