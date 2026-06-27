@@ -25,11 +25,24 @@ from pydantic import BaseModel, Field
 # RAW: what is literally on the page                                          #
 # --------------------------------------------------------------------------- #
 class Table(BaseModel):
-    """A table transcribed verbatim from the image."""
+    """A table transcribed verbatim from the image.
+
+    ``html`` is the preferred representation: a clean ``<table>`` that can encode
+    merged cells via ``colspan``/``rowspan`` (which ``headers``/``rows`` and
+    markdown cannot). ``headers``/``rows`` remain a best-effort flat view for
+    simple, machine-readable access.
+    """
     caption: str = ""
     headers: List[str] = Field(default_factory=list)
     rows: List[List[str]] = Field(default_factory=list)
-    # Rendered markdown fallback for merged/complex cells the grid can't capture.
+    html: str = Field(
+        default="",
+        description=(
+            "Clean, valid HTML for this table using <table>/<tr>/<th>/<td>, with "
+            "colspan and rowspan for merged cells. No CSS, classes, or inline styles."
+        ),
+    )
+    # Rendered markdown fallback for simple (non-merged) tables.
     markdown: str = ""
 
 
@@ -106,7 +119,9 @@ class OCRPage(BaseModel):
         if raw.text:
             parts.append(raw.text.strip())
         for table in raw.tables:
-            if table.markdown:
+            if table.html:
+                parts.append(table.html.strip())
+            elif table.markdown:
                 parts.append(table.markdown.strip())
             elif table.headers or table.rows:
                 parts.append(_render_table(table))

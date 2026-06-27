@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OCRResult.document`) with a hard boundary between `raw` (verbatim
   transcription, tables, key/value fields) and `interpretation` (summary,
   document type, key findings). Structured output is the default.
+- **OCR table extraction with merged cells.** Each ``Table`` in the structured
+  result now carries an ``html`` field; the model is guided to reproduce tables
+  as clean HTML using ``colspan``/``rowspan`` for merged cells (which the flat
+  ``headers``/``rows`` and markdown cannot represent). ``OCRPage.to_markdown()``
+  prefers it.
 - **`OCR` facade.** New ergonomic entry point: `OCR("openai")` with `.read()`
   and `.read_one()` methods, replacing direct provider construction.
 - **`Task` enum.** Replaces the eight free-form `PromptTemplate` variants with

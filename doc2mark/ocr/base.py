@@ -59,9 +59,12 @@ class Task(str, Enum):
 # the OpenAI and Vertex/Gemini providers.
 _RAW_DISCIPLINE = (
     "Transcribe every visible character verbatim into raw.text, preserving the "
-    "original language (do not translate). Put tabular data in raw.tables and "
-    "label/value pairs in raw.fields. Never mix commentary into raw.text — put "
-    "analysis only in the interpretation fields."
+    "original language (do not translate). For each table, populate raw.tables: "
+    "put a clean, valid HTML table in its `html` field using <table>/<tr>/<th>/<td>, "
+    "and MERGE cells with colspan/rowspan exactly as they appear in the image (no "
+    "CSS, classes, or inline styles); also fill headers/rows as a best-effort flat "
+    "view. Put label/value pairs in raw.fields. Never mix commentary into raw.text — "
+    "put analysis only in the interpretation fields."
 )
 TASK_PROMPTS: Dict["Task", str] = {
     Task.AUTO: _RAW_DISCIPLINE,
@@ -71,7 +74,8 @@ TASK_PROMPTS: Dict["Task", str] = {
     ),
     Task.TABLE: (
         "This image is dominated by tabular data. " + _RAW_DISCIPLINE +
-        " Capture every row and column faithfully in raw.tables."
+        " Reproduce every table precisely in raw.tables[].html as clean HTML, "
+        "preserving merged cells with colspan/rowspan and the exact cell text."
     ),
     Task.FORM: (
         "This is a form. " + _RAW_DISCIPLINE +

@@ -59,6 +59,16 @@ class TestToMarkdown:
         page = OCRPage(raw=RawExtraction(tables=[Table(markdown="| a |\n|---|")]))
         assert "| a |" in page.to_markdown()
 
+    def test_prefers_table_html_with_spans(self):
+        html = '<table><tr><th colspan="2">H</th></tr><tr><td>a</td><td>b</td></tr></table>'
+        # html wins over both markdown and headers/rows
+        page = OCRPage(raw=RawExtraction(tables=[
+            Table(html=html, markdown="| ignored |", headers=["x"], rows=[["y"]])
+        ]))
+        out = page.to_markdown()
+        assert 'colspan="2"' in out and "<table>" in out
+        assert "ignored" not in out
+
     def test_renders_headers_and_rows(self):
         page = OCRPage(raw=RawExtraction(tables=[Table(headers=["A", "B"], rows=[["1", "2"]])]))
         md = page.to_markdown()
