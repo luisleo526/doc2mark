@@ -210,6 +210,15 @@ ocr = OCR("openai", max_concurrency=32)
 Or set the `OCR_MAX_CONCURRENCY` environment variable. When neither is set,
 LangChain's default thread pool is used.
 
+To cut Vision-API token cost on large scans, cap the longest image side before
+upload by setting the `OCR_MAX_IMAGE_DIM` environment variable (off by default):
+
+```bash
+export OCR_MAX_IMAGE_DIM=1536   # downscale any image whose longest side exceeds 1536px
+```
+
+Images already within the bound are left untouched.
+
 ### Using OCR with the document loader
 
 `UnifiedDocumentLoader` still works for document-level processing and uses the
@@ -239,6 +248,7 @@ and the structured output controls instead.
 | Images | PNG, JPG, WEBP, TIFF, BMP, GIF, HEIC, HEIF, AVIF (requires `doc2mark[heif]`) |
 | Text / Data | TXT, CSV, TSV, JSON, JSONL |
 | Markup | HTML, XML, Markdown |
+| Email | EML (`message/rfc822`) |
 | Legacy | DOC, XLS, PPT, RTF, PPS (requires LibreOffice) |
 
 ## Common recipes
@@ -269,6 +279,19 @@ loader.batch_process(
     ocr_images=True,
     save_files=True,
     show_progress=True,
+)
+```
+
+Process documents concurrently (opt-in) and track progress with a callback.
+`max_workers` defaults to sequential; results preserve input order and per-file
+error entries:
+
+```python
+loader.batch_process(
+    input_dir="documents/",
+    output_dir="converted/",
+    max_workers=8,
+    progress_callback=lambda done, total, path: print(f"{done}/{total} {path}"),
 )
 ```
 
@@ -385,6 +408,19 @@ for chunk in chunks:
 Each `Chunk` carries `section_title`, `section_hierarchy`, `page_start`,
 `page_end`, `content_types`, and `chunk_index` so downstream vector stores can
 preserve document structure.
+
+To size chunks by **tokens** instead of characters (matching an embedding
+model's context budget), set `size_unit="tokens"` — this uses `tiktoken`
+(`pip install doc2mark[tokenizers]`; falls back to character counting if it is
+not installed):
+
+```python
+config = ChunkingConfig(
+    max_chunk_size=512,        # tokens, not characters
+    size_unit="tokens",
+    encoding_name="cl100k_base",
+)
+```
 
 ## CLI
 
