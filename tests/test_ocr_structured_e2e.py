@@ -58,7 +58,7 @@ class _StubChain:
         self._payloads = payloads
         self.last_config = "unset"
 
-    def batch_as_completed(self, input_dicts, config=None):
+    def batch_as_completed(self, input_dicts, config=None, return_exceptions=False):
         self.last_config = config
         pairs = [(i, self._payloads[i]) for i in range(len(input_dicts))]
         return list(reversed(pairs))

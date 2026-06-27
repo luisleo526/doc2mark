@@ -39,7 +39,7 @@ class UnifiedDocumentLoader:
             # Enhanced OCR configuration for OpenAI / Vertex AI
             model: str = "gpt-5.4-mini",
             temperature: float = 0,
-            max_tokens: int = 4096,
+            max_tokens: int = 8192,
             max_workers: int = 5,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
@@ -74,7 +74,7 @@ class UnifiedDocumentLoader:
             # Enhanced OpenAI OCR Configuration:
             model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
-            max_tokens: Maximum tokens in response (1-4096)
+            max_tokens: Maximum tokens in response (1-8192)
             max_workers: Maximum concurrent workers for batch processing
             prompt_template: Template name (see PromptTemplate enum for the full list, e.g.
                 'default', 'table_focused', 'document_focused', 'multilingual',
@@ -201,7 +201,7 @@ class UnifiedDocumentLoader:
             ocr_config: Optional[OCRConfig] = None,
             model: str = "gpt-5.4-mini",
             temperature: float = 0,
-            max_tokens: int = 4096,
+            max_tokens: int = 8192,
             max_workers: int = 5,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
@@ -329,7 +329,7 @@ class UnifiedDocumentLoader:
                 "ocr_config": None,
                 "model": "gpt-5.4-mini",
                 "temperature": 0,
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "max_workers": 5,
                 "prompt_template": PromptTemplate.DEFAULT,
                 "timeout": 30,
@@ -345,7 +345,7 @@ class UnifiedDocumentLoader:
             "ocr_config": getattr(current, "config", None),
             "model": getattr(current, "model", "gpt-5.4-mini"),
             "temperature": getattr(current, "temperature", 0),
-            "max_tokens": getattr(current, "max_tokens", 4096),
+            "max_tokens": getattr(current, "max_tokens", 8192),
             "max_workers": getattr(current, "max_workers", 5),
             "prompt_template": getattr(current, "prompt_template", PromptTemplate.DEFAULT),
             "timeout": getattr(current, "timeout", 30),

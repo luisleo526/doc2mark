@@ -98,7 +98,7 @@ class VertexAIVisionAgent:
         location: str = "global",
         model: str = "gemini-3.1-flash-lite-preview",
         temperature: float = 0,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         max_concurrency: Optional[int] = None,
         timeout: Optional[int] = None,
         max_retries: Optional[int] = None,
@@ -216,17 +216,34 @@ class VertexAIVisionAgent:
         )
 
         _cfg = {"max_concurrency": self.max_concurrency} if self.max_concurrency else None
-        results = chain.batch_as_completed(input_dicts, config=_cfg)
+        # return_exceptions=True isolates a single image's failure (e.g. a dense page
+        # truncated at max_tokens) so it does NOT abort the whole batch.
+        results = chain.batch_as_completed(input_dicts, config=_cfg, return_exceptions=True)
         sorted_results = sorted(results, key=lambda x: x[0])
 
         logger.info("Gemini batch processing complete")
 
         if effective:
             # Pass the structured payload through; OCRResult assembly happens in
-            # VertexAIOCR so it can honour detail/on_parse_error.
-            return [res[1] for res in sorted_results]
+            # VertexAIOCR so it can honour detail/on_parse_error. A failed item
+            # becomes a parse-error payload so it is recovered, not propagated.
+            out = []
+            for res in sorted_results:
+                payload = res[1]
+                if isinstance(payload, Exception):
+                    out.append({"parsed": None, "parsing_error": str(payload), "raw": None})
+                else:
+                    out.append(payload)
+            return out
 
-        return [(self._extract_text(res[1].content), self._extract_usage(res[1])) for res in sorted_results]
+        out = []
+        for res in sorted_results:
+            msg = res[1]
+            if isinstance(msg, Exception):
+                out.append(("", {}))
+            else:
+                out.append((self._extract_text(msg.content), self._extract_usage(msg)))
+        return out
 
 
 class VertexAIOCR(BaseOCR):
@@ -240,7 +257,7 @@ class VertexAIOCR(BaseOCR):
         location: str = "global",
         model: str = "gemini-3.1-flash-lite-preview",
         temperature: float = 0,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         default_prompt: Optional[str] = None,
         prompt_template: Optional[Union[str, PromptTemplate]] = None,
         timeout: int = 30,

@@ -188,7 +188,7 @@ class VisionAgent:
             api_key: Optional[str] = None,
             model: str = "gpt-5.4-mini",
             temperature: float = 0,
-            max_tokens: int = 4096,
+            max_tokens: int = 8192,
             base_url: Optional[str] = None,
             max_concurrency: Optional[int] = None,
             timeout: Optional[int] = None,
@@ -308,7 +308,9 @@ class VisionAgent:
         )
 
         _cfg = {"max_concurrency": self.max_concurrency} if self.max_concurrency else None
-        results = self._chain.batch_as_completed(input_dicts, config=_cfg)
+        # return_exceptions=True isolates a single image's failure (e.g. a dense page
+        # truncated at max_tokens) so it does NOT abort the whole batch.
+        results = self._chain.batch_as_completed(input_dicts, config=_cfg, return_exceptions=True)
         sorted_results = sorted(results, key=lambda x: x[0])
 
         logger.info(f"✅ LangChain batch processing complete")
@@ -320,6 +322,9 @@ class VisionAgent:
             # carry token usage extracted from the raw AIMessage.
             structured_output: List[Dict[str, Any]] = []
             for _idx, payload in sorted_results:
+                if isinstance(payload, Exception):
+                    structured_output.append({"parsed": None, "parsing_error": str(payload), "raw": None, "usage": {}})
+                    continue
                 raw_msg = payload.get("raw") if isinstance(payload, dict) else None
                 structured_output.append({
                     "parsed": payload.get("parsed") if isinstance(payload, dict) else None,
@@ -333,6 +338,9 @@ class VisionAgent:
         output = []
         for res in sorted_results:
             msg = res[1]
+            if isinstance(msg, Exception):
+                output.append(("", {}))
+                continue
             text = msg.content.replace('```', '`') if msg.content else msg.content
             output.append((text, self._extract_usage(msg)))
         return output
@@ -363,7 +371,7 @@ class OpenAIOCR(BaseOCR):
             config: OCR configuration (from base class)
             model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
-            max_tokens: Maximum tokens in response (1-4096)
+            max_tokens: Maximum tokens in response (1-8192)
             max_workers: Maximum concurrent workers for batch processing
             default_prompt: Custom default prompt to use instead of built-in
             prompt_template: Template name from PROMPTS dict ('default', 'table_focused', etc.)
@@ -402,7 +410,7 @@ class OpenAIOCR(BaseOCR):
         # Model configuration
         self.model = _resolve(model, cfg.model, "gpt-5.4-mini")
         self.temperature = _resolve(temperature, cfg.temperature, 0)
-        self.max_tokens = _resolve(max_tokens, cfg.max_tokens, 4096)
+        self.max_tokens = _resolve(max_tokens, cfg.max_tokens, 8192)
         self.timeout = timeout
         self.max_retries = max_retries
         resolved_base_url = base_url if base_url is not _UNSET else cfg.base_url

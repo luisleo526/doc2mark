@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the structured output controls instead.
 
 ### Fixed
+- **Dense structured OCR no longer truncates or aborts the whole batch.** The
+  default `max_tokens` was raised 4096 → 8192 (a dense page's structured JSON
+  exceeded 4096 tokens, and the resulting truncation error aborted OCR for the
+  entire document). Batch OCR now isolates per-image failures (`return_exceptions`)
+  so one image's error degrades only that image (recovered or placeholdered),
+  never the batch.
 - **OCR batch failure no longer dumps raw base64 into the output.** Previously a
   single error in the image-OCR batch flipped the whole PDF to base64 image
   extraction, producing tens of MB of useless base64 in the text/RAG output.
