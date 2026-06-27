@@ -5,11 +5,27 @@ import io
 import logging
 import os
 import uuid
+import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 from doc2mark.core.base import OCRError
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory, resolve_max_concurrency
+from doc2mark.ocr.base import (
+    BaseOCR,
+    OCRConfig,
+    OCRProvider,
+    OCRResult,
+    OCRFactory,
+    Task,
+    TASK_PROMPTS,
+    resolve_max_concurrency,
+)
+from doc2mark.ocr.schema import OCRPage, RawExtraction
+
+try:
+    from pydantic import BaseModel
+except Exception:  # pragma: no cover - pydantic ships with the schema models
+    BaseModel = object  # type: ignore
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -30,8 +46,20 @@ from doc2mark.ocr.prompts import (
     DEFAULT_OCR_PROMPT,
     PROMPTS,
     PromptTemplate,
+    add_language_instruction,
     build_prompt,
     list_available_prompts
+)
+
+# Sentinel for "constructor param not explicitly provided" so we can apply the
+# precedence: explicit param > OCRConfig field > hard-coded default.
+_UNSET = object()
+
+# Appended to the per-image prompt when detail="raw": ask the model to fill only
+# the verbatim raw.* fields and skip the (token-heavy) interpretation subtree.
+_RAW_DETAIL_INSTRUCTION = (
+    "\n\nRAW MODE: populate only the raw.* fields with the verbatim transcription. "
+    "Leave the interpretation fields empty/null — do not analyze or summarize."
 )
 
 logger = logging.getLogger(__name__)
@@ -135,6 +163,9 @@ class VisionAgent:
             max_concurrency: Optional[int] = None,
             timeout: Optional[int] = None,
             max_retries: Optional[int] = None,
+            structured: bool = False,
+            response_model: Optional[Type[BaseModel]] = None,
+            detail: str = "full",
     ):
         """Initialize the vision agent.
 
@@ -146,6 +177,14 @@ class VisionAgent:
             base_url: Optional base URL for OpenAI-compatible API endpoints
             timeout: Request timeout in seconds (forwarded to ChatOpenAI)
             max_retries: Maximum number of retries for failed requests
+            structured: When True, attach ``with_structured_output`` so the chain
+                returns ``{"raw", "parsed", "parsing_error"}`` dicts. When False
+                (default) the legacy free-form chain is used and the chain returns
+                plain ``AIMessage`` objects.
+            response_model: BYO pydantic schema for structured output; defaults to
+                :class:`~doc2mark.ocr.schema.OCRPage` when ``None``.
+            detail: ``"full"`` or ``"raw"`` — recorded for callers; the prompt-side
+                instruction is added by the provider, not here.
         """
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY')
         self.model = model
@@ -155,6 +194,9 @@ class VisionAgent:
         self.max_concurrency = max_concurrency
         self.timeout = timeout
         self.max_retries = max_retries
+        self.structured = structured
+        self.response_model = response_model
+        self.detail = detail
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")
@@ -164,7 +206,7 @@ class VisionAgent:
             logger.info(f"🤖 Initializing LangChain VisionAgent with {model}")
             if self.base_url:
                 logger.info(f"🌐 Using custom base URL: {self.base_url}")
-            
+
             # Prepare kwargs for ChatOpenAI
             llm_kwargs = {
                 "model": model,
@@ -184,7 +226,17 @@ class VisionAgent:
                 llm_kwargs["base_url"] = self.base_url
 
             self._llm = ChatOpenAI(**llm_kwargs)
-            self._chain = RunnableLambda(prepare_prompt) | self._llm
+            # prepare_prompt (image input) is identical for both paths — only the
+            # final stage of the chain changes for structured output.
+            if self.structured:
+                schema = self.response_model or OCRPage
+                logger.info(f"🧱 Structured output enabled (schema: {schema.__name__})")
+                structured_llm = self._llm.with_structured_output(
+                    schema, method="json_schema", include_raw=True,
+                )
+                self._chain = RunnableLambda(prepare_prompt) | structured_llm
+            else:
+                self._chain = RunnableLambda(prepare_prompt) | self._llm
 
     @staticmethod
     def _extract_usage(msg) -> Dict[str, Any]:
@@ -226,6 +278,23 @@ class VisionAgent:
 
         logger.info(f"✅ LangChain batch processing complete")
 
+        if getattr(self, "structured", False):
+            # Structured path: each element value is a dict
+            # {"raw": AIMessage, "parsed": OCRPage|None, "parsing_error": ...}
+            # (LangChain include_raw=True). Re-shape into a stable payload and
+            # carry token usage extracted from the raw AIMessage.
+            structured_output: List[Dict[str, Any]] = []
+            for _idx, payload in sorted_results:
+                raw_msg = payload.get("raw") if isinstance(payload, dict) else None
+                structured_output.append({
+                    "parsed": payload.get("parsed") if isinstance(payload, dict) else None,
+                    "parsing_error": payload.get("parsing_error") if isinstance(payload, dict) else None,
+                    "raw": raw_msg,
+                    "usage": self._extract_usage(raw_msg) if raw_msg is not None else {},
+                })
+            return structured_output
+
+        # Legacy free-form path: each element value is an AIMessage with .content.
         output = []
         for res in sorted_results:
             msg = res[1]
@@ -241,15 +310,15 @@ class OpenAIOCR(BaseOCR):
             self,
             api_key: Optional[str] = None,
             config: Optional[OCRConfig] = None,
-            model: str = "gpt-4.1",
-            temperature: float = 0,
-            max_tokens: int = 4096,
+            model: Any = _UNSET,
+            temperature: Any = _UNSET,
+            max_tokens: Any = _UNSET,
             max_workers: int = 5,
             default_prompt: Optional[str] = None,
             prompt_template: Optional[Union[str, PromptTemplate]] = None,
             timeout: int = 30,
             max_retries: int = 3,
-            base_url: Optional[str] = None,
+            base_url: Any = _UNSET,
             **kwargs
     ):
         """Initialize OpenAI OCR provider with comprehensive configuration.
@@ -272,16 +341,38 @@ class OpenAIOCR(BaseOCR):
         api_key = api_key or os.environ.get('OPENAI_API_KEY')
         super().__init__(api_key, config)
 
+        cfg = config or OCRConfig()
+        self.config = cfg
+
+        # One-time deprecation notice for inert/no-op config fields. They are read
+        # only by Tesseract (or by nobody) and do nothing for the LLM provider.
+        deprecated = cfg.deprecated_llm_overrides()
+        if deprecated:
+            warnings.warn(
+                "These OCRConfig fields are inert for the OpenAI provider and will "
+                f"be removed in a future release: {', '.join(deprecated)}. "
+                "Use the live knobs (model/task/language/structured/detail/...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # Resolve model knobs with precedence: explicit param > config > default.
+        def _resolve(param: Any, cfg_value: Any, default: Any) -> Any:
+            if param is not _UNSET:
+                return param
+            if cfg_value is not None:
+                return cfg_value
+            return default
+
         # Model configuration
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.model = _resolve(model, cfg.model, "gpt-4.1")
+        self.temperature = _resolve(temperature, cfg.temperature, 0)
+        self.max_tokens = _resolve(max_tokens, cfg.max_tokens, 4096)
         self.timeout = timeout
         self.max_retries = max_retries
-        self.base_url = base_url or os.environ.get('OPENAI_BASE_URL')
+        resolved_base_url = base_url if base_url is not _UNSET else cfg.base_url
+        self.base_url = resolved_base_url or os.environ.get('OPENAI_BASE_URL')
         self.model_kwargs = kwargs
-
-        self.config = config or OCRConfig()
 
         # Batch processing configuration
         self.max_workers = max_workers
@@ -332,9 +423,18 @@ class OpenAIOCR(BaseOCR):
         logger.info("🔐 Validating OpenAI API key...")
         return True
 
-    def _ensure_vision_agent(self) -> VisionAgent:
-        """Initialize the LangChain vision agent only when OCR is requested."""
-        if self._vision_agent:
+    def _ensure_vision_agent(
+            self,
+            structured: bool = False,
+            response_model: Optional[Type[BaseModel]] = None,
+            detail: str = "full",
+    ) -> VisionAgent:
+        """Initialize the LangChain vision agent only when OCR is requested.
+
+        The chain's final stage depends on ``structured``, so when a request
+        toggles structured output relative to the cached agent we rebuild it.
+        """
+        if self._vision_agent is not None and getattr(self._vision_agent, "structured", False) == structured:
             return self._vision_agent
 
         if not LANGCHAIN_AVAILABLE:
@@ -365,6 +465,9 @@ class OpenAIOCR(BaseOCR):
                 ),
                 timeout=self.timeout,
                 max_retries=self.max_retries,
+                structured=structured,
+                response_model=response_model,
+                detail=detail,
             )
         except Exception as e:
             logger.error(f"❌ Failed to initialize VisionAgent: {e}")
@@ -550,17 +653,28 @@ class OpenAIOCR(BaseOCR):
     def batch_process_images(
             self,
             images: List[bytes],
-            max_workers: Optional[int] = None,
+            *,
+            task: Optional[Union[str, Task]] = None,
+            tasks: Optional[List[Union[str, Task]]] = None,
+            language: Optional[str] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
             **kwargs
     ) -> List[OCRResult]:
         """
         Process multiple images using LangChain for optimal performance.
-        
+
         Args:
             images: List of image data
-            max_workers: Not used - kept for compatibility
-            **kwargs: Additional options
-            
+            task: Single OCR intent applied to every image (overrides config.task).
+            tasks: Per-image OCR intents for mixed batches; must match len(images).
+            language: Output language hint (overrides config.language).
+            structured: Override config.structured for this call. When False the
+                legacy free-form path runs (returns OCRResult.text, document=None).
+            detail: "full" or "raw"; "raw" skips interpretation to save tokens.
+            **kwargs: Additional options (e.g. save_locally, content_type,
+                instructions, prompt_template for the legacy path).
+
         Returns:
             List of OCR results in the same order as input
         """
@@ -577,16 +691,97 @@ class OpenAIOCR(BaseOCR):
             logger.info("💾 Saving images locally instead of performing OCR")
             return self._batch_save_images_locally(images, **kwargs)
 
-        self._ensure_vision_agent()
+        # Resolve the structured-output controls (per-call override > config).
+        resolved_structured = self.config.structured if structured is None else structured
+        resolved_detail = detail or self.config.detail
+        response_model = self.config.response_model
 
-        logger.info("🔗 Using LangChain VisionAgent for batch processing")
-        return self._batch_process_with_vision_agent(images, **kwargs)
+        self._ensure_vision_agent(
+            structured=resolved_structured,
+            response_model=response_model,
+            detail=resolved_detail,
+        )
 
-    def _batch_process_with_vision_agent(self, images: List[bytes], **kwargs) -> List[OCRResult]:
+        logger.info(
+            f"🔗 Using LangChain VisionAgent for batch processing "
+            f"(structured={resolved_structured}, detail={resolved_detail})"
+        )
+        return self._batch_process_with_vision_agent(
+            images,
+            structured=resolved_structured,
+            task=task,
+            tasks=tasks,
+            language=language,
+            detail=resolved_detail,
+            **kwargs,
+        )
+
+    def _coerce_task(self, task: Union[str, Task]) -> Task:
+        """Coerce a string/enum into a :class:`Task`."""
+        if isinstance(task, Task):
+            return task
+        try:
+            return Task(task)
+        except ValueError:
+            available = [t.value for t in Task]
+            raise ValueError(f"Unknown OCR task: {task}. Available: {available}")
+
+    def _resolve_task_prompts(
+            self,
+            n_images: int,
+            task: Optional[Union[str, Task]],
+            tasks: Optional[List[Union[str, Task]]],
+            language: Optional[str],
+            detail: str,
+    ) -> List[str]:
+        """Build a per-image structured prompt list from TASK_PROMPTS.
+
+        Per-image ``tasks`` win over the single ``task``/config.task. The
+        existing language-instruction mechanism is appended unchanged, and a
+        raw-mode instruction is appended when ``detail == "raw"``.
+        """
+        if tasks is not None:
+            if len(tasks) != n_images:
+                raise ValueError(
+                    f"tasks length ({len(tasks)}) must match number of images ({n_images})"
+                )
+            resolved_tasks = [self._coerce_task(t) for t in tasks]
+        else:
+            single = self._coerce_task(task) if task is not None else self.config.task
+            resolved_tasks = [single] * n_images
+
+        lang = language if language is not None else (self.config.language if self.config else None)
+        prompts: List[str] = []
+        for t in resolved_tasks:
+            base = TASK_PROMPTS[t]
+            base = add_language_instruction(base, lang)
+            if detail == "raw":
+                base = base + _RAW_DETAIL_INSTRUCTION
+            prompts.append(base)
+        return prompts
+
+    def _batch_process_with_vision_agent(
+            self,
+            images: List[bytes],
+            *,
+            structured: bool = False,
+            task: Optional[Union[str, Task]] = None,
+            tasks: Optional[List[Union[str, Task]]] = None,
+            language: Optional[str] = None,
+            detail: str = "full",
+            **kwargs,
+    ) -> List[OCRResult]:
         """Process images using LangChain VisionAgent for optimal performance."""
         try:
-            # Build prompt for batch processing
-            prompt = self._build_prompt(**kwargs)
+            # Build the per-image prompts. Structured output selects schema-aligned
+            # TASK_PROMPTS; the legacy path keeps the verbose template builder.
+            if structured:
+                prompts = self._resolve_task_prompts(len(images), task, tasks, language, detail)
+            else:
+                legacy_kwargs = dict(kwargs)
+                if language is not None:
+                    legacy_kwargs['language'] = language
+                prompts = [self._build_prompt(**legacy_kwargs)] * len(images)
 
             # Prepare input data for VisionAgent
             input_dicts = []
@@ -597,7 +792,7 @@ class OpenAIOCR(BaseOCR):
                 input_dicts.append({
                     'image_data': base64_image,
                     'mime_type': mime_type,
-                    'prompt': prompt,
+                    'prompt': prompts[i],
                     'index': i
                 })
 
@@ -605,14 +800,77 @@ class OpenAIOCR(BaseOCR):
             logger.info(f"🚀 Processing {len(input_dicts)} images with VisionAgent")
             batch_results = self._vision_agent.batch_invoke(input_dicts)
 
-            # Convert to OCRResult objects
-            results = []
-            for i, (text_result, token_usage) in enumerate(batch_results):
-                image_size = len(images[i])
+            results = self._results_from_batch(images, batch_results, language, kwargs)
+
+            successful = len([r for r in results if r.text])
+            logger.info(f"✅ VisionAgent batch complete: {successful}/{len(images)} successful")
+
+            return results
+
+        except (OCRError, ValueError):
+            # OCRError (e.g. on_parse_error="raise") and ValueError (e.g. a
+            # tasks/images length mismatch) are intentional — surface them as-is.
+            raise
+        except Exception as e:
+            logger.error(f"❌ VisionAgent batch processing failed: {e}")
+            raise OCRError(f"Failed to process images with LangChain: {str(e)}") from e
+
+    def _results_from_batch(
+            self,
+            images: List[bytes],
+            batch_results: List[Any],
+            language: Optional[str],
+            kwargs: Dict[str, Any],
+    ) -> List[OCRResult]:
+        """Convert VisionAgent batch output into OCRResult objects.
+
+        Shape-tolerant: structured runs yield ``{"parsed", "raw", ...}`` dicts
+        (``document`` populated), while the legacy free-form path yields
+        ``(text, token_usage)`` tuples (``document=None``).
+        """
+        on_parse_error = self.config.on_parse_error if self.config else "raw_text"
+        results: List[OCRResult] = []
+
+        for i, item in enumerate(batch_results):
+            image_size = len(images[i]) if i < len(images) else None
+
+            if isinstance(item, dict):
+                # --- Structured path ---
+                page = item.get("parsed")
+                raw_msg = item.get("raw")
+                token_usage = item.get("usage") or {}
+
+                if page is None:
+                    if on_parse_error == "raise":
+                        raise OCRError(
+                            f"Structured OCR parse failed: {item.get('parsing_error')}"
+                        )
+                    # render bridge: free-form content into raw.text
+                    content = getattr(raw_msg, "content", "") or ""
+                    if isinstance(content, str):
+                        content = content.replace('```', '`')
+                    page = OCRPage(raw=RawExtraction(text=content), interpretation=None)
+
+                results.append(OCRResult(
+                    text=page.to_markdown(),
+                    confidence=(page.interpretation.self_confidence if page.interpretation else None),
+                    language=page.raw.detected_language,
+                    metadata={
+                        "model": self.model,
+                        "token_usage": token_usage,
+                        "structured": True,
+                        "image_size_bytes": image_size,
+                        "batch_index": i,
+                    },
+                    document=page,
+                ))
+            else:
+                # --- Legacy free-form path ---
+                text_result, token_usage = item
                 results.append(OCRResult(
                     text=text_result,
                     confidence=1.0,
-                    language=kwargs.get('language') or (self.config.language if self.config else None),
+                    language=language or (self.config.language if self.config else None),
                     metadata={
                         "model": self.model,
                         "temperature": self.temperature,
@@ -624,18 +882,12 @@ class OpenAIOCR(BaseOCR):
                         "batch_index": i,
                         "content_type": kwargs.get('content_type'),
                         "model_kwargs": self.model_kwargs,
-                        "token_usage": token_usage
+                        "token_usage": token_usage,
+                        "structured": False,
                     }
                 ))
 
-            successful = len([r for r in results if r.text])
-            logger.info(f"✅ VisionAgent batch complete: {successful}/{len(images)} successful")
-
-            return results
-
-        except Exception as e:
-            logger.error(f"❌ VisionAgent batch processing failed: {e}")
-            raise OCRError(f"Failed to process images with LangChain: {str(e)}") from e
+        return results
 
     def _batch_save_images_locally(self, images: List[bytes], **kwargs) -> List[OCRResult]:
         """Batch save images locally."""

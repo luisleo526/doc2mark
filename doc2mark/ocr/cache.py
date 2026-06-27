@@ -14,14 +14,21 @@ from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from doc2mark.ocr.base import BaseOCR, OCRResult
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.schema import OCRPage
 
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = "ocr-cache-v3"
-OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v1"
+CACHE_SCHEMA_VERSION = "ocr-cache-v4"
+OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
+
+# Providers that consume an OCRConfig but are NOT LLM providers, so the
+# Tesseract-only fields (enhance_image/detect_layout/detect_tables) are live and
+# must stay in the cache key. Every other OCRConfig-backed provider is an LLM
+# provider for which only the slim, cache-relevant subset matters.
+_NON_LLM_CONFIG_PROVIDERS = {"doc2mark.ocr.tesseract.TesseractOCR"}
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
 _ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
@@ -52,6 +59,7 @@ def _normalize_result(result: Any) -> OCRResult:
             confidence=getattr(result, "confidence", None),
             language=getattr(result, "language", None),
             metadata=getattr(result, "metadata", None),
+            document=getattr(result, "document", None),
         )
     return OCRResult(text=str(result))
 
@@ -98,6 +106,32 @@ def _stable_value(value: Any, *, strict: bool = False) -> Any:
     return {"type": _type_identity(value), "repr": repr_value}
 
 
+def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
+    """Return only the cache-relevant LLM config knobs.
+
+    Inert/deprecated fields (e.g. detect_tables) are excluded so toggling them no
+    longer produces spurious cache misses for LLM providers.
+    """
+    response_model = getattr(config, "response_model", None)
+    return {
+        "language": config.language,
+        "max_concurrency": config.max_concurrency,
+        "structured": config.structured,
+        "detail": config.detail,
+        "response_model": response_model.__name__ if response_model is not None else None,
+    }
+
+
+def _config_cache_signature(provider: Any) -> Any:
+    """Hash a slim config for LLM providers, the full config otherwise."""
+    config = getattr(provider, "config", None)
+    if isinstance(config, OCRConfig):
+        qualname = f"{provider.__class__.__module__}.{provider.__class__.__qualname__}"
+        if qualname not in _NON_LLM_CONFIG_PROVIDERS:
+            return _stable_value(_slim_llm_config(config), strict=True)
+    return _stable_value(config, strict=True)
+
+
 def _api_key_hash(provider: Any) -> Optional[str]:
     api_key = getattr(provider, "api_key", None)
     if not api_key:
@@ -128,7 +162,7 @@ def build_ocr_cache_key(
         "image_sha256": hashlib.sha256(image).hexdigest(),
         "provider": f"{provider.__class__.__module__}.{provider.__class__.__qualname__}",
         "api_key_sha256": _api_key_hash(provider),
-        "config": _stable_value(getattr(provider, "config", None), strict=True),
+        "config": _config_cache_signature(provider),
         "model": _stable_value(getattr(provider, "model", None), strict=True),
         "temperature": _stable_value(getattr(provider, "temperature", None), strict=True),
         "max_tokens": _stable_value(getattr(provider, "max_tokens", None), strict=True),
@@ -168,6 +202,7 @@ def _serialize_ocr_cache_entry(
             "confidence": normalized.confidence,
             "language": normalized.language,
             "metadata": _stable_value(normalized.metadata),
+            "document": normalized.document.model_dump() if normalized.document else None,
         },
         "created_at": float(created_at),
         "expires_at": float(expires_at),
@@ -204,12 +239,16 @@ def _deserialize_ocr_cache_entry(payload: Any) -> _SerializedCacheEntry:
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Malformed OCR cache metadata") from exc
 
+    document_payload = result_payload.get("document")
+    document = OCRPage.model_validate(document_payload) if document_payload else None
+
     return _SerializedCacheEntry(
         result=OCRResult(
             text=str(result_payload["text"]),
             confidence=result_payload.get("confidence"),
             language=result_payload.get("language"),
             metadata=result_payload.get("metadata"),
+            document=document,
         ),
         created_at=created_at,
         expires_at=expires_at,
