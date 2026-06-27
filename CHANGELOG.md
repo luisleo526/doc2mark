@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as clean HTML using ``colspan``/``rowspan`` for merged cells (which the flat
   ``headers``/``rows`` and markdown cannot represent). ``OCRPage.to_markdown()``
   prefers it.
+- **Document-level OCR strategy route.** Each PDF is classified once from two
+  deterministic signals — mean per-page image coverage AND mean per-page
+  selectable-text density. "image" docs (high coverage, low text/page: slide
+  decks, scans) are OCR'd whole-page-by-page with the OCR authoritative; "text"
+  docs keep the deterministic rule-based text/table layer (BM42) and OCR only
+  embedded figures. Text density is the decisive signal: coverage alone
+  misclassifies a text document that carries large figures. A uniform per-doc
+  strategy avoids mixing OCR-only and rule-based pages.
 - **Page-level OCR for image-dominant PDFs.** Scanned pages and slide decks
   exported as pictures (little/no text layer, images covering the page) are now
   rendered and OCR'd once per page instead of per embedded image — coherent
