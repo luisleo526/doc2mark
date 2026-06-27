@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -17,7 +18,7 @@ from doc2mark.core.base import (
     ProcessingError,
     UnsupportedFormatError
 )
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
 
@@ -52,6 +53,11 @@ class UnifiedDocumentLoader:
             location: str = "global",
             # General OCR parameters
             default_prompt: Optional[str] = None,
+            # Structured-OCR knobs (override the OCRConfig sent to LLM providers
+            # when provided; None = leave the config / provider default in place)
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
             # Table output configuration
             table_style: Optional[str] = None
     ):
@@ -88,6 +94,14 @@ class UnifiedDocumentLoader:
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
 
+            # Structured-OCR knobs (LLM providers):
+            task: Override the OCRConfig task (Task enum or name, e.g. 'receipt').
+                None leaves the supplied config / provider default untouched.
+            structured: Override structured-output mode (True/False). None leaves
+                the config / provider default (structured=True) untouched.
+            detail: Override interpretation detail ('raw' or 'full'). None leaves
+                the config / provider default untouched.
+
             # Table output configuration:
             table_style: Output style for complex tables with merged cells:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
@@ -115,6 +129,9 @@ class UnifiedDocumentLoader:
             project=project,
             location=location,
             default_prompt=default_prompt,
+            task=task,
+            structured=structured,
+            detail=detail,
         )
         self._apply_ocr_cache(ocr_cache)
 
@@ -148,6 +165,34 @@ class UnifiedDocumentLoader:
             return None
         return ocr.wrapped if isinstance(ocr, CachedOCR) else ocr
 
+    @staticmethod
+    def _resolve_ocr_config(
+            ocr_config: Optional[OCRConfig],
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
+    ) -> OCRConfig:
+        """Resolve the OCRConfig handed to the OCR provider.
+
+        Always returns a concrete OCRConfig (never None) so the structured
+        defaults (structured=True) apply consistently even when the caller did
+        not supply a config. Any of ``task``/``structured``/``detail`` that are
+        not None override the matching config field; None leaves the config
+        value (or the OCRConfig default) untouched. The caller's config object
+        is never mutated.
+        """
+        config = ocr_config if ocr_config is not None else OCRConfig()
+        overrides: Dict[str, Any] = {}
+        if task is not None:
+            overrides["task"] = task if isinstance(task, Task) else Task(str(task).lower())
+        if structured is not None:
+            overrides["structured"] = structured
+        if detail is not None:
+            overrides["detail"] = detail
+        if overrides:
+            config = replace(config, **overrides)
+        return config
+
     def _create_ocr_provider(
             self,
             ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]],
@@ -167,6 +212,9 @@ class UnifiedDocumentLoader:
             project: Optional[str] = None,
             location: str = "global",
             default_prompt: Optional[str] = None,
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
             model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[BaseOCR]:
         """Create an OCR provider using the same enhanced path everywhere."""
@@ -179,6 +227,10 @@ class UnifiedDocumentLoader:
             return ocr_provider
 
         logger.info(f"🤖 Initializing OCR provider: {ocr_provider}")
+        # Resolve a concrete OCRConfig so the structured/task/detail knobs reach
+        # the provider and the structured defaults apply even when no config was
+        # supplied. This config is passed through to every provider branch below.
+        ocr_config = self._resolve_ocr_config(ocr_config, task=task, structured=structured, detail=detail)
         extra_model_kwargs = dict(model_kwargs or {})
 
         if self._is_ocr_provider(ocr_provider, OCRProvider.OPENAI):

@@ -9,7 +9,7 @@ import logging
 import sys
 
 from doc2mark import UnifiedDocumentLoader
-from doc2mark.ocr.base import OCRConfig
+from doc2mark.ocr.base import OCRConfig, Task
 
 
 def setup_logging(log_file=None, verbose=False, quiet=False):
@@ -203,6 +203,28 @@ Supported formats:
         default="eng",
         help="Language for Tesseract OCR (default: eng)"
     )
+
+    ocr_group.add_argument(
+        "--ocr-task",
+        choices=[t.value for t in Task],
+        default="auto",
+        help="OCR task intent for LLM providers (default: auto)"
+    )
+
+    ocr_group.add_argument(
+        "--no-structured",
+        dest="structured",
+        action="store_false",
+        default=True,
+        help="Disable structured OCR output (use free-form markdown)"
+    )
+
+    ocr_group.add_argument(
+        "--ocr-detail",
+        choices=["raw", "full"],
+        default="full",
+        help="OCR detail level: raw (transcription only) or full (default: full)"
+    )
     
     ocr_group.add_argument(
         "--extract-images",
@@ -380,7 +402,12 @@ Supported formats:
     if args.ocr_images:
         args.extract_images = True
 
-    ocr_config = OCRConfig(language=args.ocr_lang) if args.ocr == "tesseract" else None
+    ocr_config = OCRConfig(
+        language=args.ocr_lang if args.ocr == "tesseract" else None,
+        task=Task(args.ocr_task),
+        structured=args.structured,
+        detail=args.ocr_detail,
+    )
     load_format = "markdown" if args.format in {"json", "both"} else args.format
 
     try:

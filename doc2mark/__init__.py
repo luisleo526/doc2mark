@@ -26,7 +26,9 @@ from doc2mark.core.base import (
 )
 # Main imports
 from doc2mark.core.loader import UnifiedDocumentLoader
-from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory
+from doc2mark.ocr.base import OCRProvider, OCRConfig, OCRFactory, Task
+from doc2mark.ocr import OCR
+from doc2mark.ocr.schema import OCRPage, RawExtraction, Interpretation
 from doc2mark.ocr.cache import (
     OCRCache,
     MemoryOCRCache,
@@ -41,10 +43,14 @@ __all__ = [
     # Main class
     'UnifiedDocumentLoader',
 
+    # OCR facade
+    'OCR',
+
     # Enums
     'DocumentFormat',
     'OutputFormat',
     'OCRProvider',
+    'Task',
     'TableStyle',
 
     # Data classes
@@ -52,6 +58,11 @@ __all__ = [
     'DocumentMetadata',
     'OCRConfig',
     'OCRCache',
+
+    # Structured OCR schema
+    'OCRPage',
+    'RawExtraction',
+    'Interpretation',
 
     # Exceptions
     'ProcessingError',
