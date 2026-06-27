@@ -18,7 +18,70 @@ satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 
 from typing import List, Optional, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+# --------------------------------------------------------------------------- #
+# Table HTML sanitization                                                     #
+# --------------------------------------------------------------------------- #
+# Table.html is produced by a vision model reading a (possibly adversarial)
+# document image and flows into rendered output via OCRPage.to_markdown(). To
+# avoid an HTML-injection / XSS sink, it is sanitized to a strict allowlist of
+# table-structural tags + span attributes; everything else is dropped.
+_ALLOWED_TABLE_TAGS = frozenset({
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "col", "colgroup",
+})
+_ALLOWED_TABLE_ATTRS = frozenset({"colspan", "rowspan", "scope"})
+_DANGEROUS_TAGS = (
+    "script", "style", "iframe", "object", "embed", "link", "meta", "base",
+    "form", "input", "button", "noscript", "template", "svg", "math",
+)
+
+
+def sanitize_table_html(html: str) -> str:
+    """Sanitize model-produced table HTML to a strict table-only allowlist.
+
+    Keeps only table-structural tags and ``colspan``/``rowspan``/``scope``
+    attributes (cell text is preserved); drops scripts, styles, event handlers,
+    URLs, and every other tag/attribute. Fails **closed**: returns ``""`` when the
+    input is empty or cannot be parsed, so unsanitized HTML is never emitted.
+    """
+    if not html or not html.strip():
+        return ""
+    text = html.strip()
+    # Strip a leading ```/```html ... ``` code fence a model might wrap it in.
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text[: text.rfind("```")]
+    text = text.strip()
+    if not text:
+        return ""
+    try:
+        from lxml import etree, html as lxml_html
+        frag = lxml_html.fragment_fromstring(text, create_parent="div")
+    except Exception:
+        return ""  # fail closed — never emit unparsed LLM HTML
+    # 1. Remove dangerous elements together with their text content.
+    etree.strip_elements(frag, *_DANGEROUS_TAGS, with_tail=False)
+    # 2. Unwrap every remaining non-allowlisted element (keeps inner text).
+    #    strip_tags preserves the root wrapper, so nested <div>/<span>/<a>/... go.
+    present = {e.tag for e in frag.iter() if isinstance(e.tag, str)}
+    unwrap = tuple(t for t in present if t.lower() not in _ALLOWED_TABLE_TAGS)
+    if unwrap:
+        etree.strip_tags(frag, *unwrap)
+    # 3. Drop every attribute outside the allowlist; require integer spans.
+    for el in frag.iter():
+        if not isinstance(el.tag, str):
+            continue
+        for attr in list(el.attrib):
+            name = attr.lower()
+            if name not in _ALLOWED_TABLE_ATTRS:
+                del el.attrib[attr]
+            elif name in ("colspan", "rowspan") and not el.attrib[attr].strip().isdigit():
+                del el.attrib[attr]
+    inner = "".join(etree.tostring(child, encoding="unicode") for child in frag)
+    return inner.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -44,6 +107,13 @@ class Table(BaseModel):
     )
     # Rendered markdown fallback for simple (non-merged) tables.
     markdown: str = ""
+
+    @field_validator("html")
+    @classmethod
+    def _sanitize_html(cls, value: str) -> str:
+        """Sanitize model-supplied HTML at the boundary so the stored value is
+        always safe to embed (see :func:`sanitize_table_html`)."""
+        return sanitize_table_html(value)
 
 
 class KeyValue(BaseModel):
@@ -151,4 +221,5 @@ __all__ = [
     "RawExtraction",
     "Interpretation",
     "OCRPage",
+    "sanitize_table_html",
 ]

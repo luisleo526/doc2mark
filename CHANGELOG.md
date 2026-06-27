@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened XML parsing against XXE and entity-expansion: DOCX/PPTX footnote
   parsing uses a locked-down lxml parser (`resolve_entities=False`), and the
   markup path uses `defusedxml`.
+- Sanitized the LLM-produced ``Table.html`` (OCR) to a strict table-tag
+  allowlist (`colspan`/`rowspan`/`scope` only), dropping scripts, styles, event
+  handlers, and URLs to remove an HTML-injection / XSS sink. Fails closed.
 
 ## [0.5.2] - 2025-05-20
 

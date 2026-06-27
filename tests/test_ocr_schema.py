@@ -15,6 +15,7 @@ from doc2mark.ocr.schema import (
     Interpretation,
     Table,
     KeyValue,
+    sanitize_table_html,
 )
 
 
@@ -77,6 +78,57 @@ class TestToMarkdown:
 
     def test_empty_page(self):
         assert OCRPage().to_markdown() == ""
+
+
+class TestTableHtmlSanitization:
+    """Table.html is LLM-controlled and must be sanitized to a table allowlist."""
+
+    def test_script_is_dropped_with_content(self):
+        out = sanitize_table_html("<table><tr><td>ok<script>alert(1)</script></td></tr></table>")
+        assert "script" not in out.lower() and "alert" not in out
+        assert "ok" in out and "<td>" in out
+
+    def test_event_handler_and_style_attrs_stripped(self):
+        out = sanitize_table_html('<table><tr><td onclick="x()" style="color:red" class="c">a</td></tr></table>')
+        assert "onclick" not in out.lower() and "style" not in out.lower() and "class" not in out.lower()
+        assert "a" in out
+
+    def test_spans_preserved(self):
+        out = sanitize_table_html('<table><tr><th colspan="2" rowspan="3">H</th></tr></table>')
+        assert 'colspan="2"' in out and 'rowspan="3"' in out
+
+    def test_non_integer_span_dropped(self):
+        out = sanitize_table_html('<table><tr><td colspan="x">a</td></tr></table>')
+        assert "colspan" not in out.lower() and "a" in out
+
+    def test_inline_tags_unwrapped_keeping_text(self):
+        out = sanitize_table_html("<table><tr><td><b>bold</b> <a href='javascript:x'>link</a></td></tr></table>")
+        assert "bold" in out and "link" in out
+        assert "<b>" not in out and "<a" not in out and "javascript" not in out
+
+    def test_non_table_wrapper_dropped(self):
+        out = sanitize_table_html("<div onmouseover='x'><table><tr><td>1</td></tr></table></div>")
+        assert "<div" not in out and "onmouseover" not in out and "1" in out
+
+    def test_empty_and_unparseable_fail_closed(self):
+        assert sanitize_table_html("") == ""
+        assert sanitize_table_html("   ") == ""
+
+    def test_code_fence_stripped(self):
+        out = sanitize_table_html("```html\n<table><tr><td>x</td></tr></table>\n```")
+        assert "```" not in out and "<td>" in out and "x" in out
+
+    def test_validator_runs_on_construction(self):
+        t = Table(html="<table><tr><td onclick='x'>v<script>bad</script></td></tr></table>")
+        assert "script" not in t.html.lower() and "onclick" not in t.html.lower()
+        assert "v" in t.html
+
+    def test_to_markdown_emits_sanitized_html(self):
+        page = OCRPage(raw=RawExtraction(tables=[
+            Table(html="<table><tr><td>cell<script>alert(1)</script></td></tr></table>")
+        ]))
+        md = page.to_markdown()
+        assert "script" not in md.lower() and "cell" in md
 
 
 class TestOCRConfigCompat:
