@@ -5,7 +5,7 @@ import re
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Union, Tuple
-from xml.etree import ElementTree as ET
+import defusedxml.ElementTree as ET
 
 from doc2mark.core.base import (
     BaseProcessor,

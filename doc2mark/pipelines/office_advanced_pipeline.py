@@ -14,6 +14,23 @@ def _image_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _safe_lxml_parser():
+    """Return an lxml parser hardened against XXE / entity-expansion attacks.
+
+    ``resolve_entities=False`` is the load-bearing flag: it blocks file:// XXE
+    and entity-expansion attacks when parsing XML extracted from untrusted
+    .docx/.pptx archives.
+    """
+    from lxml import etree
+    return etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        load_dtd=False,
+        dtd_validation=False,
+        huge_tree=False,
+    )
+
+
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
 # Office document libraries
@@ -678,16 +695,6 @@ class DocxLoader(BaseOfficeLoader):
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
 
-                # Prepare batch for OCR
-                ocr_batch = []
-                image_hashes = []  # Store hashes to map results back
-
-                for info in all_images_info:
-                    base64_data = base64.b64encode(info['data']).decode('utf-8')
-                    ocr_batch.append({"image_data": base64_data})
-                    # Use hash of image data as key
-                    image_hashes.append(_image_hash(info['data']))
-
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader
                     ocr_results_map = self._batch_ocr_images(all_images_info)
@@ -852,7 +859,7 @@ class DocxLoader(BaseOfficeLoader):
                 for xml_path in ("word/footnotes.xml", "word/endnotes.xml"):
                     if xml_path not in zf.namelist():
                         continue
-                    tree = etree.parse(zf.open(xml_path))
+                    tree = etree.parse(zf.open(xml_path), parser=_safe_lxml_parser())
                     root = tree.getroot()
                     is_endnote = "endnote" in xml_path
                     tag_local = "endnote" if is_endnote else "footnote"
@@ -900,9 +907,11 @@ class DocxLoader(BaseOfficeLoader):
             pass  # Reference injection handled by _process_paragraph_with_refs below
 
     def _process_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
-                           ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+                           ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
                            processed_image_hashes: set = None):
         """Process a paragraph and extract text and images"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -944,13 +953,15 @@ class DocxLoader(BaseOfficeLoader):
                 "content": text
             })
 
-    def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+    def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
                            processed_image_hashes: set = None) -> Optional[Union[Dict[str, str], List[Dict[str, str]]]]:
         """Extract all images from a run.
 
         Returns a single dict if exactly one image is found, a list of dicts if multiple
         images are found in the run, or None if no images are present.
         """
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -988,9 +999,11 @@ class DocxLoader(BaseOfficeLoader):
         return None
 
     def _extract_image_from_inline(self, inline_element, ocr_images: bool = False,
-                                   ocr_results_map: Dict[str, str] = {}, 
+                                   ocr_results_map: Optional[Dict[str, str]] = None,
                                    processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Extract image from an inline element"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -1024,9 +1037,11 @@ class DocxLoader(BaseOfficeLoader):
         return None
 
     def _extract_image_from_anchor(self, anchor_element, ocr_images: bool = False,
-                                   ocr_results_map: Dict[str, str] = {}, 
+                                   ocr_results_map: Optional[Dict[str, str]] = None,
                                    processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Extract image from an anchor element and return formatted result"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -1059,9 +1074,11 @@ class DocxLoader(BaseOfficeLoader):
 
         return None
 
-    def _get_image_by_rid(self, rid: str, ocr_images: bool = False, ocr_results_map: Dict[str, str] = {},
+    def _get_image_by_rid(self, rid: str, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
                           processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
         """Get image data using relationship ID"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
             
@@ -1110,8 +1127,10 @@ class DocxLoader(BaseOfficeLoader):
         return None
 
     def _extract_inline_shape_image(self, inline_shape, ocr_images: bool = False,
-                                    ocr_results_map: Dict[str, str] = {}) -> Optional[Dict[str, str]]:
+                                    ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
         """Extract image from an InlineShape object"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         try:
             # Get the inline element
             inline = inline_shape._inline
@@ -1347,8 +1366,10 @@ class DocxLoader(BaseOfficeLoader):
         return None
 
     def _extract_images_from_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
-                                       ocr_images: bool = False, ocr_results_map: Dict[str, str] = {}):
+                                       ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None):
         """Extract only images from a paragraph (used for table cells to avoid duplicate text)"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         if extract_images:
             for run in paragraph.runs:
                 image_content = self._extract_run_images(run, ocr_images, ocr_results_map)
@@ -1463,16 +1484,6 @@ class PptxLoader(BaseOfficeLoader):
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
 
-                # Prepare batch for OCR
-                ocr_batch = []
-                image_hashes = []  # Store hashes to map results back
-
-                for info in all_images_info:
-                    base64_data = base64.b64encode(info['data']).decode('utf-8')
-                    ocr_batch.append({"image_data": base64_data})
-                    # Use hash of image data as key
-                    image_hashes.append(_image_hash(info['data']))
-
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader
                     ocr_results_map = self._batch_ocr_images(all_images_info)
@@ -1571,8 +1582,10 @@ class PptxLoader(BaseOfficeLoader):
         return images
 
     def _process_slide(self, slide, slide_num: int, extract_images: bool, ocr_images: bool,
-                       ocr_results_map: Dict[str, str] = {}) -> List[Dict[str, Any]]:
+                       ocr_results_map: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         """Process a single slide"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         content_items = []
 
         logger.info(f"Processing slide {slide_num}...")
@@ -1627,9 +1640,11 @@ class PptxLoader(BaseOfficeLoader):
         return content_items
 
     def _extract_from_placeholders(self, slide, slide_num: int, extract_images: bool, ocr_images: bool,
-                                   ocr_results_map: Dict[str, str] = {}) -> List[
+                                   ocr_results_map: Optional[Dict[str, str]] = None) -> List[
         Dict[str, Any]]:
         """Extract content from slide placeholders"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         content_items = []
 
         try:
@@ -1756,9 +1771,11 @@ class PptxLoader(BaseOfficeLoader):
         return None
 
     def _extract_from_shapes(self, slide, slide_num: int, extract_images: bool, ocr_images: bool,
-                             ocr_results_map: Dict[str, str] = {}) -> List[
+                             ocr_results_map: Optional[Dict[str, str]] = None) -> List[
         Dict[str, Any]]:
         """Extract content from regular shapes (non-placeholders)"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         content_items = []
 
         shape_count = len(slide.shapes) if hasattr(slide, 'shapes') else 0
@@ -1830,9 +1847,11 @@ class PptxLoader(BaseOfficeLoader):
         return content_items
 
     def _extract_from_group_shape(self, group_shape, slide_num: int, extract_images: bool, ocr_images: bool,
-                                  ocr_results_map: Dict[str, str] = {}) -> List[
+                                  ocr_results_map: Optional[Dict[str, str]] = None) -> List[
         Dict[str, Any]]:
         """Recursively extract content from grouped shapes"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         content_items = []
 
         try:
@@ -2078,9 +2097,11 @@ class PptxLoader(BaseOfficeLoader):
         return None
 
     def _extract_image_from_placeholder(self, placeholder, slide_num: int, ocr_images: bool,
-                                        ocr_results_map: Dict[str, str] = {}) -> Optional[
+                                        ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[
         Dict[str, Any]]:
         """Extract image from a picture placeholder"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         try:
             image = placeholder.image
             image_data = image.blob
@@ -2118,8 +2139,10 @@ class PptxLoader(BaseOfficeLoader):
             return None
 
     def _extract_image_from_shape(self, shape, slide_num: int, ocr_images: bool,
-                                  ocr_results_map: Dict[str, str] = {}) -> Optional[Dict[str, Any]]:
+                                  ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
         """Extract image from a shape"""
+        if ocr_results_map is None:
+            ocr_results_map = {}
         try:
             image = shape.image
             image_data = image.blob
@@ -2362,16 +2385,6 @@ class XlsxLoader(BaseOfficeLoader):
             if all_images_info:
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
-
-                # Prepare batch for OCR
-                ocr_batch = []
-                image_hashes = []  # Store hashes to map results back
-
-                for info in all_images_info:
-                    base64_data = base64.b64encode(info['data']).decode('utf-8')
-                    ocr_batch.append({"image_data": base64_data})
-                    # Use hash of image data as key
-                    image_hashes.append(_image_hash(info['data']))
 
                 try:
                     # Use the configured OCR instance from BaseOfficeLoader

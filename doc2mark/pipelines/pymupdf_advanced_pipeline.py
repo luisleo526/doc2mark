@@ -223,9 +223,6 @@ class PDFLoader:
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
 
-                # Prepare batch for OCR
-                ocr_batch = [{"image_data": info["base64"]} for info in all_images_info]
-
                 try:
                     # Use the configured OCR instance for batch processing
                     if self.ocr:
