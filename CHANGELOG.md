@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OCRResult.document`) with a hard boundary between `raw` (verbatim
   transcription, tables, key/value fields) and `interpretation` (summary,
   document type, key findings). Structured output is the default.
+- **Richer OCR schema for image-strategy pages.** When the OCR output is the
+  only representation of a page, the model now extracts deeper structure in one
+  pass. `raw` gains verbatim, BM42-safe additive indexes — `headings`, `dates`,
+  and typed `metrics` (`Metric`: label/value/unit, never normalized).
+  `interpretation` gains retrieval/comprehension anchors — `page_title`,
+  `primary_message`, `keywords` (synonyms/expansions), `entities`,
+  `column_layout`, `page_role`, `primary_date`, `action_items`, and
+  `definitions`. The meaningless `reading_order` was removed. `router_invariants()`
+  now also firewalls illustrative `metrics` and enforces `primary_date ∈ raw.dates`;
+  `to_markdown()` prepends the title and renders real (non-illustrative) metrics.
+  Designed fill-ability-first (flat lists / enums with safe defaults) so weaker
+  models populate it without returning an empty object.
 - **OCR table extraction with merged cells.** Each ``Table`` in the structured
   result now carries an ``html`` field; the model is guided to reproduce tables
   as clean HTML using ``colspan``/``rowspan`` for merged cells (which the flat

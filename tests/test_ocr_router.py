@@ -115,3 +115,43 @@ class TestRouterInvariants:
         # the empty->free-form recovery builds OCRPage(raw=..., interpretation=None)
         page = OCRPage(raw=RawExtraction(text="recovered verbatim text"), interpretation=None)
         assert router_invariants(page) == []
+
+
+class TestRichSchema:
+    """Rich OCRPage fields: raw verbatim indexes + interpretation anchors."""
+
+    def test_metric_illustrative_firewalled_off_screenshot(self):
+        from doc2mark.ocr.schema import Metric
+        page = OCRPage(
+            raw=RawExtraction(text="Revenue $1,000", metrics=[Metric(label="Revenue", value="$1,000", illustrative=True)]),
+            interpretation=Interpretation(document_type="document"),  # not a screenshot
+        )
+        assert any("only 'screenshot' may withhold" in m for m in router_invariants(page))
+
+    def test_primary_date_must_come_from_raw_dates(self):
+        ok = OCRPage(raw=RawExtraction(dates=["Q3 2024"]), interpretation=Interpretation(primary_date="Q3 2024"))
+        assert router_invariants(ok) == []
+        bad = OCRPage(raw=RawExtraction(dates=["Q3 2024"]), interpretation=Interpretation(primary_date="Q4 2024"))
+        assert any("primary_date not present in raw.dates" in m for m in router_invariants(bad))
+
+    def test_to_markdown_renders_title_and_metrics_dedup_safe(self):
+        from doc2mark.ocr.schema import Metric
+        # title not already leading raw.text -> H1 prepended; real metric -> table; illustrative skipped
+        page = OCRPage(
+            raw=RawExtraction(text="Body line", metrics=[
+                Metric(label="Uptime", value="99.9", unit="%"),
+                Metric(label="Demo", value="123", illustrative=True),
+            ]),
+            interpretation=Interpretation(page_title="Results"),
+        )
+        md = page.to_markdown()
+        assert md.startswith("# Results")
+        assert "| Uptime | 99.9 % |" in md
+        assert "Demo" not in md  # illustrative metric not rendered
+
+    def test_to_markdown_title_not_duplicated_when_already_leading(self):
+        page = OCRPage(
+            raw=RawExtraction(text="Results\nbody"),
+            interpretation=Interpretation(page_title="Results"),
+        )
+        assert page.to_markdown().count("Results") == 1  # no duplicate H1
