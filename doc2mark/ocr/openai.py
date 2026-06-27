@@ -161,9 +161,10 @@ def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
         })
         content.append({
             "type": "file",
-            "base64": context_pdf,             # RAW base64
-            "mime_type": "application/pdf",
-            "filename": "context.pdf",         # MANDATORY — omission => 400
+            "file": {
+                "filename": "context.pdf",
+                "file_data": f"data:application/pdf;base64,{context_pdf}",  # VERIFIED OpenAI format
+            },
         })
 
     return ChatPromptTemplate.from_messages(
@@ -227,13 +228,10 @@ class VisionAgent:
         self.response_model = response_model
         self.detail = detail
 
-        # Neighbor-page PDF context gate. We compute the model-capability signal so
-        # enabling later is a one-line change, but OpenAI PDF context is NOT
-        # spike-verified for this ship, so we HARD-DISABLE it here: the file block is
-        # threaded end-to-end but never emitted. Flip this to `_supports_pdf` once the
-        # OpenAI file-part path has been verified.
-        _supports_pdf = _model_supports_pdf(model)  # noqa: F841 (kept for future enablement)
-        self._context_pdf_enabled = False
+        # Neighbor-page PDF context: enabled when the model can ingest PDF. The
+        # nested {"type":"file","file":{"filename","file_data":"data:...;base64"}}
+        # block was spike-verified against gpt-5.4-mini.
+        self._context_pdf_enabled = _model_supports_pdf(model)
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")

@@ -271,9 +271,10 @@ class TestOpenAIPreparePrompt:
 
         file_parts = [p for p in human.content if p.get("type") == "file"]
         assert len(file_parts) == 1
-        assert file_parts[0]["base64"] == "FAKEPDFB64"
-        assert file_parts[0]["mime_type"] == "application/pdf"
-        assert "filename" in file_parts[0]
+        # Verified OpenAI nested format: file.file_data is a data-URI, file.filename set.
+        f = file_parts[0]["file"]
+        assert f["filename"] == "context.pdf"
+        assert f["file_data"] == "data:application/pdf;base64,FAKEPDFB64"
 
 
 # ===================================================================
