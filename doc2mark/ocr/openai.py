@@ -156,7 +156,7 @@ class VisionAgent:
     def __init__(
             self,
             api_key: Optional[str] = None,
-            model: str = "gpt-4.1",
+            model: str = "gpt-5.4-mini",
             temperature: float = 0,
             max_tokens: int = 4096,
             base_url: Optional[str] = None,
@@ -171,7 +171,7 @@ class VisionAgent:
 
         Args:
             api_key: OpenAI API key
-            model: Model to use for OCR (default: gpt-4.1)
+            model: Model to use for OCR (default: gpt-5.4-mini)
             temperature: Temperature for response generation
             max_tokens: Maximum tokens in response
             base_url: Optional base URL for OpenAI-compatible API endpoints
@@ -326,7 +326,7 @@ class OpenAIOCR(BaseOCR):
         Args:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             config: OCR configuration (from base class)
-            model: OpenAI model to use (default: gpt-4.1)
+            model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
             max_tokens: Maximum tokens in response (1-4096)
             max_workers: Maximum concurrent workers for batch processing
@@ -365,7 +365,7 @@ class OpenAIOCR(BaseOCR):
             return default
 
         # Model configuration
-        self.model = _resolve(model, cfg.model, "gpt-4.1")
+        self.model = _resolve(model, cfg.model, "gpt-5.4-mini")
         self.temperature = _resolve(temperature, cfg.temperature, 0)
         self.max_tokens = _resolve(max_tokens, cfg.max_tokens, 4096)
         self.timeout = timeout

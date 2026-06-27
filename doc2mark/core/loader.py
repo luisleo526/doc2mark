@@ -37,7 +37,7 @@ class UnifiedDocumentLoader:
             cache_dir: Optional[str] = None,
             ocr_cache: Optional[OCRCache] = None,
             # Enhanced OCR configuration for OpenAI / Vertex AI
-            model: str = "gpt-4.1",
+            model: str = "gpt-5.4-mini",
             temperature: float = 0,
             max_tokens: int = 4096,
             max_workers: int = 5,
@@ -72,7 +72,7 @@ class UnifiedDocumentLoader:
             ocr_cache: Optional request-scoped OCR cache handler
 
             # Enhanced OpenAI OCR Configuration:
-            model: OpenAI model to use (default: gpt-4.1)
+            model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
             max_tokens: Maximum tokens in response (1-4096)
             max_workers: Maximum concurrent workers for batch processing
@@ -199,7 +199,7 @@ class UnifiedDocumentLoader:
             ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]],
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
-            model: str = "gpt-4.1",
+            model: str = "gpt-5.4-mini",
             temperature: float = 0,
             max_tokens: int = 4096,
             max_workers: int = 5,
@@ -263,7 +263,7 @@ class UnifiedDocumentLoader:
             logger.info("Using enhanced Vertex AI OCR configuration")
             from doc2mark.ocr.vertex_ai import VertexAIOCR
 
-            vertex_model = model if model != "gpt-4.1" else "gemini-3.1-flash-lite-preview"
+            vertex_model = model if model != "gpt-5.4-mini" else "gemini-3.1-flash-lite-preview"
             ocr = VertexAIOCR(
                 api_key=api_key,
                 config=ocr_config,
@@ -327,7 +327,7 @@ class UnifiedDocumentLoader:
             return {
                 "api_key": None,
                 "ocr_config": None,
-                "model": "gpt-4.1",
+                "model": "gpt-5.4-mini",
                 "temperature": 0,
                 "max_tokens": 4096,
                 "max_workers": 5,
@@ -343,7 +343,7 @@ class UnifiedDocumentLoader:
         return {
             "api_key": getattr(current, "api_key", None),
             "ocr_config": getattr(current, "config", None),
-            "model": getattr(current, "model", "gpt-4.1"),
+            "model": getattr(current, "model", "gpt-5.4-mini"),
             "temperature": getattr(current, "temperature", 0),
             "max_tokens": getattr(current, "max_tokens", 4096),
             "max_workers": getattr(current, "max_workers", 5),
