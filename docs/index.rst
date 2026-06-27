@@ -21,5 +21,5 @@ OCR providers are initialized only when OCR is requested.
    :maxdepth: 2
    :caption: Reference
 
-   api
+   api/index
    development

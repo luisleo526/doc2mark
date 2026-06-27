@@ -263,30 +263,5 @@ instead.
 API reference
 -------------
 
-.. autoclass:: doc2mark.ocr.OCR
-   :members:
-
-.. autoclass:: doc2mark.ocr.base.Task
-   :members:
-   :undoc-members:
-
-.. autoclass:: doc2mark.ocr.schema.OCRPage
-   :members:
-
-.. autoclass:: doc2mark.ocr.schema.RawExtraction
-   :members:
-
-.. autoclass:: doc2mark.ocr.schema.Interpretation
-   :members:
-
-.. autoclass:: doc2mark.ocr.schema.Table
-   :members:
-
-.. autoclass:: doc2mark.ocr.schema.KeyValue
-   :members:
-
-.. autoclass:: doc2mark.ocr.base.OCRConfig
-   :members:
-
-.. autoclass:: doc2mark.ocr.base.OCRResult
-   :members:
+See the full reference for the OCR facade, providers, and configuration in
+:doc:`/api/ocr`, and the structured result models in :doc:`/api/schema`.

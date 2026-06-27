@@ -740,15 +740,17 @@ class UnifiedDocumentLoader:
             Dictionary mapping input paths to processing results
 
         Examples:
-            # Process with image extraction but no OCR
-            loader.batch_process("docs/", extract_images=True, ocr_images=False)
+            ::
 
-            # Process with batch OCR
-            loader.batch_process("docs/", extract_images=True, ocr_images=True)
+                # Process with image extraction but no OCR
+                loader.batch_process("docs/", extract_images=True, ocr_images=False)
 
-            # Process concurrently with a progress bar
-            loader.batch_process("docs/", max_workers=4,
-                                  progress_callback=lambda d, t, p: print(f"{d}/{t}"))
+                # Process with batch OCR
+                loader.batch_process("docs/", extract_images=True, ocr_images=True)
+
+                # Process concurrently with a progress bar
+                loader.batch_process("docs/", max_workers=4,
+                                     progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         input_dir = Path(input_dir)
         output_dir = Path(output_dir) if output_dir else input_dir
@@ -908,13 +910,15 @@ class UnifiedDocumentLoader:
             Dictionary mapping input paths to processing results
 
         Examples:
-            # Process specific files with OCR
-            files = ["doc1.pdf", "doc2.docx"]
-            loader.batch_process_files(files, extract_images=True, ocr_images=True)
+            ::
 
-            # Process concurrently with a progress callback
-            loader.batch_process_files(files, max_workers=4,
-                                       progress_callback=lambda d, t, p: print(f"{d}/{t}"))
+                # Process specific files with OCR
+                files = ["doc1.pdf", "doc2.docx"]
+                loader.batch_process_files(files, extract_images=True, ocr_images=True)
+
+                # Process concurrently with a progress callback
+                loader.batch_process_files(files, max_workers=4,
+                                           progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         if not file_paths:
             return {}

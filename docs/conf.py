@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 project = "doc2mark"
-author = "doc2mark Team"
-copyright = "2026, doc2mark Team"
+author = "Hao Liang Wen"
+copyright = "2026, Hao Liang Wen"
 
 from doc2mark import __version__  # noqa: E402
 
