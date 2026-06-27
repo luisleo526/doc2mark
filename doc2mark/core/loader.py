@@ -5,9 +5,10 @@ import hashlib
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
@@ -417,6 +418,19 @@ class UnifiedDocumentLoader:
             logger.error(f"Failed to import required processors: {e}")
             raise ImportError(f"Required format processors not available: {str(e)}") from e
 
+        # Optional email (.eml) processor - register it only when the handler and
+        # the matching DocumentFormat.EML member are both available, so the loader
+        # keeps working even if email.py isn't present yet (see SHARED CONTRACT).
+        try:
+            from doc2mark.formats.email import EmailProcessor
+
+            eml_format = getattr(DocumentFormat, 'EML', None)
+            if eml_format is not None:
+                self._processors[eml_format] = EmailProcessor(ocr=self.ocr)
+                logger.info("Registered EML (email) processor")
+        except ImportError:
+            logger.debug("Email processor not available; skipping .eml support")
+
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
         """Normalize string output format names to OutputFormat enum values."""
@@ -599,6 +613,92 @@ class UnifiedDocumentLoader:
 
         return results
 
+    def _execute_batch(
+            self,
+            items: List[tuple],
+            total_files: int,
+            process_one: Callable[[Path, Optional[Path]], Dict[str, Any]],
+            max_workers: Optional[int],
+            progress_callback: Optional[Callable[[int, int, str], None]],
+            show_progress: bool,
+            start_time: float,
+    ) -> tuple:
+        """Run per-file batch work either sequentially or across a thread pool.
+
+        Args:
+            items: List of (key, file_path, output_path) tuples in input order.
+            total_files: Total number of files (== len(items)).
+            process_one: Callable taking (file_path, output_path) and returning the
+                per-file result dict. It must handle its own exceptions and return a
+                ``{'status': 'failed', ...}`` dict on error so a failing file still
+                records an entry.
+            max_workers: When > 1 and more than one file is present, files are
+                processed concurrently with a ThreadPoolExecutor. None / <= 1 keeps
+                the default sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, key)``
+                after each file completes.
+            show_progress: Whether to log per-file progress.
+            start_time: Batch start timestamp for ETA logging.
+
+        Returns:
+            Tuple of (results dict, processed_count, error_count). The results dict
+            preserves the input order of ``items`` regardless of completion order.
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        processed_count = 0
+        error_count = 0
+
+        use_parallel = bool(max_workers) and max_workers > 1 and total_files > 1
+
+        if use_parallel:
+            worker_count = min(max_workers, total_files)
+            logger.info(f"⚙️  Processing {total_files} files with {worker_count} workers")
+            results_by_key: Dict[str, Dict[str, Any]] = {}
+            done = 0
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_key = {
+                    executor.submit(process_one, file_path, output_path): key
+                    for key, file_path, output_path in items
+                }
+                for future in as_completed(future_to_key):
+                    key = future_to_key[future]
+                    result = future.result()
+                    results_by_key[key] = result
+                    done += 1
+                    if result.get('status') == 'success':
+                        processed_count += 1
+                    else:
+                        error_count += 1
+                    if show_progress:
+                        logger.info(f"📄 Completed {done}/{total_files}: {Path(key).name}")
+                    if progress_callback is not None:
+                        progress_callback(done, total_files, key)
+            # Rebuild in deterministic input order so results match the sequential path.
+            for key, _file_path, _output_path in items:
+                results[key] = results_by_key[key]
+        else:
+            done = 0
+            for key, file_path, output_path in items:
+                if show_progress:
+                    logger.info(f"📄 Processing {done + 1}/{total_files}: {file_path.name}")
+                result = process_one(file_path, output_path)
+                results[key] = result
+                done += 1
+                if result.get('status') == 'success':
+                    processed_count += 1
+                else:
+                    error_count += 1
+                if progress_callback is not None:
+                    progress_callback(done, total_files, key)
+                if show_progress and done % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = (total_files - done) / rate if rate > 0 else 0
+                    logger.info(
+                        f"📊 Progress: {done}/{total_files} ({done / total_files * 100:.1f}%) - ETA: {eta:.1f}s")
+
+        return results, processed_count, error_count
+
     def batch_process(
             self,
             input_dir: Union[str, Path],
@@ -610,11 +710,13 @@ class UnifiedDocumentLoader:
             show_progress: bool = True,
             save_files: bool = True,
             encoding: str = 'utf-8',
-            delimiter: Optional[str] = None
+            delimiter: Optional[str] = None,
+            max_workers: Optional[int] = None,
+            progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process multiple documents in a directory with full result tracking.
-        
+
         Args:
             input_dir: Directory containing documents
             output_dir: Optional output directory (default: same as input)
@@ -626,16 +728,27 @@ class UnifiedDocumentLoader:
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files
             delimiter: CSV delimiter (auto-detect if None)
-            
+            max_workers: Optional number of worker threads. When set to a value > 1
+                (and more than one file is found), documents are processed
+                concurrently with a thread pool. Defaults to None, which preserves
+                the original sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, path)``
+                after each file finishes (whether it succeeded or failed). ``path``
+                is the string key used in the returned results dict.
+
         Returns:
             Dictionary mapping input paths to processing results
-            
+
         Examples:
             # Process with image extraction but no OCR
             loader.batch_process("docs/", extract_images=True, ocr_images=False)
-            
+
             # Process with batch OCR
             loader.batch_process("docs/", extract_images=True, ocr_images=True)
+
+            # Process concurrently with a progress bar
+            loader.batch_process("docs/", max_workers=4,
+                                  progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         input_dir = Path(input_dir)
         output_dir = Path(output_dir) if output_dir else input_dir
@@ -684,26 +797,24 @@ class UnifiedDocumentLoader:
             for fmt, files in files_by_format.items():
                 logger.info(f"   {fmt.value.upper()}: {len(files)} files")
 
-        # Process files
+        # Build the ordered work list and pre-create output directories on the main
+        # thread (so concurrent workers never race on mkdir).
+        items = []
         for file_path in all_files:
             if not file_path.is_file():
                 continue
+            rel_path = file_path.relative_to(input_dir)
+            if save_files:
+                output_path = output_dir / rel_path.parent / file_path.stem
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                output_path = None
+            items.append((str(file_path), file_path, output_path))
 
+        total_files = len(items)
+
+        def process_one(file_path: Path, output_path: Optional[Path]) -> Dict[str, Any]:
             try:
-                # Calculate output path
-                rel_path = file_path.relative_to(input_dir)
-                if save_files:
-                    output_path = output_dir / rel_path.parent / file_path.stem
-                    # Ensure output directory exists
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    output_path = None
-
-                # Show progress
-                if show_progress:
-                    logger.info(f"📄 Processing {processed_count + 1}/{total_files}: {file_path.name}")
-
-                # Process file
                 start_file_time = time.time()
                 result = self.load(
                     file_path=file_path,
@@ -716,13 +827,11 @@ class UnifiedDocumentLoader:
                 )
                 file_duration = time.time() - start_file_time
 
-                # Save output if requested
                 output_files = []
                 if save_files and output_path:
                     output_files = self._save_result(result, output_path, output_format)
 
-                # Store result
-                results[str(file_path)] = {
+                return {
                     'status': 'success',
                     'format': result.metadata.format.value,
                     'content_length': len(result.content) if result.content else 0,
@@ -734,24 +843,23 @@ class UnifiedDocumentLoader:
                         'pages': result.metadata.page_count or 1
                     }
                 }
-
-                processed_count += 1
-
-                if show_progress and processed_count % 10 == 0:
-                    elapsed = time.time() - start_time
-                    rate = processed_count / elapsed
-                    eta = (total_files - processed_count) / rate if rate > 0 else 0
-                    logger.info(
-                        f"📊 Progress: {processed_count}/{total_files} ({processed_count / total_files * 100:.1f}%) - ETA: {eta:.1f}s")
-
             except Exception as e:
-                error_count += 1
                 logger.error(f"❌ Failed to process {file_path}: {e}")
-                results[str(file_path)] = {
+                return {
                     'status': 'failed',
                     'error': str(e),
                     'format': file_path.suffix.lower()
                 }
+
+        results, processed_count, error_count = self._execute_batch(
+            items=items,
+            total_files=total_files,
+            process_one=process_one,
+            max_workers=max_workers,
+            progress_callback=progress_callback,
+            show_progress=show_progress,
+            start_time=start_time,
+        )
 
         # Final summary
         total_time = time.time() - start_time
@@ -771,11 +879,13 @@ class UnifiedDocumentLoader:
             show_progress: bool = True,
             save_files: bool = True,
             encoding: str = 'utf-8',
-            delimiter: Optional[str] = None
+            delimiter: Optional[str] = None,
+            max_workers: Optional[int] = None,
+            progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process a specific list of files.
-        
+
         Args:
             file_paths: List of file paths to process
             output_dir: Optional output directory
@@ -786,14 +896,25 @@ class UnifiedDocumentLoader:
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files
             delimiter: CSV delimiter (auto-detect if None)
-            
+            max_workers: Optional number of worker threads. When set to a value > 1
+                (and more than one file is provided), files are processed
+                concurrently with a thread pool. Defaults to None, which preserves
+                the original sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, path)``
+                after each file finishes (whether it succeeded or failed). ``path``
+                is the string key used in the returned results dict.
+
         Returns:
             Dictionary mapping input paths to processing results
-            
+
         Examples:
             # Process specific files with OCR
             files = ["doc1.pdf", "doc2.docx"]
             loader.batch_process_files(files, extract_images=True, ocr_images=True)
+
+            # Process concurrently with a progress callback
+            loader.batch_process_files(files, max_workers=4,
+                                       progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         if not file_paths:
             return {}
@@ -801,28 +922,24 @@ class UnifiedDocumentLoader:
         file_paths = [Path(p) for p in file_paths]
         output_format = self._normalize_output_format(output_format)
         total_files = len(file_paths)
-        results = {}
-        processed_count = 0
-        error_count = 0
         start_time = time.time()
 
         logger.info(f"📄 Starting batch processing of {total_files} files")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
-        for i, file_path in enumerate(file_paths):
+        # Build the ordered work list and pre-create output directories on the main
+        # thread (so concurrent workers never race on mkdir).
+        items = []
+        for file_path in file_paths:
+            if save_files and output_dir:
+                output_path = Path(output_dir) / file_path.stem
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                output_path = None
+            items.append((str(file_path), file_path, output_path))
+
+        def process_one(file_path: Path, output_path: Optional[Path]) -> Dict[str, Any]:
             try:
-                # Calculate output path
-                if save_files and output_dir:
-                    output_path = Path(output_dir) / file_path.stem
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    output_path = None
-
-                # Show progress
-                if show_progress:
-                    logger.info(f"📄 Processing {i + 1}/{total_files}: {file_path.name}")
-
-                # Process file
                 start_file_time = time.time()
                 result = self.load(
                     file_path=file_path,
@@ -835,13 +952,11 @@ class UnifiedDocumentLoader:
                 )
                 file_duration = time.time() - start_file_time
 
-                # Save output if requested
                 output_files = []
                 if save_files and output_path:
                     output_files = self._save_result(result, output_path, output_format)
 
-                # Store result
-                results[str(file_path)] = {
+                return {
                     'status': 'success',
                     'format': result.metadata.format.value,
                     'content_length': len(result.content) if result.content else 0,
@@ -852,17 +967,23 @@ class UnifiedDocumentLoader:
                         'tables_found': len(result.tables) if result.tables else 0
                     }
                 }
-
-                processed_count += 1
-
             except Exception as e:
-                error_count += 1
                 logger.error(f"❌ Failed to process {file_path}: {e}")
-                results[str(file_path)] = {
+                return {
                     'status': 'failed',
                     'error': str(e),
                     'format': file_path.suffix.lower()
                 }
+
+        results, processed_count, error_count = self._execute_batch(
+            items=items,
+            total_files=total_files,
+            process_one=process_one,
+            max_workers=max_workers,
+            progress_callback=progress_callback,
+            show_progress=show_progress,
+            start_time=start_time,
+        )
 
         # Final summary
         total_time = time.time() - start_time
