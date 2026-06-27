@@ -79,3 +79,23 @@ def test_process_page_empty_render_drops_page(tmp_path):
     out = p._process_page(0, extract_images=True, ocr_images=True,
                           ocr_results_map={(0, _PAGE_RENDER_XREF): "   "})
     assert out == []
+
+
+def test_ocr_failure_emits_placeholder_not_base64(tmp_path):
+    """When OCR was requested but results are missing (batch failure), images
+    become lightweight placeholders — NEVER a raw base64 dump into the text."""
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=800)
+    page.insert_text((50, 100), "Real text content. " * 30, fontsize=11)   # text layer -> not image-dominant
+    page.insert_image(fitz.Rect(50, 300, 360, 600), stream=_png((400, 400), "green"))  # 310pt, non-decorative
+    path = tmp_path / "ocr_fail.pdf"
+    doc.save(str(path))
+    doc.close()
+
+    pl = PDFLoader(str(path), ocr=_StubOCR())
+    # ocr_images requested but the results map is empty (simulates a failed batch)
+    out = pl._process_page(0, extract_images=True, ocr_images=True, ocr_results_map={})
+
+    assert all(c["type"] != "image" for c in out), "must not emit raw base64 on OCR failure"
+    assert any(c["type"] == "text:image_description" and "OCR unavailable" in c["content"] for c in out)
+    assert any("Real text content" in c.get("content", "") for c in out)  # rule-based text preserved

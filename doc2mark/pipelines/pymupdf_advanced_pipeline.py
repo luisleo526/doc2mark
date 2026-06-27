@@ -295,8 +295,12 @@ class PDFLoader:
                         ocr_images = False  # Disable OCR processing
 
                 except Exception as e:
-                    logger.error(f"Batch OCR processing failed: {e}")
-                    ocr_images = False  # Fall back to base64 extraction
+                    # Do NOT fall back to base64 extraction here: dumping megabytes of
+                    # base64 image data into a text/RAG output is useless and harmful.
+                    # Keep ocr_images on with the empty/partial map so missing images
+                    # become lightweight placeholders (see _extract_images_simple),
+                    # while the deterministic text/table layer is still emitted.
+                    logger.error(f"Batch OCR processing failed: {e}; emitting image placeholders")
 
         # Process each page
         for page_num in range(len(self.doc)):
@@ -1702,20 +1706,15 @@ class PDFLoader:
                                 position_y=img_rect.y0
                             ))
                         else:
-                            # Fallback to base64 if OCR result not found
+                            # OCR was requested but this image has no result (batch
+                            # failure or partial result). Emit a lightweight placeholder
+                            # — never dump raw base64 into a text/RAG output.
                             logger.warning(f"OCR result not found for image {xref} on page {page_num + 1}")
-                            result = self._extract_image_bytes(xref)
-                            if result is None:
-                                continue
-                            image_bytes, _, mime = result
-                            base64_data = base64.b64encode(image_bytes).decode('utf-8')
-
                             image_items.append(SimpleContent(
-                                type="image",
-                                content=base64_data,
+                                type="text:image_description",
+                                content="<image_ocr_result>[image: OCR unavailable]</image_ocr_result>",
                                 page=page_num + 1,
                                 position_y=img_rect.y0,
-                                mime_type=mime
                             ))
 
                 except Exception as e:

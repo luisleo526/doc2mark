@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the structured output controls instead.
 
 ### Fixed
+- **OCR batch failure no longer dumps raw base64 into the output.** Previously a
+  single error in the image-OCR batch flipped the whole PDF to base64 image
+  extraction, producing tens of MB of useless base64 in the text/RAG output.
+  Image-OCR failures now degrade to lightweight `[image: OCR unavailable]`
+  placeholders while the deterministic text/table layer is preserved.
 - **Structured OCR no longer silently loses content.** When a model can read an
   image but cannot fill the json_schema (some weaker/preview models return an
   empty ``OCRPage`` on dense or non-Latin images), the OpenAI and Vertex/Gemini
