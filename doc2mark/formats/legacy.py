@@ -98,7 +98,7 @@ class LegacyProcessor(BaseProcessor):
                 result.metadata.size_bytes = file_size
 
                 # Add conversion note
-                if not result.metadata.extra:
+                if result.metadata.extra is None:
                     result.metadata.extra = {}
                 result.metadata.extra['converted_from'] = extension
                 result.metadata.extra['converted_to'] = target_format
