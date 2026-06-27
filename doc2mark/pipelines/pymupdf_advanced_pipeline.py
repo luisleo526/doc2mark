@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
@@ -22,6 +23,13 @@ _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
 _IMAGE_PAGE_TEXT_LIMIT = 200    # a page with more native text than this has a usable text layer
 _IMAGE_PAGE_COVERAGE = 0.55     # images must cover >= this fraction of the page
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
+
+# --- Neighbor-page PDF context for OCR --------------------------------------
+# Gemini's INLINE request cap is ~20MB total; stay under it so an inline PDF
+# part never 400s. (OpenAI's file cap is 50MB but we gate to the tighter inline
+# limit.)
+_CONTEXT_PDF_MAX_BYTES = 18 * 1024 * 1024
+_WINDOW_CACHE_MAXLEN = 4   # windows overlap; far pages are never reused -> tiny LRU
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +75,14 @@ class PDFLoader:
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
         self._first_text_page_num = None
-        
+
+        # Neighbor-page PDF context (off by default). Resolve the context tier
+        # once from the OCR instance's config (NOT self.config, which does not
+        # exist). 0=off, 1=page-renders only, 2=renders + embedded images.
+        self._window_pdf_cache: "OrderedDict[int, Optional[str]]" = OrderedDict()
+        cfg = getattr(self.ocr, "config", None)
+        self._context_tier = int(getattr(cfg, "context_pages", 0) or 0) if (self.ocr and cfg) else 0
+
         # Set table output style
         if table_style is None:
             self.table_style = TableStyle.default()
@@ -229,6 +244,7 @@ class PDFLoader:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
 
+            self._window_pdf_cache = OrderedDict()
             all_images_info = self._collect_all_images()
 
             if all_images_info:
@@ -240,12 +256,20 @@ class PDFLoader:
                     if self.ocr:
                         # Prepare image data for batch processing
                         image_data_list = [base64.b64decode(info["base64"]) for info in all_images_info]
+                        # Per-image neighbor-page PDF context (aligned positionally
+                        # with image_data_list). All None when the feature is off.
+                        context_pdfs = [info.get("context_pdf_b64") for info in all_images_info]
 
                         # Pass language configuration if available
                         kwargs = {}
                         if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
                             kwargs['language'] = self.ocr.config.language
                             logger.info(f"🌍 Passing language configuration to OCR: {self.ocr.config.language}")
+
+                        # Only inject context when at least one image carries it, so
+                        # the off-default path stays byte-identical (cache keys + call).
+                        if any(context_pdfs):
+                            kwargs['context_pdfs'] = context_pdfs
 
                         # Always use batch processing for efficiency
                         logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
@@ -456,6 +480,35 @@ class PDFLoader:
         return (abs(rect.width) < _TINY_IMAGE_FRACTION * page.rect.width
                 and abs(rect.height) < _TINY_IMAGE_FRACTION * page.rect.height)
 
+    def _build_window_pdf(self, k: int) -> Optional[str]:
+        """Base64 (RAW, no data-uri prefix) of a PDF with only pages {k-1,k,k+1},
+        clamped to doc bounds. Built once per page index, LRU-bounded. Returns None
+        on failure/oversize -> caller treats None as 'no context' (graceful)."""
+        if k in self._window_pdf_cache:
+            self._window_pdf_cache.move_to_end(k)
+            return self._window_pdf_cache[k]
+        result: Optional[str] = None
+        try:
+            a = max(0, k - 1)
+            b = min(len(self.doc) - 1, k + 1)          # k=0->{0,1}; last->{n-2,n-1}; single->{0}
+            out = pymupdf.open()
+            try:
+                out.insert_pdf(self.doc, from_page=a, to_page=b)   # inclusive/inclusive
+                data = out.tobytes(deflate=True, garbage=3)        # compress + drop orphans
+            finally:
+                out.close()
+            if len(data) <= _CONTEXT_PDF_MAX_BYTES:
+                result = base64.b64encode(data).decode("utf-8")
+            else:
+                logger.warning(f"Context PDF for page {k+1} is {len(data)} bytes "
+                               f"(> {_CONTEXT_PDF_MAX_BYTES}); skipping context for this page.")
+        except Exception as e:
+            logger.warning(f"Failed to build context PDF for page {k+1}: {e}; OCR without context.")
+        self._window_pdf_cache[k] = result
+        if len(self._window_pdf_cache) > _WINDOW_CACHE_MAXLEN:
+            self._window_pdf_cache.popitem(last=False)             # evict oldest (LRU)
+        return result
+
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect images for batch OCR.
 
@@ -473,6 +526,7 @@ class PDFLoader:
             if self.ocr is not None and self._is_image_dominant_page(page):
                 try:
                     png = self._render_page_png(page)
+                    ctx = self._build_window_pdf(page_num) if self._context_tier >= 1 else None
                     all_images.append({
                         "page_num": page_num,
                         "xref": _PAGE_RENDER_XREF,
@@ -480,6 +534,7 @@ class PDFLoader:
                         "mime_type": "image/png",
                         "is_page_render": True,
                         "position": (0.0, 0.0, page.rect.width, page.rect.height),
+                        "context_pdf_b64": ctx,
                     })
                     continue
                 except Exception as e:
@@ -502,13 +557,15 @@ class PDFLoader:
                     image_bytes, _, mime = result
                     base64_data = base64.b64encode(image_bytes).decode('utf-8')
 
+                    ctx = self._build_window_pdf(page_num) if self._context_tier >= 2 else None
                     for img_rect in img_rects:
                         all_images.append({
                             "page_num": page_num,
                             "xref": xref,
                             "base64": base64_data,
                             "mime_type": mime,
-                            "position": (img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1)
+                            "position": (img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1),
+                            "context_pdf_b64": ctx,
                         })
 
                 except Exception as e:
@@ -521,23 +578,9 @@ class PDFLoader:
         """Process a single page and extract content in reading order"""
         page = self.doc.load_page(page_num)
 
-        # Image-dominant page OCR'd as a whole: emit the page transcription as a
-        # single block and skip per-element (table/text/image) extraction.
-        if ocr_images and ocr_results_map:
-            render_text = ocr_results_map.get((page_num, _PAGE_RENDER_XREF))
-            if render_text is not None:
-                render_text = render_text.strip()
-                if not render_text:
-                    return []
-                return [{
-                    "type": "text:image_description",
-                    "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
-                    "page": page_num + 1,
-                    "position_y": 0.0,
-                }]
-
         content_items = []
 
+        # 1. RULE-BASED layer — authoritative, emitted verbatim (BM42 invariant).
         # Extract tables first (to avoid duplicating their text in text blocks)
         table_items, table_bboxes = self._extract_tables_as_markdown(page, page_num)
         content_items.extend(table_items)
@@ -546,8 +589,17 @@ class PDFLoader:
         text_items = self._extract_text_as_markdown(page, page_num, table_bboxes)
         content_items.extend(text_items)
 
-        # Extract images
-        if extract_images:
+        # Did THIS page produce a whole-page render? (image-dominant path in
+        # _collect_all_images). On rendered pages there are no per-(page,xref)
+        # results, so calling _extract_images_simple would hit the missing-key
+        # fallback and dump raw base64 — skip per-image extraction entirely.
+        page_was_rendered = bool(
+            ocr_images and ocr_results_map is not None
+            and (page_num, _PAGE_RENDER_XREF) in ocr_results_map
+        )
+
+        # 2. Per-image augments ONLY when the page was NOT whole-rendered.
+        if extract_images and not page_was_rendered:
             image_items = self._extract_images_simple(page, page_num, ocr_images=ocr_images,
                                                       ocr_results_map=ocr_results_map)
             content_items.extend(image_items)
@@ -582,6 +634,19 @@ class PDFLoader:
                 if item.mime_type:
                     entry["mime_type"] = item.mime_type
                 simple_content.append(entry)
+
+        # 3. AUGMENT: append the whole-page OCR transcription AFTER the rule-based
+        #    content, never replacing it. Use a large FINITE sentinel position (NOT
+        #    inf -> invalid JSON) so it sorts last within the page.
+        if page_was_rendered:
+            render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
+            if render_text:
+                simple_content.append({
+                    "type": "text:image_description",
+                    "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
+                    "page": page_num + 1,
+                    "position_y": float(page.rect.height) + 1.0e6,
+                })
 
         return simple_content
 

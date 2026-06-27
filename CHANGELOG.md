@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exported as pictures (little/no text layer, images covering the page) are now
   rendered and OCR'd once per page instead of per embedded image — coherent
   per-page content, far fewer API calls, and decorative logos/icons skipped.
+- **Neighbor-page PDF context for OCR.** When OCR'ing content on PDF page *k*,
+  doc2mark can attach a small PDF of pages *{k-1, k, k+1}* as context (Gemini
+  inline PDF part) to anchor terminology and language, improving consistency.
+  Controlled by `OCRConfig.context_pages` (0=off default, 1=page-renders,
+  2=+embedded images); per-page-deduplicated, size-guarded, and context-aware
+  cache keys. The deterministic rule-based text layer is always preserved
+  verbatim — LLM OCR only augments image content (never replaces it).
 - **`OCR` facade.** New ergonomic entry point: `OCR("openai")` with `.read()`
   and `.read_one()` methods, replacing direct provider construction.
 - **`Task` enum.** Replaces the eight free-form `PromptTemplate` variants with

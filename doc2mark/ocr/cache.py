@@ -875,16 +875,32 @@ class CachedOCR(BaseOCR):
         if not images:
             return []
 
+        # Neighbor-PDF context (off by default). When absent, base_kwargs == kwargs,
+        # no context_pdf_sha256 is added, and call_kwargs omits context_pdfs, so the
+        # cache key and the provider call are byte-identical to the pre-context path.
+        context_pdfs = kwargs.get("context_pdfs")
+        base_kwargs = {k: v for k, v in kwargs.items() if k != "context_pdfs"}
+
         results: List[Optional[OCRResult]] = [None] * len(images)
         miss_images: List[bytes] = []
         miss_keys: List[str] = []
+        miss_context: List[Optional[str]] = []
         miss_positions: Dict[str, List[int]] = {}
 
         for index, image in enumerate(images):
+            ctx = context_pdfs[index] if context_pdfs else None
+            key_kwargs = base_kwargs
+            if ctx is not None:
+                # Key on a scalar sha256 of this image's own context window, never
+                # the multi-MB blob/list (keeps key construction O(1)).
+                key_kwargs = dict(base_kwargs)
+                key_kwargs["context_pdf_sha256"] = hashlib.sha256(
+                    ctx.encode("utf-8")
+                ).hexdigest()
             key = build_ocr_cache_key(
                 self.wrapped,
                 image,
-                kwargs=kwargs,
+                kwargs=key_kwargs,
                 cache_version=self.cache_version,
             )
             cached = self.cache.get(key)
@@ -896,10 +912,15 @@ class CachedOCR(BaseOCR):
                 miss_positions[key] = []
                 miss_keys.append(key)
                 miss_images.append(image)
+                miss_context.append(ctx)
             miss_positions[key].append(index)
 
         if miss_images:
-            provider_results = self.wrapped.batch_process_images(miss_images, **kwargs)
+            call_kwargs = dict(base_kwargs)
+            if context_pdfs is not None:
+                # Realign context to the deduped miss_images the provider receives.
+                call_kwargs["context_pdfs"] = miss_context
+            provider_results = self.wrapped.batch_process_images(miss_images, **call_kwargs)
             if len(provider_results) != len(miss_images):
                 for key, provider_result in zip(miss_keys, provider_results):
                     normalized = _normalize_result(provider_result)

@@ -19,6 +19,7 @@ from doc2mark.ocr.base import (
     Task,
     TASK_PROMPTS,
     resolve_max_concurrency,
+    _CONTEXT_PDF_INSTRUCTION,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 
@@ -66,6 +67,16 @@ logger = logging.getLogger(__name__)
 
 # Supported image formats for OpenAI Vision API
 SUPPORTED_IMAGE_FORMATS = {'png', 'jpeg', 'jpg', 'gif', 'webp'}
+
+# Model families that can accept a `file` (application/pdf) content part. Used to
+# gate the neighbor-page PDF context attachment so non-PDF models never 400.
+_PDF_CAPABLE_PREFIXES = ("gpt-4o", "gpt-4.1", "gpt-5", "o1")
+
+
+def _model_supports_pdf(model: str) -> bool:
+    """Whether ``model`` can accept a PDF (file) content part."""
+    m = (model or "").lower()
+    return any(m.startswith(p) for p in _PDF_CAPABLE_PREFIXES)
 
 
 def detect_image_format(image_data: bytes) -> str:
@@ -121,26 +132,40 @@ def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
     # Get the image data and determine correct MIME type
     image_base64 = data['image_data']
     mime_type = data.get('mime_type', 'image/png')  # Default to png, should be set by caller
-    
+
+    # Optional neighbor-page PDF context (raw base64, no data-uri prefix; or None).
+    # Attached as a context-only `file` part ONLY when both a context PDF is present
+    # AND the model is PDF-capable (`context_pdf_enabled`). The image remains the sole
+    # transcription target — the PDF anchors terminology/language continuity.
+    context_pdf = data.get('context_pdf')
+
+    content = [
+        # deprecated
+        # {
+        #     "type": "image_url",
+        #     "image_url": {
+        #         "url": f"data:{mime_type};base64,{image_base64}"
+        #     }
+        # }
+        {
+            "type": "image",
+            "base64": image_base64,
+            "mime_type": mime_type,
+        }
+    ]
+    if context_pdf and data.get('context_pdf_enabled'):
+        content.append({"type": "text", "text": _CONTEXT_PDF_INSTRUCTION})
+        content.append({
+            "type": "file",
+            "base64": context_pdf,             # RAW base64
+            "mime_type": "application/pdf",
+            "filename": "context.pdf",         # MANDATORY — omission => 400
+        })
+
     return ChatPromptTemplate.from_messages(
         [
             SystemMessage(content=prompt_text),
-            HumanMessage(
-                content=[
-                    # deprecated
-                    # {
-                    #     "type": "image_url",
-                    #     "image_url": {
-                    #         "url": f"data:{mime_type};base64,{image_base64}"
-                    #     }
-                    # }
-                    {
-                        "type": "image",
-                        "base64": image_base64,
-                        "mime_type": mime_type,
-                    }
-                ]
-            )
+            HumanMessage(content=content),
         ]
     )
 
@@ -197,6 +222,14 @@ class VisionAgent:
         self.structured = structured
         self.response_model = response_model
         self.detail = detail
+
+        # Neighbor-page PDF context gate. We compute the model-capability signal so
+        # enabling later is a one-line change, but OpenAI PDF context is NOT
+        # spike-verified for this ship, so we HARD-DISABLE it here: the file block is
+        # threaded end-to-end but never emitted. Flip this to `_supports_pdf` once the
+        # OpenAI file-part path has been verified.
+        _supports_pdf = _model_supports_pdf(model)  # noqa: F841 (kept for future enablement)
+        self._context_pdf_enabled = False
 
         if not LANGCHAIN_AVAILABLE:
             logger.warning("⚠️  LangChain not available - falling back to basic OpenAI client")
@@ -790,10 +823,17 @@ class OpenAIOCR(BaseOCR):
             f"⚠️  Structured OCR returned empty for {len(empty_idx)}/{len(results)} "
             f"image(s); recovering with free-form OCR"
         )
+        # Realign per-image context to the recovery sub-batch: the provider only
+        # re-OCRs images at empty_idx, so context_pdfs must be sliced to match.
+        cp = kwargs.pop("context_pdfs", None)
+        sub_kwargs = dict(kwargs)
+        if cp is not None:
+            sub_kwargs["context_pdfs"] = [cp[i] for i in empty_idx]
+
         self._ensure_vision_agent(structured=False)
         try:
             recovered = self._batch_process_with_vision_agent(
-                [images[i] for i in empty_idx], structured=False, language=language, **kwargs
+                [images[i] for i in empty_idx], structured=False, language=language, **sub_kwargs
             )
         finally:
             self._ensure_vision_agent(structured=True)
@@ -841,6 +881,10 @@ class OpenAIOCR(BaseOCR):
                     legacy_kwargs['language'] = language
                 prompts = [self._build_prompt(**legacy_kwargs)] * len(images)
 
+            # Optional per-image neighbor-page PDF context (len == len(images)).
+            # Absent when the feature is off -> off-by-default byte-identical path.
+            context_pdfs = kwargs.get('context_pdfs')
+
             # Prepare input data for VisionAgent
             input_dicts = []
             for i, image_data in enumerate(images):
@@ -851,7 +895,9 @@ class OpenAIOCR(BaseOCR):
                     'image_data': base64_image,
                     'mime_type': mime_type,
                     'prompt': prompts[i],
-                    'index': i
+                    'index': i,
+                    'context_pdf': context_pdfs[i] if context_pdfs else None,
+                    'context_pdf_enabled': getattr(self._vision_agent, '_context_pdf_enabled', False),
                 })
 
             # Use VisionAgent batch processing (same as original ocr_agent.py)

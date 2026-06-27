@@ -16,6 +16,7 @@ from doc2mark.ocr.base import (
     Task,
     TASK_PROMPTS,
     resolve_max_concurrency,
+    _CONTEXT_PDF_INSTRUCTION,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 from doc2mark.utils.image_utils import (
@@ -63,20 +64,23 @@ def _prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
     prompt_text = data.get("prompt", DEFAULT_OCR_PROMPT)
     image_base64 = data["image_data"]
     mime_type = data.get("mime_type", "image/png")
+    context_pdf = data.get("context_pdf")  # raw base64, no data-uri prefix; or None
+
+    content = [
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
+    ]
+    if context_pdf:
+        content.append({"type": "text", "text": _CONTEXT_PDF_INSTRUCTION})
+        content.append({
+            "type": "media",
+            "mime_type": "application/pdf",
+            "data": context_pdf,  # VERIFIED Gemini format; RAW base64
+        })
 
     return ChatPromptTemplate.from_messages(
         [
             SystemMessage(content=prompt_text),
-            HumanMessage(
-                content=[
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_base64}"
-                        },
-                    }
-                ]
-            ),
+            HumanMessage(content=content),
         ]
     )
 
@@ -498,8 +502,15 @@ class VertexAIOCR(BaseOCR):
             f"recovering with free-form OCR"
         )
         # Drop per-image task selectors (sub-batch differs in size) and force legacy.
-        fk = {k: v for k, v in kwargs.items() if k not in ("structured", "tasks", "task")}
+        fk = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("structured", "tasks", "task", "context_pdfs")
+        }
         fk["structured"] = False
+        cp = kwargs.get("context_pdfs")
+        if cp is not None:
+            fk["context_pdfs"] = [cp[i] for i in empty_idx]  # realign to the empty sub-batch
         recovered = self._batch_process_with_vision_agent(
             [images[i] for i in empty_idx], **fk
         )
@@ -535,6 +546,8 @@ class VertexAIOCR(BaseOCR):
             else:
                 prompts = [self._build_prompt(**kwargs)] * len(images)
 
+            context_pdfs = kwargs.get("context_pdfs")  # Optional[List[Optional[str]]], len == len(images)
+
             input_dicts = []
             for i, image_data in enumerate(images):
                 converted_data, mime_type = _shared_convert_image_to_supported_format(
@@ -547,6 +560,7 @@ class VertexAIOCR(BaseOCR):
                         "mime_type": mime_type,
                         "prompt": prompts[i],
                         "index": i,
+                        "context_pdf": context_pdfs[i] if context_pdfs else None,
                     }
                 )
 

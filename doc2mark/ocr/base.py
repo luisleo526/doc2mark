@@ -120,6 +120,17 @@ _DEPRECATED_LLM_FIELDS = (
     "enhance_image", "detect_tables", "detect_layout", "timeout", "max_retries", "extra",
 )
 
+# Strict instruction appended to the OCR prompt when a neighbor-page PDF is attached
+# as context. The image stays the sole transcription target; the PDF is context-only.
+_CONTEXT_PDF_INSTRUCTION = (
+    "The IMAGE above is the PRIMARY and ONLY target to transcribe. "
+    "The attached PDF contains the neighboring pages (previous/current/next) of the "
+    "same document and is provided STRICTLY as CONTEXT for terminology, names, and "
+    "language continuity. Do NOT transcribe, summarize, or quote the PDF. Do NOT infer "
+    "the image's content from the PDF. Transcribe ONLY what is visibly present in the "
+    "image, and respond in the document's own language."
+)
+
 
 @dataclass
 class OCRConfig:
@@ -149,6 +160,15 @@ class OCRConfig:
     detail: Literal["raw", "full"] = "full"                       # "raw" skips interpretation
     response_model: Optional[Type["BaseModel"]] = None            # BYO schema; None => OCRPage
     on_parse_error: Literal["raw_text", "raise"] = "raw_text"     # graceful degradation control
+
+    # --- neighbor-page PDF context (PDF sources only; provider-gated) ---
+    # The window is FIXED at {k-1, k, k+1} (clamped, <=3 pages). This int is a SCOPE
+    # TIER, not a window size:
+    #   0 = off (default; zero behavior change)
+    #   1 = attach context to whole-page renders only  (one upload per image page)
+    #   2 = renders + non-decorative embedded images    (opt-in; more uploads)
+    # Only Gemini/Vertex consumes it today; other providers accept-and-ignore.
+    context_pages: int = 0
 
     # --- Tesseract-only (inert for LLM providers) ---
     enhance_image: bool = True
