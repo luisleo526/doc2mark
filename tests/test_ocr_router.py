@@ -155,3 +155,66 @@ class TestRichSchema:
             interpretation=Interpretation(page_title="Results"),
         )
         assert page.to_markdown().count("Results") == 1  # no duplicate H1
+
+
+class TestNestedSchema:
+    """Nested figures / sections / entities / relations + their firewall checks."""
+
+    def _imp(self):
+        from doc2mark.ocr.schema import (Figure, DataPoint, DiagramNode, DiagramEdge,
+                                         Section, Entity, Relation)
+        return Figure, DataPoint, DiagramNode, DiagramEdge, Section, Entity, Relation
+
+    def test_figure_verbatim_must_be_in_raw_text(self):
+        Figure, DataPoint, *_ = self._imp()
+        ok = OCRPage(raw=RawExtraction(text="Revenue 2024 $4.2B"),
+                     interpretation=Interpretation(figures=[Figure(kind="bar", title="Revenue 2024",
+                         data_points=[DataPoint(label="2024", value="$4.2B")])]))
+        assert router_invariants(ok) == []
+        bad = OCRPage(raw=RawExtraction(text="something else"),
+                      interpretation=Interpretation(figures=[Figure(kind="bar", title="Ghost Title")]))
+        assert any("not found in raw.text" in m for m in router_invariants(bad))
+
+    def test_figure_datapoints_need_a_value(self):
+        Figure, DataPoint, *_ = self._imp()
+        page = OCRPage(raw=RawExtraction(text="Q1 Q2"),
+                       interpretation=Interpretation(figures=[Figure(kind="line",
+                           data_points=[DataPoint(label="Q1"), DataPoint(label="Q2")])]))
+        assert any("no point with a printed value" in m for m in router_invariants(page))
+
+    def test_edge_endpoint_must_match_a_node(self):
+        Figure, _DP, DiagramNode, DiagramEdge, *_ = self._imp()
+        page = OCRPage(raw=RawExtraction(text="A B"),
+                       interpretation=Interpretation(figures=[Figure(kind="flowchart",
+                           nodes=[DiagramNode(label="A")], edges=[DiagramEdge(from_label="A", to_label="B")])]))
+        assert any("matches no DiagramNode.label" in m for m in router_invariants(page))
+
+    def test_section_heading_must_be_in_raw_headings(self):
+        *_, Section, _E, _R = self._imp()
+        bad = OCRPage(raw=RawExtraction(text="Intro body", headings=["Intro"]),
+                      interpretation=Interpretation(sections=[Section(heading="Conclusion", level=1)]))
+        assert any("not present in raw.headings" in m for m in router_invariants(bad))
+
+    def test_entity_and_relation_must_be_verbatim(self):
+        *_, Entity, Relation = self._imp()
+        bad = OCRPage(raw=RawExtraction(text="Acme grew"),
+                      interpretation=Interpretation(
+                          typed_entities=[Entity(name="Globex", type="org")],
+                          relations=[Relation(subject="Acme", relation="acquired", object="Initech")]))
+        v = router_invariants(bad)
+        assert any("typed_entities name 'Globex'" in m for m in v)
+        assert any("relations object 'Initech'" in m for m in v)
+
+    def test_to_markdown_renders_figure_and_section_outline(self):
+        Figure, _DP, DiagramNode, DiagramEdge, Section, *_ = self._imp()
+        page = OCRPage(
+            raw=RawExtraction(text="App Core", headings=["Arch"]),
+            interpretation=Interpretation(
+                figures=[Figure(kind="flowchart", meaning="Layered architecture",
+                    nodes=[DiagramNode(label="App"), DiagramNode(label="Core")],
+                    edges=[DiagramEdge(from_label="App", to_label="Core")])],
+                sections=[Section(heading="Arch", level=1, summary="overview")]))
+        md = page.to_markdown()
+        assert "*Layered architecture*" in md
+        assert "- App --> Core" in md
+        assert "**Section outline**" in md
