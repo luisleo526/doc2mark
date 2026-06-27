@@ -46,89 +46,189 @@ print(result.content)
 `UnifiedDocumentLoader()` can process text-first documents without OCR credentials.
 OCR providers are initialized only when OCR is requested.
 
-## OCR providers
+## OCR
 
-doc2mark supports three OCR providers. Pass `ocr_provider` to `UnifiedDocumentLoader` to choose one.
+doc2mark includes an AI-powered OCR layer that returns **structured output** by
+default. The `OCR` facade is the recommended entry point.
 
-### OpenAI
+### Quick example
+
+```python
+from doc2mark import OCR
+
+ocr = OCR("openai")                        # creds from OPENAI_API_KEY env var
+results = ocr.read([image_bytes])           # List[bytes] -> List[OCRResult]
+r = results[0]
+
+# Structured output (the default)
+r.document.raw.text                         # verbatim transcription
+r.document.raw.tables                       # list of Table objects (headers + rows)
+r.document.raw.fields                       # list of KeyValue pairs (forms, receipts)
+r.document.interpretation.summary           # model's summary
+r.document.interpretation.document_type     # "receipt", "form", "table", ...
+
+# Back-compat markdown string (rendered from the structured data)
+r.text
+```
+
+For a single image, use `read_one`:
+
+```python
+r = ocr.read_one(image_bytes)
+print(r.document.raw.text)
+```
+
+### Structured output schema
+
+Every result carries an `OCRPage` on `result.document` with a hard boundary
+between **raw extraction** (verbatim transcription, no inference) and
+**interpretation** (the model's analysis):
+
+```python
+OCRPage(
+    raw=RawExtraction(
+        text="WHOLE FOODS MARKET\n123 Main St\nOrganic Bananas  $2.49\n...",
+        tables=[Table(
+            caption="Line items",
+            headers=["Item", "Price"],
+            rows=[["Organic Bananas", "$2.49"], ["Almond Milk", "$4.99"]],
+        )],
+        fields=[
+            KeyValue(label="Merchant", value="Whole Foods Market"),
+            KeyValue(label="Subtotal", value="$7.48"),
+            KeyValue(label="Tax", value="$0.62"),
+            KeyValue(label="Total", value="$8.10"),
+        ],
+        detected_language="en",
+        has_handwriting=False,
+    ),
+    interpretation=Interpretation(
+        document_type="receipt",
+        summary="A grocery receipt for two items totaling $8.10 including tax.",
+        key_findings=["2 line items", "Total $8.10", "Tax rate ~8.3%"],
+        self_confidence=0.93,
+        legibility="high",
+    ),
+)
+```
+
+### Tasks
+
+Tasks replace the old prompt templates. Set a task at construction time or per
+call:
+
+```python
+ocr = OCR("openai", task="receipt")          # all calls default to receipt
+results = ocr.read(images, task="table")     # per-call override
+```
+
+For mixed batches, assign a task per image:
+
+```python
+results = ocr.read(images, tasks=["table", "receipt", "handwriting"])
+```
+
+Available tasks: `auto` (default), `table`, `document`, `form`, `receipt`,
+`handwriting`, `code`.
+
+### Raw and legacy modes
+
+Skip the interpretation pass to save tokens:
+
+```python
+results = ocr.read(images, detail="raw")
+# r.document.interpretation is None; r.document.raw is still populated
+```
+
+Disable structured output entirely for free-form markdown (legacy behaviour):
+
+```python
+results = ocr.read(images, structured=False)
+# r.text contains free-form markdown; r.document is None
+```
+
+### Providers
+
+#### OpenAI
 
 Uses GPT-4.1 vision. Requires an API key.
 
 ```bash
 export OPENAI_API_KEY=sk-...
+pip install "doc2mark[ocr]"
 ```
 
 ```python
-loader = UnifiedDocumentLoader(ocr_provider="openai")
-
-result = loader.load(
-    "scanned_doc.pdf",
-    extract_images=True,
-    ocr_images=True,
-)
+ocr = OCR("openai")
+ocr = OCR("openai", model="gpt-4o-mini")                       # cheaper model
+ocr = OCR("openai", base_url="http://localhost:11434/v1")       # Ollama / compatible
 ```
 
-Customize the model or use an OpenAI-compatible endpoint:
+#### Google Gemini
 
-```python
-loader = UnifiedDocumentLoader(
-    ocr_provider="openai",
-    model="gpt-4o-mini",                     # cheaper model
-    base_url="http://localhost:11434/v1",     # self-hosted / Ollama
-    api_key="any-string",
-)
-```
-
-### Google Gemini / Vertex AI
-
-Uses Gemini models via Google Cloud. Authenticates with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).
+Uses Gemini models via `langchain-google-genai`. Both `"vertex_ai"` and
+`"gemini"` are accepted as provider names.
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
+pip install "doc2mark[vertex_ai]"
 ```
 
 ```python
-loader = UnifiedDocumentLoader(
-    ocr_provider="vertex_ai",
-    project="my-gcp-project",          # or set GOOGLE_CLOUD_PROJECT
-)
-
-result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
+ocr = OCR("gemini")
+ocr = OCR("vertex_ai", model="gemini-2.0-flash")
 ```
 
-Override model and region:
+#### Tesseract (offline)
+
+Local OCR, no API key. Returns `raw` only (`interpretation` is always `None`).
+
+```bash
+pip install "doc2mark[ocr]"
+```
 
 ```python
-loader = UnifiedDocumentLoader(
-    ocr_provider="vertex_ai",
-    project="my-gcp-project",
-    model="gemini-2.0-flash",          # default: gemini-3.1-flash-lite-preview
-    location="us-central1",            # default: global
-)
+ocr = OCR("tesseract", language="eng")
 ```
 
-### Tesseract (offline)
-
-Local OCR, no API key needed. Requires [Tesseract](https://github.com/tesseract-ocr/tesseract) installed on your system.
-
-```python
-from doc2mark.ocr.base import OCRConfig
-
-loader = UnifiedDocumentLoader(
-    ocr_provider="tesseract",
-    ocr_config=OCRConfig(language="chinese"),   # optional language hint
-)
-
-result = loader.load("scan.png", extract_images=True, ocr_images=True)
-```
-
-### Provider comparison
+#### Provider comparison
 
 | Provider | Requires | Best for | Install extra |
 |----------|----------|----------|---------------|
-| `openai` | `OPENAI_API_KEY` | Highest accuracy, complex layouts | `pip install doc2mark[ocr]` |
-| `vertex_ai` | GCP service account | Google Cloud workflows, Gemini models | `pip install doc2mark[vertex_ai]` |
-| `tesseract` | Tesseract binary | Offline / air-gapped environments | `pip install doc2mark[ocr]` |
+| `openai` | `OPENAI_API_KEY` | Highest accuracy, complex layouts | `doc2mark[ocr]` |
+| `vertex_ai` / `gemini` | GCP service account | Google Cloud, Gemini models | `doc2mark[vertex_ai]` |
+| `tesseract` | Tesseract binary | Offline / air-gapped (raw only) | `doc2mark[ocr]` |
+
+### Concurrency
+
+Control how many images are OCR'd in parallel:
+
+```python
+ocr = OCR("openai", max_concurrency=32)
+```
+
+Or set the `OCR_MAX_CONCURRENCY` environment variable. When neither is set,
+LangChain's default thread pool is used.
+
+### Using OCR with the document loader
+
+`UnifiedDocumentLoader` still works for document-level processing and uses the
+OCR layer internally when `ocr_images=True`:
+
+```python
+from doc2mark import UnifiedDocumentLoader
+
+loader = UnifiedDocumentLoader(ocr_provider="openai")
+result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
+```
+
+### Deprecation notice
+
+The old `OCRConfig` fields `enhance_image`, `detect_tables`, `detect_layout`,
+`timeout`, `max_retries`, and `extra` are **inert for LLM providers** (they
+were only read by Tesseract or by nobody). Setting them now emits a
+`DeprecationWarning` and they will be removed in a future release. Use `task`
+and the structured output controls instead.
 
 ## Supported formats
 
@@ -185,18 +285,20 @@ results = batch_process_files(
 )
 ```
 
-### OCR prompt templates
+### OCR tasks
 
-doc2mark includes specialized prompts for different content types:
+Use the `OCR` facade with a `task` to optimize extraction for specific content:
 
 ```python
-loader = UnifiedDocumentLoader(
-    ocr_provider="openai",
-    prompt_template="table_focused",    # optimized for tables
-)
+from doc2mark import OCR
+
+ocr = OCR("openai", task="receipt")     # receipt-optimized extraction
+r = ocr.read_one(image_bytes)
+print(r.document.raw.fields)            # KeyValue pairs: merchant, total, tax, ...
 ```
 
-Available templates: `default`, `table_focused`, `document_focused`, `multilingual`, `form_focused`, `receipt_focused`, `handwriting_focused`, `code_focused`.
+Available tasks: `auto`, `table`, `document`, `form`, `receipt`, `handwriting`,
+`code`. See the [OCR section](#ocr) above for full details.
 
 ### Table output styles
 
@@ -212,14 +314,14 @@ loader = UnifiedDocumentLoader(
 
 ### Token usage tracking
 
-When using OpenAI or Vertex AI directly, each OCR result includes token usage in
-its metadata:
+Each OCR result includes token usage in its metadata when using OpenAI or
+Gemini:
 
 ```python
-from doc2mark.ocr.openai import OpenAIOCR
+from doc2mark import OCR
 
-ocr = OpenAIOCR()
-results = ocr.batch_process_images([image_bytes])
+ocr = OCR("openai")
+results = ocr.read([image_bytes])
 
 usage = results[0].metadata.get("token_usage", {})
 print(usage)
