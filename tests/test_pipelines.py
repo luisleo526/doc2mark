@@ -7,6 +7,7 @@ from doc2mark.core.base import DocumentFormat, OutputFormat, ProcessedDocument, 
 from pathlib import Path
 import os
 import re
+from unittest.mock import Mock
 
 
 class TestPipelines:
@@ -226,3 +227,25 @@ class TestPipelines:
         if '![Image]' in result.content or 'data:image/png;base64' in result.content:
             # Either OCR code paths placed description blocks or images; accept either
             assert ('<ocr_result>' in result.content) or ('<image_ocr_result>' in result.content) or ('data:image' in result.content)
+
+
+def test_office_processor_respects_ocr_images_flag(monkeypatch, tmp_path):
+    """Office extraction should not OCR images unless ocr_images=True."""
+    from doc2mark.formats.office import OfficeProcessor
+    from doc2mark.pipelines import office_advanced_pipeline
+
+    input_file = tmp_path / "sample.docx"
+    input_file.write_bytes(b"not a real docx; loader is mocked")
+
+    def fake_load(*args, **kwargs):
+        assert kwargs["extract_images"] is True
+        assert kwargs["ocr_images"] is False
+        return {"content": [], "pages": 1}
+
+    monkeypatch.setattr(office_advanced_pipeline.UniversalOfficeLoader, "load", fake_load)
+    monkeypatch.setattr(office_advanced_pipeline, "office_to_markdown", lambda data: "")
+
+    processor = OfficeProcessor(ocr=Mock())
+    result = processor.process(input_file, extract_images=True, ocr_images=False)
+
+    assert result.metadata.format == DocumentFormat.DOCX

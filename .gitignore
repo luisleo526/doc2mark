@@ -234,3 +234,6 @@ htmlcov/
 docs/_build/
 docs/_static/
 docs/_templates/
+
+# OMC state
+.omc/

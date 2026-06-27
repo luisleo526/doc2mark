@@ -5,6 +5,10 @@ on:
     branches: [ main ]
     paths:
       - 'doc2mark/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches: [ main ]
 
@@ -13,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,5 +73,4 @@ jobs:
         if: always()
         run: |
           echo "Coverage upload step placeholder"
-
 

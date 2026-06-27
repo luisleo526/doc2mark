@@ -14,22 +14,24 @@ Turn any document into clean Markdown -- in one line.
 - One unified API + CLI for single files or entire directories
 - Batch processing with parallel execution
 - Per-call token usage tracking for OpenAI and Vertex AI providers
+- Sphinx documentation with GitHub Pages deployment workflow
 
 ## Install
 
 ```bash
-# Core (no OCR)
 pip install doc2mark
-
-# With OpenAI OCR
-pip install doc2mark[ocr]
-
-# With Google Gemini / Vertex AI OCR
-pip install doc2mark[vertex_ai]
-
-# Everything
-pip install doc2mark[all]
 ```
+
+Optional extras unlock additional capabilities:
+
+| Extra | Install command | Purpose |
+|-------|----------------|---------|
+| `[ocr]` | `pip install doc2mark[ocr]` | OpenAI and Tesseract OCR providers |
+| `[vertex_ai]` | `pip install doc2mark[vertex_ai]` | Google Gemini / Vertex AI OCR provider |
+| `[heif]` | `pip install doc2mark[heif]` | HEIC, HEIF, and AVIF image support |
+| `[mime]` | `pip install doc2mark[mime]` | Improved MIME-type detection via `python-magic` |
+| `[redis]` | `pip install doc2mark[redis]` | Redis backend for OCR result caching |
+| `[all]` | `pip install doc2mark[all]` | All of the above |
 
 ## Quick start
 
@@ -41,11 +43,14 @@ result = loader.load("document.pdf")
 print(result.content)
 ```
 
+`UnifiedDocumentLoader()` can process text-first documents without OCR credentials.
+OCR providers are initialized only when OCR is requested.
+
 ## OCR providers
 
 doc2mark supports three OCR providers. Pass `ocr_provider` to `UnifiedDocumentLoader` to choose one.
 
-### OpenAI (default)
+### OpenAI
 
 Uses GPT-4.1 vision. Requires an API key.
 
@@ -131,7 +136,7 @@ result = loader.load("scan.png", extract_images=True, ocr_images=True)
 |----------|---------|
 | Office | DOCX, XLSX, PPTX |
 | PDF | PDF (text + scanned) |
-| Images | PNG, JPG, WEBP, TIFF, BMP, GIF, HEIC, HEIF, AVIF |
+| Images | PNG, JPG, WEBP, TIFF, BMP, GIF, HEIC, HEIF, AVIF (requires `doc2mark[heif]`) |
 | Text / Data | TXT, CSV, TSV, JSON, JSONL |
 | Markup | HTML, XML, Markdown |
 | Legacy | DOC, XLS, PPT, RTF, PPS (requires LibreOffice) |
@@ -207,19 +212,77 @@ loader = UnifiedDocumentLoader(
 
 ### Token usage tracking
 
-When using OpenAI or Vertex AI, each OCR result includes token usage in its metadata:
+When using OpenAI or Vertex AI directly, each OCR result includes token usage in
+its metadata:
 
 ```python
-from doc2mark import UnifiedDocumentLoader
+from doc2mark.ocr.openai import OpenAIOCR
 
-loader = UnifiedDocumentLoader(ocr_provider="openai")
-result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
+ocr = OpenAIOCR()
+results = ocr.batch_process_images([image_bytes])
 
-# Token usage per OCR call is in result metadata
-usage = result.metadata.get("token_usage", {})
+usage = results[0].metadata.get("token_usage", {})
 print(usage)
 # {"input_tokens": 1234, "output_tokens": 567, "total_tokens": 1801}
 ```
+
+### OCR result caching
+
+doc2mark can cache OCR results so repeated processing of the same images skips
+the OCR provider call. Two backends ship out of the box: an in-memory cache and
+a Redis-backed cache.
+
+```python
+from doc2mark import load, create_ocr_cache, MemoryOCRCache
+
+# In-memory cache (default settings)
+cache = MemoryOCRCache(ttl_seconds=3600, max_entries=1024)
+result = load("scan.pdf", extract_images=True, ocr_images=True, ocr_cache=cache)
+
+# Or use the factory helper
+cache = create_ocr_cache("memory", ttl_seconds=7200)
+```
+
+For production workloads, use Redis (requires `pip install doc2mark[redis]`):
+
+```python
+from doc2mark import create_ocr_cache, UnifiedDocumentLoader
+
+cache = create_ocr_cache("redis", redis_url="redis://localhost:6379/0")
+
+loader = UnifiedDocumentLoader(ocr_provider="openai", ocr_cache=cache)
+result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
+```
+
+See the [caching documentation](docs/caching.rst) for the full API reference.
+
+### Chunking for RAG
+
+Split a processed document into section-aware chunks suitable for
+retrieval-augmented generation pipelines:
+
+```python
+from doc2mark import load, chunk_content, ChunkingConfig
+
+result = load("report.pdf", output_format="json")
+
+config = ChunkingConfig(
+    max_chunk_size=1500,   # max characters per chunk
+    overlap=200,           # overlap between consecutive chunks
+    split_on_heading_level=2,  # split on h1 and h2
+    keep_tables_whole=True,
+    include_page_markers=False,
+)
+
+chunks = chunk_content(result.json_content, config)
+
+for chunk in chunks:
+    print(chunk.chunk_index, chunk.section_title, len(chunk.content))
+```
+
+Each `Chunk` carries `section_title`, `section_hierarchy`, `page_start`,
+`page_end`, `content_types`, and `chunk_index` so downstream vector stores can
+preserve document structure.
 
 ## CLI
 
@@ -236,6 +299,9 @@ doc2mark documents/ -o converted/ -r
 # With OpenAI OCR
 doc2mark scan.pdf --ocr openai --ocr-images
 
+# With Vertex AI OCR
+doc2mark scan.pdf --ocr vertex_ai --ocr-images
+
 # With Tesseract OCR
 doc2mark scan.pdf --ocr tesseract --ocr-images
 
@@ -245,6 +311,21 @@ doc2mark report.pdf --ocr none --no-ocr-images
 # JSON output
 doc2mark report.pdf --format json
 ```
+
+CLI OCR is disabled by default. Use `--ocr-images` with an OCR provider to OCR
+embedded images or image files.
+
+## Documentation
+
+Build the Python docs locally:
+
+```bash
+pip install -e ".[docs]"
+python -m sphinx -b html -W --keep-going docs docs/_build/html
+```
+
+The repository includes `.github/workflows/docs.yml` for GitHub Pages. In the
+GitHub repository settings, set Pages source to **GitHub Actions**.
 
 ## License
 

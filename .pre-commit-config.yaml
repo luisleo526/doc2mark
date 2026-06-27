@@ -70,13 +70,6 @@ repos:
       - id: commitizen
         stages: [commit-msg]
 
-  - repo: https://github.com/python-poetry/poetry
-    rev: 1.7.0
-    hooks:
-      - id: poetry-check
-      - id: poetry-lock
-        args: ['--no-update']
-
 # Local hooks
   - repo: local
     hooks:

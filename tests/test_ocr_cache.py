@@ -743,11 +743,12 @@ def test_packaging_declares_redis_extra():
 
     assert "redis = [" in pyproject_text
     assert '"redis>=5.0.0"' in pyproject_text
-    assert '"doc2mark[ocr,heif,mime,vertex_ai,redis]"' in pyproject_text
+    assert "all = [" in pyproject_text
+    assert '"langchain-google-genai>=2.0.0"' in pyproject_text
+    assert '"pillow-heif>=0.16.0"' in pyproject_text
 
-    assert '"redis": [' in setup_text
-    assert '"redis>=5.0.0",' in setup_text
-    assert '"all": [' in setup_text
+    assert "setup()" in setup_text
+    assert "redis" not in setup_text
 
 
 def test_value_schema_version_is_private_value_schema():

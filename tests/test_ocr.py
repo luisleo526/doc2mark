@@ -29,7 +29,7 @@ class TestOCRMocked:
 
     @patch('doc2mark.ocr.openai.VisionAgent')
     def test_openai_ocr_initialization(self, mock_vision_agent):
-        """Test OpenAI OCR initialization without real API key."""
+        """Test OpenAI OCR configuration without initializing a network client."""
         # Mock the VisionAgent
         mock_agent = MagicMock()
         mock_vision_agent.return_value = mock_agent
@@ -41,7 +41,8 @@ class TestOCRMocked:
 
         assert loader is not None
         assert loader.ocr is not None
-        mock_vision_agent.assert_called_once()
+        mock_vision_agent.assert_not_called()
+        assert loader.get_ocr_configuration()["vision_agent_ready"] is False
 
     @patch('doc2mark.ocr.openai.VisionAgent')
     def test_openai_ocr_with_mock_response(self, mock_vision_agent):
@@ -66,6 +67,7 @@ class TestOCRMocked:
         assert results is not None
         assert len(results) == 1
         assert "Mocked OCR text" in results[0].text
+        mock_vision_agent.assert_called_once()
 
     def test_tesseract_ocr_fallback(self):
         """Test that Tesseract OCR works without API key."""
