@@ -22,7 +22,8 @@ _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
 _IMAGE_PAGE_TEXT_LIMIT = 200    # a page with more native text than this has a usable text layer
 _IMAGE_PAGE_COVERAGE = 0.55     # images must cover >= this fraction of the page
-_DOC_IMAGE_RATIO_THRESHOLD = 0.5  # mean per-page image coverage >= this => whole-doc OCR strategy
+# Document route: "image" strategy when mean image coverage >= _IMAGE_PAGE_COVERAGE
+# AND mean selectable text < _IMAGE_PAGE_TEXT_LIMIT chars/page (constants above).
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------
@@ -469,17 +470,21 @@ class PDFLoader:
         return min(covered / page_area, 1.0)
 
     def _document_image_strategy(self) -> str:
-        """High-level DOCUMENT route by mean per-page image-occupancy ratio.
+        """High-level DOCUMENT route from two deterministic signals: mean per-page
+        image coverage AND mean per-page selectable-text density.
 
-        - "image": the document is mostly pictures (slide deck / scanned doc).
-          Every page is rendered and OCR'd as a whole image (with neighbor-page
-          context when enabled). The OCR is authoritative for the entire doc.
-        - "text": mostly a text document. The deterministic rule-based layer
-          (complex tables + text, preserved verbatim for BM42 RAG) is
-          authoritative, and embedded figures are OCR'd individually.
+        - "image": pages are mostly pictures (mean coverage high) AND carry little
+          selectable text (mean chars/page low) — the real content is baked into the
+          page images. Every page is rendered and OCR'd as a whole image (with
+          neighbor-page context when enabled); the OCR is authoritative.
+        - "text": there is a usable selectable-text layer (mean chars/page not low)
+          OR little image coverage. The deterministic rule-based layer (complex
+          tables + text, preserved verbatim for BM42 RAG) is authoritative, and
+          embedded figures are OCR'd individually.
 
-        Decided once per document (cached); a uniform strategy avoids mixing
-        OCR-only and rule-based pages within one document.
+        Text density is the decisive signal: image coverage alone misclassifies a
+        text document that happens to carry large figures. Decided once per document
+        (cached); a uniform strategy avoids mixing OCR-only and rule-based pages.
         """
         if self._doc_strategy is not None:
             return self._doc_strategy
@@ -487,10 +492,15 @@ class PDFLoader:
         if n == 0:
             self._doc_strategy = "text"
             return self._doc_strategy
-        total = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n))
-        mean_cov = total / n
-        self._doc_strategy = "image" if mean_cov >= _DOC_IMAGE_RATIO_THRESHOLD else "text"
-        logger.info(f"📑 Document OCR strategy: {self._doc_strategy} (mean image coverage {mean_cov:.2f})")
+        mean_cov = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n)) / n
+        mean_text = sum(len(self.doc.load_page(i).get_text().strip()) for i in range(n)) / n
+
+        if mean_cov >= _IMAGE_PAGE_COVERAGE and mean_text < _IMAGE_PAGE_TEXT_LIMIT:
+            self._doc_strategy = "image"
+        else:
+            self._doc_strategy = "text"
+        logger.info(f"📑 Document OCR strategy: {self._doc_strategy} "
+                    f"(mean coverage {mean_cov:.2f}, mean text {mean_text:.0f} chars/page)")
         return self._doc_strategy
 
     def _render_page_png(self, page) -> bytes:

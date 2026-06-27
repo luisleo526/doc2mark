@@ -69,6 +69,28 @@ def test_decorative_image_filter(tmp_path):
     assert p._is_decorative_image(big, page) is False
 
 
+def _make_image_with_text_doc(tmp_path):
+    """Full-page images AND a real selectable-text layer (>200 chars/page)."""
+    doc = fitz.open()
+    for _ in range(2):
+        p = doc.new_page(width=600, height=800)
+        p.insert_image(p.rect, stream=_png((1200, 1600), "gray"))
+        # insert_textbox wraps -> a genuine multi-line text layer (>200 chars)
+        p.insert_textbox(fitz.Rect(50, 100, 550, 700),
+                         "Real selectable body text content. " * 40, fontsize=11)
+    path = tmp_path / "img_text.pdf"
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+def test_high_coverage_but_text_rich_is_text(tmp_path):
+    # The two-signal fix: high image coverage but a usable selectable-text layer
+    # routes to "text", not "image" (coverage alone would misclassify this).
+    p = PDFLoader(_make_image_with_text_doc(tmp_path), ocr=_StubOCR())
+    assert p._document_image_strategy() == "text"
+
+
 def test_image_doc_renders_every_page(tmp_path):
     # image-strategy document: every page rendered once as a whole image.
     p = PDFLoader(_make_image_doc(tmp_path), ocr=_StubOCR())
