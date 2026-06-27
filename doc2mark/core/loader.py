@@ -413,18 +413,6 @@ class UnifiedDocumentLoader:
 
             logger.info("Using individual format processors with enhanced image extraction")
 
-            # Try to import UnifiedProcessor for non-Office formats if needed
-            try:
-                from doc2mark.formats.unified_processor import UnifiedProcessor
-                unified_processor = UnifiedProcessor(ocr=self.ocr)
-                
-                # Only use UnifiedProcessor for formats not handled by our processors
-                # This allows backward compatibility while ensuring Office formats use our new code
-                logger.info("UnifiedProcessor available for additional format support")
-                
-            except ImportError:
-                logger.info("UnifiedProcessor not available, using individual processors only")
-
         except ImportError as e:
             logger.error(f"Failed to import required processors: {e}")
             raise ImportError(f"Required format processors not available: {str(e)}") from e
@@ -475,7 +463,6 @@ class UnifiedDocumentLoader:
             
         Note:
             - extract_images and ocr_images only work with Office and PDF formats
-            - show_progress only works when UnifiedProcessor is available
             - encoding and delimiter only apply to text-based formats
             
             For advanced OCR configuration, use the constructor parameters or
@@ -517,57 +504,42 @@ class UnifiedDocumentLoader:
         processor = self._processors[doc_format]
 
         try:
-            # Check if we're using UnifiedProcessor or fallback processors
-            if processor.__class__.__name__ == 'UnifiedProcessor':
-                # UnifiedProcessor handles all parameters directly
-                result = processor.process(
-                    file_path,
-                    output_format=output_format,
-                    extract_images=extract_images,
-                    ocr_images=ocr_images,
-                    preserve_layout=True,  # Keep for compatibility
-                    show_progress=show_progress,
-                    # Format-specific
-                    encoding=encoding,
-                    delimiter=delimiter
-                )
-            else:
-                # Fallback processors need parameter mapping
-                processor_kwargs = {}
+            # Fallback processors need parameter mapping
+            processor_kwargs = {}
 
-                # Map common parameters
-                if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
-                    processor_kwargs['extract_images'] = extract_images
-                    processor_kwargs['ocr_images'] = ocr_images
-                elif processor.__class__.__name__ == 'PDFProcessor':
-                    processor_kwargs['extract_images'] = extract_images
-                    processor_kwargs['use_ocr'] = ocr_images
-                    processor_kwargs['extract_tables'] = True
-                elif processor.__class__.__name__ == 'ImageProcessor':
-                    processor_kwargs['extract_images'] = extract_images
-                    processor_kwargs['ocr_images'] = ocr_images
-                elif processor.__class__.__name__ == 'TextProcessor':
-                    processor_kwargs['encoding'] = encoding
-                    if delimiter:
-                        processor_kwargs['delimiter'] = delimiter
-                elif processor.__class__.__name__ == 'MarkupProcessor':
-                    processor_kwargs['encoding'] = encoding
+            # Map common parameters
+            if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['ocr_images'] = ocr_images
+            elif processor.__class__.__name__ == 'PDFProcessor':
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['use_ocr'] = ocr_images
+                processor_kwargs['extract_tables'] = True
+            elif processor.__class__.__name__ == 'ImageProcessor':
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['ocr_images'] = ocr_images
+            elif processor.__class__.__name__ == 'TextProcessor':
+                processor_kwargs['encoding'] = encoding
+                if delimiter:
+                    processor_kwargs['delimiter'] = delimiter
+            elif processor.__class__.__name__ == 'MarkupProcessor':
+                processor_kwargs['encoding'] = encoding
 
-                # Process with mapped parameters
-                result = processor.process(file_path, **processor_kwargs)
+            # Process with mapped parameters
+            result = processor.process(file_path, **processor_kwargs)
 
-                # Apply output format conversion if needed
-                if output_format != OutputFormat.MARKDOWN:
-                    # Convert content to requested format
-                    if output_format == OutputFormat.JSON:
-                        # Create JSON structure
-                        json_data = result.to_dict()
-                        result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
-                        if result.json_content is None:
-                            result.json_content = [{"type": "text:normal", "content": json_data.get("content", "")}]
-                    elif output_format == OutputFormat.TEXT:
-                        # Convert to plain text
-                        result.content = result.text
+            # Apply output format conversion if needed
+            if output_format != OutputFormat.MARKDOWN:
+                # Convert content to requested format
+                if output_format == OutputFormat.JSON:
+                    # Create JSON structure
+                    json_data = result.to_dict()
+                    result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
+                    if result.json_content is None:
+                        result.json_content = [{"type": "text:normal", "content": json_data.get("content", "")}]
+                elif output_format == OutputFormat.TEXT:
+                    # Convert to plain text
+                    result.content = result.text
 
             # Cache result
             if self.cache_dir:
