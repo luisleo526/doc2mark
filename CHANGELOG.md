@@ -21,17 +21,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"vertex_ai"`.
 - **`detail="raw"` mode.** Skips the interpretation pass to save 10-30% output
   tokens while still returning structured `raw` extraction.
+- **`.eml` email ingestion.** New `EmailProcessor` (`DocumentFormat.EML`)
+  extracts headers and body to Markdown/JSON/text using the stdlib parser.
+- **Opt-in cross-document batch parallelism.** `batch_process` /
+  `batch_process_files` accept `max_workers` and a `progress_callback`; default
+  stays sequential.
+- **Token-aware chunking.** `ChunkingConfig(size_unit="tokens")` measures chunk
+  size with `tiktoken` (new `[tokenizers]` extra; graceful char fallback).
+- **Pre-OCR image downscale.** Optional longest-side cap (`OCR_MAX_IMAGE_DIM`
+  env var or `max_dim` arg) to reduce Vision-API token cost.
+- **Typed public API + `py.typed`** marker (PEP 561) for downstream type
+  checkers.
 
 ### Changed
 - OCR cache schema bumped to v4 to store the new structured `document` field.
   Existing v3 cache entries are invalidated on first access (one-time re-OCR).
 - Cache key no longer includes inert config fields, reducing spurious misses.
+- Minimum supported Python raised to 3.10 (matching the tested CI matrix).
+- CI now enforces test coverage and runs ruff/black/isort/bandit/mypy gates.
+- Removed the dead `UnifiedProcessor` stack and a duplicate LibreOffice
+  converter; `formats/legacy.py` is the single legacy-conversion path.
 
 ### Deprecated
 - `OCRConfig` fields `enhance_image`, `detect_tables`, `detect_layout`,
   `timeout`, `max_retries`, and `extra` are inert for LLM providers and now
   emit a `DeprecationWarning` when set to non-default values. Use `task` and
   the structured output controls instead.
+
+### Fixed
+- Repaired the release pipeline: `.bumpversion.cfg` no longer targets a
+  non-existent `pyproject.toml` version line that aborted every release.
+- Forward `OCRConfig` timeout/`max_retries` to the LLM clients (were inert).
+- `LegacyProcessor` preserves `metadata.extra` object identity (`is None` guard).
+
+### Security
+- Hardened XML parsing against XXE and entity-expansion: DOCX/PPTX footnote
+  parsing uses a locked-down lxml parser (`resolve_entities=False`), and the
+  markup path uses `defusedxml`.
 
 ## [0.5.2] - 2025-05-20
 
