@@ -312,6 +312,49 @@ class BaseOCR(ABC):
         # Base implementation - no preprocessing
         return image_data
 
+    @staticmethod
+    def _is_empty_structured(result: OCRResult) -> bool:
+        """A structured result with no usable content (some models/images cannot
+        fill the json_schema and return an empty OCRPage). Shared by all providers."""
+        if result.text and result.text.strip():
+            return False
+        doc = result.document
+        if doc is None:
+            return True
+        raw = doc.raw
+        return not (raw.text.strip() or raw.tables or raw.fields)
+
+    @staticmethod
+    def _apply_recovered(
+        results: List[OCRResult],
+        empty_idx: List[int],
+        recovered: List[OCRResult],
+    ) -> List[OCRResult]:
+        """Merge free-form-recovered text back into the empty structured results
+        (in place), tagging them ``structured_fallback='free_form'``. Shared by the
+        OpenAI and Vertex recovery paths; the provider-specific part is only the
+        free-form re-OCR call that produces ``recovered``."""
+        from doc2mark.ocr.schema import OCRPage, RawExtraction
+        for j, i in enumerate(empty_idx):
+            text = (recovered[j].text or "").strip()
+            if not text:
+                continue
+            doc = results[i].document
+            if doc is not None:
+                doc.raw.text = text
+            else:
+                doc = OCRPage(raw=RawExtraction(text=text))
+            meta = dict(results[i].metadata or {})
+            meta["structured_fallback"] = "free_form"
+            results[i] = OCRResult(
+                text=text,
+                confidence=results[i].confidence,
+                language=results[i].language,
+                metadata=meta,
+                document=doc,
+            )
+        return results
+
     @property
     def provider_name(self) -> str:
         """Get the provider name."""

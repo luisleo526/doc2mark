@@ -808,18 +808,6 @@ class OpenAIOCR(BaseOCR):
             prompts.append(base)
         return prompts
 
-    @staticmethod
-    def _is_empty_structured(result: OCRResult) -> bool:
-        """A structured result with no usable content (some models/images cannot
-        fill the json_schema and return an empty OCRPage)."""
-        if result.text and result.text.strip():
-            return False
-        doc = result.document
-        if doc is None:
-            return True
-        raw = doc.raw
-        return not (raw.text.strip() or raw.tables or raw.fields)
-
     def _recover_empty_structured(
             self,
             results: List[OCRResult],
@@ -853,25 +841,7 @@ class OpenAIOCR(BaseOCR):
         finally:
             self._ensure_vision_agent(structured=True)
 
-        for j, i in enumerate(empty_idx):
-            text = (recovered[j].text or "").strip()
-            if not text:
-                continue
-            doc = results[i].document
-            if doc is not None:
-                doc.raw.text = text
-            else:
-                doc = OCRPage(raw=RawExtraction(text=text))
-            meta = dict(results[i].metadata or {})
-            meta["structured_fallback"] = "free_form"
-            results[i] = OCRResult(
-                text=text,
-                confidence=results[i].confidence,
-                language=results[i].language,
-                metadata=meta,
-                document=doc,
-            )
-        return results
+        return self._apply_recovered(results, empty_idx, recovered)
 
     def _batch_process_with_vision_agent(
             self,
