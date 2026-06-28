@@ -22,18 +22,39 @@ from typing import Literal
 IMAGE_PAGE_COVERAGE = 0.55
 IMAGE_PAGE_TEXT_LIMIT = 200
 
+# Text-layer QUALITY gate. A selectable-text layer can exist yet be untrustworthy:
+# designed/print PDFs often draw prominent text (titles) with subset fonts that
+# carry no ToUnicode map, so extraction yields replacement chars (U+FFFD) — the
+# visible page is faithful but the text layer is not. When such an image-dominant
+# page has a headline that is at least this fraction unmappable, the render is
+# authoritative and we OCR it instead of trusting the broken text layer.
+ILLEGIBLE_TEXT_RATIO = 0.3
+
 
 def decide_doc_strategy(
     mean_image_coverage: float,
     mean_text_chars_per_page: float,
+    text_illegibility: float = 0.0,
 ) -> Literal["image", "text"]:
-    """Return the document-level OCR strategy from two per-document means.
+    """Return the document-level OCR strategy from per-document signals.
 
-    ``"image"`` iff images cover the pages (``mean_image_coverage >=
-    IMAGE_PAGE_COVERAGE``) AND there is little selectable text
-    (``mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT``); otherwise ``"text"``.
+    Routes to ``"image"`` when the document is image-dominant
+    (``mean_image_coverage >= IMAGE_PAGE_COVERAGE``) AND *either*:
+
+    - it has little selectable text
+      (``mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT``), i.e. no real text
+      layer; **or**
+    - its text layer is low quality (``text_illegibility >= ILLEGIBLE_TEXT_RATIO``),
+      i.e. the prominent text cannot be decoded (U+FFFD) and the render must be
+      trusted instead.
+
+    Otherwise ``"text"``. The quality gate is deliberately scoped to image-dominant
+    pages: a low-coverage text document with the odd unmappable glyph stays on the
+    (lossless) text path rather than being forced through whole-document OCR.
     """
-    if (mean_image_coverage >= IMAGE_PAGE_COVERAGE
-            and mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT):
+    if mean_image_coverage >= IMAGE_PAGE_COVERAGE and (
+        mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT
+        or text_illegibility >= ILLEGIBLE_TEXT_RATIO
+    ):
         return "image"
     return "text"

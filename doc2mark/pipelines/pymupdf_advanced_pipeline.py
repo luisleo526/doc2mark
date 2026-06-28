@@ -21,7 +21,10 @@ from doc2mark.core.table import TableStyle, TableRenderer, TableData
 _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
 # Document strategy decision lives in core.strategy (shared with the Office route).
-from doc2mark.core.strategy import decide_doc_strategy as _decide_doc_strategy  # noqa: E402
+from doc2mark.core.strategy import (  # noqa: E402
+    decide_doc_strategy as _decide_doc_strategy,
+    IMAGE_PAGE_COVERAGE as _IMAGE_PAGE_COVERAGE,
+)
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------
@@ -492,11 +495,45 @@ class PDFLoader:
             return self._doc_strategy
         mean_cov = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n)) / n
         mean_text = sum(len(self.doc.load_page(i).get_text().strip()) for i in range(n)) / n
+        # Text-layer quality only matters for image-dominant docs (the sole case the
+        # quality gate can flip the route), so measure it lazily — pure-text docs
+        # skip the extra dict extraction entirely.
+        illegibility = self._headline_illegibility() if mean_cov >= _IMAGE_PAGE_COVERAGE else 0.0
 
-        self._doc_strategy = _decide_doc_strategy(mean_cov, mean_text)
+        self._doc_strategy = _decide_doc_strategy(mean_cov, mean_text, illegibility)
         logger.info(f"📑 Document OCR strategy: {self._doc_strategy} "
-                    f"(mean coverage {mean_cov:.2f}, mean text {mean_text:.0f} chars/page)")
+                    f"(mean coverage {mean_cov:.2f}, mean text {mean_text:.0f} chars/page, "
+                    f"headline illegibility {illegibility:.2f})")
         return self._doc_strategy
+
+    def _headline_illegibility(self) -> float:
+        """Worst-page fraction of the most prominent (largest-font) text that is
+        unmappable (U+FFFD).
+
+        High on designed/print PDFs whose titles are drawn with subset fonts that
+        carry no ToUnicode map: the glyphs render fine but cannot be decoded to
+        text, so the selectable-text layer misrepresents the visible page. Uses
+        ``dict`` extraction because plain ``get_text`` silently DROPS glyphs it
+        cannot map (hiding the problem), whereas ``dict`` emits U+FFFD for them.
+        """
+        worst = 0.0
+        for i in range(len(self.doc)):
+            page = self.doc.load_page(i)
+            text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
+            spans = [
+                (span["size"], span.get("text", ""))
+                for block in text_dict["blocks"]
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            ]
+            if not spans:
+                continue
+            max_size = max(size for size, _ in spans)
+            headline = "".join(text for size, text in spans if size >= 0.9 * max_size)
+            if headline:
+                worst = max(worst, headline.count("�") / len(headline))
+        return worst
 
     def _render_page_png(self, page) -> bytes:
         """Rasterize a whole page to PNG bytes for page-level OCR."""
