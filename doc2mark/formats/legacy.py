@@ -1,20 +1,18 @@
 """Legacy format processors (DOC, XLS, PPT, RTF, PPS) using LibreOffice conversion."""
 
 import logging
-import os
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
-    ConversionError,
     DocumentFormat,
     ProcessedDocument,
     ProcessingError
 )
 from doc2mark.ocr.base import BaseOCR
+from doc2mark.utils.libreoffice import find_libreoffice, convert_office_to
 
 logger = logging.getLogger(__name__)
 
@@ -110,57 +108,8 @@ class LegacyProcessor(BaseProcessor):
             raise ProcessingError(f"Legacy format processing failed: {str(e)}")
 
     def _find_libreoffice(self) -> Optional[str]:
-        """Find LibreOffice installation."""
-        # Common paths for LibreOffice
-        possible_paths = [
-            # macOS
-            '/Applications/LibreOffice.app/Contents/MacOS/soffice',
-            # Linux
-            '/usr/bin/libreoffice',
-            '/usr/bin/soffice',
-            '/usr/local/bin/libreoffice',
-            '/usr/local/bin/soffice',
-            # Windows
-            'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
-            'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
-        ]
-
-        # Check each path
-        for path in possible_paths:
-            if os.path.exists(path):
-                logger.info(f"Found LibreOffice at: {path}")
-                return path
-
-        # Try to find in PATH
-        try:
-            result = subprocess.run(
-                ['which', 'libreoffice'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                path = result.stdout.strip()
-                logger.info(f"Found LibreOffice in PATH: {path}")
-                return path
-        except Exception:
-            pass
-
-        # Try soffice
-        try:
-            result = subprocess.run(
-                ['which', 'soffice'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                path = result.stdout.strip()
-                logger.info(f"Found soffice in PATH: {path}")
-                return path
-        except Exception:
-            pass
-
-        logger.warning("LibreOffice not found")
-        return None
+        """Find the LibreOffice/soffice binary (delegates to the shared helper)."""
+        return find_libreoffice()
 
     def _convert_with_libreoffice(
             self,
@@ -168,67 +117,10 @@ class LegacyProcessor(BaseProcessor):
             target_format: str,
             output_dir: str
     ) -> Path:
-        """Convert file using LibreOffice.
-        
-        Args:
-            input_path: Path to input file
-            target_format: Target format (e.g., 'docx')
-            output_dir: Directory for output file
-            
-        Returns:
-            Path to converted file
-            
-        Raises:
-            ConversionError: If conversion fails
-        """
-        # Build conversion command
-        cmd = [
-            self._libreoffice_path,
-            '--headless',
-            '--convert-to', target_format,
-            '--outdir', output_dir,
-            str(input_path)
-        ]
-
-        logger.info(f"Converting {input_path.name} to {target_format}")
-
-        try:
-            # Run conversion
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60  # 60 second timeout
-            )
-
-            if result.returncode != 0:
-                error_msg = result.stderr or result.stdout or "Unknown error"
-                raise ConversionError(
-                    f"LibreOffice conversion failed: {error_msg}"
-                )
-
-            # Find converted file
-            expected_name = input_path.stem + '.' + target_format
-            converted_path = Path(output_dir) / expected_name
-
-            if not converted_path.exists():
-                # Sometimes LibreOffice uses different naming
-                # Look for any file with the target extension
-                files = list(Path(output_dir).glob(f'*.{target_format}'))
-                if files:
-                    converted_path = files[0]
-                else:
-                    raise ConversionError(
-                        f"Converted file not found: {expected_name}"
-                    )
-
-            logger.info(f"Conversion successful: {converted_path}")
-            return converted_path
-
-        except subprocess.TimeoutExpired:
-            raise ConversionError("LibreOffice conversion timed out")
-        except Exception as e:
-            raise ConversionError(f"Conversion failed: {str(e)}")
+        """Convert a file with LibreOffice (delegates to the shared helper)."""
+        return convert_office_to(
+            input_path, target_format, output_dir, soffice_path=self._libreoffice_path
+        )
 
     def check_libreoffice_installed(self) -> bool:
         """Check if LibreOffice is installed and accessible.
