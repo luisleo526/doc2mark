@@ -85,6 +85,69 @@ def sanitize_table_html(html: str) -> str:
     return inner.strip()
 
 
+def normalize_table_html(html: str) -> str:
+    """Repair a model-emitted ``<table>`` into a rectangular grid.
+
+    A valid table has every row occupy the same number of columns. Vision models
+    transcribing a complex table (e.g. one with a sparse, header-less unit column)
+    can switch their column count mid-table, emitting rows of unequal effective
+    width — the data then misaligns and ``colspan`` arithmetic overflows. This
+    enforces the invariant deterministically: the grid width is the maximum
+    columns any row occupies (honouring ``colspan`` AND ``rowspan`` carry-over),
+    and every short row is padded with empty ``<td>`` cells to that width. It is a
+    no-op for already-rectangular tables and never drops content. Fails open: on
+    any parse error the (already-sanitized) input is returned unchanged.
+    """
+    if not html or not html.strip():
+        return html
+    try:
+        from lxml import etree, html as lxml_html
+        frag = lxml_html.fragment_fromstring(html, create_parent="div")
+    except Exception:
+        return html
+    rows = frag.findall(".//tr")
+    if not rows:
+        return html
+
+    # First pass: lay every cell onto a grid, tracking colspan width and rowspan
+    # carry-over, to learn the true grid width and each row's occupied columns.
+    occupied: set = set()
+    row_occupancy: List[int] = []
+    for r, tr in enumerate(rows):
+        col = 0
+        for cell in (e for e in tr if isinstance(e.tag, str) and e.tag in ("td", "th")):
+            while (r, col) in occupied:
+                col += 1
+            try:
+                cspan = max(1, int(cell.get("colspan", 1)))
+            except (TypeError, ValueError):
+                cspan = 1
+            try:
+                rspan = max(1, int(cell.get("rowspan", 1)))
+            except (TypeError, ValueError):
+                rspan = 1
+            for dr in range(rspan):
+                for dc in range(cspan):
+                    occupied.add((r + dr, col + dc))
+            col += cspan
+    width = max((c for (_, c) in occupied), default=-1) + 1
+    if width <= 0:
+        return html
+    for r in range(len(rows)):
+        row_occupancy.append(sum(1 for c in range(width) if (r, c) in occupied))
+
+    # Second pass: pad each short row with empty <td> cells up to the grid width.
+    changed = False
+    for tr, occ in zip(rows, row_occupancy):
+        for _ in range(width - occ):
+            etree.SubElement(tr, "td")  # appends an empty <td> to the row
+            changed = True
+    if not changed:
+        return html
+    inner = "".join(etree.tostring(child, encoding="unicode") for child in frag)
+    return inner.strip()
+
+
 # --------------------------------------------------------------------------- #
 # RAW: what is literally on the page                                          #
 # --------------------------------------------------------------------------- #
@@ -127,9 +190,10 @@ class Table(BaseModel):
     @field_validator("html")
     @classmethod
     def _sanitize_html(cls, value: str) -> str:
-        """Sanitize model-supplied HTML at the boundary so the stored value is
-        always safe to embed (see :func:`sanitize_table_html`)."""
-        return sanitize_table_html(value)
+        """Normalize then sanitize model-supplied HTML at the boundary so the stored
+        value is always both a rectangular grid (see :func:`normalize_table_html`)
+        and safe to embed (see :func:`sanitize_table_html`)."""
+        return normalize_table_html(sanitize_table_html(value))
 
 
 class KeyValue(BaseModel):
@@ -882,5 +946,6 @@ __all__ = [
     "Interpretation",
     "OCRPage",
     "sanitize_table_html",
+    "normalize_table_html",
     "router_invariants",
 ]
