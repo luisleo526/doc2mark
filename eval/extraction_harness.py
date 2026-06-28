@@ -267,14 +267,21 @@ _JUDGE = (
 )
 
 
-def meaningfulness(out: str) -> float:
+def meaningfulness(out: str, samples: int = 3) -> float:
+    """LLM coherence score 1-5, averaged over `samples` runs to damp judge noise
+    (a single call flaps +-1 on borderline docs, which would mask real regressions)."""
     try:
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage
         llm = ChatOpenAI(model=MODEL, max_tokens=4, timeout=40)
-        ans = llm.invoke([HumanMessage(content=_JUDGE + out[:9000])]).content
-        m = re.search(r"[1-5]", ans or "")
-        return float(m.group()) if m else None
+        msg = [HumanMessage(content=_JUDGE + out[:9000])]
+        scores = []
+        for _ in range(samples):
+            ans = llm.invoke(msg).content
+            m = re.search(r"[1-5]", ans or "")
+            if m:
+                scores.append(float(m.group()))
+        return round(sum(scores) / len(scores), 1) if scores else None
     except Exception as e:
         print(f"   (judge failed: {e})")
         return None
