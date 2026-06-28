@@ -219,9 +219,9 @@ never ``screenshot``.
 Neighbor-page context tightens the gate
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When neighbor-page PDF context is attached (``context_pages`` > 0, Gemini /
-Vertex only), the neighbors are read *only* to judge the host document's purpose
--- never transcribed. The non-verbatim policies (``describe`` and
+When neighbor-page PDF context is attached (``context_pages`` > 0, for any
+PDF-capable model -- OpenAI and Gemini alike), the neighbors are read *only* to
+judge the host document's purpose -- never transcribed. The non-verbatim policies (``describe`` and
 ``screenshot``) may then be applied **only** when the model's
 ``self_confidence >= 0.7`` *and* ``legibility == "high"``; otherwise, and
 whenever context is absent or conflicting, it falls back to verbatim.
