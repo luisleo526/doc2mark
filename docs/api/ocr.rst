@@ -358,7 +358,7 @@ GPT-4V-class OCR via LangChain. Structured output is produced with
 ``with_structured_output(method="json_schema")``, so the default result carries
 a full :class:`~doc2mark.OCRPage`. Requires an API key
 (``api_key=`` or ``OPENAI_API_KEY``) and the ``doc2mark[ocr]`` extra. The
-default model is ``gpt-4.1``; ``base_url`` (or ``OPENAI_BASE_URL``) targets
+default model is ``gpt-5.4-mini``; ``base_url`` (or ``OPENAI_BASE_URL``) targets
 OpenAI-compatible endpoints. Model knobs follow the precedence **explicit
 constructor argument → ``OCRConfig`` field → built-in default**.
 
@@ -366,7 +366,7 @@ constructor argument → ``OCRConfig`` field → built-in default**.
 
    from doc2mark import OCR
 
-   ocr = OCR("openai", model="gpt-4.1", detail="full")
+   ocr = OCR("openai", model="gpt-5.4-mini", detail="full")
    pages = ocr.read(images, task="document")
    print(pages[0].document.raw.text)
 

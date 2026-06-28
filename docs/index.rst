@@ -14,7 +14,11 @@ OCR providers are initialized only when OCR is requested.
 
    quickstart
    cli
+   formats
    ocr
+   ocr_policy
+   tables
+   contextual_ocr
    caching
 
 .. toctree::
