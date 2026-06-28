@@ -4,17 +4,165 @@
 [![Python](https://img.shields.io/pypi/pyversions/doc2mark.svg)](https://pypi.org/project/doc2mark/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Turn any document into clean Markdown -- in one line.
+**Turn any document into clean, RAG-ready Markdown — in one line.**
 
-## Features
+```python
+from doc2mark import load
 
-- Converts PDFs, DOCX/XLSX/PPTX, images, HTML, CSV/JSON, and more
-- AI-powered OCR via **OpenAI**, **Google Gemini (Vertex AI)**, or **Tesseract**
-- Preserves complex tables (merged cells, rowspan/colspan)
-- One unified API + CLI for single files or entire directories
-- Batch processing with parallel execution
-- Per-call token usage tracking for OpenAI and Vertex AI providers
-- Sphinx documentation with GitHub Pages deployment workflow
+print(load("report.pdf").content)
+```
+
+doc2mark converts PDFs, Office files, images, HTML, and more into Markdown that's
+faithful to the original — **merged table cells survive, headers/footers get
+stripped, and scanned pages are read by a vision LLM into a structured schema**
+instead of a flat text blob. It's built for the part everyone hits *after*
+conversion: feeding clean, structured text to an LLM or a retrieval pipeline.
+
+---
+
+## Why doc2mark
+
+Most "doc → markdown" tools are fine until the document gets real — a financial
+statement with a merged-cell header, a scanned invoice, a slide deck with a
+chart. doc2mark is built for exactly those:
+
+- **🧩 Complex tables survive.** Merged cells (`rowspan`/`colspan`), multi-level
+  headers, and group headers are preserved as clean HTML — not flattened into a
+  mangled markdown grid. ([See below.](#complex-tables-the-part-others-flatten))
+- **🧠 Structured OCR, not a text dump.** Scanned/image pages return an
+  `OCRPage` with a hard wall between **verbatim transcription** and **model
+  interpretation** (document type, summary, key-value fields, figures, entities).
+- **🧹 Noise removed.** Repeated page headers, footers, and page numbers are
+  detected and dropped before they pollute your markdown or your RAG chunks.
+- **🔌 Bring your own model.** OpenAI, Google Gemini (Vertex AI), local Tesseract,
+  or any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio) via `base_url`.
+- **🪶 No ML stack to host.** No multi-gigabyte model downloads — text parsing is
+  local and deterministic; OCR calls a hosted vision model only when you ask.
+- **📚 RAG out of the box.** Section-aware, token-budgeted chunking with page
+  spans and heading hierarchy preserved.
+
+### How it compares
+
+doc2mark sits between the ultra-light converters and the heavy ML pipelines:
+richer output than a pure text converter, far lighter to run than a local
+model stack — and the only one of the three that returns an **LLM-interpreted**
+structured page.
+
+| | **doc2mark** | **markitdown** (Microsoft) | **Docling** (IBM) |
+|---|:---:|:---:|:---:|
+| Core approach | Vision-LLM + rule-based hybrid | Text/XML parsing | Local ML pipeline (layout + TableFormer) |
+| Merged cells (`rowspan`/`colspan`) | ✅ in default markdown | ❌ flattened ([known issue](https://github.com/microsoft/markitdown/issues/1211)) | ✅ but HTML export only¹ |
+| Structured OCR schema | ✅ raw + interpretation | ❌ markdown text only | ✅ structured doc model |
+| LLM semantic layer (summary, fields, entities, figures) | ✅ | ❌ | ❌ (structure, not analysis) |
+| Header/footer/page-number stripping | ✅ | ❌ | ✅ |
+| RAG chunking built in | ✅ | ❌ | ✅ |
+| Fully offline / no API cost | ⚠️ Tesseract (raw only) | ✅ | ✅ |
+| Setup weight | 🪶 light (pip + API key) | 🪶🪶 very light | 🏋️ heavier (ML models) |
+
+**Pick markitdown** when you want the lightest possible text extraction and
+don't care about merged cells. **Pick Docling** when you need fully-offline,
+best-in-class table-structure recognition from a self-hosted model stack and
+can pay the setup/compute cost. **Pick doc2mark** when you want merged-cell
+fidelity *and* an LLM-grade structured read of each page, with a one-line API
+and no model hosting — using whichever vision model you already pay for.
+
+> Honest note: Docling's TableFormer is a purpose-trained table model and is
+> excellent at table *structure recovery*. doc2mark reaches comparable merged-cell
+> fidelity through the vision model + a rule-based renderer, and adds a semantic
+> interpretation layer those tools don't — but for fully air-gapped, no-API
+> table extraction, Docling is the stronger fit.
+
+---
+
+## Complex tables: the part others flatten
+
+Native Markdown can't express a merged cell. Tools that emit pure markdown
+tables therefore *lose* `rowspan`/`colspan` — a group header spanning three
+columns collapses, and the grid misaligns.
+
+doc2mark keeps the real structure. Both the native Office/PDF table extractor
+(`doc2mark/core/table.py`) and the vision-OCR table model emit clean HTML:
+
+```html
+<table>
+  <tr><th rowspan="2">Region</th><th colspan="2">2024</th></tr>
+  <tr><th>Q1</th><th>Q2</th></tr>
+  <tr><td>EMEA</td><td>$1.2M</td><td>$1.5M</td></tr>
+</table>
+```
+
+That `<th colspan="2">2024</th>` group header and the `rowspan="2">Region</th>`
+corner cell are exactly what a flat markdown grid cannot represent. Choose the
+rendering that fits your downstream consumer:
+
+```python
+loader = UnifiedDocumentLoader(
+    table_style="minimal_html",     # clean HTML with rowspan/colspan (default)
+    # table_style="markdown_grid",  # markdown with merge annotations
+    # table_style="styled_html",    # full HTML with inline styles
+)
+```
+
+For OCR'd tables, the vision model is explicitly instructed to reproduce merged
+cells, and the resulting HTML is sanitized to a strict table-only allowlist
+(`colspan`/`rowspan`/`scope`) before it's ever emitted — so a structured table
+read from an image is both faithful and safe to embed.
+
+### Measured: merged-cell fidelity
+
+The same merged-cell table, authored in four formats (plus a real-world spec
+sheet PDF), converted with doc2mark, Microsoft markitdown, and IBM Docling. The
+number is `colspan`/`rowspan` attributes recovered. The result that matters:
+**doc2mark preserves merged cells in the markdown you get by default.**
+
+| Document | doc2mark (default) | markitdown | Docling `to_markdown` | Docling `to_html` |
+|----------|:---:|:---:|:---:|:---:|
+| `complex_table_test.docx` | ✅ 8 / 2 | ❌ 0 / 0 | ❌ 0 / 0 | ✅ 8 / 2 |
+| `complex_table_test.pdf`  | ✅ 8 / 2 | ❌ 0 / 0 | ❌ 0 / 0 | ✅ 8 / 0 |
+| `complex_table_test.pptx` | ✅ 8 / 2 | ❌ 0 / 0 | ❌ 0 / 0 | ✅ 8 / 2 |
+| `complex_table_test.xlsx` | ✅ 9 / 2 | ❌ 0 / 0 | ❌ 0 / 0 | ✅ 9 / 2 |
+| `test-table.pdf` (untagged PDF) | ⚠️ 7 / 0 (see note) | ❌ 0 / 0 | ❌ 0 / 0 | ✅ 8 / 0 |
+
+Reading the table:
+
+- **markitdown** emits no `<table>` at all — merges collapse into blank,
+  misaligned cells (DOCX/PPTX/XLSX) or the table dissolves into loose text (PDF).
+- **Docling** has excellent table-structure recovery (TableFormer) and *does*
+  preserve spans — but **only through `export_to_html()` or its structured API**.
+  Its `export_to_markdown()`, the usual doc→markdown path, flattens every span to
+  zero, just like markitdown.
+- **doc2mark** embeds span-preserving HTML tables directly in its default
+  markdown output (`.content`), so the merges are there without choosing a
+  special export mode.
+
+So if your pipeline consumes markdown (most RAG/LLM pipelines do), doc2mark is
+the only one of the three that hands you merged-cell tables out of the box for
+documents that carry real table structure.
+
+**Where doc2mark is weaker — be honest about it.** The first four documents
+carry real table structure in their source (tagged Office/PDF), which doc2mark
+reads directly. `test-table.pdf` is an *untagged* real-world spec sheet where
+structure has to be inferred from text geometry. There, doc2mark's text path
+over-segments columns and leaves group headers (`1.0 TSI/85 kW`) as a cell plus
+empty padding instead of a true `colspan` — its 7 spans are only the section
+divider rows, not the header groups. Docling's TableFormer correctly merges
+those group headers (the `colspan="2"` on `1.0 TSI/85 kW`). If your inputs are
+mostly untagged scanned/printed PDFs, Docling — or doc2mark's own vision-LLM OCR
+path (`ocr_images=True`), which reads the table from the rendered image — is the
+better choice for table fidelity than the default text extraction.
+
+> ¹ Measured on the documents above with the current released versions, June 2026.
+> Docling recovers spans in `export_to_html()` and its structured `DoclingDocument`,
+> but `export_to_markdown()` flattens them. Your numbers may vary by version.
+
+Reproduce it on your own files — no API key needed, this is the text path:
+
+```python
+from doc2mark import load
+print(load("sample_documents/complex-tables/complex_table_test.docx").content)
+```
+
+---
 
 ## Install
 
@@ -31,6 +179,7 @@ Optional extras unlock additional capabilities:
 | `[heif]` | `pip install doc2mark[heif]` | HEIC, HEIF, and AVIF image support |
 | `[mime]` | `pip install doc2mark[mime]` | Improved MIME-type detection via `python-magic` |
 | `[redis]` | `pip install doc2mark[redis]` | Redis backend for OCR result caching |
+| `[tokenizers]` | `pip install doc2mark[tokenizers]` | Token-based RAG chunking via `tiktoken` |
 | `[all]` | `pip install doc2mark[all]` | All of the above |
 
 ## Quick start
@@ -62,7 +211,7 @@ r = results[0]
 
 # Structured output (the default)
 r.document.raw.text                         # verbatim transcription
-r.document.raw.tables                       # list of Table objects (headers + rows)
+r.document.raw.tables                       # list of Table objects (HTML + flat view)
 r.document.raw.fields                       # list of KeyValue pairs (forms, receipts)
 r.document.interpretation.summary           # model's summary
 r.document.interpretation.document_type     # "receipt", "form", "table", ...
@@ -92,6 +241,9 @@ OCRPage(
             caption="Line items",
             headers=["Item", "Price"],
             rows=[["Organic Bananas", "$2.49"], ["Almond Milk", "$4.99"]],
+            # `html` is the authoritative view — it alone can carry merged cells
+            # (colspan/rowspan). `headers`/`rows` are a best-effort flat view.
+            html="<table><tr><th>Item</th><th>Price</th></tr>...</table>",
         )],
         fields=[
             KeyValue(label="Merchant", value="Whole Foods Market"),
@@ -111,6 +263,11 @@ OCRPage(
     ),
 )
 ```
+
+> A `Table` carries three views: **`html`** (preferred — the only one that
+> encodes merged cells via `colspan`/`rowspan`), `headers`/`rows` (a flat
+> best-effort grid for simple machine access), and `markdown` (a simple-table
+> fallback). For anything with merged cells, read `html`.
 
 ### Tasks
 
@@ -151,7 +308,7 @@ results = ocr.read(images, structured=False)
 
 #### OpenAI
 
-Uses GPT-4.1 vision. Requires an API key.
+Uses a GPT vision model (default `gpt-5.4-mini`). Requires an API key.
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -160,9 +317,13 @@ pip install "doc2mark[ocr]"
 
 ```python
 ocr = OCR("openai")
-ocr = OCR("openai", model="gpt-4o-mini")                       # cheaper model
+ocr = OCR("openai", model="gpt-4o-mini")                        # different model
 ocr = OCR("openai", base_url="http://localhost:11434/v1")       # Ollama / compatible
 ```
+
+The `base_url` override points the OpenAI provider at any OpenAI-compatible
+endpoint — Ollama, vLLM, LM Studio, or a self-hosted gateway — so you can run a
+local or private vision model through the same API.
 
 #### Google Gemini
 
@@ -238,6 +399,17 @@ The old `OCRConfig` fields `enhance_image`, `detect_tables`, `detect_layout`,
 were only read by Tesseract or by nobody). Setting them now emits a
 `DeprecationWarning` and they will be removed in a future release. Use `task`
 and the structured output controls instead.
+
+## Clean PDFs: headers, footers & page numbers removed
+
+Large PDFs repeat the same header, footer, and page number on every page. Left
+in, they pollute your markdown and bloat your RAG chunks with noise. doc2mark's
+PyMuPDF pipeline detects content that recurs in the top/bottom margin zone
+across the document and drops it automatically — no configuration required.
+
+This is on by default for multi-page PDFs and is applied before both markdown
+rendering and RAG chunking, so the repeated chrome never reaches your output or
+your vector store.
 
 ## Supported formats
 
@@ -322,18 +494,6 @@ print(r.document.raw.fields)            # KeyValue pairs: merchant, total, tax, 
 
 Available tasks: `auto`, `table`, `document`, `form`, `receipt`, `handwriting`,
 `code`. See the [OCR section](#ocr) above for full details.
-
-### Table output styles
-
-Control how complex tables (with merged cells) are rendered:
-
-```python
-loader = UnifiedDocumentLoader(
-    table_style="minimal_html",     # clean HTML with rowspan/colspan (default)
-    # table_style="markdown_grid",  # markdown with merge annotations
-    # table_style="styled_html",    # full HTML with inline styles
-)
-```
 
 ### Token usage tracking
 
@@ -468,3 +628,15 @@ GitHub repository settings, set Pages source to **GitHub Actions**.
 ## License
 
 MIT -- see `LICENSE`.
+
+## Acknowledgements & comparison
+
+doc2mark stands on the shoulders of the document-AI community.
+[markitdown](https://github.com/microsoft/markitdown) (Microsoft) pioneered the
+lightweight "everything → markdown for LLMs" workflow, and
+[Docling](https://github.com/docling-project/docling) (IBM) set the bar for
+self-hosted, ML-driven table structure recovery with TableFormer. doc2mark
+targets a different point in the design space — LLM-interpreted structured
+output and merged-cell fidelity without a local model stack — and the
+comparison above is meant to help you pick the right tool, not to diminish
+excellent prior work.
