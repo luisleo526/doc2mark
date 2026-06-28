@@ -48,9 +48,11 @@ DOCS = [
     ("complex-tables/complex_table_test.pptx", "complex_table"),
     ("complex-tables/complex_table_test.xlsx", "complex_table"),
     ("complex-tables/complex_table_test.pdf", "complex_table"),
+    ("image_dominant_deck.pptx", "office_image"),
     (os.path.join(ROOT, "數辰企業簡報202606.pdf"), "image_deck"),
 ]
-IMAGE_CLASSES = {"image_deck"}
+# Image classes: no faithful text-layer ground truth -> meaningfulness judged, text skipped.
+IMAGE_CLASSES = {"image_deck", "office_image"}
 TABLE_CLASSES = {"pdf_table", "complex_table", "sheet"}
 
 # Pass thresholds (the requirements, made numeric).
@@ -249,13 +251,18 @@ def table_fidelity(gt_grids: list, out: str) -> float:
 
 
 _JUDGE = (
-    "You are grading how well a Markdown extraction represents a source document "
-    "for a RAG system. Score 1-5 (5=excellent):\n"
-    "5 = well-structured, readable: clear headings, lists/tables, diagrams described "
-    "as coherent flows; a person could understand the document from this alone.\n"
-    "3 = content is present but loosely organized.\n"
-    "1 = a fragmented dump of disconnected tokens (orphaned numbers/labels, no "
-    "structure), hard to follow.\n"
+    "You grade how well a Markdown extraction represents a source document for a RAG "
+    "system — judging COHERENCE, not just the presence of structure markers. Score 1-5:\n"
+    "5 = a coherent document: each page reads as ONE connected piece — headings with "
+    "their body text, lists, tables, flows. A person understands the document from this.\n"
+    "3 = content present but loosely organized.\n"
+    "1 = FRAGMENTED: the page was clearly OCR'd in disconnected pieces. Tell-tale signs, "
+    "score LOW when you see them: the same page carrying SEVERAL repeated 'Extracted "
+    "Text' / 'Visual Analysis' / 'Document Summary' blocks; per-fragment descriptions of "
+    "CROPPED or PARTIAL graphics ('cropped by the edge', 'only the top part is shown', "
+    "'a fragment of'); orphaned scraps (stray dates, '‹#›', lone symbols); text that "
+    "jumps between unrelated fragments. These mean the visual was split and read "
+    "piecemeal — penalize heavily even if each fragment looks tidy.\n"
     "Reply with ONLY the integer.\n\nMARKDOWN:\n"
 )
 
