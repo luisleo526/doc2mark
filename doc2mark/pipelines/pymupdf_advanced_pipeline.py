@@ -39,14 +39,7 @@ _WINDOW_CACHE_MAXLEN = 4   # windows overlap; far pages are never reused -> tiny
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SimpleContent:
-    """Simple content item with type and data"""
-    type: str  # 'text:title', 'text:section', 'text:normal', 'text:list', 'text:caption', 'table', or 'image'
-    content: str  # markdown text, markdown table, or base64 data
-    page: int
-    position_y: float  # For sorting
-    mime_type: Optional[str] = None  # MIME type for image content
+from doc2mark.core.types import SimpleContent  # shared content model
 
 
 @dataclass(frozen=True)
@@ -732,10 +725,6 @@ class PDFLoader:
                     )
 
                     if markdown_text.strip():  # Only add non-empty text
-                        # Debug logging for missing content
-                        if "demonstrates" in markdown_text.lower():
-                            logger.info(f"Found 'demonstrates' text: {markdown_text.strip()[:100]}... (type: {text_type})")
-                        
                         text_items.append(SimpleContent(
                             type=text_type,
                             content=markdown_text,
@@ -2002,14 +1991,10 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
     # Debug: Log all content items
     logger.debug(f"Converting {len(json_data.get('content', []))} content items to markdown")
     
-    for idx, item in enumerate(json_data.get("content", [])):
+    for item in json_data.get("content", []):
         item_type = item.get("type", "")
         content = item.get("content", "")
-        
-        # Debug: Log each item
-        if content and "demonstrates" in content.lower():
-            logger.info(f"Item {idx}: type={item_type}, content preview: {content.strip()[:100]}...")
-        
+
         # Skip empty content
         if not content or not content.strip():
             continue

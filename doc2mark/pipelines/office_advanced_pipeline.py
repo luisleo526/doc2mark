@@ -75,13 +75,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SimpleContent:
-    """Simple content item with type and data"""
-    type: str  # 'text:title', 'text:section', 'text:normal', 'text:list', 'text:caption', 'table', or 'image'
-    content: str  # markdown text, markdown table, or base64 data
-    page: int  # For Office docs, this might be slide number or sheet number
-    position_y: float  # For sorting (approximate position)
+from doc2mark.core.types import SimpleContent  # shared content model
 
 
 class BaseOfficeLoader:
