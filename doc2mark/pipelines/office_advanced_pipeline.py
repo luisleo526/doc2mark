@@ -3,8 +3,6 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
@@ -73,9 +71,6 @@ except ImportError:
     logging.warning("OCR functionality not available. Install VisionAgent to enable OCR.")
 
 logger = logging.getLogger(__name__)
-
-
-from doc2mark.core.types import SimpleContent  # shared content model
 
 
 class BaseOfficeLoader:
@@ -816,12 +811,6 @@ class DocxLoader(BaseOfficeLoader):
         except Exception as e:
             logger.debug(f"Failed to extract footnotes: {e}")
 
-        # Inject footnote reference markers into body text
-        try:
-            self._inject_footnote_refs(result["content"])
-        except Exception as e:
-            logger.debug(f"Failed to inject footnote references: {e}")
-
         return result
 
     def _iter_block_items(self):
@@ -877,28 +866,6 @@ class DocxLoader(BaseOfficeLoader):
             logger.debug(f"Could not parse footnotes XML: {e}")
 
         return notes
-
-    def _inject_footnote_refs(self, content: List[Dict[str, Any]]) -> None:
-        """Scan body text items for footnote/endnote reference elements and
-        append ``[^N]`` markers to the content text.
-
-        This modifies items in place.
-        """
-        for item in content:
-            if not item.get("type", "").startswith("text:"):
-                continue
-            if item["type"] in ("text:header", "text:footer", "text:footnote"):
-                continue
-            # We cannot easily map run-level references to exact text
-            # positions without re-parsing the paragraph XML.  Instead,
-            # we append all note references found in matching paragraphs
-            # at the end of the item text.  This is acceptable for RAG
-            # because the reference marker and the surrounding text end
-            # up in the same chunk.
-            # Note: The actual XML scanning is done for paragraphs that
-            # were already processed, but we don't have direct XML access
-            # from the content dict.  This is a best-effort pass.
-            pass  # Reference injection handled by _process_paragraph_with_refs below
 
     def _process_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
                            ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
@@ -1927,23 +1894,6 @@ class PptxLoader(BaseOfficeLoader):
 
         return None
 
-    def _extract_chart_info(self, shape, slide_num: int) -> Optional[Dict[str, Any]]:
-        """Extract basic information from a chart"""
-        try:
-            chart = shape.chart
-            if hasattr(chart, 'chart_title') and chart.has_title:
-                title_text = chart.chart_title.text_frame.text.strip()
-                if title_text:
-                    return {
-                        "type": "text:caption",
-                        "content": f"Chart: {title_text}",
-                        "page": slide_num
-                    }
-        except Exception as e:
-            logger.warning(f"Failed to extract chart info: {e}")
-
-        return None
-
     def _extract_slide_notes(self, slide, slide_num: int) -> Optional[Dict[str, Any]]:
         """Extract notes from a slide"""
         try:
@@ -2258,70 +2208,6 @@ class PptxLoader(BaseOfficeLoader):
             logger.warning(f"Error extracting text from shape: {e}")
 
         return text_items
-
-    def _extract_master_layout_text(self, slide, slide_num: int) -> List[Dict[str, Any]]:
-        """Extract text from slide master and layout that appears on the slide"""
-        text_items = []
-
-        try:
-            # Get the slide layout
-            slide_layout = slide.slide_layout
-
-            # Extract text from layout placeholders that might not be filled in the slide
-            for layout_placeholder in slide_layout.placeholders:
-                try:
-                    # Check if this placeholder exists in the slide
-                    slide_has_placeholder = False
-                    for slide_placeholder in slide.placeholders:
-                        if slide_placeholder.placeholder_format.idx == layout_placeholder.placeholder_format.idx:
-                            slide_has_placeholder = True
-                            break
-
-                    # If not in slide, check if layout has default text
-                    if not slide_has_placeholder and layout_placeholder.has_text_frame:
-                        layout_text = layout_placeholder.text_frame.text.strip()
-                        if layout_text:
-                            ph_type = layout_placeholder.placeholder_format.type
-                            text_items.append({
-                                "type": "text:caption",
-                                "content": f"[Layout default]: {layout_text}",
-                                "page": slide_num
-                            })
-                            logger.debug(f"  Found layout text: '{layout_text}'")
-
-                except Exception as e:
-                    logger.warning(f"Error extracting layout placeholder text: {e}")
-
-            # Check slide master for footer/header text
-            try:
-                slide_master = slide_layout.slide_master
-                for master_placeholder in slide_master.placeholders:
-                    if master_placeholder.has_text_frame:
-                        master_text = master_placeholder.text_frame.text.strip()
-                        if master_text:
-                            # Check if it's footer/header/date/slide number
-                            ph_type = master_placeholder.placeholder_format.type
-                            try:
-                                from pptx.enum.shapes import PP_PLACEHOLDER
-                                if ph_type in [PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.DATE,
-                                               PP_PLACEHOLDER.SLIDE_NUMBER]:
-                                    text_items.append({
-                                        "type": "text:caption",
-                                        "content": master_text,
-                                        "page": slide_num
-                                    })
-                                    logger.debug(f"  Found master text: '{master_text}' (type: {ph_type})")
-                            except (AttributeError, IndexError) as e:
-                                logger.debug(f"Failed to extract master text: {e}")
-
-            except Exception as e:
-                logger.warning(f"Error extracting master text: {e}")
-
-        except Exception as e:
-            logger.warning(f"Error accessing slide layout/master: {e}")
-
-        return text_items
-
 
 class XlsxLoader(BaseOfficeLoader):
     """Loader for XLSX (Excel) documents"""

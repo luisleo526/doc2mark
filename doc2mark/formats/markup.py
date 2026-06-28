@@ -351,60 +351,6 @@ class MarkupProcessor(BaseProcessor):
             logger.error(f"Failed to process Markdown: {e}")
             raise ProcessingError(f"Markdown processing failed: {str(e)}")
 
-    def _basic_html_to_markdown(self, soup) -> str:
-        """Basic HTML to Markdown conversion."""
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
-
-        # Get text content
-        text = soup.get_text()
-
-        # Process line by line
-        lines = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if line:
-                lines.append(line)
-
-        # Try to identify headers by their tags
-        markdown_parts = []
-
-        # Process headers
-        for i in range(1, 7):
-            for header in soup.find_all(f'h{i}'):
-                text = header.get_text().strip()
-                if text:
-                    markdown_parts.append(f"{'#' * i} {text}")
-
-        # Process paragraphs
-        for p in soup.find_all('p'):
-            text = p.get_text().strip()
-            if text:
-                markdown_parts.append(text)
-                markdown_parts.append("")
-
-        # Process lists
-        for ul in soup.find_all('ul'):
-            for li in ul.find_all('li'):
-                text = li.get_text().strip()
-                if text:
-                    markdown_parts.append(f"- {text}")
-            markdown_parts.append("")
-
-        for ol in soup.find_all('ol'):
-            for i, li in enumerate(ol.find_all('li'), 1):
-                text = li.get_text().strip()
-                if text:
-                    markdown_parts.append(f"{i}. {text}")
-            markdown_parts.append("")
-
-        # If no structured content found, return the plain text
-        if not markdown_parts:
-            return '\n\n'.join(lines)
-
-        return '\n'.join(markdown_parts)
-
     def _xml_to_markdown(self, element, level=0) -> str:
         """Convert XML element to markdown."""
         lines = []

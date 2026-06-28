@@ -20,13 +20,8 @@ from doc2mark.core.table import TableStyle, TableRenderer, TableData
 # that single image instead. Heuristic thresholds (general, not file-specific):
 _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
-# Document/page strategy thresholds + decision live in core.strategy (shared with
-# the Office route). Aliased here for the per-page image-dominance check below.
-from doc2mark.core.strategy import (  # noqa: E402
-    IMAGE_PAGE_COVERAGE as _IMAGE_PAGE_COVERAGE,
-    IMAGE_PAGE_TEXT_LIMIT as _IMAGE_PAGE_TEXT_LIMIT,
-    decide_doc_strategy as _decide_doc_strategy,
-)
+# Document strategy decision lives in core.strategy (shared with the Office route).
+from doc2mark.core.strategy import decide_doc_strategy as _decide_doc_strategy  # noqa: E402
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------

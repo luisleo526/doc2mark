@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Image-dominant Office docs routed like image PDFs.** A `.docx`/`.pptx` that is
+  mostly pictures with no usable text layer (e.g. a slide deck exported as images)
+  is now detected from its OOXML structure (picture coverage + text density, via the
+  shared `core.strategy` decision) and routed through the PDF image strategy —
+  converted to PDF, then whole-page render OCR + `page_markdown` synthesis — instead
+  of the native per-embedded-image path that fragmented such files. Text/table office
+  docs keep their exact native OOXML extraction (byte-identical); XLSX never routes.
+  The route is gated to OCR-enabled runs and falls back to native extraction on any
+  failure (including no LibreOffice). On the office-image benchmark, meaningfulness
+  rose from 2.0 to ~4.7 with no regression on any other document. Internals were also
+  consolidated: a shared `core.strategy` (two-signal decision), `core.types`
+  (`SimpleContent`), and `utils.libreoffice` (converter), and shared
+  empty-structured detection/recovery on `BaseOCR`.
 - **Meaningful Markdown for image-heavy pages.** Image-strategy pages (slide
   decks / scans) now emit a structured `interpretation.page_markdown` synthesis
   in the same OCR call — `##` headings, numbered cards, `A → B → C` flow chains —
