@@ -20,10 +20,13 @@ from doc2mark.core.table import TableStyle, TableRenderer, TableData
 # that single image instead. Heuristic thresholds (general, not file-specific):
 _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
-_IMAGE_PAGE_TEXT_LIMIT = 200    # a page with more native text than this has a usable text layer
-_IMAGE_PAGE_COVERAGE = 0.55     # images must cover >= this fraction of the page
-# Document route: "image" strategy when mean image coverage >= _IMAGE_PAGE_COVERAGE
-# AND mean selectable text < _IMAGE_PAGE_TEXT_LIMIT chars/page (constants above).
+# Document/page strategy thresholds + decision live in core.strategy (shared with
+# the Office route). Aliased here for the per-page image-dominance check below.
+from doc2mark.core.strategy import (  # noqa: E402
+    IMAGE_PAGE_COVERAGE as _IMAGE_PAGE_COVERAGE,
+    IMAGE_PAGE_TEXT_LIMIT as _IMAGE_PAGE_TEXT_LIMIT,
+    decide_doc_strategy as _decide_doc_strategy,
+)
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------
@@ -502,10 +505,7 @@ class PDFLoader:
         mean_cov = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n)) / n
         mean_text = sum(len(self.doc.load_page(i).get_text().strip()) for i in range(n)) / n
 
-        if mean_cov >= _IMAGE_PAGE_COVERAGE and mean_text < _IMAGE_PAGE_TEXT_LIMIT:
-            self._doc_strategy = "image"
-        else:
-            self._doc_strategy = "text"
+        self._doc_strategy = _decide_doc_strategy(mean_cov, mean_text)
         logger.info(f"📑 Document OCR strategy: {self._doc_strategy} "
                     f"(mean coverage {mean_cov:.2f}, mean text {mean_text:.0f} chars/page)")
         return self._doc_strategy
