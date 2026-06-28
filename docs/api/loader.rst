@@ -27,9 +27,9 @@ Constructor
        ocr_config=None,
        cache_dir=None,
        ocr_cache=None,
-       model='gpt-4.1',
+       model='gpt-5.4-mini',
        temperature=0,
-       max_tokens=4096,
+       max_tokens=8192,
        max_workers=5,
        prompt_template=PromptTemplate.DEFAULT,
        timeout=30,
@@ -77,8 +77,8 @@ OCR / model tuning
 ~~~~~~~~~~~~~~~~~~~
 
 ``model`` : str
-    Model name. Defaults to ``'gpt-4.1'`` for OpenAI; for ``vertex_ai`` the
-    default ``'gpt-4.1'`` is automatically swapped for a Gemini model.
+    Model name. Defaults to ``'gpt-5.4-mini'`` for OpenAI; for ``vertex_ai`` the
+    default ``'gpt-5.4-mini'`` is automatically swapped for a Gemini model.
 ``temperature`` : float
     Sampling temperature (default ``0``).
 ``max_tokens`` : int

@@ -7,13 +7,15 @@ on ``OCRResult.document``. The schema enforces a hard boundary between two
 concerns:
 
 - **raw** — what is *literally* on the page: a verbatim transcription, any
-  tables, and label/value fields. No inference, no commentary.
+  tables, label/value fields, and additive verbatim indexes (headings, dates,
+  metrics). No inference, no commentary.
 - **interpretation** — the model's *reading* of the page: document type, a
-  short summary, key findings, and confidence. This is the part that requires a
-  language model to reason about the content.
+  short summary, key findings, a knowledge graph, and confidence. This is the
+  part that requires a language model to reason about the content.
 
 This split is the most important idea in the schema. The ``raw`` half is
-always present and is the trustworthy, auditable record of the page. The
+always present and is the trustworthy, auditable record of the page. It is the
+token source for the BM42 sparse index, so everything in it is verbatim. The
 ``interpretation`` half is :data:`None` whenever the model was not asked to —
 or could not — reason about the page, specifically:
 
@@ -21,8 +23,8 @@ or could not — reason about the page, specifically:
 - the provider is non-LLM (e.g. Tesseract, which cannot infer), or
 - the structured-output parse failed and the layer fell back gracefully.
 
-All five models are Pydantic ``BaseModel`` subclasses. Every field is
-defaulted: the LLM providers emit them through LangChain's
+Every model on this page is a Pydantic ``BaseModel`` subclass, and **every
+field is defaulted**: the LLM providers emit them through LangChain's
 ``with_structured_output(method="json_schema")``, and OpenAI strict mode
 requires all properties to be present, so each field must be satisfiable
 without input. Optional fields serialize as ``anyOf: [T, null]``.
@@ -34,12 +36,42 @@ without input. Optional fields serialize as ``anyOf: [T, null]``.
    page back into a single markdown string, which is what powers the
    back-compatible ``OCRResult.text``.
 
+The authoritative, always-current field list for each model is generated below
+directly from the source (defaults, types, and per-field descriptions). The
+prose around each block explains *why* the field exists and how the models fit
+together; the field documentation itself is the rendered docstring.
+
+
+The verbatim / interpretation boundary
+--------------------------------------
+
+The single rule that holds the schema together: **the interpretation layer
+never invents a printed value, and never moves one out of** ``raw``. Anything
+the model claims is *on the page* — a figure axis label, an entity name, a
+relation's subject — is an additive copy of a string that already appears in
+``raw.text``. This keeps the sparse index intact (BM42 reads ``raw.text``)
+while making the same facts queryable as typed structure.
+
+That invariant is mechanically enforced. :func:`~doc2mark.ocr.schema.router_invariants`
+returns a list of violations for a page (empty means OK) and is intended as a
+CI / eval assertion over recorded outputs. It checks, among other things, that
+every verbatim figure string is a substring of ``raw.text``, that every
+``Section.heading`` came from ``raw.headings``, that ``primary_date`` was
+selected from ``raw.dates`` rather than fabricated, that entity names and
+relation subjects/objects are substrings of ``raw.text``, and that withheld
+("illustrative") values appear only on a high-confidence ``screenshot`` page.
+
+When you read a page, treat ``raw`` as ground truth and ``interpretation`` as
+an *additive overlay* that is safe to ignore. Always check
+``page.interpretation is not None`` before reading interpretive fields — with
+``detail="raw"`` or a Tesseract backend it will be ``None``.
+
 
 ``OCRPage`` — the top-level result
 ----------------------------------
 
 One image's structured OCR result. It bundles the always-present ``raw``
-extraction with the optional ``interpretation``.
+extraction with the optional ``interpretation``, and exposes one method.
 
 **Signature**
 
@@ -49,58 +81,15 @@ extraction with the optional ``interpretation``.
        raw: RawExtraction = Field(default_factory=RawExtraction)
        interpretation: Optional[Interpretation] = None
 
-**Fields**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 28 22 30
-
-   * - Name
-     - Type
-     - Default
-     - Meaning
-   * - ``raw``
-     - :class:`~doc2mark.ocr.schema.RawExtraction`
-     - empty ``RawExtraction``
-     - Verbatim page content. Always present.
-   * - ``interpretation``
-     - ``Optional[`` :class:`~doc2mark.ocr.schema.Interpretation` ``]``
-     - ``None``
-     - The model's analysis, or ``None`` for ``detail="raw"``, non-LLM
-       providers, and parse-error fallback.
-
-**Methods**
-
 ``to_markdown() -> str``
-    Render a readable markdown view of the page. Prefers structured
-    tables/fields over the flat text dump: it emits ``raw.text`` (stripped)
-    followed by each table — using the table's own ``markdown`` when present,
-    otherwise rendering a markdown grid from ``headers`` + ``rows``. This is the
-    string surfaced as the back-compatible ``OCRResult.text``.
-
-.. note::
-
-   Always check ``page.interpretation is not None`` before reading interpretive
-   fields. With ``detail="raw"`` or a Tesseract backend it will be ``None``.
-
-**Example**
-
-.. code-block:: python
-
-   from doc2mark.ocr.schema import OCRPage
-
-   page: OCRPage = ...  # obtained from an OCRResult.document
-
-   # The raw half is always safe to read.
-   print(page.raw.text)
-
-   # The interpretation half may be absent.
-   if page.interpretation is not None:
-       print(page.interpretation.document_type)  # e.g. "receipt"
-       print(page.interpretation.summary)
-
-   # Collapse to a single markdown string (back-compat OCRResult.text).
-   markdown = page.to_markdown()
+    Render a readable markdown view of the page, used as the back-compatible
+    ``OCRResult.text``. It prefers structured tables/fields over the flat text
+    dump, and renders the additive overlays (real metrics, then figures, then a
+    section outline) degraded-safe. When the interpretation carries a
+    ``page_markdown`` whole-page rendering that verifiably covers the verbatim
+    text, that structured rendering replaces the flat ``raw.text`` dump (with a
+    hidden verbatim tail preserving any uncovered tokens so the index stays
+    complete).
 
 .. autoclass:: doc2mark.ocr.schema.OCRPage
    :members:
@@ -110,123 +99,16 @@ extraction with the optional ``interpretation``.
 ``RawExtraction`` — verbatim page content
 -----------------------------------------
 
-A verbatim transcription of the page. No commentary, no inference. This is the
-``raw`` field of :class:`~doc2mark.ocr.schema.OCRPage`. No analysis belongs
-here.
-
-**Fields**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 22 28 20 30
-
-   * - Name
-     - Type
-     - Default
-     - Meaning
-   * - ``text``
-     - ``str``
-     - ``""``
-     - All visible text, verbatim, in the original language. No analysis.
-   * - ``tables``
-     - ``List[`` :class:`~doc2mark.ocr.schema.Table` ``]``
-     - ``[]``
-     - Tables transcribed from the image.
-   * - ``fields``
-     - ``List[`` :class:`~doc2mark.ocr.schema.KeyValue` ``]``
-     - ``[]``
-     - Label/value pairs for forms & receipts.
-   * - ``detected_language``
-     - ``Optional[str]``
-     - ``None``
-     - The language actually seen on the page (not an echo of config).
-   * - ``has_handwriting``
-     - ``bool``
-     - ``False``
-     - Whether handwriting was detected on the page.
-
-**Example**
-
-.. code-block:: python
-
-   from doc2mark.ocr.schema import RawExtraction, KeyValue
-
-   raw = RawExtraction(
-       text="ACME STORE\nThank you for shopping!",
-       fields=[
-           KeyValue(label="Total", value="$42.50"),
-           KeyValue(label="Date", value="2026-06-27"),
-       ],
-       detected_language="en",
-   )
+A verbatim transcription of the page: no commentary, no inference. This is the
+``raw`` field of :class:`~doc2mark.ocr.schema.OCRPage` and the BM42 token
+source. Alongside the full ``text`` and structured ``tables`` / ``fields``, it
+carries three **additive verbatim indexes** — ``headings``, ``dates``, and
+``metrics`` — each entry of which is a copy of tokens already present in
+``text``, surfaced so an indexer can boost or filter without re-parsing. The
+``metrics`` list holds :class:`~doc2mark.ocr.schema.Metric` objects (typed
+numeric assertions); ``headings`` and ``dates`` are plain verbatim strings.
 
 .. autoclass:: doc2mark.ocr.schema.RawExtraction
-   :members:
-   :show-inheritance:
-
-
-``Interpretation`` — the model's reading
-----------------------------------------
-
-The model's analysis of the page. Never mixed into ``raw``. This is the
-``interpretation`` field of :class:`~doc2mark.ocr.schema.OCRPage`, and is
-``None`` whenever the model was not asked to (or could not) reason.
-
-**Fields**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 22 30 18 30
-
-   * - Name
-     - Type
-     - Default
-     - Meaning
-   * - ``document_type``
-     - ``Literal["document", "table", "form", "receipt", "handwriting",
-       "code", "chart", "photo", "mixed", "blank", "other"]``
-     - ``"other"``
-     - The model's classification of the page.
-   * - ``summary``
-     - ``str``
-     - ``""``
-     - 1-3 sentence description of the content and its purpose.
-   * - ``key_findings``
-     - ``List[str]``
-     - ``[]``
-     - Notable points the model extracted from the page.
-   * - ``reading_order``
-     - ``List[int]``
-     - ``[]``
-     - Block indices in natural reading order, top-to-bottom.
-   * - ``visual_notes``
-     - ``str``
-     - ``""``
-     - Layout, branding, and non-text visual elements.
-   * - ``self_confidence``
-     - ``float`` (``0.0`` ≤ x ≤ ``1.0``)
-     - ``0.0``
-     - The model's own 0..1 confidence estimate.
-   * - ``legibility``
-     - ``Literal["high", "medium", "low"]``
-     - ``"high"``
-     - The model's estimate of how legible the page is.
-
-**Example**
-
-.. code-block:: python
-
-   from doc2mark.ocr.schema import Interpretation
-
-   interpretation = Interpretation(
-       document_type="receipt",
-       summary="Grocery receipt from ACME Store for three items totaling $42.50.",
-       key_findings=["3 line items", "Total: $42.50", "Paid by card"],
-       self_confidence=0.92,
-       legibility="high",
-   )
-
-.. autoclass:: doc2mark.ocr.schema.Interpretation
    :members:
    :show-inheritance:
 
@@ -234,53 +116,15 @@ The model's analysis of the page. Never mixed into ``raw``. This is the
 ``Table`` — a transcribed table
 -------------------------------
 
-A table transcribed verbatim from the image. Used inside the ``tables`` list of
-:class:`~doc2mark.ocr.schema.RawExtraction`.
-
-**Fields**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 24 22 34
-
-   * - Name
-     - Type
-     - Default
-     - Meaning
-   * - ``caption``
-     - ``str``
-     - ``""``
-     - Optional caption/title for the table.
-   * - ``headers``
-     - ``List[str]``
-     - ``[]``
-     - Column headers.
-   * - ``rows``
-     - ``List[List[str]]``
-     - ``[]``
-     - Row data, each row a list of cell strings.
-   * - ``markdown``
-     - ``str``
-     - ``""``
-     - Rendered markdown fallback for merged/complex cells the ``headers`` +
-       ``rows`` grid cannot capture. When set,
-       :meth:`~doc2mark.ocr.schema.OCRPage.to_markdown` prefers it over the
-       grid.
-
-**Example**
-
-.. code-block:: python
-
-   from doc2mark.ocr.schema import Table
-
-   table = Table(
-       caption="Items",
-       headers=["Item", "Qty", "Price"],
-       rows=[
-           ["Apples", "2", "$3.00"],
-           ["Bread", "1", "$2.50"],
-       ],
-   )
+A table transcribed verbatim, used inside ``RawExtraction.tables``. The
+preferred representation is ``html``: a clean ``<table>`` that can encode merged
+cells via ``colspan`` / ``rowspan`` (which the flat ``headers`` / ``rows`` grid
+and markdown cannot). The ``html`` value is **sanitized at the model boundary**
+by a field validator (see :func:`~doc2mark.ocr.schema.sanitize_table_html`) to a
+strict table-only allowlist, so the stored string is always safe to embed in
+rendered output. ``illustrative`` flags a demo/mockup table whose values are
+not real data, and ``row_count`` records how many sample rows a header-only
+illustrative table intentionally left untranscribed.
 
 .. autoclass:: doc2mark.ocr.schema.Table
    :members:
@@ -290,37 +134,129 @@ A table transcribed verbatim from the image. Used inside the ``tables`` list of
 ``KeyValue`` — a label/value pair
 ---------------------------------
 
-A single label/value pair, e.g. for forms and receipts. Used inside the
-``fields`` list of :class:`~doc2mark.ocr.schema.RawExtraction`.
-
-**Fields**
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 20 20 40
-
-   * - Name
-     - Type
-     - Default
-     - Meaning
-   * - ``label``
-     - ``str``
-     - ``""``
-     - The field label, e.g. ``"Total"``.
-   * - ``value``
-     - ``str``
-     - ``""``
-     - The field value, e.g. ``"$42.50"``.
-
-**Example**
-
-.. code-block:: python
-
-   from doc2mark.ocr.schema import KeyValue
-
-   field = KeyValue(label="Total", value="$42.50")
+A single label/value pair, used both inside ``RawExtraction.fields`` (forms,
+receipts) and inside ``Interpretation.definitions`` (term/definition pairs).
+``illustrative`` flags a demo/sample value from a screenshot or mockup region.
 
 .. autoclass:: doc2mark.ocr.schema.KeyValue
+   :members:
+   :show-inheritance:
+
+
+``Metric`` — a typed numeric assertion
+--------------------------------------
+
+A single number printed on the page, captured as a flat, four-field typed fact
+(``label``, ``value``, ``unit``, ``illustrative``). A ``Metric`` is an additive
+view of a number that is *also* present verbatim in ``raw.text`` — never a
+relocation of it. ``value`` is copied exactly as printed (e.g. ``"$4.2B"``,
+``"98.5%"``, ``"< 100 ms"``) and never normalized or computed. Metrics live in
+``RawExtraction.metrics`` and make a number queryable as a typed fact while the
+sparse index keeps reading ``raw.text``.
+
+.. autoclass:: doc2mark.ocr.schema.Metric
+   :members:
+   :show-inheritance:
+
+
+The nested interpretation models
+--------------------------------
+
+The interpretation layer carries a small family of nested models that structure
+a page's *meaning* — figures, hierarchy, and a knowledge graph. They are
+deliberately **shallow** (max nesting depth 4: ``OCRPage`` → ``interpretation``
+→ ``figures`` → ``data_points``), with no recursion, no model-unions, and every
+field defaulted, so they stay fillable under
+``with_structured_output(json_schema)``. They are **additive and BM42-safe**:
+every verbatim string inside them mirrors text already in ``raw.text``, an
+invariant enforced by :func:`~doc2mark.ocr.schema.router_invariants`.
+
+- **Metric** (above) — a typed number, in ``raw.metrics``.
+- **Figure** — one chart / diagram / infographic panel, in
+  ``interpretation.figures``. Its ``kind`` drives which branch fills:
+  quantitative kinds (bar/line/pie/…) fill ``data_points``; structural kinds
+  (flowchart/org_chart/network) fill ``nodes`` + ``edges``; everything else
+  falls back to ``labels`` + ``meaning``. ``meaning`` (and ``trend`` for
+  charts) is the always-attempt interpretive fallback when the typed data can't
+  be read.
+
+  - **DataPoint** — one ``(label, value, series)`` chart reading, flattened to
+    tidy-long form (the deepest leaf, depth 4). All three fields are verbatim
+    copies of printed text; values are never pixel-estimated.
+  - **DiagramNode** — one labelled box / shape / actor in a flowchart, org
+    chart, or network. There is no synthetic id — edges reference nodes by
+    their verbatim ``label``.
+  - **DiagramEdge** — a directed connection between two nodes, referenced by
+    verbatim ``from_label`` / ``to_label`` (each must match a
+    ``DiagramNode.label`` in the same figure).
+
+- **Section** — one heading-delimited region in reading order. Hierarchy is a
+  **flat list plus an integer** ``level`` (never recursive children). Its
+  ``heading`` is a verbatim ``raw.headings`` entry; ``summary`` and
+  ``key_points`` are paraphrase.
+- **Entity** — a typed named entity (person / org / product / location /
+  concept / other) with a ``salience`` ranking. Its ``name`` is verbatim in
+  ``raw.text``; dates, money, and KPIs are *not* entities — they live in
+  ``raw.dates`` / ``raw.metrics``.
+- **Relation** — a knowledge triple (``subject`` / ``relation`` / ``object``)
+  for a claim **explicitly stated** on the page, with an ``evidence`` quote that
+  makes it falsifiable. ``subject`` and ``object`` are substrings of
+  ``raw.text``; the predicate and evidence may paraphrase.
+
+Finally, the interpretation can carry a ``page_markdown`` string: a clean,
+structured Markdown re-layout of a whole-page image render. It is filled only
+when explicitly instructed (slide / scan image-strategy pages) and, when filled,
+must cover every word, number, and CJK character from ``raw.text`` verbatim — it
+re-flows existing content into a readable document, it never adds or removes any.
+
+.. autoclass:: doc2mark.ocr.schema.Figure
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.DataPoint
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.DiagramNode
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.DiagramEdge
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.Section
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.Entity
+   :members:
+   :show-inheritance:
+
+.. autoclass:: doc2mark.ocr.schema.Relation
+   :members:
+   :show-inheritance:
+
+
+``Interpretation`` — the model's reading
+----------------------------------------
+
+The model's analysis of the page, never mixed into ``raw``. This is the
+``interpretation`` field of :class:`~doc2mark.ocr.schema.OCRPage`, and is
+``None`` whenever the model was not asked to (or could not) reason.
+
+It classifies the page via ``document_type`` (one of 16 values: ``document``,
+``table``, ``form``, ``receipt``, ``handwriting``, ``code``, ``chart``,
+``photo``, ``screenshot``, ``diagram``, ``infographic``, ``logo``, ``stamp``,
+``mixed``, ``blank``, ``other``) and carries the retrieval / comprehension
+anchors and overlays described above — ``page_title``, ``primary_message``,
+``keywords``, the nested ``figures`` / ``sections`` / ``typed_entities`` /
+``relations``, plus ``column_layout``, ``page_role``, ``primary_date``,
+``action_items``, ``definitions``, ``content_fidelity``, ``self_confidence``,
+``legibility``, and ``page_markdown``. See the rendered field list for the exact
+defaults and meanings.
+
+.. autoclass:: doc2mark.ocr.schema.Interpretation
    :members:
    :show-inheritance:
 
@@ -334,7 +270,7 @@ the verbatim ``raw`` half and the model's ``interpretation`` half.
 .. code-block:: python
 
    from doc2mark.ocr.schema import (
-       OCRPage, RawExtraction, Interpretation, Table, KeyValue,
+       OCRPage, RawExtraction, Interpretation, Table, KeyValue, Metric,
    )
 
    page = OCRPage(
@@ -363,6 +299,8 @@ the verbatim ``raw`` half and the model's ``interpretation`` half.
                KeyValue(label="Store", value="ACME STORE"),
                KeyValue(label="Total", value="$9.50"),
            ],
+           headings=["ACME STORE"],
+           metrics=[Metric(label="Total", value="$9.50")],
            detected_language="en",
            has_handwriting=False,
        ),
@@ -373,6 +311,7 @@ the verbatim ``raw`` half and the model's ``interpretation`` half.
                "with a total of $9.50."
            ),
            key_findings=["3 line items", "Total: $9.50"],
+           primary_message="Three grocery items were purchased for $9.50.",
            self_confidence=0.94,
            legibility="high",
        ),
