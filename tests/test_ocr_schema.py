@@ -16,7 +16,74 @@ from doc2mark.ocr.schema import (
     Table,
     KeyValue,
     sanitize_table_html,
+    normalize_table_html,
 )
+
+
+def _row_grid_widths(html):
+    """Return (per-row occupied column counts, grid width) for an HTML table,
+    honouring colspan AND rowspan carry-over — the real rendered grid."""
+    from lxml import html as H
+    frag = H.fragment_fromstring(html, create_parent="div")
+    rows = frag.findall(".//tr")
+    grid = {}
+    for r, tr in enumerate(rows):
+        c = 0
+        for cell in (e for e in tr if e.tag in ("td", "th")):
+            while (r, c) in grid:
+                c += 1
+            cs = int(cell.get("colspan", 1) or 1)
+            rs = int(cell.get("rowspan", 1) or 1)
+            for dr in range(rs):
+                for dc in range(cs):
+                    grid[(r + dr, c + dc)] = True
+            c += cs
+    width = max((col for (_, col) in grid), default=-1) + 1
+    return [sum(1 for cc in range(width) if (r, cc) in grid) for r in range(len(rows))], width
+
+
+class TestTableHtmlNormalization:
+    """Every OCR table must be a rectangular grid: all rows occupy the same number
+    of columns. Models emitting ragged HTML (a sparse, header-less unit column makes
+    them switch column counts mid-table) are repaired deterministically."""
+
+    def test_pads_ragged_rows_to_uniform_width(self):
+        ragged = ("<table><tr><td>a</td><td>b</td><td>c</td></tr>"
+                  "<tr><td>x</td></tr></table>")
+        widths, w = _row_grid_widths(normalize_table_html(ragged))
+        assert w == 3 and widths == [3, 3]
+
+    def test_noop_on_already_uniform_table(self):
+        uniform = "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>"
+        widths, w = _row_grid_widths(normalize_table_html(uniform))
+        assert w == 2 and widths == [2, 2]
+
+    def test_colspan_counted_when_normalizing(self):
+        # row 1 is 3 wide via colspan; row 2 has a single cell -> pad to 3.
+        ragged = ('<table><tr><th colspan="3">H</th></tr>'
+                  "<tr><td>only</td></tr></table>")
+        widths, w = _row_grid_widths(normalize_table_html(ragged))
+        assert w == 3 and widths == [3, 3]
+
+    def test_rowspan_carryover_not_overpadded(self):
+        # 'a' spans into row 2, so row 2 already occupies 2 cols (a + c) -> no padding.
+        html = ('<table><tr><td rowspan="2">a</td><td>b</td></tr>'
+                "<tr><td>c</td></tr></table>")
+        out = normalize_table_html(html)
+        widths, w = _row_grid_widths(out)
+        assert w == 2 and widths == [2, 2]
+        # row 2 must still carry exactly ONE explicit <td> (c), not a spurious pad.
+        from lxml import html as H
+        rows = H.fragment_fromstring(out, create_parent="div").findall(".//tr")
+        assert len([e for e in rows[1] if e.tag in ("td", "th")]) == 1
+
+    def test_table_model_normalizes_html_field(self):
+        t = Table(html="<table><tr><td>a</td><td>b</td><td>c</td></tr><tr><td>x</td></tr></table>")
+        widths, w = _row_grid_widths(t.html)
+        assert w == 3 and widths == [3, 3]
+
+    def test_empty_input_safe(self):
+        assert normalize_table_html("") == ""
 
 
 class TestSchemaShape:
