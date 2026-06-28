@@ -107,6 +107,15 @@ class OfficeProcessor(BaseProcessor):
         # Get file size
         file_size = file_path.stat().st_size
 
+        # Image-dominant office docs (docx/pptx that are mostly pictures with no real
+        # text layer) have no faithful OOXML text to extract — route them through the
+        # PDF image strategy (whole-page render OCR + page_markdown synthesis), the
+        # same content-based decision the PDF pipeline already makes. Text/table office
+        # docs stay on the native path; any failure falls back to native extraction.
+        routed = self._maybe_route_image_dominant(file_path, file_size, **kwargs)
+        if routed is not None:
+            return routed
+
         # Use advanced pipeline if available
         json_content = None
         if ADVANCED_PIPELINE_AVAILABLE:
@@ -148,6 +157,117 @@ class OfficeProcessor(BaseProcessor):
             json_content=json_content
         )
 
+    # ------------------------------------------------------------------ #
+    # Office image-dominance route — delegates to the PDF image strategy   #
+    # ------------------------------------------------------------------ #
+    def _maybe_route_image_dominant(
+        self, file_path: Path, file_size: int, **kwargs
+    ) -> Optional[ProcessedDocument]:
+        """Return a ProcessedDocument via the PDF image strategy when this office
+        doc is image-dominant; else None so the caller continues with native
+        extraction. Gated to docx/pptx with OCR enabled; never raises (any failure
+        — including no LibreOffice — falls back to native)."""
+        ext = file_path.suffix.lower().lstrip('.')
+        if ext not in ('docx', 'pptx'):                 # xlsx (data grids) never routes
+            return None
+        ocr_requested = bool(kwargs.get('ocr_images') and kwargs.get('extract_images', False))
+        if self.ocr is None or not ocr_requested:
+            return None
+        try:
+            if not self._is_image_dominant(file_path):
+                return None
+            return self._process_as_image_dominant(file_path, file_size, **kwargs)
+        except Exception as e:
+            logger.warning(
+                f"Office image-dominance route unavailable ({e}); using native extraction"
+            )
+            return None
+
+    def _is_image_dominant(self, file_path: Path) -> bool:
+        """Two-signal image/text decision from the OOXML structure (no rendering)."""
+        from doc2mark.core.strategy import decide_doc_strategy
+        ext = file_path.suffix.lower().lstrip('.')
+        if ext == 'pptx':
+            mean_cov, mean_text = self._pptx_image_signals(file_path)
+        elif ext == 'docx':
+            mean_cov, mean_text = self._docx_image_signals(file_path)
+        else:
+            return False
+        strategy = decide_doc_strategy(mean_cov, mean_text)
+        logger.info(
+            f"📑 Office strategy: {strategy} (mean coverage {mean_cov:.2f}, "
+            f"mean text {mean_text:.0f} chars)"
+        )
+        return strategy == 'image'
+
+    def _pptx_image_signals(self, file_path: Path) -> Tuple[float, float]:
+        """Mean picture coverage + mean text chars per slide (python-pptx)."""
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        prs = Presentation(str(file_path))
+        slide_area = float((prs.slide_width or 0) * (prs.slide_height or 0)) or 1.0
+        covs: List[float] = []
+        texts: List[int] = []
+        for slide in prs.slides:
+            img_area = 0.0
+            txt = 0
+            for shape in slide.shapes:
+                try:
+                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        img_area += float((shape.width or 0) * (shape.height or 0))
+                except Exception:
+                    pass
+                if getattr(shape, 'has_text_frame', False):
+                    txt += len(shape.text_frame.text)
+            covs.append(min(img_area / slide_area, 1.0))
+            texts.append(txt)
+        n = len(covs) or 1
+        return sum(covs) / n, sum(texts) / n
+
+    def _docx_image_signals(self, file_path: Path) -> Tuple[float, float]:
+        """Total picture coverage (vs one page) + total text chars (python-docx).
+
+        Totals (not per-page) suffice for the decision: a real multi-page text doc
+        easily exceeds the 200-char text limit, while python-docx undercounting
+        anchored/floating images biases toward 'text' — the safe direction.
+        """
+        import docx
+        d = docx.Document(str(file_path))
+        text_len = sum(len(p.text) for p in d.paragraphs)
+        sect = d.sections[0]
+        page_area = float((sect.page_width or 0) * (sect.page_height or 0)) or 1.0
+        img_area = sum(float((s.width or 0) * (s.height or 0)) for s in d.inline_shapes)
+        return min(img_area / page_area, 1.0), float(text_len)
+
+    def _process_as_image_dominant(
+        self, file_path: Path, file_size: int, **kwargs
+    ) -> ProcessedDocument:
+        """Convert the office doc to PDF and process it with the PDF image strategy
+        (whole-page render OCR + page_markdown synthesis), then restore the office
+        identity in the metadata."""
+        import tempfile
+        from doc2mark.utils.libreoffice import convert_office_to
+        from doc2mark.formats.pdf import PDFProcessor
+        ext = file_path.suffix.lower().lstrip('.')
+        doc_format = DocumentFormat.DOCX if ext == 'docx' else DocumentFormat.PPTX
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = convert_office_to(file_path, 'pdf', tmp, timeout=300)
+            pdf_proc = PDFProcessor(ocr=self.ocr, table_style=self.table_style)
+            result = pdf_proc.process(
+                pdf_path,
+                extract_images=kwargs.get('extract_images', True),
+                use_ocr=bool(kwargs.get('ocr_images', True)),
+                show_progress=kwargs.get('show_progress', False),
+            )
+        # Restore the original office identity; record the routing for downstream.
+        result.metadata.format = doc_format
+        result.metadata.filename = file_path.name
+        result.metadata.size_bytes = file_size
+        if result.metadata.extra is None:
+            result.metadata.extra = {}
+        result.metadata.extra['routed_via'] = 'pdf'
+        return result
+
     def _process_with_advanced_pipeline(
         self,
         file_path: Path,
@@ -157,7 +277,7 @@ class OfficeProcessor(BaseProcessor):
         try:
             # Configure options
             extract_images = kwargs.get('extract_images', False)
-            ocr_images = extract_images and self.ocr is not None
+            ocr_images = kwargs.get('ocr_images', False) and extract_images and self.ocr is not None
 
             # Use the advanced pipeline
             json_data = UniversalOfficeLoader.load(

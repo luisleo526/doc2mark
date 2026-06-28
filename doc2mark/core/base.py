@@ -1,7 +1,8 @@
 """Base classes and interfaces for doc2mark."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+import base64
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -36,6 +37,9 @@ class DocumentFormat(Enum):
     XML = "xml"
     MARKDOWN = "md"
     
+    # Email formats
+    EML = "eml"
+
     # Image formats
     PNG = "png"
     JPG = "jpg"
@@ -91,6 +95,19 @@ class DocumentMetadata:
     extra: Dict[str, Any] = field(default_factory=dict)  # For any additional metadata
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert document values into JSON-serializable data."""
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 @dataclass
 class ProcessedDocument:
     """Container for processed document data."""
@@ -100,6 +117,19 @@ class ProcessedDocument:
     tables: Optional[List[Dict[str, Any]]] = None
     sections: Optional[List[Dict[str, Any]]] = None
     json_content: Optional[List[Dict[str, Any]]] = None  # For UnifiedMarkdownLoader compatibility
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable representation of the processed document."""
+        metadata = asdict(self.metadata)
+        metadata["format"] = self.metadata.format.value
+        return {
+            "content": self.content,
+            "metadata": _json_safe(metadata),
+            "images": _json_safe(self.images),
+            "tables": _json_safe(self.tables),
+            "sections": _json_safe(self.sections),
+            "json_content": _json_safe(self.json_content),
+        }
 
     def get_chunks(self, config=None):
         """Split document into section-aware chunks for RAG.

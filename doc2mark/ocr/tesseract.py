@@ -8,6 +8,7 @@ from typing import List, Optional
 
 from doc2mark.core.base import OCRError
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.ocr.schema import OCRPage, RawExtraction
 from doc2mark.utils.image_utils import (
     detect_image_format,
     PIL_SUPPORTED_FORMATS,
@@ -165,6 +166,15 @@ class TesseractOCR(BaseOCR):
 
             logger.debug("✅ Tesseract OCR completed successfully")
 
+            # Build structured document (interpretation-free for non-LLM provider)
+            document = OCRPage(
+                raw=RawExtraction(
+                    text=text,
+                    detected_language=self.config.language,
+                ),
+                interpretation=None,
+            )
+
             return OCRResult(
                 text=text,
                 confidence=confidence,
@@ -177,7 +187,8 @@ class TesseractOCR(BaseOCR):
                     "original_image_size": original_size,
                     "original_image_mode": original_mode,
                     "enhanced": self.config.enhance_image
-                }
+                },
+                document=document,
             )
 
         except Exception as e:

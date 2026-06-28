@@ -29,7 +29,7 @@ class TestOCRMocked:
 
     @patch('doc2mark.ocr.openai.VisionAgent')
     def test_openai_ocr_initialization(self, mock_vision_agent):
-        """Test OpenAI OCR initialization without real API key."""
+        """Test OpenAI OCR configuration without initializing a network client."""
         # Mock the VisionAgent
         mock_agent = MagicMock()
         mock_vision_agent.return_value = mock_agent
@@ -41,7 +41,8 @@ class TestOCRMocked:
 
         assert loader is not None
         assert loader.ocr is not None
-        mock_vision_agent.assert_called_once()
+        mock_vision_agent.assert_not_called()
+        assert loader.get_ocr_configuration()["vision_agent_ready"] is False
 
     @patch('doc2mark.ocr.openai.VisionAgent')
     def test_openai_ocr_with_mock_response(self, mock_vision_agent):
@@ -66,6 +67,155 @@ class TestOCRMocked:
         assert results is not None
         assert len(results) == 1
         assert "Mocked OCR text" in results[0].text
+        mock_vision_agent.assert_called_once()
+
+    def test_openai_structured_path_returns_document(self):
+        """Structured OCR returns OCRResult.document with the parsed OCRPage."""
+        from types import SimpleNamespace
+        from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
+        from doc2mark.ocr.base import OCRConfig
+        from doc2mark.ocr.schema import (
+            OCRPage,
+            RawExtraction,
+            Interpretation,
+            KeyValue,
+        )
+
+        page = OCRPage(
+            raw=RawExtraction(
+                text="hi",
+                fields=[KeyValue(label="Total", value="$8.10")],
+            ),
+            interpretation=Interpretation(document_type="receipt", summary="s"),
+        )
+        # AIMessage-ish: carries .content and .usage_metadata for usage extraction.
+        aimsg = SimpleNamespace(content="hi", usage_metadata={"total_tokens": 5})
+
+        chain = MagicMock()
+        chain.batch_as_completed.return_value = [
+            (0, {"raw": aimsg, "parsed": page, "parsing_error": None})
+        ]
+
+        # Build a real VisionAgent on the structured path without constructing a
+        # live ChatOpenAI, then swap in the mocked chain.
+        agent = VisionAgent.__new__(VisionAgent)
+        agent.structured = True
+        agent.response_model = None
+        agent.detail = "full"
+        agent.max_concurrency = None
+        agent._chain = chain
+
+        ocr = OpenAIOCR(api_key="test-key-123", config=OCRConfig(structured=True))
+        ocr._vision_agent = agent  # pre-inject so _ensure_vision_agent reuses it
+
+        results = ocr.batch_process_images([b"fake-image-data"])
+
+        assert len(results) == 1
+        assert results[0].document is not None
+        assert results[0].document.interpretation.document_type == "receipt"
+        assert "hi" in results[0].text
+        assert results[0].metadata["structured"] is True
+
+    def test_openai_structured_parse_error_raw_text_fallback(self):
+        """on_parse_error='raw_text' renders the raw message content into raw.text."""
+        from types import SimpleNamespace
+        from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
+        from doc2mark.ocr.base import OCRConfig
+
+        aimsg = SimpleNamespace(content="partial blob", usage_metadata={})
+        chain = MagicMock()
+        chain.batch_as_completed.return_value = [
+            (0, {"raw": aimsg, "parsed": None, "parsing_error": "boom"})
+        ]
+
+        agent = VisionAgent.__new__(VisionAgent)
+        agent.structured = True
+        agent.response_model = None
+        agent.detail = "full"
+        agent.max_concurrency = None
+        agent._chain = chain
+
+        ocr = OpenAIOCR(
+            api_key="test-key-123",
+            config=OCRConfig(structured=True, on_parse_error="raw_text"),
+        )
+        ocr._vision_agent = agent
+
+        results = ocr.batch_process_images([b"fake-image-data"])
+
+        assert len(results) == 1
+        assert results[0].document is not None
+        assert results[0].document.interpretation is None
+        assert "partial blob" in results[0].text
+
+    def test_openai_structured_parse_error_raise(self):
+        """on_parse_error='raise' surfaces an OCRError when parsing fails."""
+        from types import SimpleNamespace
+        from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
+        from doc2mark.ocr.base import OCRConfig
+        from doc2mark.core.base import OCRError
+
+        aimsg = SimpleNamespace(content="", usage_metadata={})
+        chain = MagicMock()
+        chain.batch_as_completed.return_value = [
+            (0, {"raw": aimsg, "parsed": None, "parsing_error": "boom"})
+        ]
+
+        agent = VisionAgent.__new__(VisionAgent)
+        agent.structured = True
+        agent.response_model = None
+        agent.detail = "full"
+        agent.max_concurrency = None
+        agent._chain = chain
+
+        ocr = OpenAIOCR(
+            api_key="test-key-123",
+            config=OCRConfig(structured=True, on_parse_error="raise"),
+        )
+        ocr._vision_agent = agent
+
+        with pytest.raises(OCRError):
+            ocr.batch_process_images([b"fake-image-data"])
+
+    def test_openai_legacy_path_keeps_freeform(self):
+        """structured=False preserves the legacy free-form result (document=None)."""
+        mock_agent = MagicMock()
+        mock_agent.structured = False
+        mock_agent.batch_invoke.return_value = [
+            ("Legacy free-form text", {"total_tokens": 7})
+        ]
+
+        with patch('doc2mark.ocr.openai.VisionAgent', return_value=mock_agent):
+            from doc2mark.ocr.openai import OpenAIOCR
+            from doc2mark.ocr.base import OCRConfig
+
+            ocr = OpenAIOCR(api_key="test-key-123", config=OCRConfig(structured=False))
+            results = ocr.batch_process_images([b"fake-image-data"])
+
+        assert len(results) == 1
+        assert results[0].document is None
+        assert results[0].text == "Legacy free-form text"
+        assert results[0].metadata["structured"] is False
+
+    def test_openai_per_image_tasks_length_mismatch_raises(self):
+        """tasks must match the number of images."""
+        from doc2mark.ocr.openai import OpenAIOCR, VisionAgent
+        from doc2mark.ocr.base import OCRConfig
+
+        agent = VisionAgent.__new__(VisionAgent)
+        agent.structured = True
+        agent.response_model = None
+        agent.detail = "full"
+        agent.max_concurrency = None
+        agent._chain = MagicMock()
+
+        ocr = OpenAIOCR(api_key="test-key-123", config=OCRConfig(structured=True))
+        ocr._vision_agent = agent
+
+        with pytest.raises(ValueError):
+            ocr.batch_process_images(
+                [b"img1", b"img2"], tasks=["receipt"]
+            )
 
     def test_tesseract_ocr_fallback(self):
         """Test that Tesseract OCR works without API key."""

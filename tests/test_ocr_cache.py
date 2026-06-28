@@ -12,6 +12,7 @@ from doc2mark import create_ocr_cache as exported_create_ocr_cache
 from doc2mark.ocr import RedisOCRCache as OCRPackageRedisOCRCache
 from doc2mark.ocr import create_ocr_cache as ocr_package_create_ocr_cache
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.schema import Interpretation, OCRPage, RawExtraction, Table
 from doc2mark.ocr.cache import (
     CACHE_SCHEMA_VERSION,
     OCR_CACHE_VALUE_SCHEMA_VERSION,
@@ -203,6 +204,133 @@ def assert_common_stats(stats, backend):
         assert key in stats
 
 
+def make_sample_document():
+    return OCRPage(
+        raw=RawExtraction(
+            text="Invoice 42",
+            tables=[Table(headers=["Item", "Qty"], rows=[["Widget", "3"]])],
+            detected_language="en",
+            has_handwriting=False,
+        ),
+        interpretation=Interpretation(
+            document_type="receipt",
+            summary="A short invoice.",
+            key_findings=["total is due"],
+            self_confidence=0.8,
+        ),
+    )
+
+
+def test_serialization_round_trips_structured_document():
+    document = make_sample_document()
+    payload = _serialize_ocr_cache_entry(
+        OCRResult(text="Invoice 42", document=document),
+        created_at=1000.0,
+        expires_at=1060.0,
+    )
+
+    entry = _deserialize_ocr_cache_entry(payload)
+
+    assert entry.result.document is not None
+    assert isinstance(entry.result.document, OCRPage)
+    assert entry.result.document == document
+    assert entry.result.document.raw.tables[0].rows == [["Widget", "3"]]
+    assert entry.result.document.interpretation.document_type == "receipt"
+
+
+def test_serialization_keeps_document_none_when_absent():
+    payload = _serialize_ocr_cache_entry(
+        OCRResult(text="plain"),
+        created_at=1000.0,
+        expires_at=1060.0,
+    )
+    entry = _deserialize_ocr_cache_entry(payload)
+    assert entry.result.document is None
+
+
+def test_memory_cache_round_trips_structured_document():
+    cache = MemoryOCRCache(ttl_seconds=60)
+    document = make_sample_document()
+
+    cache.set("key", OCRResult(text="Invoice 42", document=document))
+    cached = cache.get("key")
+
+    assert cached.text == "Invoice 42"
+    assert isinstance(cached.document, OCRPage)
+    assert cached.document == document
+    # The cache returns copies; mutating the original must not affect cached state.
+    document.raw.text = "mutated"
+    assert cache.get("key").document.raw.text == "Invoice 42"
+
+
+def test_redis_cache_round_trips_structured_document(monkeypatch):
+    client = install_fake_redis(monkeypatch)
+    cache = RedisOCRCache("redis://localhost/0", key_prefix="test")
+    document = make_sample_document()
+
+    cache.set("key", OCRResult(text="Invoice 42", document=document))
+    cached = cache.get("key")
+
+    assert cached.text == "Invoice 42"
+    assert isinstance(cached.document, OCRPage)
+    assert cached.document == document
+
+
+def test_cached_ocr_round_trips_structured_document_via_provider():
+    class StructuredOCR(FakeOCR):
+        def batch_process_images(self, images, **kwargs):
+            self.calls.append(list(images))
+            return [
+                OCRResult(text="Invoice 42", document=make_sample_document())
+                for _ in images
+            ]
+
+    provider = StructuredOCR()
+    cache = MemoryOCRCache(ttl_seconds=60)
+    ocr = CachedOCR(provider, cache)
+
+    first = ocr.batch_process_images([b"img"], language="en")
+    second = ocr.batch_process_images([b"img"], language="en")
+
+    assert first[0].document == make_sample_document()
+    assert second[0].document == make_sample_document()
+    # Second call is a cache hit, so the provider is only invoked once.
+    assert len(provider.calls) == 1
+
+
+def test_cache_key_ignores_inert_config_fields_for_llm_provider():
+    image = b"same-image"
+
+    provider = FakeOCR()
+    provider.config = OCRConfig(language="en", detect_tables=True)
+    tables_on_key = build_ocr_cache_key(provider, image)
+
+    provider.config = OCRConfig(language="en", detect_tables=False)
+    tables_off_key = build_ocr_cache_key(provider, image)
+
+    # Toggling an inert Tesseract-only field must not change the LLM cache key.
+    assert tables_on_key == tables_off_key
+
+
+def test_cache_key_tracks_relevant_config_fields_for_llm_provider():
+    image = b"same-image"
+
+    provider = FakeOCR()
+    provider.config = OCRConfig(language="en", structured=True, detail="full")
+    base_key = build_ocr_cache_key(provider, image)
+
+    provider.config = OCRConfig(language="zh", structured=True, detail="full")
+    language_key = build_ocr_cache_key(provider, image)
+
+    provider.config = OCRConfig(language="en", structured=False, detail="full")
+    structured_key = build_ocr_cache_key(provider, image)
+
+    provider.config = OCRConfig(language="en", structured=True, detail="raw")
+    detail_key = build_ocr_cache_key(provider, image)
+
+    assert len({base_key, language_key, structured_key, detail_key}) == 4
+
+
 def test_memory_cache_hit_miss_and_clear():
     cache = MemoryOCRCache(ttl_seconds=60, max_entries=10)
 
@@ -377,7 +505,7 @@ def test_cache_key_schema_and_api_key_identity_are_credential_scoped():
     provider.api_key = "tenant-b-secret"
     tenant_b_key = build_ocr_cache_key(provider, image)
 
-    assert CACHE_SCHEMA_VERSION == "ocr-cache-v3"
+    assert CACHE_SCHEMA_VERSION == "ocr-cache-v4"
     assert tenant_a_key != tenant_b_key
     assert "tenant-a-secret" not in tenant_a_key
     assert "tenant-b-secret" not in tenant_b_key
@@ -743,12 +871,13 @@ def test_packaging_declares_redis_extra():
 
     assert "redis = [" in pyproject_text
     assert '"redis>=5.0.0"' in pyproject_text
-    assert '"doc2mark[ocr,heif,mime,vertex_ai,redis]"' in pyproject_text
+    assert "all = [" in pyproject_text
+    assert '"langchain-google-genai>=2.0.0"' in pyproject_text
+    assert '"pillow-heif>=0.16.0"' in pyproject_text
 
-    assert '"redis": [' in setup_text
-    assert '"redis>=5.0.0",' in setup_text
-    assert '"all": [' in setup_text
+    assert "setup()" in setup_text
+    assert "redis" not in setup_text
 
 
 def test_value_schema_version_is_private_value_schema():
-    assert OCR_CACHE_VALUE_SCHEMA_VERSION == "ocr-cache-value-v1"
+    assert OCR_CACHE_VALUE_SCHEMA_VERSION == "ocr-cache-value-v2"

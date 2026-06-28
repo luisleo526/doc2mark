@@ -25,9 +25,15 @@ def test_resolve_precedence(monkeypatch):
 
 
 def _agent_with_chain(cls, max_concurrency):
-    """Build a vision agent without invoking its LLM __init__, with a mock chain."""
+    """Build a vision agent without invoking its LLM __init__, with a mock chain.
+
+    The mock chain returns objects with a ``.content`` attribute, so the agent
+    must be on the LEGACY (non-structured) path for that shape to stay valid —
+    the structured path expects ``{"raw", "parsed", ...}`` dict payloads instead.
+    """
     agent = cls.__new__(cls)
     agent.max_concurrency = max_concurrency
+    agent.structured = False
     msg = MagicMock(); msg.content = "ocr text"; msg.usage_metadata = {}
     chain = MagicMock(); chain.batch_as_completed.return_value = [(0, msg)]
     agent._chain = chain

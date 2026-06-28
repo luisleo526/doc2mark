@@ -33,6 +33,26 @@ def test_loader_initialization():
         assert hasattr(loader, 'ocr')
 
 
+def test_default_loader_processes_text_without_api_key(monkeypatch, temp_text_file):
+    """Default loader should not require OpenAI credentials for text-only work."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    loader = UnifiedDocumentLoader()
+    result = loader.load(temp_text_file)
+
+    assert "This is a sample text document" in result.content
+
+
+def test_loader_can_disable_ocr(temp_text_file):
+    """ocr_provider=None should disable OCR cleanly."""
+    loader = UnifiedDocumentLoader(ocr_provider=None)
+
+    assert loader.ocr is None
+    assert loader.validate_ocr() is False
+    assert loader.get_ocr_configuration()["enabled"] is False
+    assert "This is a sample text document" in loader.load(temp_text_file).content
+
+
 def test_supported_formats():
     """Test that all expected formats are supported."""
     loader = UnifiedDocumentLoader(ocr_provider='tesseract')
@@ -155,6 +175,19 @@ def test_basic_text_loading():
     assert result.content is not None
     assert len(result.content) > 0
     assert result.metadata.format == DocumentFormat.TXT
+
+
+def test_cache_dir_reuses_processed_document(tmp_path, temp_text_file):
+    """cache_dir should persist and restore processed documents."""
+    cache_dir = tmp_path / "cache"
+    loader = UnifiedDocumentLoader(ocr_provider=None, cache_dir=cache_dir)
+
+    first = loader.load(temp_text_file)
+    second = loader.load(temp_text_file)
+
+    assert first.content == second.content
+    assert second.metadata.filename == temp_text_file.name
+    assert list(cache_dir.glob("*.json"))
 
 
 if __name__ == "__main__":

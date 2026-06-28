@@ -5,15 +5,64 @@ on:
     branches: [ main ]
     paths:
       - 'doc2mark/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches: [ main ]
 
 jobs:
+  lint:
+    name: Lint (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies (core + dev)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[all,dev]
+          pip install ruff bandit
+
+      # TODO: make blocking once clean (43 errors as of 2026-06-27)
+      - name: Ruff check
+        continue-on-error: true
+        run: ruff check doc2mark/
+
+      # TODO: make blocking once clean (48 files need reformatting as of 2026-06-27)
+      - name: Black format check
+        continue-on-error: true
+        run: black --check doc2mark/ tests/
+
+      # TODO: make blocking once clean (42 files have incorrect imports as of 2026-06-27)
+      - name: isort import order check
+        continue-on-error: true
+        run: isort --check-only doc2mark/ tests/
+
+      # TODO: make blocking once clean (11 low-severity findings as of 2026-06-27)
+      - name: Bandit security check
+        continue-on-error: true
+        run: bandit -r doc2mark -c pyproject.toml -q
+
+      # TODO: make blocking once clean (238 errors in 19 files as of 2026-06-27)
+      - name: Mypy type check
+        continue-on-error: true
+        run: mypy doc2mark/
+
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,18 +71,33 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies (core + dev)
         run: |
           python -m pip install --upgrade pip
           pip install -e .[all,dev]
-      
-      - name: Run unit tests (no OCR external API)
+
+      - name: Run unit tests with coverage
         env:
           # Ensure no accidental OpenAI calls in CI
           OPENAI_API_KEY: ""
         run: |
-          python -m pytest -m "not integration and not requires_api_key" -q
+          python -m pytest -m "not integration and not requires_api_key" -q \
+            --cov=doc2mark --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=50
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12' && always()
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
 
   test-ocr:
     name: OCR tests (OpenAI)
@@ -49,6 +113,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies (with OCR extras)
         run: |
@@ -64,10 +130,3 @@ jobs:
         if: ${{ env.OPENAI_API_KEY == '' }}
         run: |
           echo "Skipping OCR tests: OPENAI_API_KEY not set in repository secrets"
-
-      - name: Upload coverage (optional)
-        if: always()
-        run: |
-          echo "Coverage upload step placeholder"
-
-

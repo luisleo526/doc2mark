@@ -55,6 +55,9 @@ class MimeTypeMapper:
         'text/markdown': DocumentFormat.MARKDOWN,
         'text/x-markdown': DocumentFormat.MARKDOWN,
         
+        # Email formats
+        'message/rfc822': DocumentFormat.EML,
+
         # Image formats
         'image/png': DocumentFormat.PNG,
         'image/jpeg': DocumentFormat.JPG,
@@ -88,6 +91,7 @@ class MimeTypeMapper:
         DocumentFormat.HTML: 'text/html',
         DocumentFormat.XML: 'text/xml',
         DocumentFormat.MARKDOWN: 'text/markdown',
+        DocumentFormat.EML: 'message/rfc822',
         DocumentFormat.PNG: 'image/png',
         DocumentFormat.JPG: 'image/jpeg',
         DocumentFormat.JPEG: 'image/jpeg',
@@ -165,6 +169,7 @@ class MimeTypeMapper:
             '.avif': 'image/avif',
             '.csv': 'text/csv',  # Explicitly set CSV to avoid Windows mimetypes issues
             '.tsv': 'text/tab-separated-values',
+            '.eml': 'message/rfc822',
         }
         
         for ext, mime_type in custom_types.items():

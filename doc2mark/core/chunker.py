@@ -1,7 +1,10 @@
 """Section-aware chunking for RAG pipelines."""
 
+import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Literal, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,6 +27,32 @@ class ChunkingConfig:
     split_on_heading_level: int = 2
     keep_tables_whole: bool = True
     include_page_markers: bool = False
+    size_unit: Literal["chars", "tokens"] = "chars"
+    encoding_name: str = "cl100k_base"
+
+
+def _make_length_fn(config: ChunkingConfig) -> Callable[[str], int]:
+    """Return a function that measures string length according to *config*.
+
+    When ``size_unit`` is ``"chars"`` the built-in :func:`len` is returned.
+    When ``"tokens"``, the function uses *tiktoken* with the requested
+    ``encoding_name``.  If *tiktoken* is not installed a warning is logged and
+    the function silently falls back to character counting.
+    """
+    if config.size_unit == "tokens":
+        try:
+            import tiktoken  # lazy import – optional dependency
+        except ImportError:
+            logger.warning(
+                "tiktoken is not installed; falling back to character-based "
+                "chunk sizing.  Install it with:  pip install tiktoken"
+            )
+            return len
+
+        enc = tiktoken.get_encoding(config.encoding_name)
+        return lambda text: len(enc.encode(text))
+
+    return len
 
 
 def chunk_content(
@@ -44,6 +73,8 @@ def chunk_content(
 
     if config is None:
         config = ChunkingConfig()
+
+    length_fn = _make_length_fn(config)
 
     # 0. Separate footnote items from body content
     body_items: List[Dict[str, Any]] = []
@@ -66,12 +97,12 @@ def chunk_content(
     # 2. Convert sections into chunks, splitting large ones
     chunks: List[Chunk] = []
     for section in sections:
-        section_chunks = _section_to_chunks(section, config)
+        section_chunks = _section_to_chunks(section, config, length_fn)
         chunks.extend(section_chunks)
 
     # 3. Add overlap between consecutive chunks
     if config.overlap > 0 and len(chunks) > 1:
-        _apply_overlap(chunks, config)
+        _apply_overlap(chunks, config, length_fn)
 
     # 4. Attach footnotes to referencing chunks
     if footnote_map:
@@ -117,7 +148,10 @@ def _item_to_markdown(item: Dict[str, Any], config: ChunkingConfig) -> str:
     if t == "image":
         return f"![Image](data:image/png;base64,{c})"
     if t == "text:image_description":
-        return f"```\n<ocr_result>\n{c}\n</ocr_result>\n```"
+        # OCR'd-image text: strip the internal <image_ocr_result> provenance wrapper
+        # and emit clean text — no code-fence / <ocr_result> noise — so the export
+        # is readable and RAG-clean.
+        return c.replace("<image_ocr_result>", "").replace("</image_ocr_result>", "").strip()
     # Skip header/footer items (deduped content)
     if t in ("text:header", "text:footer"):
         return ""
@@ -179,6 +213,7 @@ def _group_into_sections(
 def _section_to_chunks(
     section: _Section,
     config: ChunkingConfig,
+    length_fn: Callable[[str], int] = len,
 ) -> List[Chunk]:
     """Convert a section into one or more chunks, respecting size limits."""
     # Render all items
@@ -198,7 +233,7 @@ def _section_to_chunks(
     types = list({item.get("type", "") for item in section.items})
 
     # If it fits, return single chunk
-    if len(full_text) <= config.max_chunk_size:
+    if length_fn(full_text) <= config.max_chunk_size:
         return [Chunk(
             content=full_text,
             section_title=section.title,
@@ -221,7 +256,7 @@ def _section_to_chunks(
         if not text:
             continue
 
-        item_len = len(text) + (2 if current_parts else 0)  # account for \n\n separator
+        item_len = length_fn(text) + (length_fn("\n\n") if current_parts else 0)  # account for separator
         is_table = item.get("type") == "table"
 
         # If adding this item would exceed limit and we have content already
@@ -285,14 +320,39 @@ def _attach_footnotes(chunks: List[Chunk], footnote_map: Dict[str, str]) -> None
         chunks[-1].content = chunks[-1].content + "\n\n" + "\n".join(remaining)
 
 
-def _apply_overlap(chunks: List[Chunk], config: ChunkingConfig) -> None:
+def _tail_by_units(text: str, config: ChunkingConfig) -> str:
+    """Return the trailing portion of *text* spanning *config.overlap* units.
+
+    In ``"chars"`` mode this is a simple character slice.  In ``"tokens"`` mode
+    the text is encoded with *tiktoken*, the last *overlap* tokens are taken,
+    and decoded back to a string.  Falls back to character slicing when
+    *tiktoken* is unavailable.
+    """
+    if config.size_unit == "tokens":
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding(config.encoding_name)
+            tokens = enc.encode(text)
+            overlap_tokens = tokens[-config.overlap:]
+            return enc.decode(overlap_tokens)
+        except ImportError:
+            pass  # fall through to char-based slicing
+    return text[-config.overlap:]
+
+
+def _apply_overlap(
+    chunks: List[Chunk],
+    config: ChunkingConfig,
+    length_fn: Callable[[str], int] = len,
+) -> None:
     """Prepend trailing text from the previous chunk as overlap."""
     for i in range(1, len(chunks)):
         prev_text = chunks[i - 1].content
-        if len(prev_text) <= config.overlap:
+        if length_fn(prev_text) <= config.overlap:
             overlap_text = prev_text
         else:
-            overlap_text = prev_text[-config.overlap:]
+            overlap_text = _tail_by_units(prev_text, config)
             # Try to break at a word boundary
             space_idx = overlap_text.find(" ")
             if space_idx != -1:

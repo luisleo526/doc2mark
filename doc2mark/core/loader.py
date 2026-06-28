@@ -1,20 +1,25 @@
 """Main UnifiedDocumentLoader implementation."""
 
+import base64
+import hashlib
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
+    DocumentMetadata,
     DocumentFormat,
     OutputFormat,
     ProcessedDocument,
     ProcessingError,
     UnsupportedFormatError
 )
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
 
@@ -26,15 +31,15 @@ class UnifiedDocumentLoader:
 
     def __init__(
             self,
-            ocr_provider: Union[str, OCRProvider, BaseOCR] = 'openai',
+            ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]] = 'openai',
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
             cache_dir: Optional[str] = None,
             ocr_cache: Optional[OCRCache] = None,
             # Enhanced OCR configuration for OpenAI / Vertex AI
-            model: str = "gpt-4.1",
+            model: str = "gpt-5.4-mini",
             temperature: float = 0,
-            max_tokens: int = 4096,
+            max_tokens: int = 8192,
             max_workers: int = 5,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
@@ -49,6 +54,11 @@ class UnifiedDocumentLoader:
             location: str = "global",
             # General OCR parameters
             default_prompt: Optional[str] = None,
+            # Structured-OCR knobs (override the OCRConfig sent to LLM providers
+            # when provided; None = leave the config / provider default in place)
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
             # Table output configuration
             table_style: Optional[str] = None
     ):
@@ -62,11 +72,13 @@ class UnifiedDocumentLoader:
             ocr_cache: Optional request-scoped OCR cache handler
 
             # Enhanced OpenAI OCR Configuration:
-            model: OpenAI model to use (default: gpt-4.1)
+            model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
-            max_tokens: Maximum tokens in response (1-4096)
+            max_tokens: Maximum tokens in response (1-8192)
             max_workers: Maximum concurrent workers for batch processing
-            prompt_template: Template name ('default', 'table_focused', 'document_focused', 'multilingual')
+            prompt_template: Template name (see PromptTemplate enum for the full list, e.g.
+                'default', 'table_focused', 'document_focused', 'multilingual',
+                'form_focused', 'receipt_focused', 'handwriting_focused', 'code_focused')
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
 
@@ -82,6 +94,14 @@ class UnifiedDocumentLoader:
 
             # General OCR parameters:
             default_prompt: Custom default prompt to override built-in prompts
+
+            # Structured-OCR knobs (LLM providers):
+            task: Override the OCRConfig task (Task enum or name, e.g. 'receipt').
+                None leaves the supplied config / provider default untouched.
+            structured: Override structured-output mode (True/False). None leaves
+                the config / provider default (structured=True) untouched.
+            detail: Override interpretation detail ('raw' or 'full'). None leaves
+                the config / provider default untouched.
 
             # Table output configuration:
             table_style: Output style for complex tables with merged cells:
@@ -110,6 +130,9 @@ class UnifiedDocumentLoader:
             project=project,
             location=location,
             default_prompt=default_prompt,
+            task=task,
+            structured=structured,
+            detail=detail,
         )
         self._apply_ocr_cache(ocr_cache)
 
@@ -138,17 +161,47 @@ class UnifiedDocumentLoader:
         return False
 
     @staticmethod
-    def _unwrap_ocr(ocr: BaseOCR) -> BaseOCR:
+    def _unwrap_ocr(ocr: Optional[BaseOCR]) -> Optional[BaseOCR]:
+        if ocr is None:
+            return None
         return ocr.wrapped if isinstance(ocr, CachedOCR) else ocr
+
+    @staticmethod
+    def _resolve_ocr_config(
+            ocr_config: Optional[OCRConfig],
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
+    ) -> OCRConfig:
+        """Resolve the OCRConfig handed to the OCR provider.
+
+        Always returns a concrete OCRConfig (never None) so the structured
+        defaults (structured=True) apply consistently even when the caller did
+        not supply a config. Any of ``task``/``structured``/``detail`` that are
+        not None override the matching config field; None leaves the config
+        value (or the OCRConfig default) untouched. The caller's config object
+        is never mutated.
+        """
+        config = ocr_config if ocr_config is not None else OCRConfig()
+        overrides: Dict[str, Any] = {}
+        if task is not None:
+            overrides["task"] = task if isinstance(task, Task) else Task(str(task).lower())
+        if structured is not None:
+            overrides["structured"] = structured
+        if detail is not None:
+            overrides["detail"] = detail
+        if overrides:
+            config = replace(config, **overrides)
+        return config
 
     def _create_ocr_provider(
             self,
-            ocr_provider: Union[str, OCRProvider, BaseOCR],
+            ocr_provider: Optional[Union[str, OCRProvider, BaseOCR]],
             api_key: Optional[str] = None,
             ocr_config: Optional[OCRConfig] = None,
-            model: str = "gpt-4.1",
+            model: str = "gpt-5.4-mini",
             temperature: float = 0,
-            max_tokens: int = 4096,
+            max_tokens: int = 8192,
             max_workers: int = 5,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
@@ -160,14 +213,25 @@ class UnifiedDocumentLoader:
             project: Optional[str] = None,
             location: str = "global",
             default_prompt: Optional[str] = None,
+            task: Optional[Union[str, Task]] = None,
+            structured: Optional[bool] = None,
+            detail: Optional[str] = None,
             model_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> BaseOCR:
+    ) -> Optional[BaseOCR]:
         """Create an OCR provider using the same enhanced path everywhere."""
+        if ocr_provider is None or (isinstance(ocr_provider, str) and ocr_provider.lower() in {"none", "disabled"}):
+            logger.info("OCR provider disabled")
+            return None
+
         if isinstance(ocr_provider, BaseOCR):
             logger.info(f"✓ Using provided OCR instance: {type(ocr_provider).__name__}")
             return ocr_provider
 
         logger.info(f"🤖 Initializing OCR provider: {ocr_provider}")
+        # Resolve a concrete OCRConfig so the structured/task/detail knobs reach
+        # the provider and the structured defaults apply even when no config was
+        # supplied. This config is passed through to every provider branch below.
+        ocr_config = self._resolve_ocr_config(ocr_config, task=task, structured=structured, detail=detail)
         extra_model_kwargs = dict(model_kwargs or {})
 
         if self._is_ocr_provider(ocr_provider, OCRProvider.OPENAI):
@@ -199,7 +263,7 @@ class UnifiedDocumentLoader:
             logger.info("Using enhanced Vertex AI OCR configuration")
             from doc2mark.ocr.vertex_ai import VertexAIOCR
 
-            vertex_model = model if model != "gpt-4.1" else "gemini-3.1-flash-lite-preview"
+            vertex_model = model if model != "gpt-5.4-mini" else "gemini-3.1-flash-lite-preview"
             ocr = VertexAIOCR(
                 api_key=api_key,
                 config=ocr_config,
@@ -232,6 +296,12 @@ class UnifiedDocumentLoader:
 
     def _apply_ocr_cache(self, ocr_cache: Optional[OCRCache] = None):
         """Apply an explicit cache, preserve embedded cache, or reuse loader cache."""
+        if self.ocr is None:
+            if ocr_cache is not None:
+                self.ocr_cache = ocr_cache
+                logger.info(f"OCR cache configured for later use: {type(self.ocr_cache).__name__}")
+            return
+
         if ocr_cache is not None:
             self.ocr_cache = ocr_cache
             if isinstance(self.ocr, CachedOCR):
@@ -253,12 +323,29 @@ class UnifiedDocumentLoader:
     def _current_ocr_constructor_options(self) -> Dict[str, Any]:
         """Read current provider settings so set_ocr_provider does not downgrade OCR config."""
         current = self._unwrap_ocr(self.ocr)
+        if current is None:
+            return {
+                "api_key": None,
+                "ocr_config": None,
+                "model": "gpt-5.4-mini",
+                "temperature": 0,
+                "max_tokens": 8192,
+                "max_workers": 5,
+                "prompt_template": PromptTemplate.DEFAULT,
+                "timeout": 30,
+                "max_retries": 3,
+                "base_url": None,
+                "project": None,
+                "location": "global",
+                "default_prompt": None,
+                "model_kwargs": {},
+            }
         return {
             "api_key": getattr(current, "api_key", None),
             "ocr_config": getattr(current, "config", None),
-            "model": getattr(current, "model", "gpt-4.1"),
+            "model": getattr(current, "model", "gpt-5.4-mini"),
             "temperature": getattr(current, "temperature", 0),
-            "max_tokens": getattr(current, "max_tokens", 4096),
+            "max_tokens": getattr(current, "max_tokens", 8192),
             "max_workers": getattr(current, "max_workers", 5),
             "prompt_template": getattr(current, "prompt_template", PromptTemplate.DEFAULT),
             "timeout": getattr(current, "timeout", 30),
@@ -327,21 +414,35 @@ class UnifiedDocumentLoader:
 
             logger.info("Using individual format processors with enhanced image extraction")
 
-            # Try to import UnifiedProcessor for non-Office formats if needed
-            try:
-                from doc2mark.formats.unified_processor import UnifiedProcessor
-                unified_processor = UnifiedProcessor(ocr=self.ocr)
-                
-                # Only use UnifiedProcessor for formats not handled by our processors
-                # This allows backward compatibility while ensuring Office formats use our new code
-                logger.info("UnifiedProcessor available for additional format support")
-                
-            except ImportError:
-                logger.info("UnifiedProcessor not available, using individual processors only")
-
         except ImportError as e:
             logger.error(f"Failed to import required processors: {e}")
-            raise ImportError(f"Required format processors not available: {str(e)}")
+            raise ImportError(f"Required format processors not available: {str(e)}") from e
+
+        # Optional email (.eml) processor - register it only when the handler and
+        # the matching DocumentFormat.EML member are both available, so the loader
+        # keeps working even if email.py isn't present yet (see SHARED CONTRACT).
+        try:
+            from doc2mark.formats.email import EmailProcessor
+
+            eml_format = getattr(DocumentFormat, 'EML', None)
+            if eml_format is not None:
+                self._processors[eml_format] = EmailProcessor(ocr=self.ocr)
+                logger.info("Registered EML (email) processor")
+        except ImportError:
+            logger.debug("Email processor not available; skipping .eml support")
+
+    @staticmethod
+    def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
+        """Normalize string output format names to OutputFormat enum values."""
+        if isinstance(output_format, OutputFormat):
+            return output_format
+        if isinstance(output_format, str):
+            try:
+                return OutputFormat(output_format.lower())
+            except ValueError as e:
+                valid = ", ".join(fmt.value for fmt in OutputFormat)
+                raise ValueError(f"Unsupported output format: {output_format}. Expected one of: {valid}") from e
+        raise TypeError(f"Unsupported output format type: {type(output_format).__name__}")
 
     def load(
             self,
@@ -376,13 +477,13 @@ class UnifiedDocumentLoader:
             
         Note:
             - extract_images and ocr_images only work with Office and PDF formats
-            - show_progress only works when UnifiedProcessor is available
             - encoding and delimiter only apply to text-based formats
             
             For advanced OCR configuration, use the constructor parameters or
             update_ocr_configuration() method.
         """
         file_path = Path(file_path)
+        output_format = self._normalize_output_format(output_format)
 
         # Validate file exists
         if not file_path.exists():
@@ -397,84 +498,72 @@ class UnifiedDocumentLoader:
 
         # Check cache
         if self.cache_dir:
-            cached = self._get_cached(file_path, output_format)
+            cache_options = {
+                "output_format": output_format.value,
+                "extract_images": extract_images,
+                "ocr_images": ocr_images,
+                "encoding": encoding,
+                "delimiter": delimiter,
+                "table_style": self.table_style,
+                "ocr_provider": type(self._unwrap_ocr(self.ocr)).__name__ if self.ocr else None,
+            }
+            cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
                 return cached
+        else:
+            cache_options = {}
 
         # Process document
         processor = self._processors[doc_format]
 
         try:
-            # Check if we're using UnifiedProcessor or fallback processors
-            if processor.__class__.__name__ == 'UnifiedProcessor':
-                # UnifiedProcessor handles all parameters directly
-                result = processor.process(
-                    file_path,
-                    output_format=output_format,
-                    extract_images=extract_images,
-                    ocr_images=ocr_images,
-                    preserve_layout=True,  # Keep for compatibility
-                    show_progress=show_progress,
-                    # Format-specific
-                    encoding=encoding,
-                    delimiter=delimiter
-                )
-            else:
-                # Fallback processors need parameter mapping
-                processor_kwargs = {}
+            # Fallback processors need parameter mapping
+            processor_kwargs = {}
 
-                # Map common parameters
-                if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
-                    processor_kwargs['extract_images'] = extract_images
-                    # Note: These processors don't support all parameters
-                elif processor.__class__.__name__ == 'PDFProcessor':
-                    processor_kwargs['extract_images'] = extract_images
-                    processor_kwargs['use_ocr'] = ocr_images
-                    processor_kwargs['extract_tables'] = True
-                elif processor.__class__.__name__ == 'ImageProcessor':
-                    processor_kwargs['extract_images'] = extract_images
-                    processor_kwargs['ocr_images'] = ocr_images
-                elif processor.__class__.__name__ == 'TextProcessor':
-                    processor_kwargs['encoding'] = encoding
-                    if delimiter:
-                        processor_kwargs['delimiter'] = delimiter
-                elif processor.__class__.__name__ == 'MarkupProcessor':
-                    processor_kwargs['encoding'] = encoding
+            # Map common parameters
+            if processor.__class__.__name__ in ['OfficeProcessor', 'LegacyProcessor']:
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['ocr_images'] = ocr_images
+            elif processor.__class__.__name__ == 'PDFProcessor':
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['use_ocr'] = ocr_images
+                processor_kwargs['extract_tables'] = True
+            elif processor.__class__.__name__ == 'ImageProcessor':
+                processor_kwargs['extract_images'] = extract_images
+                processor_kwargs['ocr_images'] = ocr_images
+            elif processor.__class__.__name__ == 'TextProcessor':
+                processor_kwargs['encoding'] = encoding
+                if delimiter:
+                    processor_kwargs['delimiter'] = delimiter
+            elif processor.__class__.__name__ == 'MarkupProcessor':
+                processor_kwargs['encoding'] = encoding
 
-                # Process with mapped parameters
-                result = processor.process(file_path, **processor_kwargs)
+            # Process with mapped parameters
+            result = processor.process(file_path, **processor_kwargs)
 
-                # Apply output format conversion if needed
-                if output_format != OutputFormat.MARKDOWN:
-                    # Convert content to requested format
-                    if output_format == OutputFormat.JSON:
-                        # Create JSON structure
-                        json_data = {
-                            "filename": result.metadata.filename,
-                            "format": result.metadata.format.value,
-                            "content": [{"type": "text:normal", "content": result.content}],
-                            "metadata": {
-                                "size_bytes": result.metadata.size_bytes,
-                                "page_count": result.metadata.page_count,
-                                "word_count": result.metadata.word_count
-                            }
-                        }
-                        result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
-                        result.json_content = json_data.get('content', [])
-                    elif output_format == OutputFormat.TEXT:
-                        # Convert to plain text
-                        result.content = result.text
+            # Apply output format conversion if needed
+            if output_format != OutputFormat.MARKDOWN:
+                # Convert content to requested format
+                if output_format == OutputFormat.JSON:
+                    # Create JSON structure
+                    json_data = result.to_dict()
+                    result.content = json.dumps(json_data, indent=2, ensure_ascii=False)
+                    if result.json_content is None:
+                        result.json_content = [{"type": "text:normal", "content": json_data.get("content", "")}]
+                elif output_format == OutputFormat.TEXT:
+                    # Convert to plain text
+                    result.content = result.text
 
             # Cache result
             if self.cache_dir:
-                self._cache_result(file_path, output_format, result)
+                self._cache_result(file_path, output_format, result, cache_options)
 
             return result
 
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
-            raise ProcessingError(f"Processing failed: {str(e)}")
+            raise ProcessingError(f"Processing failed: {str(e)}") from e
 
     def load_directory(
             self,
@@ -497,6 +586,7 @@ class UnifiedDocumentLoader:
             List of processed documents
         """
         directory = Path(directory)
+        output_format = self._normalize_output_format(output_format)
         if not directory.is_dir():
             raise ValueError(f"Not a directory: {directory}")
 
@@ -523,6 +613,92 @@ class UnifiedDocumentLoader:
 
         return results
 
+    def _execute_batch(
+            self,
+            items: List[tuple],
+            total_files: int,
+            process_one: Callable[[Path, Optional[Path]], Dict[str, Any]],
+            max_workers: Optional[int],
+            progress_callback: Optional[Callable[[int, int, str], None]],
+            show_progress: bool,
+            start_time: float,
+    ) -> tuple:
+        """Run per-file batch work either sequentially or across a thread pool.
+
+        Args:
+            items: List of (key, file_path, output_path) tuples in input order.
+            total_files: Total number of files (== len(items)).
+            process_one: Callable taking (file_path, output_path) and returning the
+                per-file result dict. It must handle its own exceptions and return a
+                ``{'status': 'failed', ...}`` dict on error so a failing file still
+                records an entry.
+            max_workers: When > 1 and more than one file is present, files are
+                processed concurrently with a ThreadPoolExecutor. None / <= 1 keeps
+                the default sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, key)``
+                after each file completes.
+            show_progress: Whether to log per-file progress.
+            start_time: Batch start timestamp for ETA logging.
+
+        Returns:
+            Tuple of (results dict, processed_count, error_count). The results dict
+            preserves the input order of ``items`` regardless of completion order.
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        processed_count = 0
+        error_count = 0
+
+        use_parallel = bool(max_workers) and max_workers > 1 and total_files > 1
+
+        if use_parallel:
+            worker_count = min(max_workers, total_files)
+            logger.info(f"⚙️  Processing {total_files} files with {worker_count} workers")
+            results_by_key: Dict[str, Dict[str, Any]] = {}
+            done = 0
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_key = {
+                    executor.submit(process_one, file_path, output_path): key
+                    for key, file_path, output_path in items
+                }
+                for future in as_completed(future_to_key):
+                    key = future_to_key[future]
+                    result = future.result()
+                    results_by_key[key] = result
+                    done += 1
+                    if result.get('status') == 'success':
+                        processed_count += 1
+                    else:
+                        error_count += 1
+                    if show_progress:
+                        logger.info(f"📄 Completed {done}/{total_files}: {Path(key).name}")
+                    if progress_callback is not None:
+                        progress_callback(done, total_files, key)
+            # Rebuild in deterministic input order so results match the sequential path.
+            for key, _file_path, _output_path in items:
+                results[key] = results_by_key[key]
+        else:
+            done = 0
+            for key, file_path, output_path in items:
+                if show_progress:
+                    logger.info(f"📄 Processing {done + 1}/{total_files}: {file_path.name}")
+                result = process_one(file_path, output_path)
+                results[key] = result
+                done += 1
+                if result.get('status') == 'success':
+                    processed_count += 1
+                else:
+                    error_count += 1
+                if progress_callback is not None:
+                    progress_callback(done, total_files, key)
+                if show_progress and done % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = (total_files - done) / rate if rate > 0 else 0
+                    logger.info(
+                        f"📊 Progress: {done}/{total_files} ({done / total_files * 100:.1f}%) - ETA: {eta:.1f}s")
+
+        return results, processed_count, error_count
+
     def batch_process(
             self,
             input_dir: Union[str, Path],
@@ -534,11 +710,13 @@ class UnifiedDocumentLoader:
             show_progress: bool = True,
             save_files: bool = True,
             encoding: str = 'utf-8',
-            delimiter: Optional[str] = None
+            delimiter: Optional[str] = None,
+            max_workers: Optional[int] = None,
+            progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process multiple documents in a directory with full result tracking.
-        
+
         Args:
             input_dir: Directory containing documents
             output_dir: Optional output directory (default: same as input)
@@ -550,19 +728,33 @@ class UnifiedDocumentLoader:
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files
             delimiter: CSV delimiter (auto-detect if None)
-            
+            max_workers: Optional number of worker threads. When set to a value > 1
+                (and more than one file is found), documents are processed
+                concurrently with a thread pool. Defaults to None, which preserves
+                the original sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, path)``
+                after each file finishes (whether it succeeded or failed). ``path``
+                is the string key used in the returned results dict.
+
         Returns:
             Dictionary mapping input paths to processing results
-            
+
         Examples:
-            # Process with image extraction but no OCR
-            loader.batch_process("docs/", extract_images=True, ocr_images=False)
-            
-            # Process with batch OCR
-            loader.batch_process("docs/", extract_images=True, ocr_images=True)
+            ::
+
+                # Process with image extraction but no OCR
+                loader.batch_process("docs/", extract_images=True, ocr_images=False)
+
+                # Process with batch OCR
+                loader.batch_process("docs/", extract_images=True, ocr_images=True)
+
+                # Process concurrently with a progress bar
+                loader.batch_process("docs/", max_workers=4,
+                                     progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         input_dir = Path(input_dir)
         output_dir = Path(output_dir) if output_dir else input_dir
+        output_format = self._normalize_output_format(output_format)
 
         if not input_dir.exists():
             raise FileNotFoundError(f"Directory not found: {input_dir}")
@@ -607,26 +799,24 @@ class UnifiedDocumentLoader:
             for fmt, files in files_by_format.items():
                 logger.info(f"   {fmt.value.upper()}: {len(files)} files")
 
-        # Process files
+        # Build the ordered work list and pre-create output directories on the main
+        # thread (so concurrent workers never race on mkdir).
+        items = []
         for file_path in all_files:
             if not file_path.is_file():
                 continue
+            rel_path = file_path.relative_to(input_dir)
+            if save_files:
+                output_path = output_dir / rel_path.parent / file_path.stem
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                output_path = None
+            items.append((str(file_path), file_path, output_path))
 
+        total_files = len(items)
+
+        def process_one(file_path: Path, output_path: Optional[Path]) -> Dict[str, Any]:
             try:
-                # Calculate output path
-                rel_path = file_path.relative_to(input_dir)
-                if save_files:
-                    output_path = output_dir / rel_path.parent / file_path.stem
-                    # Ensure output directory exists
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    output_path = None
-
-                # Show progress
-                if show_progress:
-                    logger.info(f"📄 Processing {processed_count + 1}/{total_files}: {file_path.name}")
-
-                # Process file
                 start_file_time = time.time()
                 result = self.load(
                     file_path=file_path,
@@ -639,13 +829,11 @@ class UnifiedDocumentLoader:
                 )
                 file_duration = time.time() - start_file_time
 
-                # Save output if requested
                 output_files = []
                 if save_files and output_path:
                     output_files = self._save_result(result, output_path, output_format)
 
-                # Store result
-                results[str(file_path)] = {
+                return {
                     'status': 'success',
                     'format': result.metadata.format.value,
                     'content_length': len(result.content) if result.content else 0,
@@ -657,24 +845,23 @@ class UnifiedDocumentLoader:
                         'pages': result.metadata.page_count or 1
                     }
                 }
-
-                processed_count += 1
-
-                if show_progress and processed_count % 10 == 0:
-                    elapsed = time.time() - start_time
-                    rate = processed_count / elapsed
-                    eta = (total_files - processed_count) / rate if rate > 0 else 0
-                    logger.info(
-                        f"📊 Progress: {processed_count}/{total_files} ({processed_count / total_files * 100:.1f}%) - ETA: {eta:.1f}s")
-
             except Exception as e:
-                error_count += 1
                 logger.error(f"❌ Failed to process {file_path}: {e}")
-                results[str(file_path)] = {
+                return {
                     'status': 'failed',
                     'error': str(e),
                     'format': file_path.suffix.lower()
                 }
+
+        results, processed_count, error_count = self._execute_batch(
+            items=items,
+            total_files=total_files,
+            process_one=process_one,
+            max_workers=max_workers,
+            progress_callback=progress_callback,
+            show_progress=show_progress,
+            start_time=start_time,
+        )
 
         # Final summary
         total_time = time.time() - start_time
@@ -694,11 +881,13 @@ class UnifiedDocumentLoader:
             show_progress: bool = True,
             save_files: bool = True,
             encoding: str = 'utf-8',
-            delimiter: Optional[str] = None
+            delimiter: Optional[str] = None,
+            max_workers: Optional[int] = None,
+            progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
         """
         Batch process a specific list of files.
-        
+
         Args:
             file_paths: List of file paths to process
             output_dir: Optional output directory
@@ -709,42 +898,52 @@ class UnifiedDocumentLoader:
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files
             delimiter: CSV delimiter (auto-detect if None)
-            
+            max_workers: Optional number of worker threads. When set to a value > 1
+                (and more than one file is provided), files are processed
+                concurrently with a thread pool. Defaults to None, which preserves
+                the original sequential behavior.
+            progress_callback: Optional callable invoked as ``(done, total, path)``
+                after each file finishes (whether it succeeded or failed). ``path``
+                is the string key used in the returned results dict.
+
         Returns:
             Dictionary mapping input paths to processing results
-            
+
         Examples:
-            # Process specific files with OCR
-            files = ["doc1.pdf", "doc2.docx"]
-            loader.batch_process_files(files, extract_images=True, ocr_images=True)
+            ::
+
+                # Process specific files with OCR
+                files = ["doc1.pdf", "doc2.docx"]
+                loader.batch_process_files(files, extract_images=True, ocr_images=True)
+
+                # Process concurrently with a progress callback
+                loader.batch_process_files(files, max_workers=4,
+                                           progress_callback=lambda d, t, p: print(f"{d}/{t}"))
         """
         if not file_paths:
             return {}
 
         file_paths = [Path(p) for p in file_paths]
+        output_format = self._normalize_output_format(output_format)
         total_files = len(file_paths)
-        results = {}
-        processed_count = 0
-        error_count = 0
         start_time = time.time()
 
         logger.info(f"📄 Starting batch processing of {total_files} files")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
-        for i, file_path in enumerate(file_paths):
+        # Build the ordered work list and pre-create output directories on the main
+        # thread (so concurrent workers never race on mkdir).
+        items = []
+        for file_path in file_paths:
+            if save_files and output_dir:
+                output_path = Path(output_dir) / file_path.stem
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                output_path = None
+            items.append((str(file_path), file_path, output_path))
+
+        def process_one(file_path: Path, output_path: Optional[Path]) -> Dict[str, Any]:
             try:
-                # Calculate output path
-                if save_files and output_dir:
-                    output_path = Path(output_dir) / file_path.stem
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    output_path = None
-
-                # Show progress
-                if show_progress:
-                    logger.info(f"📄 Processing {i + 1}/{total_files}: {file_path.name}")
-
-                # Process file
                 start_file_time = time.time()
                 result = self.load(
                     file_path=file_path,
@@ -757,13 +956,11 @@ class UnifiedDocumentLoader:
                 )
                 file_duration = time.time() - start_file_time
 
-                # Save output if requested
                 output_files = []
                 if save_files and output_path:
                     output_files = self._save_result(result, output_path, output_format)
 
-                # Store result
-                results[str(file_path)] = {
+                return {
                     'status': 'success',
                     'format': result.metadata.format.value,
                     'content_length': len(result.content) if result.content else 0,
@@ -774,17 +971,23 @@ class UnifiedDocumentLoader:
                         'tables_found': len(result.tables) if result.tables else 0
                     }
                 }
-
-                processed_count += 1
-
             except Exception as e:
-                error_count += 1
                 logger.error(f"❌ Failed to process {file_path}: {e}")
-                results[str(file_path)] = {
+                return {
                     'status': 'failed',
                     'error': str(e),
                     'format': file_path.suffix.lower()
                 }
+
+        results, processed_count, error_count = self._execute_batch(
+            items=items,
+            total_files=total_files,
+            process_one=process_one,
+            max_workers=max_workers,
+            progress_callback=progress_callback,
+            show_progress=show_progress,
+            start_time=start_time,
+        )
 
         # Final summary
         total_time = time.time() - start_time
@@ -822,9 +1025,8 @@ class UnifiedDocumentLoader:
         elif output_format == OutputFormat.JSON:
             # Save JSON
             json_path = output_path.with_suffix('.json')
-            import json
             with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result.json_content, f, ensure_ascii=False, indent=2)
+                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
             output_files.append(str(json_path))
 
         # Save images if extracted
@@ -905,7 +1107,8 @@ class UnifiedDocumentLoader:
     def _get_cached(
             self,
             file_path: Path,
-            output_format: OutputFormat
+            output_format: OutputFormat,
+            options: Optional[Dict[str, Any]] = None
     ) -> Optional[ProcessedDocument]:
         """Get cached result if available.
         
@@ -916,15 +1119,27 @@ class UnifiedDocumentLoader:
         Returns:
             Cached document or None
         """
-        # Implementation depends on caching strategy
-        # This is a placeholder
-        return None
+        if not self.cache_dir:
+            return None
+
+        cache_file = self._cache_file_path(file_path, output_format, options or {})
+        if not cache_file.exists():
+            return None
+
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return self._document_from_cache_dict(payload["document"])
+        except Exception as e:
+            logger.warning(f"Failed to read cache for {file_path}: {e}")
+            return None
 
     def _cache_result(
             self,
             file_path: Path,
             output_format: OutputFormat,
-            result: ProcessedDocument
+            result: ProcessedDocument,
+            options: Optional[Dict[str, Any]] = None
     ):
         """Cache processing result.
         
@@ -933,9 +1148,89 @@ class UnifiedDocumentLoader:
             output_format: Output format
             result: Processing result
         """
-        # Implementation depends on caching strategy
-        # This is a placeholder
-        pass
+        if not self.cache_dir:
+            return
+
+        cache_file = self._cache_file_path(file_path, output_format, options or {})
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "doc2mark-document-cache-v1",
+            "source": str(file_path.resolve()),
+            "output_format": output_format.value,
+            "document": self._document_to_cache_dict(result),
+        }
+        tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            tmp_file.replace(cache_file)
+        except Exception as e:
+            logger.warning(f"Failed to write cache for {file_path}: {e}")
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cache_file_path(self, file_path: Path, output_format: OutputFormat, options: Dict[str, Any]) -> Path:
+        stat = file_path.stat()
+        key_payload = {
+            "path": str(file_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "output_format": output_format.value,
+            "options": self._json_cache_safe(options),
+        }
+        cache_key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{cache_key}.json"
+
+    @classmethod
+    def _json_cache_safe(cls, value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"__bytes__": base64.b64encode(value).decode("ascii")}
+        if isinstance(value, (DocumentFormat, OutputFormat, OCRProvider, PromptTemplate)):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): cls._json_cache_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_cache_safe(item) for item in value]
+        return value
+
+    @classmethod
+    def _restore_cache_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            if set(value.keys()) == {"__bytes__"}:
+                return base64.b64decode(value["__bytes__"].encode("ascii"))
+            return {key: cls._restore_cache_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._restore_cache_value(item) for item in value]
+        return value
+
+    @classmethod
+    def _document_to_cache_dict(cls, result: ProcessedDocument) -> Dict[str, Any]:
+        return {
+            "content": result.content,
+            "metadata": cls._json_cache_safe(result.metadata.__dict__),
+            "images": cls._json_cache_safe(result.images),
+            "tables": cls._json_cache_safe(result.tables),
+            "sections": cls._json_cache_safe(result.sections),
+            "json_content": cls._json_cache_safe(result.json_content),
+        }
+
+    @classmethod
+    def _document_from_cache_dict(cls, payload: Dict[str, Any]) -> ProcessedDocument:
+        metadata_dict = cls._restore_cache_value(payload["metadata"])
+        metadata_dict["format"] = DocumentFormat(metadata_dict["format"])
+        metadata = DocumentMetadata(**metadata_dict)
+        return ProcessedDocument(
+            content=payload["content"],
+            metadata=metadata,
+            images=cls._restore_cache_value(payload.get("images")),
+            tables=cls._restore_cache_value(payload.get("tables")),
+            sections=cls._restore_cache_value(payload.get("sections")),
+            json_content=cls._restore_cache_value(payload.get("json_content")),
+        )
 
     @property
     def supported_formats(self) -> List[str]:
@@ -952,11 +1247,13 @@ class UnifiedDocumentLoader:
         Returns:
             True if OCR is properly configured
         """
+        if self.ocr is None:
+            return False
         return self.ocr.validate_api_key()
 
     def set_ocr_provider(
             self,
-            provider: Union[str, OCRProvider, BaseOCR],
+            provider: Optional[Union[str, OCRProvider, BaseOCR]],
             api_key: Optional[str] = None,
             config: Optional[OCRConfig] = None,
             ocr_cache: Optional[OCRCache] = None
@@ -975,7 +1272,9 @@ class UnifiedDocumentLoader:
         if config is not None:
             preserved_options["ocr_config"] = config
 
-        if isinstance(provider, BaseOCR):
+        if provider is None or (isinstance(provider, str) and provider.lower() in {"none", "disabled"}):
+            self.ocr = None
+        elif isinstance(provider, BaseOCR):
             self.ocr = provider
         else:
             self.ocr = self._create_ocr_provider(
@@ -996,6 +1295,13 @@ class UnifiedDocumentLoader:
         Returns:
             Dictionary with OCR configuration details
         """
+        if self.ocr is None:
+            return {
+                "provider": None,
+                "enabled": False,
+                "api_key_configured": False,
+                "config": None,
+            }
         if hasattr(self.ocr, 'get_configuration_summary'):
             return self.ocr.get_configuration_summary()
         else:
@@ -1022,6 +1328,10 @@ class UnifiedDocumentLoader:
             - max_retries: int
         """
         logger.info("🔧 Updating OCR configuration...")
+
+        if self.ocr is None:
+            logger.warning("OCR provider is disabled; no configuration was updated")
+            return
 
         if hasattr(self.ocr, 'update_model_config'):
             # Extract model configuration parameters
@@ -1064,6 +1374,8 @@ class UnifiedDocumentLoader:
         Returns:
             Dictionary of template names and descriptions
         """
+        if self.ocr is None:
+            return {}
         if hasattr(self.ocr, 'get_available_prompts'):
             return self.ocr.get_available_prompts()
         else:
@@ -1076,6 +1388,17 @@ class UnifiedDocumentLoader:
             Dictionary with validation results
         """
         logger.info("🔐 Validating OCR setup...")
+
+        if self.ocr is None:
+            return {
+                "provider": None,
+                "enabled": False,
+                "api_key_configured": False,
+                "api_key_valid": False,
+                "configuration": self.get_ocr_configuration(),
+                "available_templates": {},
+                "errors": [],
+            }
 
         validation_results = {
             "provider": type(self.ocr).__name__,

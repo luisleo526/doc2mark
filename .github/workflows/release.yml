@@ -56,7 +56,7 @@ jobs:
     - name: Get current version
       id: current_version
       run: |
-        echo "version=$(python -c "import re; content = open('setup.py').read(); print(re.search(r'version=\"([^\"]+)\"', content).group(1))")" >> $GITHUB_OUTPUT
+        echo "version=$(python -c "import re; content = open('doc2mark/__init__.py').read(); print(re.search(r'__version__ = \"([^\"]+)\"', content).group(1))")" >> $GITHUB_OUTPUT
     
     - name: Bump version
       id: bump_version
@@ -70,9 +70,13 @@ jobs:
         tag = True
         tag_name = v{new_version}
         
-        [bumpversion:file:setup.py]
-        search = version="{current_version}"
-        replace = version="{new_version}"
+        [bumpversion:file:doc2mark/__init__.py]
+        search = __version__ = "{current_version}"
+        replace = __version__ = "{new_version}"
+        
+        [bumpversion:file:pyproject.toml]
+        search = version = "{current_version}"
+        replace = version = "{new_version}"
         EOF
         fi
         
@@ -80,7 +84,7 @@ jobs:
         bump2version ${{ github.event.inputs.version_bump }} --verbose
         
         # Get the new version
-        NEW_VERSION=$(python -c "import re; content = open('setup.py').read(); print(re.search(r'version=\"([^\"]+)\"', content).group(1))")
+        NEW_VERSION=$(python -c "import re; content = open('doc2mark/__init__.py').read(); print(re.search(r'__version__ = \"([^\"]+)\"', content).group(1))")
         echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
         echo "tag_name=v$NEW_VERSION" >> $GITHUB_OUTPUT
     
