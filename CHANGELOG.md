@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Document-level OCR token-usage aggregation.** The token usage that each LLM
+  OCR call records in `OCRResult.metadata["token_usage"]` (LangChain
+  `usage_metadata` — `input_tokens`/`output_tokens`/`total_tokens`) is now summed
+  across every OCR call made during a single `UnifiedDocumentLoader.load()` and
+  stamped onto `ProcessedDocument.metadata.extra["token_usage"]`, so downstream
+  consumers can meter OCR cost without reaching into per-image internals. A thin
+  `UsageAggregatingOCR` wrapper (same transparent shape as `CachedOCR`) is placed
+  around the shared OCR instance handed to every processor, so the count covers
+  all providers (OpenAI, Vertex/Gemini) and all source families (PDF page
+  renders/embedded figures, Office/image extracted images) through the one merge
+  point. Naming variants (`prompt_tokens`/`completion_tokens`, total-only
+  payloads) are folded defensively, and `total_tokens` is derived when absent.
+  A no-OCR load — or a usage-less provider such as Tesseract — leaves `extra`
+  byte-identical (nothing is stamped). Accumulation is per-`load()` and
+  thread-local, so the loader's concurrent batch processing does not
+  cross-contaminate. The aggregated count reflects **only fresh provider spend**
+  this `load()`: a `CachedOCR` cache hit, an intra-batch dedup fan-out copy, and a
+  whole-document `cache_dir` replay each carry no new spend and are excluded, so a
+  billing consumer of `metadata.extra["token_usage"]` is never charged for tokens
+  that were not spent. `CachedOCR` flags such non-fresh results
+  (`metadata["doc2mark_from_cache"]`) on the returned copy only — never on the
+  value written to the cache, so the marker neither round-trips into a stored
+  payload nor changes the cache key. A document-cache replay renames its stamped
+  `token_usage` to `token_usage_cached` (the original run was billed once; the
+  count stays visible for diagnostics).
 - **Image-dominant Office docs routed like image PDFs.** A `.docx`/`.pptx` that is
   mostly pictures with no usable text layer (e.g. a slide deck exported as images)
   is now detected from its OOXML structure (picture coverage + text density, via the
