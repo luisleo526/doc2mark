@@ -24,6 +24,15 @@ CACHE_SCHEMA_VERSION = "ocr-cache-v4"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 
+# Metadata flag CachedOCR stamps on every OCRResult it returns WITHOUT a fresh
+# provider call *this batch* — a cache hit or an intra-batch dedup fan-out copy.
+# A usage/billing consumer (UsageAggregatingOCR) keys off it to count only fresh
+# provider spend, so a replay is never re-billed. It is stamped ONLY on the
+# returned copy the caller owns, never on the value written to the cache, so it
+# neither round-trips into a stored payload nor affects the cache key (keys are
+# built from the image bytes + provider attrs, never result metadata).
+FROM_CACHE_METADATA_KEY = "doc2mark_from_cache"
+
 # Providers that consume an OCRConfig but are NOT LLM providers, so the
 # Tesseract-only fields (enhance_image/detect_layout/detect_tables) are live and
 # must stay in the cache key. Every other OCRConfig-backed provider is an LLM
@@ -48,6 +57,17 @@ _STAT_COUNTERS = (
 def _copy_result(result: OCRResult) -> OCRResult:
     """Copy cached OCR results so callers cannot mutate shared cache state."""
     return copy.deepcopy(result)
+
+
+def _mark_from_cache(result: OCRResult) -> OCRResult:
+    """Flag an already-copied result as served from cache / intra-batch dedup
+    (i.e. NOT a fresh provider call this batch) so a usage-aggregating consumer
+    skips it. Mutates the copy's metadata in place — the caller MUST own the
+    result (an ``_copy_result`` output), never shared cache state."""
+    metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+    metadata[FROM_CACHE_METADATA_KEY] = True
+    result.metadata = metadata
+    return result
 
 
 def _normalize_result(result: Any) -> OCRResult:
@@ -871,6 +891,29 @@ class CachedOCR(BaseOCR):
         results = self.batch_process_images([image], **kwargs)
         return results[0] if results else OCRResult(text="")
 
+    def _store_and_fanout(
+        self,
+        results: List[Optional[OCRResult]],
+        key: str,
+        provider_result: Any,
+        positions: List[int],
+    ) -> None:
+        """Cache one fresh provider result and place it at every deduped position.
+
+        The value written to the cache is the clean, unmarked result. Only the
+        first position is a fresh provider call this batch; the remaining
+        positions are intra-batch dedup copies of the SAME single call, so they
+        are flagged non-fresh (``FROM_CACHE_METADATA_KEY``) to keep a usage
+        consumer from counting one provider call N times.
+        """
+        normalized = _normalize_result(provider_result)
+        self.cache.set(key, normalized)
+        for offset, position in enumerate(positions):
+            copied = _copy_result(normalized)
+            if offset:
+                _mark_from_cache(copied)
+            results[position] = copied
+
     def batch_process_images(self, images: List[bytes], **kwargs) -> List[OCRResult]:
         if not images:
             return []
@@ -905,7 +948,9 @@ class CachedOCR(BaseOCR):
             )
             cached = self.cache.get(key)
             if cached is not None:
-                results[index] = cached
+                # Cache hit: no fresh provider spend this batch -> flag it so a
+                # usage consumer does not re-bill tokens that were never spent.
+                results[index] = _mark_from_cache(cached)
                 continue
 
             if key not in miss_positions:
@@ -923,17 +968,11 @@ class CachedOCR(BaseOCR):
             provider_results = self.wrapped.batch_process_images(miss_images, **call_kwargs)
             if len(provider_results) != len(miss_images):
                 for key, provider_result in zip(miss_keys, provider_results):
-                    normalized = _normalize_result(provider_result)
-                    self.cache.set(key, normalized)
-                    for position in miss_positions[key]:
-                        results[position] = _copy_result(normalized)
+                    self._store_and_fanout(results, key, provider_result, miss_positions[key])
                 raise RuntimeError("OCR provider returned a different number of results than requested")
 
             for key, provider_result in zip(miss_keys, provider_results):
-                normalized = _normalize_result(provider_result)
-                self.cache.set(key, normalized)
-                for position in miss_positions[key]:
-                    results[position] = _copy_result(normalized)
+                self._store_and_fanout(results, key, provider_result, miss_positions[key])
 
         final_results: List[OCRResult] = []
         for result in results:

@@ -1164,10 +1164,28 @@ class UnifiedDocumentLoader:
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            return self._document_from_cache_dict(payload["document"])
+            document = self._document_from_cache_dict(payload["document"])
+            return self._demote_cached_token_usage(document)
         except Exception as e:
             logger.warning(f"Failed to read cache for {file_path}: {e}")
             return None
+
+    @staticmethod
+    def _demote_cached_token_usage(document: ProcessedDocument) -> ProcessedDocument:
+        """Strip a document-cache replay of its billable OCR token count.
+
+        A document served from the on-disk ``cache_dir`` spent NO OCR tokens this
+        ``load()`` — it is a replay of an earlier run. The earlier run already
+        stamped ``metadata.extra['token_usage']`` and was billed for it once, so
+        this method renames that key to ``'token_usage_cached'`` on the replay:
+        a billing consumer (which reads only ``'token_usage'``) never re-bills a
+        cache hit, while the original run's count stays visible for diagnostics.
+        Idempotent; a no-op when no usage was stamped."""
+        metadata = getattr(document, "metadata", None)
+        extra = getattr(metadata, "extra", None)
+        if isinstance(extra, dict) and "token_usage" in extra:
+            extra["token_usage_cached"] = extra.pop("token_usage")
+        return document
 
     def _cache_result(
             self,

@@ -14,6 +14,13 @@ import threading
 import pytest
 
 from doc2mark.ocr.base import BaseOCR, OCRResult
+from doc2mark.ocr.cache import (
+    FROM_CACHE_METADATA_KEY,
+    CachedOCR,
+    MemoryOCRCache,
+    NoOpOCRCache,
+    build_ocr_cache_key,
+)
 from doc2mark.ocr.usage import (
     UsageAggregatingOCR,
     merge_usage_into,
@@ -269,3 +276,129 @@ def test_loader_text_file_never_touches_usage(temp_text_file):
     loader = _make_loader(_FakeUsageOCR({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}))
     result = loader.load(temp_text_file)
     assert "token_usage" not in (result.metadata.extra or {})
+
+
+# --------------------------------------------------------------------------- #
+# Fresh-spend-only semantic — count ONLY actual provider calls this load       #
+#                                                                              #
+# The consumer bills money from ProcessedDocument.metadata.extra['token_usage'],#
+# so a result that is NOT fresh provider spend (a cache hit, an intra-batch     #
+# dedup fan-out copy, or a whole-document cache replay) must never add to the   #
+# billed count.                                                                 #
+# --------------------------------------------------------------------------- #
+def test_cache_hit_is_not_counted_as_fresh_usage():
+    """FINDING 1: UsageAggregatingOCR(CachedOCR(...)) must not re-bill a cache hit."""
+    inner = _FakeUsageOCR({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    ocr = UsageAggregatingOCR(CachedOCR(inner, MemoryOCRCache(ttl_seconds=60)))
+
+    # First pass over the image is a real provider call -> counted.
+    ocr.begin_document_usage()
+    ocr.batch_process_images([b"img"])
+    assert ocr.pop_document_usage() == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert inner.image_count == 1
+
+    # Second pass over the SAME image is served from cache -> zero fresh spend.
+    ocr.begin_document_usage()
+    ocr.batch_process_images([b"img"])
+    assert ocr.pop_document_usage() is None
+    assert inner.image_count == 1  # provider was not called again
+
+
+def test_cache_hit_not_counted_via_process_image():
+    """FINDING 1 (single-image path): process_image cache hits are also skipped."""
+    inner = _FakeUsageOCR({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
+    ocr = UsageAggregatingOCR(CachedOCR(inner, MemoryOCRCache(ttl_seconds=60)))
+
+    ocr.begin_document_usage()
+    ocr.process_image(b"one")
+    assert ocr.pop_document_usage() == {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+
+    ocr.begin_document_usage()
+    ocr.process_image(b"one")
+    assert ocr.pop_document_usage() is None
+    assert inner.image_count == 1
+
+
+def test_intra_batch_dedup_counts_single_provider_spend():
+    """FINDING 2: duplicate images in one batch are one provider call -> counted once.
+
+    Fires even with a no-op cache, because CachedOCR dedups identical images
+    before calling the provider regardless of the cache backend.
+    """
+    inner = _FakeUsageOCR({"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
+    ocr = UsageAggregatingOCR(CachedOCR(inner, NoOpOCRCache()))
+
+    ocr.begin_document_usage()
+    results = ocr.batch_process_images([b"dup", b"dup", b"dup"])
+
+    assert len(results) == 3
+    assert all(r.text == "ocr text" for r in results)
+    assert inner.image_count == 1  # deduped to a single provider call
+    # Usage counted once, not three times.
+    assert ocr.pop_document_usage() == {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+
+
+def test_dedup_fanout_marks_only_copies_and_never_leaks_into_cache():
+    """FINDING 2 mechanics: the fresh position is unmarked, dedup copies are marked,
+    and the value stored in the cache stays clean (no marker round-trips into storage)."""
+    inner = _FakeUsageOCR({"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
+    cache = MemoryOCRCache(ttl_seconds=60)
+    cached = CachedOCR(inner, cache)
+
+    results = cached.batch_process_images([b"dup", b"dup"])
+
+    assert FROM_CACHE_METADATA_KEY not in (results[0].metadata or {})       # fresh spend
+    assert results[1].metadata.get(FROM_CACHE_METADATA_KEY) is True         # dedup copy
+    # The stored value is clean — cache.get() itself never adds the marker.
+    stored = cache.get(build_ocr_cache_key(inner, b"dup"))
+    assert FROM_CACHE_METADATA_KEY not in (stored.metadata or {})
+
+
+def test_document_cache_replay_demotes_token_usage(tmp_path):
+    """FINDING 3: a whole-document cache replay must not re-present billable usage."""
+    Image = pytest.importorskip("PIL.Image")
+    from doc2mark.core.loader import UnifiedDocumentLoader
+
+    img_path = tmp_path / "pic.png"
+    Image.new("RGB", (32, 24), "white").save(str(img_path))
+
+    inner = _FakeUsageOCR({"input_tokens": 12, "output_tokens": 6, "total_tokens": 18})
+    loader = UnifiedDocumentLoader(ocr_provider=inner, cache_dir=str(tmp_path / "doccache"))
+
+    # First load actually runs OCR -> usage billed once under the canonical key.
+    first = loader.load(img_path, extract_images=True, ocr_images=True)
+    assert first.metadata.extra["token_usage"] == {"input_tokens": 12, "output_tokens": 6, "total_tokens": 18}
+    assert inner.image_count == 1
+
+    # Second load hits the on-disk document cache: NO OCR runs, so the billing key
+    # must be absent; the original count is preserved for diagnostics only.
+    second = loader.load(img_path, extract_images=True, ocr_images=True)
+    assert inner.image_count == 1  # provider not called again (document cache hit)
+    extra = second.metadata.extra or {}
+    assert "token_usage" not in extra
+    assert extra["token_usage_cached"] == {"input_tokens": 12, "output_tokens": 6, "total_tokens": 18}
+
+
+def test_loader_with_cache_counts_fresh_load_then_zero_on_ocr_cache_hit(tmp_path):
+    """End-to-end FINDING 1 through the loader: an OCR-cache hit on a re-load bills nothing.
+
+    Two separate loads of the same image share an OCR cache (no document cache),
+    so the second load re-runs the processor but the OCR call is a cache hit ->
+    the stamped document carries no billable token_usage.
+    """
+    Image = pytest.importorskip("PIL.Image")
+    from doc2mark.core.loader import UnifiedDocumentLoader
+
+    img_path = tmp_path / "pic.png"
+    Image.new("RGB", (48, 32), "white").save(str(img_path))
+
+    inner = _FakeUsageOCR({"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
+    loader = UnifiedDocumentLoader(ocr_provider=inner, ocr_cache=MemoryOCRCache(ttl_seconds=300))
+
+    first = loader.load(img_path, extract_images=True, ocr_images=True)
+    assert first.metadata.extra["token_usage"] == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    assert inner.image_count == 1
+
+    second = loader.load(img_path, extract_images=True, ocr_images=True)
+    assert inner.image_count == 1  # OCR served from cache, no fresh provider call
+    assert "token_usage" not in (second.metadata.extra or {})

@@ -20,6 +20,7 @@ import threading
 from typing import Any, Dict, Iterable, List, Optional
 
 from doc2mark.ocr.base import BaseOCR, OCRResult
+from doc2mark.ocr.cache import FROM_CACHE_METADATA_KEY
 
 # Read-side key aliases: the LLM providers emit LangChain's ``usage_metadata``
 # (input_tokens/output_tokens/total_tokens), but be defensive about the common
@@ -161,14 +162,25 @@ class UsageAggregatingOCR(BaseOCR):
         return None
 
     def _record(self, results: Iterable[Any]) -> None:
-        """Fold the usage of each result into the active sink (no-op if none)."""
+        """Fold the usage of each *fresh* result into the active sink.
+
+        Results that :class:`CachedOCR` served from a cache hit or an intra-batch
+        dedup fan-out carry the ``FROM_CACHE_METADATA_KEY`` flag — they represent
+        NO fresh provider spend this ``load()``, so they are skipped. Counting
+        them would double-bill the consumer of
+        ``ProcessedDocument.metadata.extra['token_usage']`` for tokens that were
+        never spent (cache hit) or spent only once (dedup). No-op when no sink is
+        active."""
         sink = getattr(self._usage_local, "sink", None)
         if sink is None:
             return
         for result in results:
             metadata = getattr(result, "metadata", None)
-            if isinstance(metadata, dict):
-                merge_usage_into(sink, metadata.get("token_usage"))
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get(FROM_CACHE_METADATA_KEY):
+                continue
+            merge_usage_into(sink, metadata.get("token_usage"))
 
     # --- intercepted OCR calls ----------------------------------------------
     def batch_process_images(self, images: List[bytes], **kwargs) -> List[OCRResult]:
