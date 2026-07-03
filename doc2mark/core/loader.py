@@ -22,6 +22,7 @@ from doc2mark.core.base import (
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
+from doc2mark.ocr.usage import UsageAggregatingOCR
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,17 @@ class UnifiedDocumentLoader:
         if ocr is None:
             return None
         return ocr.wrapped if isinstance(ocr, CachedOCR) else ocr
+
+    @staticmethod
+    def _wrap_usage_aggregation(ocr: Optional[BaseOCR]) -> Optional[BaseOCR]:
+        """Wrap the OCR instance so per-load token usage can be aggregated.
+
+        Returns ``None`` unchanged when OCR is disabled, and never double-wraps.
+        The wrapper is transparent, so callers treat it exactly like the provider.
+        """
+        if ocr is None or isinstance(ocr, UsageAggregatingOCR):
+            return ocr
+        return UsageAggregatingOCR(ocr)
 
     @staticmethod
     def _resolve_ocr_config(
@@ -369,13 +381,20 @@ class UnifiedDocumentLoader:
             from doc2mark.formats.legacy import LegacyProcessor
             from doc2mark.formats.image import ImageProcessor
 
+            # Every OCR-capable processor shares ONE usage-aggregating wrapper around
+            # the loader's OCR instance, so token usage from any OCR call (any format,
+            # any provider) accumulates in one place for load() to read. self.ocr is
+            # left untouched (raw provider / CachedOCR) for the public API and tests;
+            # the wrapper is transparent and is None when OCR is disabled.
+            ocr = self._usage_ocr = self._wrap_usage_aggregation(self.ocr)
+
             # Initialize processors with OCR support
-            office_processor = OfficeProcessor(ocr=self.ocr, table_style=self.table_style)
-            pdf_processor = PDFProcessor(ocr=self.ocr, table_style=self.table_style)
+            office_processor = OfficeProcessor(ocr=ocr, table_style=self.table_style)
+            pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style)
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
-            legacy_processor = LegacyProcessor(ocr=self.ocr)
-            image_processor = ImageProcessor(ocr=self.ocr)
+            legacy_processor = LegacyProcessor(ocr=ocr)
+            image_processor = ImageProcessor(ocr=ocr)
 
             # Register processors for each format
             # Office formats - use our new OfficeProcessor
@@ -426,7 +445,7 @@ class UnifiedDocumentLoader:
 
             eml_format = getattr(DocumentFormat, 'EML', None)
             if eml_format is not None:
-                self._processors[eml_format] = EmailProcessor(ocr=self.ocr)
+                self._processors[eml_format] = EmailProcessor(ocr=self._usage_ocr)
                 logger.info("Registered EML (email) processor")
         except ImportError:
             logger.debug("Email processor not available; skipping .eml support")
@@ -539,8 +558,24 @@ class UnifiedDocumentLoader:
             elif processor.__class__.__name__ == 'MarkupProcessor':
                 processor_kwargs['encoding'] = encoding
 
+            # Start a fresh per-load OCR token-usage count, run the processor, then
+            # fold the sum onto the document. Done BEFORE any output-format conversion
+            # or caching so JSON output and cached copies carry the usage too.
+            usage_ocr = getattr(self, "_usage_ocr", None)
+            if usage_ocr is not None:
+                usage_ocr.begin_document_usage()
+
             # Process with mapped parameters
             result = processor.process(file_path, **processor_kwargs)
+
+            if usage_ocr is not None:
+                token_usage = usage_ocr.pop_document_usage()
+                # Only stamp it when OCR actually reported tokens, so a no-OCR load
+                # (or a usage-less provider like Tesseract) stays byte-identical.
+                if token_usage:
+                    if result.metadata.extra is None:
+                        result.metadata.extra = {}
+                    result.metadata.extra["token_usage"] = token_usage
 
             # Apply output format conversion if needed
             if output_format != OutputFormat.MARKDOWN:

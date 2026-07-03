@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Document-level OCR token-usage aggregation.** The token usage that each LLM
+  OCR call records in `OCRResult.metadata["token_usage"]` (LangChain
+  `usage_metadata` — `input_tokens`/`output_tokens`/`total_tokens`) is now summed
+  across every OCR call made during a single `UnifiedDocumentLoader.load()` and
+  stamped onto `ProcessedDocument.metadata.extra["token_usage"]`, so downstream
+  consumers can meter OCR cost without reaching into per-image internals. A thin
+  `UsageAggregatingOCR` wrapper (same transparent shape as `CachedOCR`) is placed
+  around the shared OCR instance handed to every processor, so the count covers
+  all providers (OpenAI, Vertex/Gemini) and all source families (PDF page
+  renders/embedded figures, Office/image extracted images) through the one merge
+  point. Naming variants (`prompt_tokens`/`completion_tokens`, total-only
+  payloads) are folded defensively, and `total_tokens` is derived when absent.
+  A no-OCR load — or a usage-less provider such as Tesseract — leaves `extra`
+  byte-identical (nothing is stamped). Accumulation is per-`load()` and
+  thread-local, so the loader's concurrent batch processing does not
+  cross-contaminate.
 - **Image-dominant Office docs routed like image PDFs.** A `.docx`/`.pptx` that is
   mostly pictures with no usable text layer (e.g. a slide deck exported as images)
   is now detected from its OOXML structure (picture coverage + text density, via the
