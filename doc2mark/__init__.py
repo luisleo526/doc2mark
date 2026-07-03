@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 __author__ = "Hao Liang Wen"
 __email__ = "luisleo52655@gmail.com"
 
