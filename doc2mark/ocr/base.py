@@ -410,9 +410,9 @@ class BaseOCR(ABC):
         ``_recovery=True`` so they are not sanitized yet): the verbatim answer goes to
         ``document.raw.text`` and its sanitized Markdown to ``text``. A recovered
         answer that is itself only a refusal / "no readable text" statement is not
-        applied. When either answer was one, the result stays
-        empty and is flagged ``metadata["ocr_refusal"] = True``, so a refusal is
-        never indexed as page content.
+        applied. When either answer was one, the result stays empty and is flagged
+        ``metadata["ocr_refusal"] = True``, so a refusal is never indexed as page
+        content.
         """
         from doc2mark.ocr.refusal import non_content_reason
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
