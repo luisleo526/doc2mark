@@ -1,7 +1,7 @@
 """Shared content-based OCR strategy decision — used by every format pipeline.
 
-A document is processed by one of two strategies, decided from two per-document
-signals (mean image coverage + mean selectable-text density):
+A document is processed by one of two strategies, decided from per-document signals
+(mean image coverage, mean text density, text-layer quality):
 
 - ``"image"``: the document is mostly pictures with no usable text layer (slide
   decks, scans). It is rendered page-by-page and OCR'd as whole images, with the
@@ -10,47 +10,118 @@ signals (mean image coverage + mean selectable-text density):
   The deterministic rule-based layer (text + tables, verbatim for BM42 sparse
   retrieval) is authoritative; embedded figures are OCR'd individually.
 
-Keeping the thresholds and the decision here is the single source of truth so the
-PDF and Office routes never diverge.
-"""
-from typing import Literal
+The document route is the default for every page. Where a pipeline can measure
+single pages (PDF), a page overrides it when its own signals clearly disagree:
+a searchable scan, a page whose text layer is garbage, a page whose only content
+is vector outlines or inline images, a scanned page inside a text report, a dense
+text page inside an image deck (:func:`decide_page_route`).
 
+This module is the single source of truth for what the signals mean, the
+thresholds and the decisions, so the PDF and Office routes never diverge. The
+pipelines only measure (PyMuPDF, python-pptx, ...).
+"""
+import logging
+import math
+import re
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, List, Literal, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
+Route = Literal["image", "text"]
+
+#: Optional legibility judge: ``judge(page_text) -> Optional[float]``; see :func:`judge_text_layer`.
+LegibilityJudge = Callable[[str], Optional[float]]
+
+# --- Density and coverage ---------------------------------------------------
 # A page is "image-like" when raster images cover at least this fraction of it AND
-# it carries fewer than this many selectable-text characters (i.e. no real text
-# layer). Text density is the decisive signal — coverage alone misclassifies a
-# text document that happens to carry large figures.
+# it carries less than this much legible text (i.e. no real text layer). Text density
+# is the decisive signal: coverage alone misclassifies a text document that happens
+# to carry large figures.
 IMAGE_PAGE_COVERAGE = 0.55
 IMAGE_PAGE_TEXT_LIMIT = 200
 
-# Text-layer QUALITY gate. A selectable-text layer can exist yet be untrustworthy:
-# designed/print PDFs often draw prominent text (titles) with subset fonts that
-# carry no ToUnicode map, so extraction yields replacement chars (U+FFFD) — the
-# visible page is faithful but the text layer is not. When such an image-dominant
-# page has a headline that is at least this fraction unmappable, the render is
-# authoritative and we OCR it instead of trusting the broken text layer.
+# Text density is counted in Latin-character equivalents (see text_weight): only
+# non-whitespace, legible characters count, and a character of a script that packs
+# more content per character counts more. A CJK ideograph is a whole morpheme, about
+# three Latin letters; a kana or hangul syllable about two.
+IDEOGRAPH_WEIGHT = 3.0
+SYLLABLE_WEIGHT = 2.0
+
+# --- Text-layer quality -----------------------------------------------------
+# A selectable-text layer can exist yet be untrustworthy: designed/print PDFs often
+# draw text with subset fonts that carry no (or a broken) ToUnicode map, so the page
+# renders faithfully but extraction yields U+FFFD, private-use glyphs, control/CID
+# codes or mojibake. A page's layer is "garbled" when at least MIN_GARBAGE_GLYPHS
+# such glyphs make up at least GARBAGE_TEXT_RATIO of its text, where every character
+# is weighted by its prominence, (font size / the page's body size) squared, capped
+# at MAX_PROMINENCE: an unreadable title weighs as much as the body lines it
+# visually outweighs, a single decorative glyph does not tip a page.
+GARBAGE_TEXT_RATIO = 0.1
+MIN_GARBAGE_GLYPHS = 3
+MAX_PROMINENCE = 4.0
+
+# Document level: an image-dominant document whose text pages are garbled in at least
+# this share routes to image as a whole (a share of pages, never one worst page).
 ILLEGIBLE_TEXT_RATIO = 0.3
+
+# Optional judge (see judge_text_layer): a page it rates below this probability of
+# being legible is treated like a garbled one. Consulted only for layers of at least
+# MIN_JUDGED_CHARS characters that the deterministic detector did not flag.
+LEGIBILITY_JUDGE_THRESHOLD = 0.7
+MIN_JUDGED_CHARS = 20
+
+# --- Per-page overrides -------------------------------------------------------
+# A page overrides the document route only when it clears the thresholds by this
+# margin (hysteresis), so pages near a threshold follow their document and a deck or
+# report keeps one consistent treatment:
+# - in a text document, a page covered by pictures for at least
+#   IMAGE_PAGE_COVERAGE * (1 + margin) with less than IMAGE_PAGE_TEXT_LIMIT * (1 - margin)
+#   legible text is a scanned page;
+# - in an image document, a page covered for less than IMAGE_PAGE_COVERAGE * (1 - margin)
+#   with at least IMAGE_PAGE_TEXT_LIMIT * (1 + margin) legible text is a text page.
+PAGE_OVERRIDE_MARGIN = 0.5
+
+# A page with less legible text than this has no usable text layer; if it still shows
+# ink that neither its text layer nor its OCR-able raster images account for (at least
+# MIN_UNCAPTURED_INK of its area: vector-outlined text, inline images) only OCR of the
+# page render can read it.
+NO_TEXT_LIMIT = IMAGE_PAGE_TEXT_LIMIT / 4
+MIN_UNCAPTURED_INK = 0.005
+
+# Invisible (render mode 3) text is the OCR layer of a searchable scan when at least
+# this share of it lies over raster images covering the page; anywhere else it is
+# hidden text and never content.
+SCAN_LAYER_OVER_IMAGES = 0.5
+
+# Reasons reported for a page route.
+REASON_DOCUMENT = "document_route"
+REASON_SEARCHABLE_SCAN = "searchable_scan"
+REASON_ILLEGIBLE = "illegible_text_layer"
+REASON_NO_TEXT_LAYER = "no_text_layer"
+REASON_IMAGE_PAGE = "image_dominant_page"
+REASON_TEXT_PAGE = "dense_text_page"
 
 
 def decide_doc_strategy(
     mean_image_coverage: float,
     mean_text_chars_per_page: float,
     text_illegibility: float = 0.0,
-) -> Literal["image", "text"]:
+) -> Route:
     """Return the document-level OCR strategy from per-document signals.
 
     Routes to ``"image"`` when the document is image-dominant
     (``mean_image_coverage >= IMAGE_PAGE_COVERAGE``) AND *either*:
 
-    - it has little selectable text
-      (``mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT``), i.e. no real text
-      layer; **or**
-    - its text layer is low quality (``text_illegibility >= ILLEGIBLE_TEXT_RATIO``),
-      i.e. the prominent text cannot be decoded (U+FFFD) and the render must be
+    - it has little legible text
+      (``mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT``, measured with
+      :func:`text_weight`), i.e. no real text layer; **or**
+    - its text layer is low quality (``text_illegibility >= ILLEGIBLE_TEXT_RATIO``,
+      the share of its text pages whose layer is garbled), i.e. the render must be
       trusted instead.
 
-    Otherwise ``"text"``. The quality gate is deliberately scoped to image-dominant
-    pages: a low-coverage text document with the odd unmappable glyph stays on the
-    (lossless) text path rather than being forced through whole-document OCR.
+    Otherwise ``"text"``. Garbled pages of a text document are handled page by page
+    (:func:`decide_page_route`), so one bad page never flips a whole document.
     """
     if mean_image_coverage >= IMAGE_PAGE_COVERAGE and (
         mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT
@@ -58,3 +129,257 @@ def decide_doc_strategy(
     ):
         return "image"
     return "text"
+
+
+# --- Measuring text ---------------------------------------------------------
+
+_CID = re.compile(r"\(cid:\d+\)")
+# UTF-8 bytes decoded as Latin-1/cp1252: a lead byte followed by a continuation byte
+# (no-break space excluded: "é :" is ordinary French typography).
+_MOJIBAKE = re.compile("[ÃÂâæåèéçä][\u0080-\u009f¡-¿€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ]")
+
+
+def _is_private_use(code: int) -> bool:
+    return 0xE000 <= code <= 0xF8FF or 0xF0000 <= code <= 0x10FFFD
+
+
+def _script_weight(code: int) -> float:
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF \
+            or 0x20000 <= code <= 0x323AF:
+        return IDEOGRAPH_WEIGHT
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D \
+            or 0xAC00 <= code <= 0xD7AF:
+        return SYLLABLE_WEIGHT
+    return 1.0
+
+
+def _scan_text(text: str) -> Tuple[int, int, float]:
+    """(garbage glyphs, counted characters, legible weight) of one run of text.
+
+    Counted characters are the non-whitespace ones, except a lone private-use glyph
+    (an icon or bullet from a symbol font), which is neither text nor garbage.
+    Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, mojibake pairs.
+    """
+    text = _CID.sub("�", text)
+    mojibake = set()
+    for match in _MOJIBAKE.finditer(text):
+        mojibake.update(range(match.start(), match.end()))
+    garbage = counted = 0
+    weight = 0.0
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        code = ord(char)
+        if _is_private_use(code):
+            neighbours = (text[index - 1] if index else "", text[index + 1] if index + 1 < len(text) else "")
+            if not any(n and _is_private_use(ord(n)) for n in neighbours):
+                continue
+            garbage += 1
+        elif char == "�" or code < 0x20 or 0x7F <= code <= 0x9F or index in mojibake:
+            garbage += 1
+        else:
+            weight += _script_weight(code)
+        counted += 1
+    return garbage, counted, weight
+
+
+def text_weight(text: str) -> float:
+    """Amount of legible text in Latin-character equivalents: non-whitespace,
+    non-garbage characters, a CJK ideograph counting ``IDEOGRAPH_WEIGHT`` and a
+    kana or hangul syllable ``SYLLABLE_WEIGHT``. This is the unit of
+    ``IMAGE_PAGE_TEXT_LIMIT``."""
+    return _scan_text(text)[2]
+
+
+@dataclass(frozen=True)
+class TextLayerStats:
+    """Size and quality of one text layer of a page (see :func:`text_layer_stats`)."""
+
+    chars: int = 0              # counted characters (non-whitespace, garbage included)
+    weight: float = 0.0         # legible text, in text_weight units
+    garbage_glyphs: int = 0
+    garbage_ratio: float = 0.0  # prominence-weighted share of garbage glyphs
+
+    @property
+    def garbled(self) -> bool:
+        """The deterministic garbage detector's verdict."""
+        return self.garbage_glyphs >= MIN_GARBAGE_GLYPHS and self.garbage_ratio >= GARBAGE_TEXT_RATIO
+
+
+def text_layer_stats(spans: Iterable[Tuple[str, float]]) -> TextLayerStats:
+    """Measure a text layer given as ``(text, font size)`` runs in reading order.
+
+    The body size is the character-weighted median font size; a character's
+    prominence is ``min(size / body size, MAX_PROMINENCE) ** 2``.
+    """
+    runs = []
+    for text, size in spans:
+        garbage, counted, weight = _scan_text(text or "")
+        if counted:
+            runs.append((float(size or 0.0), garbage, counted, weight))
+    if not runs:
+        return TextLayerStats()
+    by_size = sorted(runs)
+    half, seen, body = sum(run[2] for run in runs) / 2, 0, by_size[-1][0]
+    for size, _, counted, _ in by_size:
+        seen += counted
+        if seen >= half:
+            body = size
+            break
+    garbage_mass = total_mass = 0.0
+    for size, garbage, counted, _ in runs:
+        prominence = min(size / body, MAX_PROMINENCE) ** 2 if size > 0 and body > 0 else 1.0
+        garbage_mass += garbage * prominence
+        total_mass += counted * prominence
+    return TextLayerStats(
+        chars=sum(run[2] for run in runs),
+        weight=sum(run[3] for run in runs),
+        garbage_glyphs=sum(run[1] for run in runs),
+        garbage_ratio=garbage_mass / total_mass if total_mass else 0.0,
+    )
+
+
+def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, text: str) -> Optional[float]:
+    """Ask the optional legibility judge about a text layer; return its verdict or None.
+
+    Contract of ``judge(page_text) -> Optional[float]``:
+
+    - ``page_text`` is the text layer of one page, exactly as extracted (lines joined
+      with ``"\\n"``): the visible text, or the invisible OCR layer of a searchable scan.
+    - It returns the probability, in ``[0, 1]``, that the text is legible content a
+      person could read (prose, tables, code, identifiers, any script), as opposed to
+      text garbled by a broken text layer (substituted or shifted letters, mojibake,
+      placeholder glyphs); or ``None`` when it cannot judge.
+    - It is consulted only where the deterministic detector cannot decide: for layers
+      of at least ``MIN_JUDGED_CHARS`` characters that are not already garbled, once
+      per page. Below ``LEGIBILITY_JUDGE_THRESHOLD`` the page is treated as garbled:
+      OCR'd from its render when an OCR provider is active, otherwise kept and
+      reported.
+    - ``None``, an exception or a value outside ``[0, 1]`` count as "cannot judge":
+      the text is kept, exactly as without a judge.
+    """
+    if judge is None or layer.garbled or layer.chars < MIN_JUDGED_CHARS:
+        return None
+    try:
+        verdict = judge(text)
+    except Exception as exc:  # the judge is optional: its failures must not fail the conversion
+        logger.warning(f"legibility_judge failed ({exc!r}); keeping the text layer")
+        return None
+    if verdict is None:
+        return None
+    try:
+        verdict = float(verdict)
+    except (TypeError, ValueError):
+        verdict = math.nan
+    if not 0.0 <= verdict <= 1.0:
+        logger.warning(f"legibility_judge returned {verdict!r}, not a probability; ignoring it")
+        return None
+    return verdict
+
+
+# --- Page and document decisions --------------------------------------------
+
+
+@dataclass(frozen=True)
+class PageSignals:
+    """What a pipeline measured on one page.
+
+    ``image_coverage`` is the share of the page covered by raster images (the union of
+    their visible rectangles). ``visible`` / ``invisible`` describe the painted text and
+    the invisible (render mode 3) text. ``invisible_over_images`` is the share of the
+    invisible text lying over raster images. ``uncaptured_ink`` is the share of the page
+    showing ink that neither the text layer nor the OCR-able raster images account for
+    (None when not measured: pages with a usable text layer or image-dominant pages).
+    ``judge_legibility`` is the optional judge's verdict on :attr:`text_layer`.
+    """
+
+    image_coverage: float = 0.0
+    visible: TextLayerStats = field(default_factory=TextLayerStats)
+    invisible: TextLayerStats = field(default_factory=TextLayerStats)
+    invisible_over_images: float = 0.0
+    uncaptured_ink: Optional[float] = None
+    judge_legibility: Optional[float] = None
+
+    @property
+    def searchable_scan(self) -> bool:
+        """An invisible OCR layer over a page-covering scan, with (almost) no painted text."""
+        return (self.invisible.chars > 0
+                and self.image_coverage >= IMAGE_PAGE_COVERAGE
+                and self.invisible_over_images >= SCAN_LAYER_OVER_IMAGES
+                and self.visible.weight < IMAGE_PAGE_TEXT_LIMIT)
+
+    @property
+    def text_layer(self) -> TextLayerStats:
+        """The layer the page's text comes from: the OCR layer of a searchable scan, else the painted text."""
+        return self.invisible if self.searchable_scan else self.visible
+
+    @property
+    def text_layer_illegible(self) -> bool:
+        if self.text_layer.garbled:
+            return True
+        return self.judge_legibility is not None and self.judge_legibility < LEGIBILITY_JUDGE_THRESHOLD
+
+    @property
+    def uncaptured_content(self) -> bool:
+        """No usable text layer, yet ink only OCR of the render can read (vector outlines, inline images)."""
+        return (self.visible.weight < NO_TEXT_LIMIT
+                and self.uncaptured_ink is not None
+                and self.uncaptured_ink >= MIN_UNCAPTURED_INK)
+
+
+def document_signals(pages: Sequence[PageSignals]) -> Tuple[float, float, float]:
+    """(mean image coverage, mean legible text weight, share of garbled text pages)."""
+    if not pages:
+        return 0.0, 0.0, 0.0
+    text_pages = [page for page in pages if page.visible.chars and not page.searchable_scan]
+    illegible = sum(1 for page in text_pages if page.text_layer_illegible)
+    return (
+        sum(page.image_coverage for page in pages) / len(pages),
+        sum(page.visible.weight for page in pages) / len(pages),
+        illegible / len(text_pages) if text_pages else 0.0,
+    )
+
+
+def decide_document_route(pages: Sequence[PageSignals]) -> Route:
+    """The document route (:func:`decide_doc_strategy`) from its pages' signals."""
+    return decide_doc_strategy(*document_signals(pages))
+
+
+def decide_page_route(page: PageSignals, document_route: Route) -> Tuple[Route, str]:
+    """Route one page when an OCR provider is active: ``(route, reason)``.
+
+    ``"image"``: OCR the page render, and the render is the page's only content.
+    ``"text"``: emit the page's text layer and tables, OCR its embedded pictures.
+    A page follows ``document_route`` unless one of these holds (first match wins):
+
+    1. searchable scan: OCR the render and drop the invisible layer, one source only;
+    2. its text layer is garbled (detector or judge): OCR the render;
+    3. no usable text layer, but ink the text route cannot capture: OCR the render;
+    4. in a text document, a clearly scanned page (see ``PAGE_OVERRIDE_MARGIN``): image;
+    5. in an image document, a clearly text page (see ``PAGE_OVERRIDE_MARGIN``): text.
+    """
+    if page.searchable_scan:
+        return "image", REASON_SEARCHABLE_SCAN
+    if page.text_layer_illegible:
+        return "image", REASON_ILLEGIBLE
+    if page.uncaptured_content:
+        return "image", REASON_NO_TEXT_LAYER
+    if document_route == "text":
+        if (page.image_coverage >= min(1.0, IMAGE_PAGE_COVERAGE * (1 + PAGE_OVERRIDE_MARGIN))
+                and page.visible.weight < IMAGE_PAGE_TEXT_LIMIT * (1 - PAGE_OVERRIDE_MARGIN)):
+            return "image", REASON_IMAGE_PAGE
+    elif (page.image_coverage < IMAGE_PAGE_COVERAGE * (1 - PAGE_OVERRIDE_MARGIN)
+          and page.visible.weight >= IMAGE_PAGE_TEXT_LIMIT * (1 + PAGE_OVERRIDE_MARGIN)):
+        return "text", REASON_TEXT_PAGE
+    return document_route, REASON_DOCUMENT
+
+
+def pages_without_text(pages: Sequence[PageSignals]) -> List[int]:
+    """0-based indexes of pages with (almost) no usable text layer whose content is in
+    page-covering pictures or in ink only OCR can read: without OCR their content is
+    not extracted."""
+    return [
+        index for index, page in enumerate(pages)
+        if page.text_layer.weight < NO_TEXT_LIMIT
+        and (page.image_coverage >= IMAGE_PAGE_COVERAGE or page.uncaptured_content)
+    ]

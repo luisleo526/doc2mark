@@ -61,7 +61,9 @@ class UnifiedDocumentLoader:
             structured: Optional[bool] = None,
             detail: Optional[str] = None,
             # Table output configuration
-            table_style: Optional[str] = None
+            table_style: Optional[str] = None,
+            # Optional text-layer legibility judge (PDF quality gate)
+            legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
     ):
         """Initialize the document loader with enhanced OCR configuration.
 
@@ -109,6 +111,13 @@ class UnifiedDocumentLoader:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
                 - 'markdown_grid': Markdown with merge annotations
                 - 'styled_html': Full HTML with inline styles (legacy)
+
+            # Text-layer quality gate (PDF):
+            legibility_judge: Optional ``judge(page_text) -> Optional[float]``
+                returning the probability that a page's extracted text is legible, or
+                None when it cannot judge. Consulted only for text layers the
+                deterministic garbage detector does not flag; see
+                doc2mark.core.strategy.judge_text_layer for the full contract.
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
 
@@ -146,6 +155,7 @@ class UnifiedDocumentLoader:
         # Table output style (default: minimal_html for cleaner output)
         self.table_style = table_style if table_style else "minimal_html"
         logger.info(f"📊 Table style: {self.table_style}")
+        self.legibility_judge = legibility_judge
 
         # Registry of format processors
         self._processors: Dict[DocumentFormat, BaseProcessor] = {}
@@ -390,7 +400,8 @@ class UnifiedDocumentLoader:
 
             # Initialize processors with OCR support
             office_processor = OfficeProcessor(ocr=ocr, table_style=self.table_style)
-            pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style)
+            pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style,
+                                         legibility_judge=getattr(self, "legibility_judge", None))
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
             legacy_processor = LegacyProcessor(ocr=ocr)
@@ -480,7 +491,7 @@ class UnifiedDocumentLoader:
             file_path: Path to the document
             output_format: Desired output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images as base64 (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             show_progress: Whether to show progress messages during processing
             
             # Format-specific parameters:
@@ -514,6 +525,12 @@ class UnifiedDocumentLoader:
             raise UnsupportedFormatError(
                 f"Unsupported format: {doc_format.value}"
             )
+
+        # OCR needs the images: ocr_images=True with the default extract_images=False
+        # means "OCR my images", not "do nothing".
+        if ocr_images and not extract_images and self.ocr is not None:
+            logger.info("ocr_images=True implies extract_images=True (images are extracted for OCR)")
+            extract_images = True
 
         # Check cache
         if self.cache_dir:
@@ -757,7 +774,7 @@ class UnifiedDocumentLoader:
             output_dir: Optional output directory (default: same as input)
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             recursive: Whether to process subdirectories
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
@@ -928,7 +945,7 @@ class UnifiedDocumentLoader:
             output_dir: Optional output directory
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files
