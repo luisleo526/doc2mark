@@ -134,9 +134,13 @@ def decide_doc_strategy(
 # --- Measuring text ---------------------------------------------------------
 
 _CID = re.compile(r"\(cid:\d+\)")
-# UTF-8 bytes decoded as Latin-1/cp1252: a lead byte followed by a continuation byte
-# (no-break space excluded: "é :" is ordinary French typography).
-_MOJIBAKE = re.compile("[ÃÂâæåèéçä][\u0080-\u009f¡-¿€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ]")
+# Mojibake: UTF-8 read as Latin-1 or cp1252, i.e. a UTF-8 lead byte (Latin-1 reading)
+# followed by a continuation byte (Latin-1 or cp1252 reading). The no-break space
+# (0xA0) is not counted: an accented letter before it is ordinary French typography.
+_MOJIBAKE_LEADS = bytes([0xC3, 0xC2, 0xE2, 0xE6, 0xE5, 0xE8, 0xE9, 0xE7, 0xE4]).decode("latin-1")
+_MOJIBAKE_TRAILS = (bytes(b for b in range(0x80, 0xC0) if b != 0xA0).decode("latin-1")
+                    + bytes(range(0x80, 0xA0)).decode("cp1252", errors="ignore"))
+_MOJIBAKE = re.compile(f"[{re.escape(_MOJIBAKE_LEADS)}][{re.escape(_MOJIBAKE_TRAILS)}]")
 
 
 def _is_private_use(code: int) -> bool:
@@ -160,7 +164,7 @@ def _scan_text(text: str) -> Tuple[int, int, float]:
     (an icon or bullet from a symbol font), which is neither text nor garbage.
     Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, mojibake pairs.
     """
-    text = _CID.sub("�", text)
+    text = _CID.sub("\ufffd", text)
     mojibake = set()
     for match in _MOJIBAKE.finditer(text):
         mojibake.update(range(match.start(), match.end()))
@@ -175,7 +179,7 @@ def _scan_text(text: str) -> Tuple[int, int, float]:
             if not any(n and _is_private_use(ord(n)) for n in neighbours):
                 continue
             garbage += 1
-        elif char == "�" or code < 0x20 or 0x7F <= code <= 0x9F or index in mojibake:
+        elif char == "\ufffd" or code < 0x20 or 0x7F <= code <= 0x9F or index in mojibake:
             garbage += 1
         else:
             weight += _script_weight(code)

@@ -19,7 +19,7 @@ import pytest
 from tests.e2e import builders_route, pdfgen
 
 RENDER_OCR = "text:image_description"
-GARBAGE = re.compile("[�-]|Ã[\u0080-¿]")
+GARBAGE = re.compile("[\ufffd\ue000-\uf8ff]|\u00c3[\u0080-\u00bf]")
 
 
 def words(text):
@@ -174,7 +174,7 @@ def test_garbled_text_layer_without_ocr_is_kept_and_flagged(run_cli, e2e_dir):
     result = run_cli(pdf, "--ocr", "none", fmt="both")
 
     assert result.exit_code == 0, result.describe()
-    assert result.markdown.count("�") > 50, result.describe()
+    assert result.markdown.count("\ufffd") > 50, result.describe()
     assert "text_layer_quality" in extra(result), result.describe()
     quality = extra(result)["text_layer_quality"]
     assert [(entry["page"], entry["legible"]) for entry in quality] == [(1, False)], quality
@@ -192,7 +192,7 @@ def test_spec_sheet_title_is_ocrd_through_the_quality_gate(run_cli, require_tool
 
     assert result.exit_code == 0, result.describe()
     assert "Technical Specifications" in words(result.markdown), result.describe()
-    assert "�" not in result.markdown, result.describe()
+    assert "\ufffd" not in result.markdown, result.describe()
     routing = extra(result).get("ocr_routing")
     assert routing is not None, result.describe()
     assert routing["document_route"] == "text", routing
@@ -367,7 +367,7 @@ def test_one_bad_cover_title_sends_only_the_cover_to_ocr(run_cli, require_tool, 
 
     assert result.exit_code == 0, result.describe()
     assert "SPRING COLLECTION" in words(result.markdown).upper(), result.describe()
-    assert "�" not in result.markdown, result.describe()
+    assert "\ufffd" not in result.markdown, result.describe()
     for page, (title, body) in enumerate(pages[1:], 2):
         assert not [item for item in page_items(result, page) if item["type"] == RENDER_OCR], result.describe()
         page_text = words(" ".join(item["content"] for item in text_layer_items(result, page)))
@@ -386,7 +386,7 @@ def test_illegible_title_below_a_bigger_page_number_is_ocrd(run_cli, require_too
 
     assert result.exit_code == 0, result.describe()
     assert "SUPPLY AGREEMENT TERMS" in words(result.markdown).upper(), result.describe()
-    assert "�" not in result.markdown, result.describe()
+    assert "\ufffd" not in result.markdown, result.describe()
 
 
 # ---------------------------------------------------------------------------------------------------------------
