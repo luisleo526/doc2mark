@@ -45,45 +45,65 @@ MAX_JUDGE_CHARS = 600
 JUDGE_THRESHOLD = 0.5
 
 _APOS = "['’]"
-_NEG = (
-    rf"(?:can(?:no|{_APOS})?t|can\s+not|won{_APOS}?t|will\s+not|could(?:n{_APOS}?t|\s+not)"
-    rf"|(?:am|{_APOS}m|are|{_APOS}re)\s+(?:unable|not\s+able)\s+to)"
+# "I can't", "I cannot", "I won't", "I'm unable to", "I am not able to" (first person only:
+# notices say "we", and a model's refusal is about itself).
+_I_NEG = (
+    rf"i\s*(?:can(?:no|{_APOS})?t|can\s+not|won{_APOS}?t|will\s+not|could(?:n{_APOS}?t|\s+not)"
+    rf"|(?:am|{_APOS}m)\s+(?:unable|not\s+able)\s+to|do(?:n{_APOS}t|\s+not)\s+have\s+the\s+ability\s+to)"
 )
-# What a refusal refuses: "help with ...", "assist you", "transcribe", "do that" (a bare
-# "I can't help falling in love" is not one).
-_REFUSED_ACTION = (
-    r"(?:(?:help|assist)(?:\s+(?:with|you|in|on)\b|\s*[.!,]|\s*$)"
-    r"|comply\b|fulfil?l\b|do\s+(?:that|this)\b"
-    r"|(?:transcribe|read|process|extract|identify|recogni[sz]e|analy[sz]e|describe|interpret)\b"
-    r"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|text|description)\b)"
+_IMAGE_NOUN = r"(?:image|picture|photo(?:graph)?|scan|screenshot)s?"
+# The object of a refused reading action: the image, its text or content, a page or a
+# document ("the text in this image", "copyrighted book pages") -- not "your payment",
+# "the file" or "your handwriting".
+_READING_OBJECT = (
+    r"(?:(?:the|this|that|these|those|your|any|its)\s+)?(?:\w+\s+){0,2}?"
+    rf"(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
+)
+# What a refusal refuses ("I can't help falling in love" and "I can't do this alone" are
+# not refusals).
+_REFUSED = (
+    r"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|your\s+request|the\s+request"
+    r"|identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing|describing)\b|\s*[.!]?\s*$)"
+    r"|comply(?:\s+with\s+(?:that|this|your|the)\s+request)?\s*(?:[.!]|$)"
+    r"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?\s*[.!]?\s*$"
+    rf"|(?:transcribe|read|process|extract|identify|recogni[sz]e|analy[sz]e|interpret|describe)\s+{_READING_OBJECT}"
+    r"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)\b)"
 )
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
-_IMAGE_WORD = r"(?:image|picture|photo(?:graph)?|page|document|scan|screenshot|file)"
-_ZH_TOPIC = r"(?:圖|图|影像|照片|文字|內容|内容|畫面|画面|文件|頁面|页面)"
+_BLANK = (
+    r"(?:(?:mostly|completely|entirely|totally|largely|almost\s+entirely|too|very)\s+)?"
+    r"(?:blank|empty|illegible|unreadable|blurry|blurred|out\s+of\s+focus|low[\s-]resolution|low\s+quality"
+    r"|not\s+(?:legible|readable|clear))"
+)
+_ZH_IMAGE = r"(?:圖|图|影像|照片|畫面|画面)"
 _ZH_READ = r"(?:辨識|辨识|識別|识别|讀取|读取|處理|处理|轉錄|转录|解析|看清|判讀|判读)"
 
-# Patterns anchored at the start of the (normalized) answer. Case-insensitive.
+# Patterns anchored at the start of the (normalized) answer. Case-insensitive. Each one
+# needs the model to speak about itself or about the image, so short page text such as
+# "We're sorry, we are unable to process your payment" or "Unable to read the file." is
+# never taken for a refusal.
 _START_PATTERNS = [
-    # "I'm sorry, but I can't ...", "Sorry, I cannot ...", "Unfortunately, I am unable to ..."
-    rf"(?:i{_APOS}?m\s+|i\s+am\s+|we{_APOS}?re\s+|we\s+are\s+)?(?:very\s+|so\s+|really\s+|truly\s+)?sorry\b"
-    rf"[^.!?\n]{{0,60}}?\b(?:i|we)\s*(?:{_NEG}|do(?:n{_APOS}t|\s+not)|must\s+not)\s+(?:\w+\s+){{0,4}}?{_REFUSED_ACTION}",
-    rf"(?:unfortunately|apologies|my\s+apologies|i\s+apologi[sz]e)\b[^.!?\n]{{0,60}}?\b(?:i|we)\s*{_NEG}\s+"
-    rf"(?:\w+\s+){{0,4}}?{_REFUSED_ACTION}",
-    # "I can't transcribe ...", "I am unable to read ...", "I'm not able to help with ..."
-    rf"i\s*{_NEG}\s+(?:\w+\s+){{0,2}}?{_REFUSED_ACTION}",
-    r"(?:unable|not\s+able)\s+to\s+(?:\w+\s+){0,2}?"
-    r"(?:process|read|transcribe|extract|recogni[sz]e|identify|analy[sz]e|interpret|decode|parse)\b",
-    r"as\s+an\s+ai\b",
-    # "The image appears to be blank", "The page seems to be mostly empty"
-    rf"(?:the\s+|this\s+)?(?:provided\s+|uploaded\s+|attached\s+|given\s+)?{_IMAGE_WORD}\s+"
-    r"(?:is|appears\s+to\s+be|seems\s+to\s+be|looks(?:\s+to\s+be)?|was)\s+(?:\w+\s+){0,2}?"
-    r"(?:blank|empty|illegible|unreadable|too\s+(?:blurry|blurred|small|dark|faint|low)|not\s+(?:legible|readable|clear))",
-    # "There is no readable text ...", "No text detected.", "I don't see any text ..."
-    rf"(?:there\s+is|there{_APOS}s|there\s+are)\s+no\s+(?:{_TEXT_QUALIFIER}\s+)?(?:text|content)\b",
+    # "I'm sorry, but I can't assist with that request.", "Sorry, I cannot read this image."
+    rf"(?:i{_APOS}?m\s+|i\s+am\s+)?(?:very\s+|so\s+|really\s+|truly\s+)?sorry\b[^.!?\n]{{0,60}}?"
+    rf"\b(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|must\s+not))\s+(?:\w+\s+){{0,3}}?{_REFUSED}",
+    rf"(?:unfortunately|apologies|my\s+apologies|i\s+apologi[sz]e)\b[^.!?\n]{{0,60}}?\b{_I_NEG}\s+"
+    rf"(?:\w+\s+){{0,3}}?{_REFUSED}",
+    # "I can't transcribe copyrighted book pages", "I am unable to read the text in this image"
+    rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_REFUSED}",
+    # "Unable to process the image."
+    r"(?:unable|not\s+able)\s+to\s+(?:process|read|transcribe|extract|recogni[sz]e|identify|analy[sz]e|interpret"
+    rf"|decode)\s+(?:the\s+|this\s+|that\s+|your\s+)?(?:provided\s+|uploaded\s+|attached\s+|given\s+)?{_IMAGE_NOUN}\b",
+    r"as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,",
+    # "The image appears to be blank", "The page seems to be mostly empty" (a page or
+    # document only with the hedge: "This page is intentionally left blank." is page text)
+    r"(?:the\s+|this\s+)?(?:provided\s+|uploaded\s+|attached\s+|given\s+)?"
+    rf"(?:{_IMAGE_NOUN}\s+(?:is|was|appears\s+to\s+be|seems\s+to\s+be|looks(?:\s+to\s+be)?)"
+    rf"|(?:page|document)\s+(?:appears\s+to\s+be|seems\s+to\s+be|looks(?:\s+to\s+be)?))\s+{_BLANK}",
+    # "There is no readable text in this image", "No text detected.", "I don't see any text"
+    rf"(?:there\s+is|there{_APOS}s|there\s+are)\s+no\s+(?:{_TEXT_QUALIFIER}\s+(?:text|content|words|characters)"
+    rf"|(?:text|content)\s+(?:in|on|within)\s+(?:this|the)\s+{_IMAGE_NOUN})\b",
     rf"no\s+(?:{_TEXT_QUALIFIER}\s+)?text\s+(?:was\s+|were\s+|is\s+|could\s+be\s+)?"
-    r"(?:detected|found|present|visible|recogni[sz]ed|identified|extracted|available|in\s+(?:this|the)\s+"
-    r"(?:image|picture|page|photo|scan))\b",
-    rf"no\s+{_TEXT_QUALIFIER}\s+content\b",
+    rf"(?:detected|found|present|visible|recogni[sz]ed|identified|extracted|available|in\s+(?:this|the)\s+{_IMAGE_NOUN})\b",
     rf"i\s+(?:do\s+not|don{_APOS}t|did\s+not|didn{_APOS}t|could\s+not|couldn{_APOS}t|cannot|can{_APOS}t)\s+"
     rf"(?:see|find|detect|identify|locate|make\s+out)\s+any\s+(?:{_TEXT_QUALIFIER}\s+)?"
     r"(?:text|content|words|characters|writing)",
@@ -91,37 +111,39 @@ _START_PATTERNS = [
     r"\[\s*(?:no\s+(?:readable\s+)?(?:text|content)(?:\s+(?:found|detected|available))?"
     r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\][.!]?$",
     r"(?:no\s+(?:readable\s+)?text(?:\s+(?:found|detected|available))?|illegible|unreadable)[.!]?$",
-    # Chinese: apology or "cannot" + a reading verb, about the image/text
-    rf"(?=[^。\n]*{_ZH_TOPIC})(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
+    # Chinese: an apology or "cannot" + a reading verb, about the image
+    rf"(?=[^。\n]*{_ZH_IMAGE})(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
     rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n]{{0,6}}?{_ZH_READ}",
-    rf"(?=[^。\n]*{_ZH_TOPIC})(?:我)?(?:目前)?(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}",
-    r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|頁面|页面|畫面|画面)"
+    rf"(?=[^。\n]*{_ZH_IMAGE})(?:我)?(?:目前)?(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}",
+    r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
     r"(?:中|裡|里|上|內|内)?(?:並|并)?(?:沒有|没有|無|无|不含|未包含|未發現|未发现|找不到|未能找到)"
     r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)",
     # Japanese
-    r"(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n]{0,40}?"
+    r"(?=[^。\n]*(?:画像|写真|イメージ))(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n]{0,40}?"
     r"(?:読み取|読|認識|処理|文字起こし|転記|抽出|判読)[^。\n]{0,10}?(?:できません|ません|不可|困難)",
     r"(?:この)?画像(?:に|には|の中に)(?:は)?(?:読み取れる|判読できる|認識できる)?(?:文字|テキスト)"
     r"(?:は|が)(?:ありません|含まれていません|見つかりません|見当たりません)",
     # Korean
-    r"(?:죄송|미안)(?:하지만|합니다|해요)[^.\n]{0,40}?(?:인식|읽|처리|추출|판독|전사)[^.\n]{0,10}?(?:수\s*없|못)",
+    r"(?=[^.\n]*(?:이미지|사진|그림))(?:죄송|미안)(?:하지만|합니다|해요)[^.\n]{0,40}?"
+    r"(?:인식|읽|처리|추출|판독|전사)[^.\n]{0,10}?(?:수\s*없|못)",
     r"(?:이\s*)?이미지(?:에는|에|에서)\s*(?:읽을\s*수\s*있는\s*)?(?:텍스트|글자|문자)(?:가|는)\s*"
     r"(?:없습니다|없어요|보이지\s*않습니다)",
     # German
+    r"(?=[^.\n]*\b(?:bild|foto|abbildung|grafik|scan)\w*)"
     r"(?:leider\s+(?:kann|konnte)\s+ich|es\s+tut\s+mir\s+leid[,.\s]+(?:aber\s+)?ich\s+(?:kann|konnte)"
-    r"|ich\s+(?:kann|konnte)\s+(?:den|diesen|dieses|das|die)\s+(?:text|bild|dokument|inhalt))\b"
+    r"|ich\s+(?:kann|konnte)\s+(?:den|diesen|dieses|das|die)\s+(?:text|bild|inhalt))\b"
     r"[^.\n]{0,80}?\b(?:nicht|keinen|keine)\b[^.\n]{0,40}?"
     r"(?:erkennen|lesen|entziffern|transkribieren|verarbeiten|extrahieren)",
     r"(?:das|dieses)\s+bild\s+enth(?:ä|ae)lt\s+keinen\s+(?:lesbaren\s+|erkennbaren\s+)?text",
     # Spanish
-    r"(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+[^.\n]{0,40}?no\s+(?:puedo|es\s+posible|pude)\s+"
-    r"(?:\w+\s+){0,2}?(?:transcribir|leer|procesar|extraer|reconocer|identificar|ayudar)",
-    r"no\s+(?:puedo|pude)\s+(?:transcribir|leer|procesar|extraer|reconocer)",
+    r"(?=[^.\n]*\b(?:imagen|foto|fotograf(?:í|i)a)\b)"
+    r"(?:(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+[^.\n]{0,40}?)?no\s+(?:puedo|es\s+posible|pude)\s+"
+    r"(?:\w+\s+){0,2}?(?:transcribir|leer|procesar|extraer|reconocer|identificar)",
     # French
-    r"(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+[^.\n]{0,40}?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
+    r"(?=[^.\n]*\b(?:image|photo|capture)\b)"
+    r"(?:(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+[^.\n]{0,40}?)?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
     r"(?:pas\s+)?(?:de\s+|à\s+)?(?:\w+\s+){0,2}?"
-    r"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier|aider)",
-    r"je\s+ne\s+(?:peux|parviens)\s+pas\s+(?:à\s+)?(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre)",
+    r"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier)",
 ]
 _START_RE = re.compile("|".join(f"(?:{p})" for p in _START_PATTERNS), re.IGNORECASE)
 # A refusal clause anywhere in a short answer: "..., so I won't transcribe it."

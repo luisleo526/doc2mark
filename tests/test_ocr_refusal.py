@@ -10,7 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
-from doc2mark.ocr.base import OCRConfig, OCRResult
+from doc2mark.core.base import OCRError
+from doc2mark.ocr.base import REFUSAL_USAGE_KEY, OCRConfig, OCRResult
 from doc2mark.ocr.openai import OpenAIOCR
 from doc2mark.ocr.refusal import matches_non_content_pattern, non_content_reason
 from doc2mark.ocr.schema import OCRPage, RawExtraction
@@ -83,6 +84,16 @@ def test_patterns_on_the_jev_labelled_answers(answer, is_non_content):
     "I can't help falling in love with you",
     "Leider kann ich morgen nicht kommen.",
     "申し訳ございませんが、ご利用いただけません。",
+    "Unable to read the file.\nError code 0x80070570\nContact your administrator",
+    "We're sorry, we are unable to process your payment at this time.",
+    "無法讀取檔案內容，請稍後再試。",
+    "As an AI-first company, we ship faster.",
+    "I can't do this alone.",
+    "This page is intentionally left blank.",
+    "I'm sorry, I can't make it tonight.",
+    "Sorry, I can't read your handwriting.",
+    "I'm sorry, but I can't comply with the new policy.",
+    "There is no content yet.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -221,7 +232,9 @@ def test_gemini_free_form_block_returns_no_text():
     agent._chain = MagicMock()
     agent._chain.batch_as_completed.return_value = [(0, blocked)]
 
-    assert agent.batch_invoke([{"image_data": "", "prompt": "p"}], structured=False) == [("", {"total_tokens": 3})]
+    assert agent.batch_invoke([{"image_data": "", "prompt": "p"}], structured=False) == [
+        ("", {"total_tokens": 3, REFUSAL_USAGE_KEY: "finish_reason=SAFETY"})
+    ]
 
 
 def test_gemini_stop_is_content():
@@ -237,3 +250,56 @@ def test_gemini_stop_is_content():
 
     assert result.text == "Board minutes 2026" and not result.metadata.get("ocr_refusal")
     assert agent.calls == ["structured"]
+
+
+class _Agent:
+    """A vision agent double for one mode; records the calls it serves."""
+
+    def __init__(self, structured, calls):
+        self.structured, self.calls = structured, calls
+
+    def batch_invoke(self, input_dicts):
+        self.calls.append("structured" if self.structured else "free_form")
+        if self.structured:
+            page = OCRPage(raw=RawExtraction(text="Board minutes 2026"))
+            return [{"parsed": page, "raw": None, "parsing_error": None, "usage": {}} for _ in input_dicts]
+        return [("Board minutes 2026", {}) for _ in input_dicts]
+
+
+def test_each_openai_call_uses_an_agent_of_its_own_mode(monkeypatch):
+    """The free-form recovery swaps the shared agent; a structured call that starts while
+    the free-form agent is installed must still run on a structured agent."""
+    calls = []
+    ocr = OpenAIOCR(api_key="test-key", config=OCRConfig())
+    monkeypatch.setattr("doc2mark.ocr.openai.VisionAgent", lambda **kw: _Agent(kw["structured"], calls))
+    ocr._vision_agent = _Agent(False, calls)  # left installed by another thread's recovery
+
+    [result] = ocr._batch_process_with_vision_agent([_png()], structured=True)
+
+    assert calls == ["structured"]
+    assert result.document is not None and result.text == "Board minutes 2026"
+
+
+def test_firewall_redo_parse_failure_surfaces_with_on_parse_error_raise(monkeypatch):
+    ocr = OpenAIOCR(api_key="test-key", config=OCRConfig(on_parse_error="raise"))
+    withheld = OCRResult(text="t", document=OCRPage(raw=RawExtraction(text="t")),
+                         metadata={"router_violations": ["illustrative content on document_type='table'"]})
+
+    def redo(indices):
+        raise OCRError("Structured OCR parse failed: boom")
+
+    with pytest.raises(OCRError):
+        ocr._enforce_router_firewall([withheld], redo)
+
+
+def test_firewall_redo_failure_keeps_the_flagged_result_by_default():
+    ocr = OpenAIOCR(api_key="test-key", config=OCRConfig())
+    withheld = OCRResult(text="t", document=OCRPage(raw=RawExtraction(text="t")),
+                         metadata={"router_violations": ["illustrative content on document_type='table'"]})
+
+    def redo(indices):
+        raise OCRError("Structured OCR parse failed: boom")
+
+    [kept] = ocr._enforce_router_firewall([withheld], redo)
+
+    assert kept.text == "t" and kept.metadata["router_fallback"] == "unresolved"

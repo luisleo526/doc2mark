@@ -23,6 +23,7 @@ from doc2mark.ocr.base import (
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    REFUSAL_USAGE_KEY,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
 
@@ -359,9 +360,14 @@ class VisionAgent:
             if isinstance(msg, Exception):
                 output.append(("", {}))
                 continue
-            # A native refusal (message.refusal, content null) is no content.
             text = msg.content.replace('```', '`') if msg.content else ""
-            output.append((text, self._extract_usage(msg)))
+            usage = self._extract_usage(msg)
+            refusal = (getattr(msg, "additional_kwargs", None) or {}).get("refusal")
+            if refusal:
+                # A native refusal (message.refusal) is no content; the usage dict
+                # carries the signal (REFUSAL_USAGE_KEY) so the result gets flagged.
+                text, usage = "", {**usage, REFUSAL_USAGE_KEY: str(refusal)}
+            output.append((text, usage))
         return output
 
 
@@ -895,6 +901,15 @@ class OpenAIOCR(BaseOCR):
     ) -> List[OCRResult]:
         """Process images using LangChain VisionAgent for optimal performance."""
         try:
+            # This call's agent, matching its mode: the recovery swaps the shared agent
+            # between structured and free-form, so another thread's call must not ride
+            # on whatever agent happens to be installed.
+            agent = self._ensure_vision_agent(
+                structured=structured,
+                response_model=self.config.response_model if self.config else None,
+                detail=detail,
+            ) or self._vision_agent
+
             # Build the per-image prompts. Structured output selects schema-aligned
             # TASK_PROMPTS; the legacy path keeps the verbose template builder.
             synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
@@ -917,7 +932,7 @@ class OpenAIOCR(BaseOCR):
             # Optional per-image neighbor-page PDF context (len == len(images)).
             # Absent when the feature is off -> off-by-default byte-identical path.
             context_pdfs = kwargs.get('context_pdfs')
-            context_enabled = getattr(self._vision_agent, '_context_pdf_enabled', False)
+            context_enabled = getattr(agent, '_context_pdf_enabled', False)
 
             # Prepare input data for VisionAgent
             input_dicts = []
@@ -937,7 +952,7 @@ class OpenAIOCR(BaseOCR):
 
             # Use VisionAgent batch processing (same as original ocr_agent.py)
             logger.info(f"🚀 Processing {len(input_dicts)} images with VisionAgent")
-            batch_results = self._vision_agent.batch_invoke(input_dicts)
+            batch_results = agent.batch_invoke(input_dicts)
 
             results = self._results_from_batch(images, batch_results, language, kwargs)
             if structured:
@@ -1037,7 +1052,9 @@ class OpenAIOCR(BaseOCR):
             else:
                 # --- Legacy free-form path ---
                 text_result, token_usage = item
-                text_result = text_result or ""
+                token_usage = dict(token_usage or {})
+                refusal = token_usage.pop(REFUSAL_USAGE_KEY, None)
+                text_result = "" if refusal else (text_result or "")
                 if not kwargs.get('_recovery'):
                     # Final free-form answer: model Markdown, sanitized once at this boundary.
                     text_result = _sanitize_markdown(text_result)
@@ -1058,6 +1075,8 @@ class OpenAIOCR(BaseOCR):
                         "model_kwargs": self.model_kwargs,
                         "token_usage": token_usage,
                         "structured": False,
+                        **({"refusal": refusal, "non_content": "provider_refusal", "ocr_refusal": True}
+                           if refusal else {}),
                     }
                 ))
 

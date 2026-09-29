@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+import shlex
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -44,6 +45,22 @@ _ENGINE_FAILURE_MARKERS = (
 )
 
 
+def _tessdata_dir_option(tesseract_config: Optional[str]) -> Optional[str]:
+    """The ``--tessdata-dir`` a caller passes through ``tesseract_config``, if any."""
+    if not tesseract_config:
+        return None
+    try:
+        parts = shlex.split(tesseract_config)
+    except ValueError:
+        parts = tesseract_config.split()
+    for index, part in enumerate(parts):
+        if part == "--tessdata-dir" and index + 1 < len(parts):
+            return parts[index + 1]
+        if part.startswith("--tessdata-dir="):
+            return part.split("=", 1)[1]
+    return None
+
+
 class TesseractOCR(BaseOCR):
     """Tesseract-based OCR implementation."""
 
@@ -57,9 +74,9 @@ class TesseractOCR(BaseOCR):
         super().__init__(api_key, config)
         self._pytesseract = None
         self._pil = None
-        # (requested language, tessdata env, binary) the engine check passed for, and
-        # the language code it resolved to; re-checked when any of them changes.
-        self._engine_checked_for: Optional[Tuple[str, Optional[str], str]] = None
+        # (requested language, tessdata env, binary, --tessdata-dir) the engine check
+        # passed for, and the language code it resolved to; re-checked on any change.
+        self._engine_checked_for: Optional[Tuple[str, Optional[str], str, Optional[str]]] = None
         self._engine_language: Optional[str] = None
 
         logger.info("📝 Initializing Tesseract OCR (offline mode)")
@@ -133,7 +150,7 @@ class TesseractOCR(BaseOCR):
         """
         image_size = len(image_data)
         if language_code is None:
-            language_code = self._ensure_engine()
+            language_code = self._ensure_engine(kwargs.get("tesseract_config"))
         logger.debug(f"🖼️  Processing image with Tesseract ({image_size} bytes)")
 
         try:
@@ -264,7 +281,7 @@ class TesseractOCR(BaseOCR):
         # The engine must be usable before any image is read: a missing binary or
         # missing language data fails the batch loudly (OCREngineError) instead of
         # turning every image into an empty result.
-        language_code = self._ensure_engine()
+        language_code = self._ensure_engine(kwargs.get("tesseract_config"))
 
         def process_single_image(index: int, image_data: bytes):
             """One image; a failure on this image becomes a failed (empty) result."""
@@ -393,24 +410,26 @@ class TesseractOCR(BaseOCR):
         logger.debug(f"🌐 Language mapping: '{requested}' -> '{'+'.join(codes)}'")
         return '+'.join(codes)
 
-    def _installed_languages(self) -> Tuple[Optional[str], List[str]]:
+    def _installed_languages(self, tessdata_dir: Optional[str] = None) -> Tuple[Optional[str], List[str]]:
         """``tesseract --list-langs``: the tessdata directory and the installed codes."""
         command = self.pytesseract.pytesseract.tesseract_cmd
+        argv = [command] + (["--tessdata-dir", tessdata_dir] if tessdata_dir else []) + ["--list-langs"]
         try:
-            listing = subprocess.run([command, "--list-langs"], capture_output=True, text=True, timeout=30)
+            listing = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             raise OCREngineError(self._engine_hint(
                 f"Tesseract is not installed or not runnable ({command!r}): {exc}")) from exc
+        # Tesseract 4+ prints the list on stdout, 3.x on stderr, under a header line.
+        for stream in (listing.stdout or "", listing.stderr or ""):
+            lines = [line.strip() for line in stream.splitlines() if line.strip()]
+            if lines and lines[0].lower().startswith("list of available languages"):
+                match = re.search(r'"([^"]*)"', lines[0])
+                return (match.group(1) if match else None), lines[1:]
         lines = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
-        directory = None
-        if lines and lines[0].lower().startswith("list of available languages"):
-            match = re.search(r'"([^"]*)"', lines[0])
-            directory = match.group(1) if match else None
-            lines = lines[1:]
         if listing.returncode != 0 and not lines:
             raise OCREngineError(self._engine_hint(
                 f"'tesseract --list-langs' failed: {(listing.stderr or '').strip() or listing.returncode}"))
-        return directory, lines
+        return None, lines
 
     @staticmethod
     def _engine_hint(message: str) -> str:
@@ -418,9 +437,10 @@ class TesseractOCR(BaseOCR):
         where = f"TESSDATA_PREFIX={prefix}" if prefix else "TESSDATA_PREFIX is not set"
         return f"{message} ({where}; install the tessdata language packs or point TESSDATA_PREFIX at them)"
 
-    def _ensure_engine(self) -> str:
+    def _ensure_engine(self, tesseract_config: Optional[str] = None) -> str:
         """Check once (per language and environment) that Tesseract can run with the
-        requested language data, and return the ``-l`` value to use.
+        requested language data, and return the ``-l`` value to use. A
+        ``--tessdata-dir`` in ``tesseract_config`` is where the data is looked up.
 
         Raises:
             OCREngineError: Tesseract is missing, the language value is invalid, or
@@ -432,10 +452,11 @@ class TesseractOCR(BaseOCR):
             command = str(self.pytesseract.pytesseract.tesseract_cmd)
         except (ValueError, ImportError) as exc:
             raise OCREngineError(str(exc)) from exc
-        key = (requested, os.environ.get("TESSDATA_PREFIX"), command)
+        tessdata_dir = _tessdata_dir_option(tesseract_config)
+        key = (requested, os.environ.get("TESSDATA_PREFIX"), command, tessdata_dir)
         if self._engine_checked_for == key and self._engine_language:
             return self._engine_language
-        directory, installed = self._installed_languages()
+        directory, installed = self._installed_languages(tessdata_dir)
         by_name = {code.lower(): code for code in installed}
         resolved, missing = [], []
         for code in requested.split('+'):

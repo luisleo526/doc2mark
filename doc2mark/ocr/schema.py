@@ -64,8 +64,12 @@ _ASCII_DIGITS_RE = re.compile(r"[0-9]+")  # str.isdigit() also accepts "²", whi
 # grid is left unpadded rather than materialized.
 _MAX_COLSPAN = 1000
 _MAX_GRID_CELLS = 250_000
-# Rows longer than this are padded at the end without the alignment search.
+# Column slots a table layout may visit; spans that claim more are dropped.
+_MAX_LAYOUT_WORK = 500_000
+# The pad-alignment search: rows longer than this, or past this many column slots per
+# table, are padded at the end.
 _MAX_ALIGNED_ROW_CELLS = 256
+_MAX_ALIGNMENT_WORK = 200_000
 
 
 def _clean_controls(text: str) -> str:
@@ -235,24 +239,27 @@ def _caption_of(table):
 
 
 def _split_newlines_into_breaks(cell) -> None:
-    """Newlines inside cell text become <br> (the shared HTML-cell rule)."""
-    pieces = _LINE_BREAK_RE.split(cell.text or "")
-    if len(pieces) > 1:
-        cell.text = pieces[0]
-        for index, piece in enumerate(pieces[1:]):
+    """Newlines inside cell text become <br> (the shared HTML-cell rule); one pass."""
+    def split(text: Optional[str]) -> Tuple[Optional[str], list]:
+        pieces = _LINE_BREAK_RE.split(text or "")
+        if len(pieces) == 1:
+            return text, []
+        breaks = []
+        for piece in pieces[1:]:
             br = cell.makeelement("br", {})
             br.tail = piece
-            cell.insert(index, br)
+            breaks.append(br)
+        return pieces[0], breaks
+
+    cell.text, children = split(cell.text)
+    added = bool(children)
     for child in list(cell):
-        pieces = _LINE_BREAK_RE.split(child.tail or "")
-        if len(pieces) > 1:
-            child.tail = pieces[0]
-            anchor = child
-            for piece in pieces[1:]:
-                br = cell.makeelement("br", {})
-                br.tail = piece
-                anchor.addnext(br)
-                anchor = br
+        child.tail, breaks = split(child.tail)
+        children.append(child)
+        children.extend(breaks)
+        added = added or bool(breaks)
+    if added:
+        cell[:] = children
 
 
 def _tidy_breaks(cell) -> None:
@@ -497,17 +504,22 @@ def _occupancy(carried: set, placed: list, spans: dict) -> int:
 
 
 def _pad_position(cells: list, carried: set, spans: dict, deficit: int,
-                  kinds: List[Optional[str]], tags: List[Optional[str]]) -> int:
+                  kinds: List[Optional[str]], tags: List[Optional[str]], budget: List[int]) -> int:
     """Where a short row lost its cell(s): the insertion point for ``deficit`` empty
     cells that best lines the row's cells up with their columns (numbers under number
-    columns, labels under label columns, <td> under <td>). Ties keep the pads at the
-    end of the row, the historical behaviour; header rows (and very long rows) are
-    always padded at the end."""
-    if not cells or len(cells) > _MAX_ALIGNED_ROW_CELLS or all(_tag(cell) == "th" for cell in cells):
+    columns, labels under label columns, <td> under <td>). Pads never go before a cell
+    that spans rows (moving it would change the rows below). Ties keep the pads at the
+    end of the row, the historical behaviour; header rows are always padded at the end,
+    and so is every row once the table's search ``budget`` (column slots) is spent."""
+    first = max((index + 1 for index, cell in enumerate(cells) if spans[cell][0] > 1), default=0)
+    cost = (len(cells) - first + 1) * (len(cells) + deficit + len(carried))
+    if (first >= len(cells) or len(cells) > _MAX_ALIGNED_ROW_CELLS or cost > budget[0]
+            or all(_tag(cell) == "th" for cell in cells)):
         return len(cells)
+    budget[0] -= cost
     cell_kinds = [_cell_kind(cell) for cell in cells]
     best, best_score = len(cells), -1
-    for position in range(len(cells), -1, -1):
+    for position in range(len(cells), first - 1, -1):
         sequence = list(range(position)) + [None] * deficit + list(range(position, len(cells)))
         col, score = 0, 0
         for index in sequence:
@@ -527,6 +539,45 @@ def _pad_position(cells: list, carried: set, spans: dict, deficit: int,
         if score > best_score:
             best, best_score = position, score
     return best
+
+
+def _lay_out(groups: List[list], cells: dict, spans: dict, visit) -> Dict[object, Tuple[int, list]]:
+    """HTML table layout, row group by row group, with rowspan carry-over.
+    ``visit(row, carried)`` may change ``cells[row]`` before the row is placed.
+    Returns ``{row: (occupied columns, [(cell, start column)])}``."""
+    layout = {}
+    for group in groups:
+        carry: Dict[int, int] = {}
+        for row in group:
+            carried = {col for col, left in carry.items() if left > 0}
+            visit(row, carried)
+            placed = _place(cells[row], carried, spans)
+            layout[row] = _occupancy(carried, placed, spans), placed
+            carry = {col: left - 1 for col, left in carry.items() if left > 1}
+            for cell, start in placed:
+                rowspan, colspan = spans[cell]
+                if rowspan > 1:
+                    for col in range(start, start + colspan):
+                        carry[col] = max(carry.get(col, 0), rowspan - 1)
+    return layout
+
+
+def _layout_work(groups: List[list], cells: dict, spans: dict) -> int:
+    """Upper bound of the column slots a layout visits: per row, its own spans plus
+    every span reaching down into it from the rows above (counted without laying out)."""
+    work = 0
+    for group in groups:
+        delta = [0] * (len(group) + 1)
+        reaching = 0
+        for r, row in enumerate(group):
+            reaching += delta[r]
+            work += reaching + sum(spans[cell][1] for cell in cells[row])
+            for cell in cells[row]:
+                rowspan, colspan = spans[cell]
+                if rowspan > 1:
+                    delta[r + 1] += colspan
+                    delta[r + rowspan] -= colspan
+    return work
 
 
 def _normalize_table(table) -> bool:
@@ -556,6 +607,13 @@ def _normalize_table(table) -> bool:
                 changed = _write_span(cell, "colspan", colspan) or changed
                 changed = _write_span(cell, "rowspan", rowspan) or changed
                 spans[cell] = (rowspan, colspan)
+    #    Spans that together still claim a grid too large to lay out (or to render)
+    #    are dropped; every cell and its text stays.
+    if _layout_work(groups, cells, spans) > _MAX_LAYOUT_WORK:
+        for cell in spans:
+            changed = _write_span(cell, "colspan", 1) or changed
+            changed = _write_span(cell, "rowspan", 1) or changed
+            spans[cell] = (1, 1)
 
     # 2. Reference width: rows no rowspan reaches into cannot carry a double count.
     reference = []
@@ -568,35 +626,22 @@ def _normalize_table(table) -> bool:
                 covered_until = max(covered_until, r + spans[cell][0] - 1)
     reference_width = max(reference)
 
-    # 3. Lay out every row. A row wider than the reference that also emitted an empty
-    #    cell for a position a rowspan above already covers (a double-counted rowspan)
-    #    loses those empty cells; nothing with text is ever removed.
-    layout = {}
-    for group in groups:
-        carry: Dict[int, int] = {}
-        for row in group:
-            carried = {col for col, left in carry.items() if left > 0}
-            placed = _place(cells[row], carried, spans)
-            occupancy = _occupancy(carried, placed, spans)
-            if occupancy > reference_width:
-                excess, natural = occupancy - reference_width, 0
-                for cell in list(cells[row]):
-                    start, natural = natural, natural + spans[cell][1]
-                    if excess and start in carried and spans[cell] == (1, 1) and _is_blank_cell(cell):
-                        _remove_keep_tail(cell)
-                        cells[row].remove(cell)
-                        excess -= 1
-                        changed = True
-                placed = _place(cells[row], carried, spans)
-                occupancy = _occupancy(carried, placed, spans)
-            layout[row] = occupancy, placed
-            carry = {col: left - 1 for col, left in carry.items() if left > 1}
-            for cell, start in placed:
-                rowspan, colspan = spans[cell]
-                if rowspan > 1:
-                    for col in range(start, start + colspan):
-                        carry[col] = max(carry.get(col, 0), rowspan - 1)
+    # 3. A row wider than the reference that also emitted an empty cell for a position
+    #    a rowspan above already covers (a double-counted rowspan) loses those empty
+    #    cells; nothing with text is ever removed.
+    def drop_double_counts(row, carried) -> None:
+        nonlocal changed
+        excess = _occupancy(carried, _place(cells[row], carried, spans), spans) - reference_width
+        natural = 0
+        for cell in list(cells[row]):
+            start, natural = natural, natural + spans[cell][1]
+            if excess > 0 and start in carried and spans[cell] == (1, 1) and _is_blank_cell(cell):
+                _remove_keep_tail(cell)
+                cells[row].remove(cell)
+                excess -= 1
+                changed = True
 
+    layout = _lay_out(groups, cells, spans, drop_double_counts)
     width = max(occupancy for occupancy, _ in layout.values())
     if width * len(rows) > _MAX_GRID_CELLS:
         return changed
@@ -616,33 +661,37 @@ def _normalize_table(table) -> bool:
                     kind_votes[start][kind] += 1
     kinds = [_dominant(v) for v in kind_votes]
     tags = [_dominant(v) for v in tag_votes]
+    budget = [_MAX_ALIGNMENT_WORK]
 
-    # 5. Pad every short row with empty cells where its cells line up best.
-    for group in groups:
-        carry = {}
-        for row in group:
-            carried = {col for col, left in carry.items() if left > 0}
-            row_cells = cells[row]
-            placed = _place(row_cells, carried, spans)
-            deficit = width - _occupancy(carried, placed, spans)
-            if deficit > 0:
-                position = _pad_position(row_cells, carried, spans, deficit, kinds, tags)
-                pads = [row.makeelement("td", {}) for _ in range(deficit)]
-                for pad in pads:
-                    spans[pad] = (1, 1)
-                    if position < len(row_cells):
-                        row_cells[position].addprevious(pad)
-                    else:
-                        row.append(pad)
-                row_cells[position:position] = pads
-                placed = _place(row_cells, carried, spans)
-                changed = True
-            carry = {col: left - 1 for col, left in carry.items() if left > 1}
-            for cell, start in placed:
-                rowspan, colspan = spans[cell]
-                if rowspan > 1:
-                    for col in range(start, start + colspan):
-                        carry[col] = max(carry.get(col, 0), rowspan - 1)
+    # 5. Pad every short row with empty cells where its cells line up best, then (a
+    #    safety net for overlapping spans) pad whatever is still short at its end.
+    def pad(row, carried, *, align: bool) -> None:
+        nonlocal changed
+        row_cells = cells[row]
+        deficit = width - _occupancy(carried, _place(row_cells, carried, spans), spans)
+        if deficit <= 0:
+            return
+        pads = [row.makeelement("td", {}) for _ in range(deficit)]
+        for new in pads:
+            spans[new] = (1, 1)
+        position = len(row_cells)
+        if align:
+            candidate = _pad_position(row_cells, carried, spans, deficit, kinds, tags, budget)
+            trial = row_cells[:candidate] + pads + row_cells[candidate:]
+            # Keep a mid-row insertion only if the row then spans exactly the grid
+            # (a shifted colspan can overlap a rowspan differently); else pad at the end.
+            if candidate < len(row_cells) and _occupancy(carried, _place(trial, carried, spans), spans) == width:
+                position = candidate
+        for new in pads:
+            if position < len(row_cells):
+                row_cells[position].addprevious(new)
+            else:
+                row.append(new)
+        row_cells[position:position] = pads
+        changed = True
+
+    _lay_out(groups, cells, spans, lambda row, carried: pad(row, carried, align=True))
+    _lay_out(groups, cells, spans, lambda row, carried: pad(row, carried, align=False))
     return changed
 
 
@@ -690,15 +739,18 @@ def normalize_table_html(html: str) -> str:
 # Markdown/HTML structure is escaped. A "<" becomes "&lt;" only before a letter,
 # "/", "!" or "?" (a tag, comment or processing instruction; "x < 5" stays), and
 # "&" only where it starts an entity. Plain text (a verbatim transcription) also
-# gets a backslash before line-leading block markers, so a transcribed "# 3" or
-# "1." stays text instead of becoming a heading or list.
+# gets a backslash before line-leading block markers, so a transcribed "# 3", "1.",
+# "==" underline or "[1]: url" line stays text instead of becoming structure.
 _TAG_START_RE = re.compile(r"<(?=[A-Za-z/!?])")
 _ENTITY_START_RE = re.compile(r"&(?=#[0-9]{1,8};|#[xX][0-9A-Fa-f]{1,8};|[A-Za-z][A-Za-z0-9]{1,31};)")
 _BLOCK_MARKER_RE = re.compile(
     r"^([ \t]{0,3})(#{1,6}(?=[ \t]|$)|>|[-+*](?=[ \t]|$)|[0-9]{1,9}(?=[.)](?:[ \t]|$))|`{3,}|~{3,})",
     re.M,
 )
-_RULE_LINE_RE = re.compile(r"^([ \t]{0,3})(?=(?:[-=*_][ \t]*){3,}$)", re.M)
+# A rule (---, ***, ___), or a setext heading underline (any run of = or -).
+_RULE_LINE_RE = re.compile(r"^([ \t]{0,3})(?=(?:[-=*_][ \t]*){3,}$|=+[ \t]*$|-+[ \t]*$)", re.M)
+# "[label]: destination" would become an invisible link reference definition.
+_LINK_DEFINITION_RE = re.compile(r"^([ \t]{0,3})(?=\[[^\]\n]*\]:)", re.M)
 
 
 def _neutralize_html(text: str, *, keep_breaks: bool = False) -> str:
@@ -714,6 +766,7 @@ def _escape_line_starts(text: str) -> str:
         return f"{indent}{token}\\" if token[0] in "0123456789" else f"{indent}\\{token}"
 
     text = _RULE_LINE_RE.sub(lambda match: match.group(1) + "\\", text)
+    text = _LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text)
     return _BLOCK_MARKER_RE.sub(marker, text)
 
 
@@ -755,7 +808,11 @@ def _sanitize_markdown(text: str) -> str:
                 out.append(_neutralize_html(text[last:start], keep_breaks=True))
                 out.append(normalize_table_html(sanitize_table_html(text[start:match.end()])))
                 last = match.end()
-    out.append(_neutralize_html(text[last:], keep_breaks=True))
+    if depth:  # a table still open at the end (e.g. an answer cut off at max_tokens)
+        out.append(_neutralize_html(text[last:start], keep_breaks=True))
+        out.append(normalize_table_html(sanitize_table_html(text[start:])))
+    else:
+        out.append(_neutralize_html(text[last:], keep_breaks=True))
     return "".join(out)
 
 
@@ -1263,11 +1320,11 @@ class OCRPage(BaseModel):
         # to the standard verbatim rendering — never worse than today.
         md = (interp.page_markdown or "").strip() if interp is not None else ""
         if md:
-            table_text = " ".join((t.html or t.markdown or "") for t in raw.tables)
-            covered, missing = _coverage(raw.text, md + "\n" + table_text)
+            # Coverage is judged on what is emitted: the sanitized rendering (text the
+            # sanitizer removes, e.g. inside an <svg>, must land in the tail).
+            out = [_sanitize_markdown(md)] + [_render_table_block(table) for table in raw.tables]
+            covered, missing = _coverage(raw.text, "\n".join(out))
             if covered >= _SYNTH_COVERAGE_MIN:
-                out = [_sanitize_markdown(md)]
-                out.extend(_render_table_block(table) for table in raw.tables)
                 if missing:
                     out.append("<!-- raw-verbatim-tail\n" + "\n".join(missing) + "\n-->")
                 return "\n\n".join(p for p in out if p)

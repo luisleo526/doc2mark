@@ -16,6 +16,12 @@ if TYPE_CHECKING:  # avoid a runtime import cycle (schema has no deps on base)
 logger = logging.getLogger(__name__)
 
 
+# Key under which the vision agents report a provider refusal or safety block of a
+# free-form answer in its usage dict (the per-item channel of their public
+# ``(text, usage)`` return shape); the providers turn it into ``ocr_refusal``.
+REFUSAL_USAGE_KEY = "doc2mark_refusal"
+
+
 class OCREngineError(OCRError):
     """The OCR engine itself cannot run: not installed, language data missing, a
     broken ``TESSDATA_PREFIX``. Unlike a failure on one image it affects every image,
@@ -390,6 +396,8 @@ class BaseOCR(ABC):
         from doc2mark.ocr.refusal import non_content_reason
         judge = self._non_content_judge()
         for index, result in enumerate(results):
+            if (result.metadata or {}).get("ocr_refusal"):
+                continue  # the provider already refused (flagged by the result builder)
             reason = non_content_reason(result.text or "", judge)
             if reason:
                 results[index] = replace(
@@ -475,6 +483,11 @@ class BaseOCR(ABC):
         )
         try:
             redone: Optional[List[OCRResult]] = redo_verbatim(indices)
+        except OCRError:
+            if getattr(self.config, "on_parse_error", "raw_text") == "raise":
+                raise  # the caller asked for parse failures to surface
+            logger.warning("Router firewall: verbatim redo failed; keeping the flagged results")
+            redone = None
         except Exception as exc:  # keep the original results, flagged
             logger.warning(f"Router firewall: verbatim redo failed: {exc}")
             redone = None

@@ -68,3 +68,15 @@ def test_an_unreadable_image_fails_alone(images):
     assert results[1].text == "" and results[1].metadata["failed"] is True and results[1].metadata["error"]
     if images == 3:
         assert "PAGE 2046" in results[2].text
+
+
+def test_tessdata_dir_in_the_tesseract_config_is_where_languages_are_checked(tmp_path):
+    if shutil.which("tesseract") is None:
+        pytest.skip("Tesseract binary not installed")
+    ocr = TesseractOCR(config=OCRConfig(language="eng"))
+    default_dir, installed = ocr._installed_languages()
+    assert "eng" in installed and default_dir
+
+    assert ocr._ensure_engine(f"--tessdata-dir {default_dir}") == "eng"
+    with pytest.raises(OCREngineError, match="eng"):
+        TesseractOCR(config=OCRConfig(language="eng"))._ensure_engine(f"--tessdata-dir {tmp_path}")

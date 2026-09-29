@@ -20,6 +20,7 @@ from doc2mark.ocr.base import (
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    REFUSAL_USAGE_KEY,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
 from doc2mark.utils.image_utils import (
@@ -275,9 +276,12 @@ class VertexAIVisionAgent:
             msg = res[1]
             if isinstance(msg, Exception):
                 out.append(("", {}))
-            elif _blocked_reason(msg):
-                # A safety/recitation block is no content, even when partial text came back.
-                out.append(("", self._extract_usage(msg)))
+                continue
+            blocked = _blocked_reason(msg)
+            if blocked:
+                # A safety/recitation block is no content, even when partial text came
+                # back; the usage dict carries the signal so the result gets flagged.
+                out.append(("", {**self._extract_usage(msg), REFUSAL_USAGE_KEY: blocked}))
             else:
                 out.append((self._extract_text(msg.content), self._extract_usage(msg)))
         return out
@@ -659,7 +663,9 @@ class VertexAIOCR(BaseOCR):
         results = []
         for i, (text_result, token_usage) in enumerate(batch_results):
             image_size = len(images[i])
-            text_result = text_result or ""
+            token_usage = dict(token_usage or {})
+            blocked = token_usage.pop(REFUSAL_USAGE_KEY, None)
+            text_result = "" if blocked else (text_result or "")
             if not kwargs.get("_recovery"):
                 # Final free-form answer: model Markdown, sanitized once at this boundary.
                 text_result = _sanitize_markdown(text_result)
@@ -682,6 +688,8 @@ class VertexAIOCR(BaseOCR):
                         "batch_index": i,
                         "content_type": kwargs.get("content_type"),
                         "token_usage": token_usage,
+                        **({"refusal": blocked, "non_content": "provider_refusal", "ocr_refusal": True}
+                           if blocked else {}),
                     },
                 )
             )
