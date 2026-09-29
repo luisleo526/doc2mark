@@ -117,6 +117,19 @@ def test_t9_many_wide_and_tall_spans_do_not_stall_the_conversion(run_cli, fake_l
     assert _implied_grid_cells(result.markdown) <= 100_000, "the emitted table must not be a table bomb"
 
 
+def test_t9_padding_does_not_blow_small_tables_up(run_cli, fake_llm, scan):
+    """A 32-cell x colspan-32 header over 243 one-cell rows: padding every row to the
+    1024-column header would turn 5 KB of HTML into 2 MB, twelve times over."""
+    one = "<table><tr>" + "<td colspan='32'>h</td>" * 32 + "</tr>" + "<tr><td>1</td></tr>" * 243 + "</table>"
+    fake_llm.script(structured=[fake.page("Padding", tables=[fake.table(one * 12)])])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    assert len(result.markdown) < 500_000, f"{len(result.markdown)} chars of Markdown"
+    assert result.markdown.count("<td>1</td>") == 12 * 243, "every cell's text must survive"
+
+
 # --------------------------------------------------------------------------- #
 # T10: every OCR text field that reaches Markdown is sanitised                #
 # --------------------------------------------------------------------------- #
@@ -199,6 +212,21 @@ def test_t10_text_removed_by_sanitizing_page_markdown_is_still_indexed(run_cli, 
 
     assert result.exit_code == 0, result.describe()
     assert "800" in result.markdown and "<svg" not in result.markdown, result.describe()
+
+
+def test_t10_model_markdown_that_mentions_a_table_tag_keeps_its_structure(run_cli, fake_llm, scan):
+    """A literal "<table>" in prose is not a truncated table: the Markdown after it stays."""
+    answer = ("The <table> element represents tabular data.\n\n## Attributes\n\n"
+              "- border: width of the frame\n- summary: deprecated\n\n1. Step one\n2. Step two")
+    fake_llm.script(free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured")
+
+    assert result.exit_code == 0, result.describe()
+    rendered = build.render(result.markdown)
+    assert [h.get_text() for h in rendered.find_all("h2")] == ["Attributes"], result.describe()
+    assert len(rendered.find_all("li")) == 4, result.describe()
+    assert "The <table> element represents tabular data." in build.visible_text(result.markdown)
 
 
 def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
@@ -437,6 +465,12 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "無法讀取檔案內容，請稍後再試。",
     "As an AI-first company, we ship faster.",
     "This page is intentionally left blank.",
+    "無法處理的問題，請參考下圖。",
+    "Hi team, I can't read the text in the attachment - can you resend it?",
+    "Sorry, I cannot read the document you sent.",
+    "Unable to process the uploaded image. Please upload a JPG or PNG under 10 MB.",
+    "The photo is blurry.\nHold the camera steady and retake it.",
+    "As an AI assistant, Aria answers customer questions 24/7.",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])

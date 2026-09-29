@@ -37,12 +37,12 @@ def _random_table(rng: random.Random) -> str:
         cells = []
         for _ in range(rng.randint(0, 5)):
             spans = ""
-            if rng.random() < 0.25:
+            if rng.random() < 0.3:
                 spans += f' rowspan="{rng.randint(0, 4)}"'
-            if rng.random() < 0.25:
+            if rng.random() < 0.3:
                 spans += f' colspan="{rng.randint(0, 4)}"'
-            tag = "th" if rng.random() < 0.2 else "td"
-            text = rng.choice(["", "", "12", "3.5%", "North", "Q1", "NT$"])
+            tag = "th" if rng.random() < 0.25 else "td"
+            text = rng.choice(["", "", "", "12", "3.5%", "North", "Q1", "NT$"])
             cells.append(f"<{tag}{spans}>{text}</{tag}>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     return "<table>" + "".join(rows) + "</table>"
@@ -54,9 +54,15 @@ def test_a_short_row_padded_mid_row_does_not_shift_a_rowspan():
     assert len(set(widths)) == 1, widths
 
 
+def test_dropping_a_double_count_does_not_leave_an_unstable_colspan():
+    html = '<table><tr><td rowspan="2" colspan="2"></td></tr><tr><th></th><td></td></tr></table>'
+    once = Table(html=html).html
+    assert Table(html=once).html == once, once
+
+
 def test_normalized_tables_are_rectangular_and_stable():
     rng = random.Random(20260930)
-    for _ in range(2000):
+    for _ in range(4000):
         source = _random_table(rng)
         once = Table(html=source).html
         widths = _row_widths(once)

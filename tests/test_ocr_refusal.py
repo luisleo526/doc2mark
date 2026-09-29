@@ -71,9 +71,24 @@ JEV_ANSWERS = [
 JSON_ERROR = '{"error": "image could not be read"}'
 
 
+# Refusals the deterministic patterns deliberately leave to the judge, because the same
+# words also appear as real page text (an app's upload error, an API error screenshot).
+LEFT_TO_THE_JUDGE = {
+    "Unable to process the image. Please provide a clearer scan of the page.",
+}
+
+
 @pytest.mark.parametrize("answer, is_non_content", JEV_ANSWERS)
 def test_patterns_on_the_jev_labelled_answers(answer, is_non_content):
-    assert matches_non_content_pattern(answer) is is_non_content
+    expected = is_non_content and answer not in LEFT_TO_THE_JUDGE
+    assert matches_non_content_pattern(answer) is expected
+
+
+def test_patterns_catch_most_jev_refusals_without_false_alarms():
+    refusals = [answer for answer, label in JEV_ANSWERS if label] + [JSON_ERROR]
+    content = [answer for answer, label in JEV_ANSWERS if not label]
+    assert sum(map(matches_non_content_pattern, refusals)) >= 18  # of 20 (the Jev regex baseline: 17)
+    assert not any(map(matches_non_content_pattern, content))
 
 
 @pytest.mark.parametrize("answer", [
@@ -94,6 +109,13 @@ def test_patterns_on_the_jev_labelled_answers(answer, is_non_content):
     "Sorry, I can't read your handwriting.",
     "I'm sorry, but I can't comply with the new policy.",
     "There is no content yet.",
+    "無法處理的問題，請參考下圖。",
+    "Hi team, I can't read the text in the attachment - can you resend it?",
+    "Sorry, I cannot read the document you sent.",
+    "Unable to process the uploaded image. Please upload a JPG or PNG under 10 MB.",
+    "The photo is blurry.\nHold the camera steady and retake it.",
+    "As an AI assistant, Aria answers customer questions 24/7.",
+    "抱歉，無法讀取您上傳的圖片，請重新上傳。",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
