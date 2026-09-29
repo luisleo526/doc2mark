@@ -183,7 +183,8 @@ class TestPipelines:
 
     @pytest.mark.requires_api_key
     def test_xlsx_ocr_embeds_in_cell(self, sample_documents_dir):
-        """XLSX: a picture's OCR result is embedded in the table cell it is anchored to."""
+        """XLSX: a picture's OCR result is placed where the picture is anchored (its cell, or the
+        title line above the table), never as a #VALUE! placeholder."""
         xlsx = sample_documents_dir / 'sample_spreadsheet.xlsx'
         if not xlsx.exists():
             pytest.skip("sample_spreadsheet.xlsx not found")
@@ -205,7 +206,7 @@ class TestPipelines:
         # Ensure no literal placeholder remains
         assert '#VALUE!' not in result.content
 
-        # The picture anchored in the table carries its OCR text in its own cell
+        # The picture anchored at A4 ("Sample Image:", a title row) carries its OCR text there
         assert '[Image: ' in result.content
 
     def test_pptx_ocr_uses_self_ocr_not_visionagent(self, sample_documents_dir):

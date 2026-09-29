@@ -91,7 +91,8 @@ _W_SDT, _W_SDT_CONTENT, _W_CUSTOM_XML = qn('w:sdt'), qn('w:sdtContent'), qn('w:c
 _W_DEL, _W_MOVE_FROM, _W_DRAWING = qn('w:del'), qn('w:moveFrom'), qn('w:drawing')
 _W_PPR, _W_P_STYLE, _W_NUM_PR = qn('w:pPr'), qn('w:pStyle'), qn('w:numPr')
 _W_NUM_ID, _W_ILVL, _W_OUTLINE_LVL = qn('w:numId'), qn('w:ilvl'), qn('w:outlineLvl')
-_M_OMATH, _M_OMATH_PARA, _M_T = qn('m:oMath'), qn('m:oMathPara'), qn('m:t')
+_M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+_M_OMATH, _M_OMATH_PARA, _M_T = f'{{{_M_NS}}}oMath', f'{{{_M_NS}}}oMathPara', f'{{{_M_NS}}}t'
 _MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
 _MC_ALTERNATE_CONTENT = f'{{{_MC_NS}}}AlternateContent'
 _MC_CHOICE, _MC_FALLBACK = f'{{{_MC_NS}}}Choice', f'{{{_MC_NS}}}Fallback'
@@ -359,16 +360,15 @@ class _DocxStructure:
             style_id = based_on.get(_W_VAL) if based_on is not None else None
 
     def outline_level(self, p_el) -> Optional[int]:
-        """Outline level 0-8 from the paragraph or its style chain; None for body text."""
+        """The outline level set on the paragraph or, failing that, the nearest style of its
+        chain: 0-8 for heading levels 1-9, 9 for body text; None when none is set."""
         ppr = p_el.find(_W_PPR)
         if ppr is not None and ppr.find(_W_OUTLINE_LVL) is not None:
-            level = _docx_int(ppr.find(_W_OUTLINE_LVL), 9)
-            return level if 0 <= level <= 8 else None
+            return min(max(_docx_int(ppr.find(_W_OUTLINE_LVL), 9), 0), 9)
         for _, style in self._style_chain(p_el):
             style_ppr = style.find(_W_PPR)
             if style_ppr is not None and style_ppr.find(_W_OUTLINE_LVL) is not None:
-                level = _docx_int(style_ppr.find(_W_OUTLINE_LVL), 9)
-                return level if 0 <= level <= 8 else None
+                return min(max(_docx_int(style_ppr.find(_W_OUTLINE_LVL), 9), 0), 9)
         return None
 
     def _num_pr(self, p_el) -> Tuple[Optional[int], Optional[int], Optional[str]]:
@@ -481,9 +481,14 @@ def _formula_uncached(cell) -> bool:
     return not (value.text or '').strip() and cell.get('t') != 'str'
 
 
-def _zip_member_contains(archive, name: str, needles) -> bool:
-    """Whether a zip member contains any of the byte strings (streamed in 1 MiB chunks)."""
-    overlap = max(len(needle) for needle in needles) - 1
+# A formula element or a value-metadata attribute, with or without a namespace prefix
+# (openpyxl writes <f>, the Open XML SDK writes <x:f>).
+_FORMULA_OR_RICH_VALUE = re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s/>]|\svm="')
+_ZIP_SCAN_OVERLAP = 256  # longer than any tag prefix the pattern has to see whole
+
+
+def _zip_member_matches(archive, name: str, pattern) -> bool:
+    """Whether a zip member matches ``pattern`` anywhere (streamed in 1 MiB chunks)."""
     tail = b''
     with archive.open(name) as stream:
         while True:
@@ -491,9 +496,9 @@ def _zip_member_contains(archive, name: str, needles) -> bool:
             if not chunk:
                 return False
             window = tail + chunk
-            if any(needle in window for needle in needles):
+            if pattern.search(window):
                 return True
-            tail = window[-overlap:]
+            tail = window[-_ZIP_SCAN_OVERLAP:]
 
 
 def _part_path(base_dir: str, target: str) -> str:
@@ -1134,7 +1139,8 @@ class DocxLoader(BaseOfficeLoader):
             style_name = paragraph.style.name if paragraph.style is not None else ""
         except (AttributeError, KeyError, ValueError):
             style_name = ""
-        level = self._heading_level(paragraph._p, style_name)
+        outline = self._structure.outline_level(paragraph._p)
+        level = self._heading_level(outline, style_name)
         if level:
             item = {"type": "text:title" if level == 1 else "text:section", "content": text, "level": min(level, 6)}
             if numbering and numbering[0] != '-':
@@ -1144,13 +1150,18 @@ class DocxLoader(BaseOfficeLoader):
             marker, depth = numbering
             return {"type": "text:list", "content": text, "marker": marker,
                     "list_level": max(depth, _style_list_depth(style_name))}
-        return {"type": self._classify_text_type(text, style_name), "content": text}
+        text_type = self._classify_text_type(text, style_name)
+        if outline == 9 and text_type in ("text:title", "text:section"):
+            text_type = "text:normal"  # explicitly body text, whatever the style is called
+        return {"type": text_type, "content": text}
 
-    def _heading_level(self, p_el, style_name: str) -> Optional[int]:
-        """1-9 for headings: the outline level Word uses for its navigation pane, else
-        the built-in Title (1), Subtitle (2) and Heading N styles; None for body text."""
-        outline = self._structure.outline_level(p_el)
-        if outline is not None:
+    @staticmethod
+    def _heading_level(outline: Optional[int], style_name: str) -> Optional[int]:
+        """1-9 for headings, None for body text. The outline level Word uses for its
+        navigation pane decides (9 is body text, even in a style named "Heading 2"); the
+        built-in Title (1) and Subtitle (2) styles, which have none, go by name, and so do
+        Heading N styles when no outline level is set anywhere."""
+        if outline is not None and outline <= 8:
             return outline + 1
         name = (style_name or "").strip().lower()
         if name == "title":
@@ -1158,7 +1169,7 @@ class DocxLoader(BaseOfficeLoader):
         if name == "subtitle":
             return 2
         match = re.fullmatch(r'heading\s*([1-9])', name)
-        return int(match.group(1)) if match else None
+        return int(match.group(1)) if match and outline is None else None
 
     def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
                            processed_image_hashes: set = None) -> Optional[Union[Dict[str, str], List[Dict[str, str]]]]:
@@ -1524,22 +1535,6 @@ class DocxLoader(BaseOfficeLoader):
                 if image_content:
                     content.append(image_content)
 
-    def _extract_cell_content_with_images(self, cell, extract_images: bool = True,
-                                          ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None) -> str:
-        """Extract complete cell content including text and images (with OCR if enabled)
-
-        Args:
-            cell: DOCX table cell object (python-docx ``_Cell``) or its ``w:tc`` element
-            extract_images: Whether to extract images
-            ocr_images: Whether to use OCR on images
-            ocr_results_map: Pre-computed OCR results map
-
-        Returns:
-            Combined cell content as string, one line per paragraph or nested-table row
-        """
-        tc = getattr(cell, '_tc', cell)
-        return "\n".join(self._tc_lines(tc, extract_images, ocr_images, ocr_results_map or {}))
-
     # ------------------------------------------------------------------ #
     # Tables: read from the w:tbl XML                                     #
     # ------------------------------------------------------------------ #
@@ -1672,8 +1667,7 @@ class DocxLoader(BaseOfficeLoader):
                 markers.append(f"[Image: {ocr_text}]" if ocr_text else "[Image]")
         return markers
 
-    @staticmethod
-    def _table_text_fallback(tbl) -> str:
+    def _table_text_fallback(self, tbl) -> str:
         """Every cell's text on a plain grid (no merges), for a table whose structure
         could not be read; the text itself is never dropped."""
         try:
@@ -1682,7 +1676,7 @@ class DocxLoader(BaseOfficeLoader):
             width = max((len(row) for row in rows), default=0)
             rows = [row + [""] * (width - len(row)) for row in rows if any(cell.strip() for cell in row)]
             if rows:
-                return TableRenderer().render(TableData.from_raw(rows, {'is_complex': False}))
+                return TableRenderer(self.table_style).render(TableData.from_raw(rows, {'is_complex': False}))
         except Exception as e:
             logger.warning(f"DOCX table text fallback failed ({e}); emitting the raw text")
         return "\n".join(t.text for t in tbl.iter(_W_T) if t.text)
@@ -2647,39 +2641,33 @@ class XlsxLoader(BaseOfficeLoader):
 
         merges = [(r.min_row, r.min_col, r.max_row, r.max_col) for r in sheet.merged_cells.ranges
                   if texts.get((r.min_row, r.min_col))]
+        # Decided on the text alone: a logo beside a title must not make the title a table row.
+        table_start = self._table_start(texts, merges)
 
+        cells = dict(texts)
         if extract_images and (texts or pictures):
             marks = self._picture_marks(sheet, texts, merges, pictures, ocr_images, ocr_results_map,
                                         image_data_cache, embedded)
             for position, labels in marks.items():
-                texts[position] = " ".join([texts[position]] + labels) if texts.get(position) else " ".join(labels)
-        if not texts:
+                cells[position] = " ".join(([cells[position]] if cells.get(position) else []) + labels)
+        if not cells:
             return [], embedded
+        if table_start is None:
+            table_start = min(row for row, _ in cells)
 
-        rows = sorted({row for row, _ in texts})
-        cells_in_row: Dict[int, List[int]] = {}
-        for row, col in texts:
-            cells_in_row.setdefault(row, []).append(col)
-
-        # Rows above the first row with two or more cells that hold a single, unmerged
-        # cell are titles ("ACME Corp - Sales Report FY2025"): text above the table, so
-        # the real header row heads the table.
-        first_multi = next((row for row in rows if len(cells_in_row[row]) >= 2), None)
-        titles = []
-        for row in rows:
-            if first_multi is None or row >= first_multi:
-                break
-            col = cells_in_row[row][0]
-            if any(r1 <= row <= r2 and c1 <= col <= c2 for r1, c1, r2, c2 in merges):
-                break
-            titles.append(texts[(row, col)])
-        table_rows = rows[len(titles):]
-        cols = sorted({col for row in table_rows for col in cells_in_row[row]})
-
-        items = [{"type": "text:normal", "content": title, "page": sheet_num} for title in titles]
+        by_row: Dict[int, Dict[int, str]] = {}
+        for (row, col), text in cells.items():
+            by_row.setdefault(row, {})[col] = text
+        # Rows above the table (titles, and pictures placed between them and the table) are
+        # text, one paragraph per row with its cells in column order.
+        items = [{"type": "text:normal", "content": " ".join(text for _, text in sorted(by_row[row].items())),
+                  "page": sheet_num}
+                 for row in sorted(row for row in by_row if row < table_start)]
+        table_rows = sorted(row for row in by_row if row >= table_start)
+        cols = sorted({col for row in table_rows for col in by_row[row]})
         row_pos = {row: i for i, row in enumerate(table_rows)}
         col_pos = {col: j for j, col in enumerate(cols)}
-        grid = [[texts.get((row, col), "") for col in cols] for row in table_rows]
+        grid = [[by_row[row].get(col, "") for col in cols] for row in table_rows]
         # A merge spans the rows and columns it covers that are still in the table.
         spans = {}
         for r1, c1, r2, c2 in merges:
@@ -2697,6 +2685,37 @@ class XlsxLoader(BaseOfficeLoader):
                 "page": sheet_num
             })
         return items, embedded
+
+    @staticmethod
+    def _table_start(texts: Dict[Tuple[int, int], str], merges) -> Optional[int]:
+        """First row of the sheet's table; the text rows above it are titles.
+
+        Only rows above the first row with two or more cells can be titles, and only on
+        strong evidence: the row's single cell is merged across the table's width, or a
+        blank row separates it from the table ("ACME Corp - Sales Report FY2025", blank row,
+        header row). A lone cell right above the table ("Customer" over two-column data) may
+        be a header and stays in the table. None when the sheet has no text.
+        """
+        rows = sorted({row for row, _ in texts})
+        if not rows:
+            return None
+        cols_by_row: Dict[int, List[int]] = {}
+        for row, col in texts:
+            cols_by_row.setdefault(row, []).append(col)
+        first_multi = next((row for row in rows if len(cols_by_row[row]) >= 2), None)
+        if first_multi is None:
+            return rows[0]
+        table_cols = [col for row, col in texts if row >= first_multi]
+        left, right = min(table_cols), max(table_cols)
+        start = first_multi
+        for row in reversed([row for row in rows if row < first_multi]):
+            col = cols_by_row[row][0]
+            across = any((r1, c1) == (row, col) and c1 <= left and c2 >= right and r2 < start
+                         for r1, c1, r2, c2 in merges)
+            if across or start - row > 1:
+                return start
+            start = row
+        return start
 
     @staticmethod
     def _sheet_cells(sheet):
@@ -2736,21 +2755,27 @@ class XlsxLoader(BaseOfficeLoader):
                              if r1 <= position[0] <= r2 and c1 <= position[1] <= c2), position)
             if not (row_lo <= position[0] <= row_hi and col_lo <= position[1] <= col_hi):
                 continue
-            data = image_data_cache.get((sheet.title, index))
-            marks.setdefault(position, []).append(self._picture_label(data, ocr_images, ocr_results_map))
-            embedded.add(('anchor', index))
+            label = self._picture_label(image_data_cache.get((sheet.title, index)), ocr_images, ocr_results_map)
+            marks.setdefault(position, []).append(label)
+            if label != "[Image]":
+                embedded.add(('anchor', index))
         for position, media in pictures.items():
-            data = self._media_bytes(media)
-            marks.setdefault(position, []).append(self._picture_label(data, ocr_images, ocr_results_map))
-            embedded.add(('media', media))
+            label = self._picture_label(self._media_bytes(media), ocr_images, ocr_results_map)
+            marks.setdefault(position, []).append(label)
+            if label != "[Image]":
+                embedded.add(('media', media))
         return marks
 
     def _picture_label(self, data: Optional[bytes], ocr_images: bool, ocr_results_map) -> str:
+        """``[Image: <OCR text>]`` when OCR read the picture, else ``[Image]``. Only a picture
+        whose OCR text went into its cell counts as embedded; any other picture is still
+        emitted after the table, so extracted image data is never dropped."""
         if not (ocr_images and data):
             return "[Image]"
-        text = ocr_results_map.get(_image_hash(data))
-        if text is None:
-            text = self._ocr_image(data)
+        img_hash = _image_hash(data)
+        text = ocr_results_map.get(img_hash)
+        if text is None:  # not in the batch: OCR it once, and remember it for the image item
+            text = ocr_results_map[img_hash] = self._ocr_image(data)
         text = (text or "").strip()
         return f"[Image: {text}]" if text else "[Image]"
 
@@ -2803,7 +2828,7 @@ class XlsxLoader(BaseOfficeLoader):
         with zipfile.ZipFile(self.file_path) as archive:
             names = set(archive.namelist())
             for title, part in _xlsx_sheet_parts(archive).items():
-                if part not in names or not _zip_member_contains(archive, part, (b'<f', b' vm=')):
+                if part not in names or not _zip_member_matches(archive, part, _FORMULA_OR_RICH_VALUE):
                     continue
                 formulas: Dict[Tuple[int, int], str] = {}
                 for _, element in etree.iterparse(archive.open(part), events=('end',), tag=_SML_C,

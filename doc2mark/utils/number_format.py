@@ -13,7 +13,7 @@ rendering, which never drops a digit.
 import datetime
 import re
 from decimal import ROUND_HALF_UP, Decimal
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 __all__ = ["format_cell_value"]
 
@@ -23,6 +23,7 @@ _DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Su
 
 _DATE_TOKEN = re.compile(r"(?i)am/pm|a/p|yyyy|yy|e|b[12]?|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|\.0+")
 _BRACKET = re.compile(r"\[([^\]]*)\]")
+_CONDITION = re.compile(r"\[(<=|>=|<>|<|>|=)\s*(-?\d+(?:\.\d+)?)\]")
 _QUOTED_OR_ESCAPED = re.compile(r'"[^"]*"|\\.')
 _DIGIT_PLACEHOLDERS = "0#?"
 _EMPTY_SLOT = {"0": "0", "#": "", "?": " "}
@@ -88,35 +89,65 @@ def _split_sections(fmt: str) -> List[str]:
     return sections
 
 
-def _strip_brackets(section: str) -> Tuple[str, bool]:
-    """Drop colours and locale tags, keep currency symbols as literals and elapsed-time
-    tokens as plain tokens; report whether the section has a condition like ``[>100]``."""
-    has_condition = False
+def _strip_brackets(section: str) -> str:
+    """Drop colours, conditions and locale tags; keep currency symbols as literals and
+    elapsed-time tokens as plain tokens."""
 
     def replace(match):
-        nonlocal has_condition
         inner = match.group(1)
         if inner.startswith("$"):
             symbol = inner[1:].split("-", 1)[0]
             return f'"{symbol}"' if symbol else ""
-        if inner[:1] in "<>=":
-            has_condition = True
-            return ""
         if re.fullmatch(r"(?i)h+|m+|s+", inner):
             return inner
-        return ""  # colour ([Red], [Color10]) or another tag without text
+        return ""  # colour ([Red], [Color10]), condition ([<0]) or another tag without text
 
-    return _BRACKET.sub(replace, section), has_condition
+    return _BRACKET.sub(replace, section)
+
+
+def _condition(section: str) -> Optional[Tuple[str, float]]:
+    """The ``[<100]``-style condition of a section, if it has one."""
+    match = _CONDITION.search(_unquoted(section))
+    return (match.group(1), float(match.group(2))) if match else None
+
+
+def _holds(condition: Tuple[str, float], value) -> bool:
+    operator, threshold = condition
+    return {"<": value < threshold, "<=": value <= threshold, ">": value > threshold,
+            ">=": value >= threshold, "=": value == threshold, "<>": value != threshold}[operator]
 
 
 def _pick_section(sections: List[str], value) -> Tuple[str, bool]:
-    """(section, show_minus): positive;negative;zero sections, as spreadsheets apply them.
-    An explicit negative section formats the absolute value and shows no automatic minus."""
+    """(section, explicit) as spreadsheets choose it: positive;negative;zero, or by the
+    sections' conditions (``[<0]``, ``[>=1000]``) when the first or second has one.
+
+    ``explicit`` is False when the first section applies only because no other section
+    does; spreadsheets then put a minus in front of a negative number themselves. An
+    explicitly chosen section is given the absolute value.
+    """
+    conditions = [_condition(section) for section in sections]
+    if any(conditions[:2]):
+        if conditions[0] and _holds(conditions[0], value):
+            return sections[0], True
+        if len(sections) > 1 and conditions[1]:
+            if _holds(conditions[1], value):
+                return sections[1], True
+            if len(sections) > 2:
+                return sections[2], True
+        elif len(sections) > 1:
+            return sections[1], True  # a second section without a condition takes the rest
+        return ("General", False) if conditions[0] else (sections[0], False)
     if value < 0 and len(sections) >= 2 and sections[1].strip():
-        return sections[1], False
+        return sections[1], True
     if value == 0 and len(sections) >= 3 and sections[2].strip():
-        return sections[2], False
-    return sections[0], True
+        return sections[2], True
+    return sections[0], False
+
+
+def _writes_sign(tokens: List[Token]) -> bool:
+    """Whether a section prints the sign itself: a literal ``-`` or ``(`` (``-#,##0``,
+    ``(#,##0)``). A negative section told apart only by colour (``[Red]#,##0``) does not."""
+    return any(kind == "lit" and ("-" in text or "(" in text) for kind, text in tokens)
 
 
 # --------------------------------------------------------------------------- numbers
@@ -197,18 +228,22 @@ def _group(digits: str) -> str:
 
 
 def _format_number(value, fmt: str) -> str:
-    section, show_minus = _pick_section(_split_sections(fmt), value)
-    section, has_condition = _strip_brackets(section)
+    section, explicit = _pick_section(_split_sections(fmt), value)
+    section = _strip_brackets(section)
     unquoted = _unquoted(section)
-    if has_condition or "/" in unquoted:
+    if "/" in unquoted:
         return _general(value)
+    tokens = _tokens(section)
+    # The sign survives unless the chosen section prints it itself: a negative section that
+    # differs only by colour ("#,##0.00;[Red]#,##0.00") would otherwise display -1234.5 as
+    # 1,234.50, and the colour does not reach the text.
+    minus = "-" if value < 0 and not (explicit and _writes_sign(tokens)) else ""
     if section.strip().lower() in ("general", ""):
-        return _general(value if show_minus else abs(value))
+        return minus + _general(abs(value))
     if re.search(r"(?i)[ymdhs]", unquoted) and not re.search(r"[0#?]", unquoted):
         return _general(value)  # a date/time format on a plain number
-    tokens = _tokens(section)
     digits = [i for i, token in enumerate(tokens) if _is_digit(token)]
-    if not digits:  # "@", or a literal-only section such as "Yes"
+    if not digits:  # "@", or a literal-only section such as "Yes": the number is not shown
         return _plain(tokens, value) or _general(value)
 
     body = tokens[digits[0]:digits[-1] + 1]
@@ -226,7 +261,8 @@ def _format_number(value, fmt: str) -> str:
         text = _fixed(number, body)
     else:
         text = _scientific(number, body[:exp_at], body[exp_at][1], body[exp_at + 1:])
-    minus = "-" if show_minus and value < 0 and re.search(r"[1-9]", text) else ""
+    if not re.search(r"[1-9]", text):
+        minus = ""  # a value that rounds to zero shows no sign
     return (minus + _plain(prefix, value) + text + _plain(suffix, value)).strip()
 
 
@@ -309,7 +345,7 @@ def _iso(value) -> str:
 
 
 def _format_temporal(value, fmt: str) -> str:
-    section, _ = _strip_brackets(_split_sections(fmt)[0])
+    section = _strip_brackets(_split_sections(fmt)[0])
     if section.strip().lower() == "general" or not re.search(r"(?i)[ymdhs]", _unquoted(section)):
         return _iso(value)
     if isinstance(value, datetime.datetime):

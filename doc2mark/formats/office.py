@@ -18,7 +18,8 @@ from doc2mark.ocr.base import BaseOCR
 # Import the advanced pipeline loader
 try:
     from doc2mark.pipelines.office_advanced_pipeline import (
-        DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader
+        DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader,
+        _W_T, _attr_int, _docx_rendered,
     )
     ADVANCED_PIPELINE_AVAILABLE = True
 except ImportError:
@@ -29,24 +30,11 @@ logger = logging.getLogger(__name__)
 
 _P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 _A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
-_W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 _WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
-_MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
-_W_T = f'{{{_W_NS}}}t'
 _WP_INLINE = f'{{{_WP_NS}}}inline'
 _WP_ANCHOR = f'{{{_WP_NS}}}anchor'
 _WP_EXTENT = f'{{{_WP_NS}}}extent'
 _PIC_PIC = '{http://schemas.openxmlformats.org/drawingml/2006/picture}pic'
-# Subtrees whose content the rendered document does not show (deleted revisions)
-# or shows a second copy of (mc:Fallback duplicates the mc:Choice drawing).
-_DOCX_UNRENDERED = {f'{{{_W_NS}}}del', f'{{{_W_NS}}}moveFrom', f'{{{_MC_NS}}}Fallback'}
-
-
-def _int_attr(element, name: str, default: int = 0) -> int:
-    try:
-        return int(element.get(name, default))
-    except (TypeError, ValueError):
-        return default
 
 
 def _union_area(rects, width: float, height: float) -> float:
@@ -127,10 +115,10 @@ def _pptx_walk_shapes(shapes, transform=(1.0, 0.0, 1.0, 0.0)):
             off, ext = xfrm.find(f'{{{_A_NS}}}off'), xfrm.find(f'{{{_A_NS}}}ext')
             ch_off, ch_ext = xfrm.find(f'{{{_A_NS}}}chOff'), xfrm.find(f'{{{_A_NS}}}chExt')
             if None not in (off, ext, ch_off, ch_ext):
-                csx = _int_attr(ext, 'cx') / _int_attr(ch_ext, 'cx') if _int_attr(ch_ext, 'cx') else 1.0
-                csy = _int_attr(ext, 'cy') / _int_attr(ch_ext, 'cy') if _int_attr(ch_ext, 'cy') else 1.0
-                child = (csx, _int_attr(off, 'x') - _int_attr(ch_off, 'x') * csx,
-                         csy, _int_attr(off, 'y') - _int_attr(ch_off, 'y') * csy)
+                csx = _attr_int(ext, 'cx') / _attr_int(ch_ext, 'cx') if _attr_int(ch_ext, 'cx') else 1.0
+                csy = _attr_int(ext, 'cy') / _attr_int(ch_ext, 'cy') if _attr_int(ch_ext, 'cy') else 1.0
+                child = (csx, _attr_int(off, 'x') - _attr_int(ch_off, 'x') * csx,
+                         csy, _attr_int(off, 'y') - _attr_int(ch_off, 'y') * csy)
         yield from _pptx_walk_shapes(shape.shapes, (child[0] * sx, child[1] * sx + dx, child[2] * sy, child[3] * sy + dy))
 
 
@@ -152,19 +140,26 @@ def _pptx_text_length(shape) -> int:
     return length
 
 
-def _docx_rendered_elements(root):
-    """Every element under ``root`` in document order, minus deleted revisions and
-    ``mc:Fallback`` duplicates."""
-    stack = [iter(root)]
-    while stack:
-        for element in stack[-1]:
-            if not isinstance(element.tag, str) or element.tag in _DOCX_UNRENDERED:
-                continue
-            yield element
-            stack.append(iter(element))
-            break
-        else:
-            stack.pop()
+def _pdf_document_route(pdf_path, ocr=None, table_style=None) -> Optional[str]:
+    """The PDF pipeline's document-level route for ``pdf_path``: ``"image"`` or ``"text"``,
+    or None when the PDF side does not answer in that shape.
+
+    The only call the Office route makes into the PDF pipeline's internals
+    (``PDFLoader._document_image_strategy``, owned by the PDF route); callers treat None
+    as "stay native". ``tests/test_office_route.py`` pins this contract, so a change on
+    the PDF side fails a test instead of silently re-routing Office documents.
+    """
+    from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
+    loader = PDFLoader(pdf_path, ocr=ocr, table_style=table_style)
+    try:
+        decide = getattr(loader, '_document_image_strategy', None)
+        route = decide() if callable(decide) else None
+    finally:
+        loader.close()
+    if route in ('image', 'text'):
+        return route
+    logger.warning(f"PDF route for {Path(pdf_path).name} answered {route!r} instead of 'image'/'text'")
+    return None
 
 
 class OfficeProcessor(BaseProcessor):
@@ -408,27 +403,16 @@ class OfficeProcessor(BaseProcessor):
         text_len = 0
         img_area = 0.0
         for root in roots:
-            for el in _docx_rendered_elements(root):
+            for el in _docx_rendered(root):
                 if el.tag == _W_T:
                     text_len += len(el.text or '')
                 elif el.tag in (_WP_INLINE, _WP_ANCHOR) and el.find(f'.//{_PIC_PIC}') is not None:
                     extent = el.find(_WP_EXTENT)
                     if extent is not None:
-                        img_area += _int_attr(extent, 'cx') * float(_int_attr(extent, 'cy'))
+                        img_area += _attr_int(extent, 'cx') * float(_attr_int(extent, 'cy'))
         sect = d.sections[0]
         page_area = float((sect.page_width or 0) * (sect.page_height or 0)) or 1.0
         return min(img_area / page_area, 1.0), float(text_len)
-
-    def _converted_pdf_route(self, pdf_path: Path) -> Optional[str]:
-        """The PDF pipeline's document route (``"image"``/``"text"``) for the
-        converted file, or None when it cannot be evaluated."""
-        from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
-        loader = PDFLoader(pdf_path, ocr=self.ocr, table_style=self.table_style)
-        try:
-            decide = getattr(loader, '_document_image_strategy', None)
-            return decide() if decide is not None else None
-        finally:
-            loader.close()
 
     def _process_as_image_dominant(
         self, file_path: Path, file_size: int, route_info: Optional[Dict[str, Any]] = None, **kwargs
@@ -437,24 +421,27 @@ class OfficeProcessor(BaseProcessor):
         ``image``, process it with the PDF image strategy (whole-page render OCR +
         page_markdown synthesis), then restore the office identity in the metadata.
 
-        Only the converted PDF's decision counts. When it routes ``text`` (the OOXML
-        pre-filter over-estimated the pictures) this returns None and the caller
-        uses native extraction, which keeps the OOXML tables and structure; the PDF
-        pipeline evaluates the same rule on the same file, so an ``image`` decision
-        here cannot turn into a PDF text-route extraction.
+        Only the converted PDF's decision counts, and only ``image`` routes: when it is
+        ``text`` (the OOXML pre-filter over-estimated the pictures) or cannot be read
+        (:func:`_pdf_document_route` answers None), this returns None and the caller uses
+        native extraction, which keeps the OOXML tables and structure. The PDF pipeline
+        evaluates the same rule on the same file, so an ``image`` decision here cannot
+        turn into a PDF text-route extraction.
         """
         import tempfile
         from doc2mark.utils.libreoffice import convert_office_to
         from doc2mark.formats.pdf import PDFProcessor
         ext = file_path.suffix.lower().lstrip('.')
         doc_format = DocumentFormat.DOCX if ext == 'docx' else DocumentFormat.PPTX
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             pdf_path = convert_office_to(file_path, 'pdf', tmp, timeout=300)
-            if self._converted_pdf_route(pdf_path) == 'text':
-                logger.info(f"📑 {file_path.name}: the converted PDF routes text; using native extraction")
+            route = _pdf_document_route(pdf_path, ocr=self.ocr, table_style=self.table_style)
+            if route != 'image':
+                reason = 'converted PDF routes text' if route == 'text' else 'converted PDF route unavailable'
+                logger.info(f"📑 {file_path.name}: {reason}; using native extraction")
                 if route_info is not None:
                     route_info['routed_via'] = 'native'
-                    route_info['route_reason'] = 'converted PDF routes text'
+                    route_info['route_reason'] = reason
                 return None
             pdf_proc = PDFProcessor(ocr=self.ocr, table_style=self.table_style)
             result = pdf_proc.process(

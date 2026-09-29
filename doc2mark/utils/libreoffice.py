@@ -13,6 +13,7 @@ missing output file; separate profiles make them independent.
 """
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -36,6 +37,8 @@ _CANDIDATE_PATHS = (
 # One retry absorbs a transient failure (a crashed start-up, a busy disk) without
 # doubling the wait on a document that genuinely cannot be converted.
 _ATTEMPTS = 2
+# Seconds to wait for a timed-out soffice to exit after its process group was killed.
+_KILL_WAIT = 10
 
 
 def find_libreoffice() -> Optional[str]:
@@ -107,7 +110,8 @@ class _Timeout(Exception):
 
 
 def _convert_once(soffice: str, input_path: Path, target_format: str, output_dir: Path, timeout: int) -> Path:
-    with tempfile.TemporaryDirectory(prefix="doc2mark-lo-profile-") as profile:
+    profile = tempfile.mkdtemp(prefix="doc2mark-lo-profile-")
+    try:
         cmd = [soffice, f"-env:UserInstallation={Path(profile).as_uri()}", "--headless", "--norestore",
                "--convert-to", target_format, "--outdir", str(output_dir), str(input_path)]
         # A process group of its own: on Linux ``soffice`` is a wrapper script around
@@ -118,10 +122,12 @@ def _convert_once(soffice: str, input_path: Path, target_format: str, output_dir
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc)
-            proc.communicate()
+            _reap(proc)
             raise _Timeout(f"LibreOffice conversion timed out after {timeout}s")
         if proc.returncode != 0:
             raise ConversionError(f"LibreOffice conversion failed: {stderr or stdout or 'unknown error'}")
+    finally:
+        _remove_profile(profile)
     expected = output_dir / (input_path.stem + "." + target_format)
     if expected.exists():
         return expected
@@ -130,6 +136,30 @@ def _convert_once(soffice: str, input_path: Path, target_format: str, output_dir
     if len(matches) == 1:
         return matches[0]
     raise ConversionError(f"Converted file not found: {expected.name}")
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Wait a bounded time for a killed soffice to exit. One stuck in the kernel is left
+    behind (with its pipes closed) rather than blocking the caller forever."""
+    try:
+        proc.communicate(timeout=_KILL_WAIT)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        logger.warning(f"LibreOffice process {proc.pid} was still running {_KILL_WAIT}s after it was killed")
+
+
+def _remove_profile(path: str) -> None:
+    """Delete a conversion's throwaway profile; a failure is logged, never raised over the
+    conversion's own result or error."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        logger.warning(f"Could not remove LibreOffice profile {path}: {exc}")
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
