@@ -112,6 +112,13 @@ REASON_NO_TEXT_LAYER = "no_text_layer"
 REASON_IMAGE_PAGE = "image_dominant_page"
 REASON_TEXT_PAGE = "dense_text_page"
 
+# A page overridden to render OCR for one of these reasons may still carry a little
+# legible painted text (a caption, a heading, a stamp). Whatever of it the OCR did not
+# reproduce is kept verbatim after the OCR, so the override never loses real text.
+# (A garbled layer has nothing verbatim to keep; pages following an image document
+# route are the document's slides or scans.)
+VERBATIM_TAIL_REASONS = (REASON_SEARCHABLE_SCAN, REASON_NO_TEXT_LAYER, REASON_IMAGE_PAGE)
+
 
 def decide_doc_strategy(
     mean_image_coverage: float,

@@ -28,6 +28,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     document_signals as _document_signals,
     judge_text_layer as _judge_text_layer,
     pages_without_text as _pages_without_text,
+    VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
 )
 from doc2mark.pipelines import pdf_routing  # noqa: E402
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
@@ -826,12 +827,24 @@ class PDFLoader:
             render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
             if render_text:
                 self._rendered_pages.add(page_num)
-                return [{
+                items = [{
                     "type": "text:image_description",
                     "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
                     "page": page_num + 1,
                     "position_y": 0.0,
                 }]
+                # A page overridden to render OCR keeps whatever real painted text the
+                # OCR did not reproduce (verbatim first).
+                if self._page_routes.get(page_num, (None, None))[1] in _VERBATIM_TAIL_REASONS:
+                    missing = pdf_routing.missing_painted_lines(page, self._page_measure(page_num), render_text)
+                    if missing:
+                        items.append({
+                            "type": "text:normal",
+                            "content": "\n".join(missing),
+                            "page": page_num + 1,
+                            "position_y": float(page.rect.height),
+                        })
+                return items
             # Blank render, refusal or OCR failure: keep the page's own text layer
             # (verbatim first) rather than drop the page.
             fallback = self._process_page(page_num, extract_images=False, ocr_images=False)

@@ -433,6 +433,22 @@ def text_source(page, measure: PageMeasure, keep_layer: bool):
                            trace_origins=measure.trace_origins), copy
 
 
+def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str]:
+    """The page's painted, legible text lines that ``ocr_text`` does not reproduce (compared
+    without whitespace and case)."""
+    if not measure.signals.visible.chars or measure.signals.visible.garbled:
+        return []
+    seen = "".join(ocr_text.split()).casefold()
+    missing = []
+    for block in page.get_text("dict", flags=TEXT_FLAGS).get("blocks", []):
+        for line in block.get("lines", []) if block.get("type") == 0 else []:
+            text = "".join(span.get("text", "") for span in line.get("spans", [])
+                           if not span_is_invisible(span, measure.trace_origins)).strip()
+            if text and "".join(text.split()).casefold() not in seen:
+                missing.append(text)
+    return missing
+
+
 def describe_pages(page_numbers: Sequence[int], limit: int = 10) -> str:
     """``"pages 2, 5 and 9"`` for 0-based page indexes (at most ``limit`` listed)."""
     shown = [str(number + 1) for number in page_numbers[:limit]]

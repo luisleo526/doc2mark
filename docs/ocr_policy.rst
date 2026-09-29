@@ -183,6 +183,11 @@ matching rule wins):
        (0.55 x 0.5) and it has at least 300 legible characters (200 x 1.5) -- a
        text appendix in a slide deck keeps its verbatim text layer.
 
+A page overridden to render OCR as a searchable scan, a page without a usable
+text layer or a scanned page may still carry a little real, legible text (a
+caption, a heading, a stamp). Whatever of it the OCR did not reproduce is kept
+verbatim after the OCR text, so an override never loses real text.
+
 The margins are hysteresis: a page near a threshold follows its document, so a
 deck or a report keeps one consistent treatment, and only clear outliers switch.
 For example, a Traditional-Chinese product deck with about 82 characters of

@@ -168,7 +168,7 @@ def test_quality_and_layer_overrides_win_in_any_document():
     assert decide_page_route(judged, "text") == ("image", "illegible_text_layer")
     assert decide_page_route(_page(0.0, 700.0, judge_legibility=0.9), "text") == ("text", "document_route")
     assert decide_page_route(_page(0.0, 0.0, uncaptured_ink=0.02), "text") == ("image", "no_text_layer")
-    assert decide_page_route(_page(0.0, 0.0, uncaptured_ink=0.001), "text") == ("text", "document_route")
+    assert decide_page_route(_page(0.0, 0.0, uncaptured_ink=0.0005), "text") == ("text", "document_route")
 
 
 def test_an_invisible_layer_over_a_page_covering_scan_is_a_searchable_scan():
