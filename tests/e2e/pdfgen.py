@@ -19,10 +19,8 @@ Pages = Union[str, Sequence[str]]
 
 A4_POINTS = (595, 842)
 A4_PIXELS_200DPI = (1654, 2339)
+MARGIN_POINTS = 72
 MARGIN_PIXELS = 100
-
-# CJK font for ``font_path`` (installed by ``fonts-noto-cjk`` in tests/e2e/Dockerfile).
-NOTO_CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 
 def _as_pages(pages: Pages) -> List[str]:
@@ -33,13 +31,21 @@ def text_pdf(path: Path, pages: Pages, *, cjk: bool = False, fontsize: int = 14)
     """PDF with a real text layer (extractable without OCR), one A4 page per item.
 
     ``cjk=True`` writes the text with PyMuPDF's built-in Traditional Chinese font
-    (``china-t``); the default is Helvetica.
+    (``china-t``); the default is Helvetica. Text that does not fit on the page
+    raises ``ValueError`` instead of being dropped silently.
     """
     fontname = "china-t" if cjk else "helv"
+    max_width = A4_POINTS[0] - 2 * MARGIN_POINTS
     doc = pymupdf.open()
     for text in _as_pages(pages):
+        lines = text.splitlines()
+        for line in lines:
+            if pymupdf.get_text_length(line, fontname=fontname, fontsize=fontsize) > max_width:
+                raise ValueError(f"line is wider than the page at fontsize={fontsize}: {line!r}")
         page = doc.new_page(width=A4_POINTS[0], height=A4_POINTS[1])
-        page.insert_text((72, 72), text, fontname=fontname, fontsize=fontsize)
+        written = page.insert_text((MARGIN_POINTS, MARGIN_POINTS), text, fontname=fontname, fontsize=fontsize)
+        if written < len(lines):
+            raise ValueError(f"only {written} of {len(lines)} lines fit on the page at fontsize={fontsize}")
     doc.save(str(path))
     doc.close()
     return Path(path)
@@ -48,7 +54,8 @@ def text_pdf(path: Path, pages: Pages, *, cjk: bool = False, fontsize: int = 14)
 def text_png(text: str, *, font_size: int = 110, font_path: Optional[str] = None) -> bytes:
     """PNG (A4 at 200 dpi, black on white) with ``text`` drawn large enough for Tesseract to read reliably.
 
-    The default font is Pillow's built-in Latin one; pass ``font_path`` for other scripts.
+    The default font is Pillow's built-in Latin one (needs Pillow >= 10.1); pass ``font_path`` for other
+    scripts (the first face of a ``.ttc`` file is used).
     """
     width, height = A4_PIXELS_200DPI
     font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default(size=font_size)

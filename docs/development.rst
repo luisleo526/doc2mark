@@ -48,7 +48,9 @@ the checkout into a throwaway container (the checkout itself is mounted read-onl
 installs it with ``pip install -e ".[ocr,dev]"`` (pip cache in the
 ``d2m-e2e-pip-cache`` volume), sets ``D2M_E2E_STRICT=1`` and runs
 ``pytest -m e2e`` with your arguments appended; a later ``-m`` replaces
-``-m e2e``. The exit code is pytest's.
+``-m e2e``. The exit code is pytest's, or 90 when the runner itself could not set
+the run up (image build, copying the checkout, ``pip install``, or a name in
+``D2M_E2E_PASS_ENV`` that is not set).
 
 To forward host environment variables into the container, list their names in
 ``D2M_E2E_PASS_ENV`` (space-separated). Only the names go on the ``docker run``
@@ -78,11 +80,13 @@ Writing E2E tests
 
 ``tests/e2e/conftest.py`` provides:
 
-* ``run_cli(input_path, *args, fmt="markdown", env=None, timeout=300)``: runs the
-  installed ``doc2mark`` console script and returns a result with ``exit_code``,
-  ``stdout``, ``stderr``, ``markdown``, ``json`` (parsed, when ``fmt`` is ``json``
-  or ``both``), ``out_dir`` and ``describe()`` for assertion messages. It supplies
-  ``-o`` and ``--format`` itself, and each call writes to its own fresh directory.
+* ``run_cli(input_path, *args, fmt="markdown", env=None, timeout=300, raw=False)``:
+  runs the installed ``doc2mark`` console script on one file and returns a result
+  with ``exit_code``, ``stdout``, ``stderr``, ``markdown``, ``json`` (parsed, when
+  ``fmt`` is ``json`` or ``both``), ``out_dir`` and ``describe()`` for assertion
+  messages. It supplies ``-o`` and ``--format`` itself, and each call writes to its
+  own fresh directory. ``raw=True`` leaves the whole command line to you (directory
+  input, stdout output); ``markdown`` and ``json`` are then ``None``.
 * ``e2e_dir``: a per-test scratch directory named ``e2e-<test>-<timestamp>`` for
   input files.
 * ``require_tool("tesseract")`` / ``require_tool("soffice")``: call it first in a
@@ -90,9 +94,8 @@ Writing E2E tests
 
 ``tests/e2e/pdfgen.py`` builds input PDFs at test time with PyMuPDF and Pillow:
 ``text_pdf`` (Latin, or CJK with ``cjk=True``) and ``image_pdf`` (page images with
-no text layer, so only OCR can read them; pass ``font_path=pdfgen.NOTO_CJK_FONT``
-for CJK text). Put builders that belong to one lane in your own module so parallel
-work does not conflict.
+no text layer, so only OCR can read them). Put builders that belong to one lane in
+your own module so parallel work does not conflict.
 
 .. code-block:: python
 

@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -30,7 +32,8 @@ def pytest_collection_modifyitems(items):
 
 @dataclass(frozen=True)
 class CliResult:
-    """One CLI run. ``markdown`` / ``json`` are None when the CLI did not write that file."""
+    """One CLI run. ``markdown`` / ``json`` are None when the CLI did not write that file (or, for ``json``,
+    wrote something that is not valid JSON)."""
 
     argv: tuple
     exit_code: int
@@ -62,10 +65,22 @@ def _cli() -> str:
     return script
 
 
+def _read(path: Path) -> Optional[str]:
+    """The file exactly as written (no newline translation) decoded as UTF-8, or None if it does not exist."""
+    return path.read_bytes().decode("utf-8", errors="replace") if path.exists() else None
+
+
+def _parse_json(text: Optional[str]) -> Optional[dict]:
+    try:
+        return json.loads(text) if text is not None else None
+    except ValueError:
+        return None
+
+
 @pytest.fixture
 def e2e_dir(request, tmp_path) -> Path:
     """Per-test scratch dir ``e2e-<test name>-<timestamp>``: build inputs here; ``run_cli`` writes outputs under it."""
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.name)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.name)[:80]
     path = tmp_path / f"e2e-{name}-{time.strftime('%Y%m%d-%H%M%S')}"
     path.mkdir()
     return path
@@ -77,46 +92,53 @@ def run_cli(e2e_dir):
 
     The fixture owns ``-o`` and ``--format``, so do not pass them: ``fmt`` is
     ``markdown`` (default), ``json`` or ``both``, and the output is read back from
-    ``result.md`` / ``result.json``. Every call writes to its own fresh
-    ``<e2e_dir>/out-<n>/``, so a run that writes nothing cannot be mistaken for an
-    earlier run. ``env`` overrides the inherited environment (a ``None`` value
-    removes the variable).
+    ``result.md`` / ``result.json``. ``input_path`` is a single file. Every call
+    writes to its own fresh ``<e2e_dir>/out-<n>/``, so a run that writes nothing
+    cannot be mistaken for an earlier run. ``raw=True`` adds neither ``-o`` nor
+    ``--format`` (``markdown`` and ``json`` stay None), for directory or stdout runs;
+    ``result.out_dir`` is then a scratch directory you can pass as ``-o`` yourself.
+    ``env`` overrides the inherited environment (a ``None`` value removes the
+    variable). On ``timeout`` the whole process group is killed and the test fails.
     """
     runs = itertools.count(1)
 
-    def run(input_path, *args, fmt="markdown", env=None, timeout=300) -> CliResult:
+    def run(input_path, *args, fmt="markdown", env=None, timeout=300, raw=False) -> CliResult:
         out_dir = e2e_dir / f"out-{next(runs)}"
         out_dir.mkdir()
-        argv = [_cli(), str(input_path), "-o", str(out_dir / "result"), "--format", fmt, *map(str, args)]
+        output_args = [] if raw else ["-o", str(out_dir / "result"), "--format", fmt]
+        argv = [_cli(), str(input_path), *output_args, *map(str, args)]
         child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         for key, value in (env or {}).items():
             if value is None:
                 child_env.pop(key, None)
             else:
                 child_env[key] = value
+        proc = subprocess.Popen(
+            argv,
+            cwd=e2e_dir,
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         try:
-            proc = subprocess.run(
-                argv,
-                cwd=e2e_dir,
-                env=child_env,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            pytest.fail(f"doc2mark did not finish within {timeout}s: {' '.join(argv)}", pytrace=False)
-        markdown_file, json_file = out_dir / "result.md", out_dir / "result.json"
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)  # doc2mark and whatever it spawned, e.g. soffice
+            _, stderr = proc.communicate()
+            tail = stderr.decode("utf-8", errors="replace")[-2000:]
+            message = f"doc2mark did not finish within {timeout}s: {' '.join(argv)}\n--- stderr (tail) ---\n{tail}"
+            pytest.fail(message, pytrace=False)
         return CliResult(
             argv=tuple(argv),
             exit_code=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
             out_dir=out_dir,
-            markdown=markdown_file.read_text(encoding="utf-8") if markdown_file.exists() else None,
-            json=json.loads(json_file.read_text(encoding="utf-8")) if json_file.exists() else None,
+            markdown=_read(out_dir / "result.md"),
+            json=_parse_json(_read(out_dir / "result.json")),
         )
 
     return run

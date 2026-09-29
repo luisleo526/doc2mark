@@ -7,7 +7,8 @@
 # checkout into a throwaway container (the checkout itself stays untouched),
 # installs it with `pip install -e ".[ocr,dev]"` (pip cache in the named volume
 # d2m-e2e-pip-cache) and runs `pytest -m e2e <args>` with D2M_E2E_STRICT=1.
-# The exit code is pytest's.
+# The exit code is pytest's, or 90 when the runner could not set the run up
+# (image build, copying the checkout, pip install, an unset D2M_E2E_PASS_ENV variable).
 #
 # D2M_E2E_PASS_ENV: space-separated names of host env vars to forward into the
 # container. Only the names go on the docker command line; the values are read
@@ -31,14 +32,14 @@ image="d2m-e2e:$digest"
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "run_e2e_docker.sh: building $image" >&2
-    docker build -t "$image" - < "$dockerfile"
+    docker build -t "$image" - < "$dockerfile" || exit 90
 fi
 
 pass_env=()
 for var in ${D2M_E2E_PASS_ENV:-}; do
     if [ -z "${!var+x}" ]; then
         echo "run_e2e_docker.sh: $var is listed in D2M_E2E_PASS_ENV but is not set" >&2
-        exit 2
+        exit 90
     fi
     pass_env+=(-e "$var")
 done
@@ -55,6 +56,7 @@ exec docker run --rm --init --name "$name" \
     ${pass_env[@]+"${pass_env[@]}"} \
     "$image" \
     bash -euo pipefail -c '
+        trap "exit 90" ERR
         mkdir /work
         tar -C /src --exclude=.git --exclude=.venv --exclude=.omc --exclude=__pycache__ \
             --exclude=.pytest_cache --exclude="*.egg-info" -cf - . | tar -C /work -xf -
