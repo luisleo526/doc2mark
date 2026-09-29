@@ -96,8 +96,15 @@ def run_cli(e2e_dir):
                 child_env[key] = value
         try:
             proc = subprocess.run(
-                argv, cwd=e2e_dir, env=child_env, stdin=subprocess.DEVNULL, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                argv,
+                cwd=e2e_dir,
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             pytest.fail(f"doc2mark did not finish within {timeout}s: {' '.join(argv)}", pytrace=False)
