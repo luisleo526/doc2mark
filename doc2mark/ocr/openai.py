@@ -902,13 +902,15 @@ class OpenAIOCR(BaseOCR):
         """Process images using LangChain VisionAgent for optimal performance."""
         try:
             # This call's agent, matching its mode: the recovery swaps the shared agent
-            # between structured and free-form, so another thread's call must not ride
-            # on whatever agent happens to be installed.
-            agent = self._ensure_vision_agent(
-                structured=structured,
-                response_model=self.config.response_model if self.config else None,
-                detail=detail,
-            ) or self._vision_agent
+            # between structured and free-form, so a call must not ride on an agent of
+            # the other mode that another thread installed meanwhile.
+            agent = self._vision_agent
+            if isinstance(getattr(agent, "structured", None), bool) and agent.structured != structured:
+                agent = self._ensure_vision_agent(
+                    structured=structured,
+                    response_model=self.config.response_model if self.config else None,
+                    detail=detail,
+                )
 
             # Build the per-image prompts. Structured output selects schema-aligned
             # TASK_PROMPTS; the legacy path keeps the verbose template builder.

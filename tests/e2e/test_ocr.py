@@ -182,8 +182,10 @@ def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_
     rendered = build.render(result.markdown)
     assert rendered.find(["h1", "h2", "h3", "blockquote"]) is None, result.describe()
     visible = build.visible_text(result.markdown)
-    for line in ("# 3 approved motions", "> Chair: J. Lin", "Total ==", "[1]: https://example.com/minutes"):
+    for line in ("# 3 approved motions", "> Chair: J. Lin", "Total", "[1]: https://example.com/minutes"):
         assert line in visible, visible
+    # CommonMark turns the paragraph above a bare "==" / "--" line into a heading.
+    assert not re.search(r"^ {0,3}(=+|-+)[ \t]*$", result.markdown, re.M), result.describe()
 
 
 def test_t10_text_removed_by_sanitizing_page_markdown_is_still_indexed(run_cli, fake_llm, scan):
