@@ -268,10 +268,11 @@ def _runs_overlap(chars: Sequence[Char]) -> bool:
         extent[0] = min(extent[0], char.x0)
         extent[1] = max(extent[1], char.x1)
         extent[2] += 0 if char.text.isspace() else 1
-    boxes = list(extents.values())
-    for i in range(len(boxes)):
-        for j in range(i + 1, len(boxes)):
-            (a0, a1, a_count), (b0, b1, b_count) = boxes[i], boxes[j]
+    boxes = sorted(extents.values())
+    for i, (a0, a1, a_count) in enumerate(boxes):
+        for b0, b1, b_count in boxes[i + 1:]:
+            if b0 >= a1:
+                break  # sorted by left edge: no later run reaches back into this one
             narrower = (a1 - a0, a_count) if a1 - a0 <= b1 - b0 else (b1 - b0, b_count)
             if narrower[1] >= 2 and min(a1, b1) - max(a0, b0) > 0.5 * narrower[0]:
                 return True

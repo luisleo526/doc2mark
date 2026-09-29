@@ -130,8 +130,8 @@ class TableData(BaseModel):
     Invariants enforced by validators:
     - cells is always rectangular (ragged rows padded)
     - All spans clamped to table bounds
-    - A span never covers a non-empty cell or another span: such spans are shrunk
-      (widest first, then tallest) so every value stays visible
+    - A span never covers a non-empty cell: such spans are shrunk (widest first,
+      then tallest) so every value stays visible
     - Continuation cells marked for spanned regions
     - is_complex auto-detected from spans
     - No None values — empty Cell() for missing data
@@ -205,15 +205,14 @@ class TableData(BaseModel):
             padded.append(new_row)
 
         # Pass 2: Mark continuation cells. A span may only cover empty cells that no
-        # earlier span claimed and that anchor no span of their own; otherwise it is
-        # shrunk (keep the widest run of free cells in its first row, then as many
-        # rows as stay free across that width), so no value is ever hidden.
+        # earlier span claimed (an empty cell's own span, e.g. one repeated on every
+        # position of a merged range, is absorbed); a span that would cover text is
+        # shrunk (keep the widest run of free cells in its first row, then as many rows
+        # as stay free across that width), so no value is ever hidden.
         claimed = set()
 
         def is_free(r, c):
-            cell = padded[r][c]
-            return ((r, c) not in claimed and not cell.text.strip()
-                    and cell.rowspan == 1 and cell.colspan == 1)
+            return (r, c) not in claimed and not padded[r][c].text.strip()
 
         shrunk = 0
         for r in range(row_count):

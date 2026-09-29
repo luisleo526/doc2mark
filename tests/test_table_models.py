@@ -133,15 +133,15 @@ class TestTableData:
     def test_span_clamping(self):
         cells = [
             [Cell(text="X", rowspan=100)],
-            [Cell(text="Y")],
-            [Cell(text="Z")],
+            [Cell()],
+            [Cell()],
         ]
         table = TableData(cells=cells)
         assert table.cell(0, 0).rowspan == 3  # clamped to table height
 
     def test_colspan_clamping(self):
         cells = [
-            [Cell(text="X", colspan=10), Cell(text="Y")],
+            [Cell(text="X", colspan=10), Cell()],
         ]
         table = TableData(cells=cells)
         assert table.cell(0, 0).colspan == 2  # clamped to table width
@@ -161,6 +161,14 @@ class TestTableData:
         assert [[c.text for c in row] for row in table.cells] == [["A", "B", "C"], ["D", "E", "F"]]
         assert not any(c.is_continuation for row in table.cells for c in row)
         assert table.cell(0, 0).rowspan == 1 and table.cell(0, 0).colspan == 1
+
+    def test_span_absorbs_empty_cells_that_repeat_it(self):
+        # a merged range reported on each of its positions (the DOCX reader does this)
+        data = [["H", "Q", "R", "S"], ["Grand Total", "", "", "$55,000"]]
+        spans = {(1, 0): (1, 3), (1, 1): (1, 3), (1, 2): (1, 3)}
+        table = TableData.from_raw(data, {"cell_spans": spans, "is_complex": True})
+        assert (table.cell(1, 0).rowspan, table.cell(1, 0).colspan) == (1, 3)
+        assert table.cell(1, 3).text == "$55,000" and not table.cell(1, 3).is_continuation
 
     def test_span_shrinks_to_the_empty_cells(self):
         # widest run of empty cells in the first row, then as many rows as stay empty
