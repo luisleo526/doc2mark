@@ -580,6 +580,97 @@ class PDFLoader:
             self._page_routes[page_num] = route
         return route
 
+    def _text_source(self, page, page_num: int, ocr_images: bool, ocr_results_map: Optional[Dict[tuple, str]]):
+        """The page as the text and table extractors should read it.
+
+        Invisible (render mode 3) text stays only when it is the OCR layer of a
+        searchable scan whose pictures are not OCR'd in this run (no OCR provider,
+        or the page's OCR failed): then it is the only text the page has. With the
+        scan OCR'd it would duplicate the OCR (R-F1); on any other page it is
+        hidden text, not content (H-F15).
+        """
+        measure = self._page_measure(page_num)
+        if not measure.has_invisible_text:
+            return page
+        if measure.signals.searchable_scan and not self._pictures_are_ocrd(page_num, ocr_images, ocr_results_map):
+            return page
+        return pdf_routing.VisibleTextPage(page, measure.trace_origins)
+
+    def _pictures_are_ocrd(self, page_num: int, ocr_images: bool, ocr_results_map: Optional[Dict[tuple, str]]) -> bool:
+        """Whether OCR supplies the content of this page's pictures in this run."""
+        if not ocr_images or self.ocr is None:
+            return False
+        if ocr_results_map is None:
+            return True  # per-page OCR in _extract_images_simple
+        return any(key[0] == page_num and text for key, text in ocr_results_map.items())
+
+    def _record_routing(self, document: Dict[str, Any], ocr_active: bool) -> None:
+        """Record the routing facts in ``document`` and warn about text that cannot be trusted or extracted.
+
+        - ``ocr_routing`` (OCR active only): the document route and the pages that
+          overrode it, with the reason (see core.strategy.decide_page_route).
+        - ``text_layer_quality``: pages whose text layer is garbled (detector or
+          legibility judge), and whether it was replaced by OCR of the render
+          (``"ocr"``) or kept as extracted (``"kept"``, with a warning).
+        - ``hidden_text``: pages whose invisible (render mode 3) text was left out.
+        - A warning when the output is empty, or, without OCR, for pages that have
+          no usable text layer but show content (scans, vector outlines).
+        """
+        n = len(self.doc)
+        if n == 0:
+            return
+        name = self.pdf_path.name
+        signals = [self._page_signals(i) for i in range(n)]
+        if ocr_active:
+            doc_route = self._document_image_strategy()
+            overrides = []
+            for i in range(n):
+                route, reason = self._page_route(i)
+                if route != doc_route:
+                    overrides.append({"page": i + 1, "route": route, "reason": reason})
+            document["ocr_routing"] = {"document_route": doc_route, "overrides": overrides}
+
+        quality, kept = [], []
+        for i, page in enumerate(signals):
+            if not page.text_layer_illegible:
+                continue
+            ocrd = i in self._rendered_pages
+            layer = page.text_layer
+            quality.append({
+                "page": i + 1,
+                "legible": False,
+                "garbage_ratio": round(layer.garbage_ratio, 3),
+                "garbage_glyphs": layer.garbage_glyphs,
+                "judge_legibility": page.judge_legibility,
+                "action": "ocr" if ocrd else "kept",
+            })
+            if not ocrd:
+                kept.append(i)
+        if quality:
+            document["text_layer_quality"] = quality
+        if kept:
+            logger.warning(f"{name} {pdf_routing.describe_pages(kept)}: the text layer looks garbled (undecodable "
+                           f"glyphs or unreadable text) and was kept as extracted; OCR of the page render (an OCR "
+                           f"provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) reads it instead")
+
+        hidden = [i for i, page in enumerate(signals)
+                  if self._page_measures[i].has_invisible_text and not page.searchable_scan]
+        if hidden:
+            document["hidden_text"] = [{"page": i + 1, "chars": signals[i].invisible.chars} for i in hidden]
+            logger.warning(f"{name} {pdf_routing.describe_pages(hidden)}: invisible (render mode 3) text that the "
+                           f"page does not show was left out of the output")
+
+        if not any(str(item.get("content", "")).strip() for item in document.get("content", [])):
+            hint = ("" if ocr_active else "; its pages carry no usable text layer, enable OCR (an OCR provider "
+                    "with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read scanned or drawn pages")
+            logger.warning(f"{name}: no text could be extracted from its {n} page(s){hint}")
+        elif not ocr_active:
+            missing = _pages_without_text(signals)
+            if missing:
+                logger.warning(f"{name} {pdf_routing.describe_pages(missing)}: little or no text layer; content "
+                               f"shown only as scanned images or drawn outlines was not extracted; enable OCR (an "
+                               f"OCR provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read it")
+
     def _render_page_png(self, page) -> bytes:
         """Rasterize a whole page to PNG bytes for page-level OCR."""
         return page.get_pixmap(dpi=_PAGE_RENDER_DPI).tobytes("png")
@@ -765,97 +856,6 @@ class PDFLoader:
                 simple_content.append(entry)
 
         return simple_content
-
-    def _text_source(self, page, page_num: int, ocr_images: bool, ocr_results_map: Optional[Dict[tuple, str]]):
-        """The page as the text and table extractors should read it.
-
-        Invisible (render mode 3) text stays only when it is the OCR layer of a
-        searchable scan whose pictures are not OCR'd in this run (no OCR provider,
-        or the page's OCR failed): then it is the only text the page has. With the
-        scan OCR'd it would duplicate the OCR (R-F1); on any other page it is
-        hidden text, not content (H-F15).
-        """
-        measure = self._page_measure(page_num)
-        if not measure.has_invisible_text:
-            return page
-        if measure.signals.searchable_scan and not self._pictures_are_ocrd(page_num, ocr_images, ocr_results_map):
-            return page
-        return pdf_routing.VisibleTextPage(page, measure.trace_origins)
-
-    def _pictures_are_ocrd(self, page_num: int, ocr_images: bool, ocr_results_map: Optional[Dict[tuple, str]]) -> bool:
-        """Whether OCR supplies the content of this page's pictures in this run."""
-        if not ocr_images or self.ocr is None:
-            return False
-        if ocr_results_map is None:
-            return True  # per-page OCR in _extract_images_simple
-        return any(key[0] == page_num and text for key, text in ocr_results_map.items())
-
-    def _record_routing(self, document: Dict[str, Any], ocr_active: bool) -> None:
-        """Record the routing facts in ``document`` and warn about text that cannot be trusted or extracted.
-
-        - ``ocr_routing`` (OCR active only): the document route and the pages that
-          overrode it, with the reason (see core.strategy.decide_page_route).
-        - ``text_layer_quality``: pages whose text layer is garbled (detector or
-          legibility judge), and whether it was replaced by OCR of the render
-          (``"ocr"``) or kept as extracted (``"kept"``, with a warning).
-        - ``hidden_text``: pages whose invisible (render mode 3) text was left out.
-        - A warning when the output is empty, or, without OCR, for pages that have
-          no usable text layer but show content (scans, vector outlines).
-        """
-        n = len(self.doc)
-        if n == 0:
-            return
-        name = self.pdf_path.name
-        signals = [self._page_signals(i) for i in range(n)]
-        if ocr_active:
-            doc_route = self._document_image_strategy()
-            overrides = []
-            for i in range(n):
-                route, reason = self._page_route(i)
-                if route != doc_route:
-                    overrides.append({"page": i + 1, "route": route, "reason": reason})
-            document["ocr_routing"] = {"document_route": doc_route, "overrides": overrides}
-
-        quality, kept = [], []
-        for i, page in enumerate(signals):
-            if not page.text_layer_illegible:
-                continue
-            ocrd = i in self._rendered_pages
-            layer = page.text_layer
-            quality.append({
-                "page": i + 1,
-                "legible": False,
-                "garbage_ratio": round(layer.garbage_ratio, 3),
-                "garbage_glyphs": layer.garbage_glyphs,
-                "judge_legibility": page.judge_legibility,
-                "action": "ocr" if ocrd else "kept",
-            })
-            if not ocrd:
-                kept.append(i)
-        if quality:
-            document["text_layer_quality"] = quality
-        if kept:
-            logger.warning(f"{name} {pdf_routing.describe_pages(kept)}: the text layer looks garbled (undecodable "
-                           f"glyphs or unreadable text) and was kept as extracted; OCR of the page render (an OCR "
-                           f"provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) reads it instead")
-
-        hidden = [i for i, page in enumerate(signals)
-                  if self._page_measures[i].has_invisible_text and not page.searchable_scan]
-        if hidden:
-            document["hidden_text"] = [{"page": i + 1, "chars": signals[i].invisible.chars} for i in hidden]
-            logger.warning(f"{name} {pdf_routing.describe_pages(hidden)}: invisible (render mode 3) text that the "
-                           f"page does not show was left out of the output")
-
-        if not any(str(item.get("content", "")).strip() for item in document.get("content", [])):
-            hint = ("" if ocr_active else "; its pages carry no usable text layer, enable OCR (an OCR provider "
-                    "with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read scanned or drawn pages")
-            logger.warning(f"{name}: no text could be extracted from its {n} page(s){hint}")
-        elif not ocr_active:
-            missing = _pages_without_text(signals)
-            if missing:
-                logger.warning(f"{name} {pdf_routing.describe_pages(missing)}: little or no text layer; content "
-                               f"shown only as scanned images or drawn outlines was not extracted; enable OCR (an "
-                               f"OCR provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read it")
 
     def _extract_text_as_markdown(self, page, page_num: int, table_bboxes: List[tuple] = None) -> List[SimpleContent]:
         """Extract text blocks and convert to markdown format with text type classification"""
