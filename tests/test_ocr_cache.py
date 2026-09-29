@@ -505,7 +505,7 @@ def test_cache_key_schema_and_api_key_identity_are_credential_scoped():
     provider.api_key = "tenant-b-secret"
     tenant_b_key = build_ocr_cache_key(provider, image)
 
-    assert CACHE_SCHEMA_VERSION == "ocr-cache-v4"
+    assert CACHE_SCHEMA_VERSION == "ocr-cache-v5"
     assert tenant_a_key != tenant_b_key
     assert "tenant-a-secret" not in tenant_a_key
     assert "tenant-b-secret" not in tenant_b_key

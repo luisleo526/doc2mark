@@ -1,0 +1,239 @@
+"""Refusal / "no readable text" handling for the logic the CLI E2E tests cannot reach:
+the deterministic patterns over the labelled answers of the Jev spike (report section
+3.2), the optional ``non_content_judge`` hook, and Gemini's native block signals
+(the E2E image has no Gemini client and no Google credentials)."""
+
+import io
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from PIL import Image
+
+from doc2mark.ocr.base import OCRConfig, OCRResult
+from doc2mark.ocr.openai import OpenAIOCR
+from doc2mark.ocr.refusal import matches_non_content_pattern, non_content_reason
+from doc2mark.ocr.schema import OCRPage, RawExtraction
+from doc2mark.ocr.vertex_ai import VertexAIOCR, VertexAIVisionAgent
+
+# (answer, is_non_content): 41 of the 42 hand-labelled answers of the Jev spike B dataset
+# (the 42nd, a JSON error body, is JSON_ERROR below).
+JEV_ANSWERS = [
+    ("I'm sorry, but I can't assist with that request.", True),
+    ("I'm sorry, I can't help with identifying or making assumptions about people in images.", True),
+    ("I am unable to transcribe this image because the resolution is too low and the text is not legible.", True),
+    ("The image appears to be blank or contains no visible text.", True),
+    ("No text detected.", True),
+    ("There is no readable text in this image. It seems to be a decorative background graphic.", True),
+    ("As an AI language model, I cannot read the contents of this document image.", True),
+    ("Unable to process the image. Please provide a clearer scan of the page.", True),
+    ("I can't transcribe copyrighted book pages in full, but I can summarize the general topic if you'd like.", True),
+    ("抱歉，我無法辨識這張圖片中的文字。", True),
+    ("很抱歉，這張圖片解析度過低，無法進行文字轉錄。", True),
+    ("对不起，我无法处理这张图片的内容。", True),
+    ("圖片中沒有可辨識的文字。", True),
+    ("申し訳ありませんが、この画像の文字を読み取ることができません。", True),
+    ("죄송하지만 이 이미지의 텍스트를 인식할 수 없습니다.", True),
+    ("Leider kann ich den Text in diesem Bild nicht erkennen.", True),
+    ("[No content]", True),
+    ("The page seems to be mostly empty; I could not find any content to transcribe.", True),
+    ("This image may contain sensitive personal information, so I won't transcribe it.", True),
+    ("## 03 / 關鍵差異\n一般 AI 工具多聚焦個人效率；TeamSync AI 聚焦組織導入後的資料治理、流程銜接、權限控管與跨系統執行。", False),
+    ("產品定位\nAI Core 企業AI作業核心", False),
+    ("Introduction\nThis is a comprehensive sample DOCX document that demonstrates various document elements "
+     "including text formatting, images, and tables.", False),
+    ("<table><tr><th>Engine</th><th>MT</th><th>DSG</th></tr><tr><td>1.0 TSI/85 kW</td><td>✓</td><td>–</td></tr></table>", False),
+    ("7-ELEVEN 統一超商\n2026/09/12 14:03\n鮮奶茶 1 x 35\n御飯糰 2 x 32\n合計 NT$99\n統一編號 22555003", False),
+    ("Bar chart titled 'Quarterly revenue (NT$M)'. Q1 120, Q2 135, Q3 160, Q4 171. Revenue grows every quarter.", False),
+    ("A photograph of a factory floor with two workers inspecting a CNC machine; a sign on the wall reads "
+     "'SAFETY FIRST'.", False),
+    ("數辰創藝科技 logo", False),
+    ("Sorry we missed you!\nWe tried to deliver your parcel today. Scan the QR code to reschedule delivery.", False),
+    ("We cannot accept returns after 30 days. Items must be unused and in the original packaging.", False),
+    ("Dear Mr. Chen,\nI am sorry to inform you that your application for the 2026 grant was not successful. "
+     "We received 412 proposals this year.", False),
+    ("Error 503\nService Unavailable\nThe server is temporarily unable to service your request. "
+     "Please try again later.", False),
+    ("No text? No problem.\nOur OCR engine reads handwriting, stamps and faded scans.", False),
+    ("致歉聲明\n本公司因系統異常導致9月12日訂單延遲出貨，造成不便，深感抱歉。", False),
+    ("Name: ________\nDate: ________\nSignature: ________\n(This page intentionally left blank for notes)", False),
+    ("This page intentionally left blank.", False),
+    ("$ pip install doc2mark\nSuccessfully installed doc2mark-0.6.1", False),
+    ("Thank you!\nQ&A", False),
+    ("- 12 -", False),
+    ("第3章 システム構成\n本システムは、データ収集層、解析層、表示層の三層で構成される。", False),
+    ("Here is the transcription of the image:\n\nMeeting agenda\n1. Budget review\n2. Hiring plan\n3. Q4 roadmap", False),
+    ("Invoice No. 2026-0917\nBill to: Acme Ltd.\nAmount due: [illegible]\nDue date: 2026-10-15", False),
+]
+# A JSON error body could also be a screenshot of an API error: the patterns leave it
+# to the judge (conservative), which the Jev spike showed catches it.
+JSON_ERROR = '{"error": "image could not be read"}'
+
+
+@pytest.mark.parametrize("answer, is_non_content", JEV_ANSWERS)
+def test_patterns_on_the_jev_labelled_answers(answer, is_non_content):
+    assert matches_non_content_pattern(answer) is is_non_content
+
+
+@pytest.mark.parametrize("answer", [
+    "There are no words to describe our gratitude.",
+    "We can't open on Sundays.",
+    "抱歉，本店無法提供外送服務。",
+    "No content found",
+    "I can't help falling in love with you",
+    "Leider kann ich morgen nicht kommen.",
+    "申し訳ございませんが、ご利用いただけません。",
+])
+def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
+    assert not matches_non_content_pattern(answer)
+
+
+def test_patterns_ignore_long_answers_that_start_with_an_apology():
+    answer = "I'm sorry, but I can't read the header. " + "Line item 12 costs 30 dollars. " * 20
+    assert not matches_non_content_pattern(answer)
+
+
+class TestJudgeContract:
+    def test_judge_decides_what_the_patterns_leave(self):
+        seen = []
+        assert non_content_reason(JSON_ERROR, lambda text: seen.append(text) or 0.97) == "judge"
+        assert seen == [JSON_ERROR]
+
+    def test_judge_is_not_consulted_when_a_pattern_fires(self):
+        seen = []
+        assert non_content_reason("No text detected.", lambda text: seen.append(text) or 0.0) == "pattern"
+        assert seen == []
+
+    @pytest.mark.parametrize("judge", [
+        pytest.param(lambda text: None, id="cannot-judge"),
+        pytest.param(lambda text: 0.49, id="below-threshold"),
+        pytest.param(lambda text: 1 / 0, id="raises"),
+        pytest.param(lambda text: "yes", id="not-a-probability"),
+    ])
+    def test_answers_are_kept_unless_the_judge_says_non_content(self, judge):
+        assert non_content_reason(JSON_ERROR, judge) is None
+
+    def test_threshold_is_inclusive(self):
+        assert non_content_reason(JSON_ERROR, lambda text: 0.5) == "judge"
+
+    def test_long_answers_are_not_sent_to_the_judge(self):
+        seen = []
+        assert non_content_reason("word " * 200, lambda text: seen.append(text) or 1.0) is None
+        assert seen == []
+
+
+class TestProviderJudgeHook:
+    """OCRConfig.non_content_judge on an LLM provider: a judged refusal goes to the
+    free-form recovery; if that is a refusal too, the result is empty and flagged."""
+
+    def _provider(self, monkeypatch, judge, recovered_text):
+        ocr = OpenAIOCR(api_key="test-key", config=OCRConfig(non_content_judge=judge))
+        monkeypatch.setattr(ocr, "_ensure_vision_agent", lambda *a, **k: None)
+        monkeypatch.setattr(ocr, "_batch_process_with_vision_agent",
+                            lambda imgs, *a, **k: [OCRResult(text=recovered_text) for _ in imgs])
+        return ocr
+
+    @staticmethod
+    def _answer(text):
+        return OCRResult(text=text, document=OCRPage(raw=RawExtraction(text=text)), metadata={})
+
+    @staticmethod
+    def _judge(text):
+        """Recognizes the JSON error body only, like a real judge would."""
+        return 0.97 if text == JSON_ERROR else 0.02
+
+    def test_judged_refusal_is_recovered(self, monkeypatch):
+        ocr = self._provider(monkeypatch, self._judge, "Invoice No. 2026-0917")
+        results = [self._answer(JSON_ERROR)]
+
+        ocr._screen_structured_answers(results)
+        out = ocr._recover_empty_structured(results, [b"img"])
+
+        assert out[0].text == "Invoice No. 2026-0917"
+        assert out[0].metadata["structured_fallback"] == "free_form"
+        assert not out[0].metadata.get("ocr_refusal")
+
+    def test_judged_refusal_with_refused_recovery_is_empty_and_flagged(self, monkeypatch):
+        ocr = self._provider(monkeypatch, self._judge, "I'm sorry, but I can't assist with that request.")
+        results = [self._answer(JSON_ERROR)]
+
+        ocr._screen_structured_answers(results)
+        out = ocr._recover_empty_structured(results, [b"img"])
+
+        assert out[0].text == ""
+        assert out[0].metadata["ocr_refusal"] is True
+
+    def test_without_a_judge_the_answer_is_kept(self, monkeypatch):
+        ocr = self._provider(monkeypatch, None, "unused")
+        results = [self._answer(JSON_ERROR)]
+
+        ocr._screen_structured_answers(results)
+
+        assert results[0].text == JSON_ERROR
+
+
+def _png() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _ScriptedGeminiAgent:
+    """Stands in for the LangChain Gemini chain: structured and free-form replies are
+    scripted, everything after the chain is the real provider code."""
+
+    def __init__(self, structured, free_form):
+        self.structured, self.free_form, self.calls = list(structured), list(free_form), []
+
+    def batch_invoke(self, input_dicts, structured=None):
+        self.calls.append("structured" if structured else "free_form")
+        replies = self.structured if structured else self.free_form
+        return [replies.pop(0) for _ in input_dicts]
+
+    _extract_usage = staticmethod(VertexAIVisionAgent._extract_usage)
+
+
+@pytest.mark.parametrize("finish_reason", ["SAFETY", "RECITATION", "FinishReason.PROHIBITED_CONTENT", 4])
+def test_gemini_blocked_answer_is_no_content(finish_reason):
+    blocked = SimpleNamespace(content="partial recited page", usage_metadata={},
+                              response_metadata={"finish_reason": finish_reason})
+    parsed = OCRPage(raw=RawExtraction(text="partial recited page"))
+    agent = _ScriptedGeminiAgent(
+        structured=[{"parsed": parsed, "raw": blocked, "parsing_error": None}],
+        free_form=[("", {})],
+    )
+    ocr = VertexAIOCR(api_key="test-key", config=OCRConfig())
+    ocr._vision_agent = agent
+
+    [result] = ocr.batch_process_images([_png()])
+
+    assert result.text == "" and "partial" not in result.document.raw.text
+    assert result.metadata["ocr_refusal"] is True
+    assert agent.calls == ["structured", "free_form"], "the free-form recovery must be tried first"
+
+
+def test_gemini_free_form_block_returns_no_text():
+    blocked = SimpleNamespace(content="partial", usage_metadata={"total_tokens": 3},
+                              response_metadata={"finish_reason": "SAFETY"})
+    agent = VertexAIVisionAgent.__new__(VertexAIVisionAgent)
+    agent.structured = False
+    agent.max_concurrency = None
+    agent._chain = MagicMock()
+    agent._chain.batch_as_completed.return_value = [(0, blocked)]
+
+    assert agent.batch_invoke([{"image_data": "", "prompt": "p"}], structured=False) == [("", {"total_tokens": 3})]
+
+
+def test_gemini_stop_is_content():
+    ok = SimpleNamespace(content="Board minutes 2026", usage_metadata={}, response_metadata={"finish_reason": "STOP"})
+    agent = _ScriptedGeminiAgent(
+        structured=[{"parsed": OCRPage(raw=RawExtraction(text="Board minutes 2026")), "raw": ok, "parsing_error": None}],
+        free_form=[],
+    )
+    ocr = VertexAIOCR(api_key="test-key", config=OCRConfig())
+    ocr._vision_agent = agent
+
+    [result] = ocr.batch_process_images([_png()])
+
+    assert result.text == "Board minutes 2026" and not result.metadata.get("ocr_refusal")
+    assert agent.calls == ["structured"]

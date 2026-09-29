@@ -186,6 +186,93 @@ See :doc:`/tables` for how tables flow through the loader and into the final
 document.
 
 
+Sanitised output
+----------------
+
+OCR text comes from a model reading an image, and an image can show anything,
+including markup. ``OCRResult.text`` (what the loader writes into the document) is
+therefore rendered safe, while the structured fields keep what the model returned.
+
+``Table.html`` is cleaned when the result is built:
+
+- only table tags (``table``/``thead``/``tbody``/``tfoot``/``tr``/``th``/``td``/
+  ``caption``/``col``/``colgroup``), the inert ``<br>`` and the ``colspan`` /
+  ``rowspan`` / ``scope`` attributes survive; scripts, styles and embedded objects are
+  removed with their content, every other tag is unwrapped keeping its text, and HTML
+  comments and processing instructions are dropped;
+- line structure inside a cell (``<br>``, ``<p>``, ``<li>``, ``<div>``, a newline)
+  becomes ``<br>``, so ``Net<br>income`` never turns into ``Netincome``;
+- text next to a table is kept: before it, it becomes the table's ``<caption>`` (a
+  title or a unit line such as ``Unit: NT$ thousand``); after it, it follows the
+  table. A Markdown pipe table put in the field is converted to HTML;
+- the grid is made rectangular per table (a nested table or a second table keeps its
+  own grid). Spans are bounded: ``colspan`` never exceeds the widest row's cell count
+  and ``rowspan`` never runs past its row group (``rowspan="0"`` is written out as the
+  rows to the end of the group), so a model cannot make one table cost seconds or
+  megabytes. An empty cell emitted for a position a rowspan already covers is dropped,
+  and a short row is padded where its cells line up with their columns (``Cost | 80``
+  under ``Item | Unit | 2024`` keeps ``80`` under ``2024``).
+
+Every other string is escaped when the page is rendered
+(:meth:`~doc2mark.ocr.schema.OCRPage.to_markdown`), following the escaping policy used
+for all document text: a ``<`` becomes ``&lt;`` only before a letter, ``/``, ``!`` or
+``?`` (so ``x < 5`` stays as it is), ``&`` only where it starts an entity, and control
+characters are removed.
+
+- Transcriptions (``raw.text``, captions, figure and section labels, and Tesseract
+  output) are plain text: a line that starts with a Markdown block marker (``#``,
+  ``>``, ``-``, ``1.``, a code fence, a rule) gets a backslash, so it stays text.
+- Model-written Markdown (``page_markdown``, ``Table.markdown`` and free-form
+  answers) keeps its Markdown; any ``<table>`` in it goes through the table cleaner
+  above, and other raw HTML except ``<br>`` is neutralised.
+- The flat ``headers`` / ``rows`` table escapes ``|`` and turns line breaks into
+  spaces, so every value stays in its cell.
+
+
+Refusals and "no readable text" answers
+---------------------------------------
+
+A vision model sometimes answers with "I'm sorry, but I can't assist with that
+request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark never
+indexes such an answer as page content:
+
+1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
+   when a structured answer ignores the schema), and Gemini answers stopped for
+   ``SAFETY``, ``RECITATION``, ``BLOCKLIST``, ``PROHIBITED_CONTENT`` or ``SPII``.
+2. A short answer that starts with a refusal or "no readable text" phrase (English,
+   Chinese, Japanese, Korean, German, Spanish, French) counts as no content too. The
+   check is conservative: real text that merely mentions an apology ("Sorry we missed
+   you!", "This page intentionally left blank.") is kept.
+3. A structured answer with no content goes to the free-form recovery, as an empty
+   one always did. If the recovered answer is a refusal as well, the result is empty
+   text with ``metadata["ocr_refusal"] = True``.
+
+For the cases the patterns cannot decide, pass a judge:
+
+.. code-block:: python
+
+   def judge(ocr_text: str) -> float | None:
+       """Probability (0..1) that ocr_text is ONLY a refusal, apology, error or
+       "no readable text" statement; None when it cannot tell."""
+
+   ocr = OCR("openai", non_content_judge=judge)
+   loader = UnifiedDocumentLoader(ocr_provider="openai", ocr_config=OCRConfig(non_content_judge=judge))
+
+The judge sees answers of at most 600 characters, and only when the patterns did not
+fire. A probability of 0.5 or more counts as no content; ``None``, or an exception
+(logged), keeps the answer. Without a judge the patterns alone decide, and an
+undecided answer is kept.
+
+The loader reports what happened per document in
+``ProcessedDocument.metadata.extra["ocr_issues"]`` (present only when something did):
+``refused`` (answers emitted empty as refusals), ``failed`` (images that could not be
+read), ``withheld`` (images whose illustrative rows stayed withheld; their Markdown
+says ``[N illustrative rows not transcribed]``) and up to five ``errors``. An OCR engine
+that cannot run at all, such as Tesseract without the requested language data, raises
+``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI
+exits non-zero.
+
+
 Providers
 ---------
 

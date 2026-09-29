@@ -59,11 +59,19 @@ class TestTableHtmlNormalization:
         assert w == 2 and widths == [2, 2]
 
     def test_colspan_counted_when_normalizing(self):
-        # row 1 is 3 wide via colspan; row 2 has a single cell -> pad to 3.
+        # row 1 is 3 wide via colspan (row 2 cell by cell); row 3 has a single cell -> pad to 3.
         ragged = ('<table><tr><th colspan="3">H</th></tr>'
+                  "<tr><td>a</td><td>b</td><td>c</td></tr>"
                   "<tr><td>only</td></tr></table>")
         widths, w = _row_grid_widths(normalize_table_html(ragged))
-        assert w == 3 and widths == [3, 3]
+        assert w == 3 and widths == [3, 3, 3]
+
+    def test_colspan_is_capped_at_the_widest_row(self):
+        # no row has more than one cell, so a colspan of 3 cannot widen the grid.
+        out = normalize_table_html('<table><tr><th colspan="3">H</th></tr><tr><td>only</td></tr></table>')
+        widths, w = _row_grid_widths(out)
+        assert w == 1 and widths == [1, 1]
+        assert "colspan" not in out and "H" in out and "only" in out
 
     def test_rowspan_carryover_not_overpadded(self):
         # 'a' spans into row 2, so row 2 already occupies 2 cols (a + c) -> no padding.
