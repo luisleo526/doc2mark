@@ -3166,11 +3166,16 @@ def office_to_json(
     return json_data
 
 
+_MARKDOWN_LIST_MARKER = re.compile(r'[-+*]|\d{1,9}[.)]')
+
+
 def office_to_markdown(json_data: Dict[str, Any]) -> str:
     """Convert Office JSON data to markdown string"""
     markdown_parts = []
     current_page = None
-    list_depth, list_page = -1, None  # nesting of the previous list item; -1 after anything else
+    # Depth of the deepest list item still open in the current run of list items
+    # (only markers Markdown recognises open one); -1 when none is.
+    list_depth, list_page = -1, None
 
     # Determine marker label from filename
     filename = json_data.get("filename", "")
@@ -3192,13 +3197,19 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
 
         # Structure read from the file (list marker, heading level) sits beside the
         # verbatim ``content``; only the prefix is built here. A list item nests at
-        # most one level deeper than the list item right before it, so an indented
-        # line can never start an indented code block.
+        # most one level below a preceding item of the same run whose marker is a
+        # Markdown list marker ("-", "1.", "1)"), so an indented line always continues
+        # a list and never starts an indented code block.
         if item["type"] == "text:list" and item.get("marker"):
-            continues = list_depth >= 0 and item.get("page") == list_page
-            depth = min(item.get("list_level", 0), list_depth + 1) if continues else 0
+            if item.get("page") != list_page:
+                list_depth = -1
+            depth = min(item.get("list_level", 0), list_depth + 1)
             markdown_parts.append(f"{'    ' * depth}{item['marker']} {item['content']}\n")
-            list_depth, list_page = depth, item.get("page")
+            if _MARKDOWN_LIST_MARKER.fullmatch(item["marker"]):
+                list_depth = depth
+            else:  # a paragraph ("(a) ..."): it closes list items at its own depth and deeper
+                list_depth = min(list_depth, depth - 1)
+            list_page = item.get("page")
             continue
         list_depth = -1
         if item["type"] in ("text:title", "text:section") and item.get("level"):
