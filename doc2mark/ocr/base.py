@@ -1,14 +1,25 @@
 """Base OCR interface for doc2mark."""
 
+import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Type, Union
+
+from doc2mark.core.base import OCRError
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (schema has no deps on base)
     from pydantic import BaseModel
     from doc2mark.ocr.schema import OCRPage
+
+logger = logging.getLogger(__name__)
+
+
+class OCREngineError(OCRError):
+    """The OCR engine itself cannot run: not installed, language data missing, a
+    broken ``TESSDATA_PREFIX``. Unlike a failure on one image it affects every image,
+    so the document loader re-raises it instead of emitting placeholder text."""
 
 
 def resolve_max_concurrency(config_value: Optional[int] = None) -> Optional[int]:
@@ -113,6 +124,16 @@ _ROUTER_CONFIDENCE_CLAUSE = (
     "transcribe them. The describe and screenshot policies may be used ONLY when your "
     "self_confidence >= 0.7 AND legibility is \"high\". Otherwise, and whenever context "
     "is absent or conflicting, use VERBATIM."
+)
+
+# Sent with every auto-routed request that carries NO neighbor-page PDF: context is
+# absent, so the router's third gate cannot hold and nothing may be withheld. The
+# providers also enforce this on the result (schema.withholding_violations).
+_ROUTER_NO_CONTEXT_CLAUSE = (
+    "No neighbor-page context is attached to this image, so context is absent: use "
+    "VERBATIM. Transcribe every legible printed character, every table row and every "
+    "value; never leave a table header-only and never mark anything illustrative. The "
+    "describe policy may only add interpretation on top of a complete verbatim transcription."
 )
 
 TASK_PROMPTS: Dict["Task", str] = {
@@ -251,6 +272,13 @@ class OCRConfig:
     timeout: int = 30
     extra: Optional[Dict[str, Any]] = None
 
+    # --- optional judge for refusal / "no readable text" answers (LLM providers) ---
+    # ``judge(ocr_text) -> Optional[float]``: probability that a short OCR answer is
+    # ONLY a refusal, apology, error or "no readable text" statement. Consulted when
+    # the deterministic check does not fire; None (the default) or a None answer keeps
+    # the text. Full contract: doc2mark.ocr.refusal.NonContentJudge.
+    non_content_judge: Optional[Callable[[str], Optional[float]]] = None
+
     def deprecated_llm_overrides(self) -> List[str]:
         """Return the names of deprecated/inert fields the user set to a
         non-default value. LLM providers use this to emit a single
@@ -324,8 +352,49 @@ class BaseOCR(ABC):
         raw = doc.raw
         return not (raw.text.strip() or raw.tables or raw.fields)
 
+    # --- refusals and "no readable text" answers (shared by the LLM providers) ---
+    def _non_content_judge(self) -> Optional[Callable[[str], Optional[float]]]:
+        return getattr(self.config, "non_content_judge", None) if self.config is not None else None
+
     @staticmethod
+    def _without_content(result: OCRResult, **flags: Any) -> OCRResult:
+        """``result`` with no text and an empty page, plus metadata ``flags``."""
+        from doc2mark.ocr.schema import OCRPage
+        meta = dict(result.metadata or {})
+        meta.update(flags)
+        return replace(result, text="", document=OCRPage(), metadata=meta)
+
+    def _screen_structured_answers(self, results: List[OCRResult]) -> None:
+        """Empty (in place) every structured answer that is only a refusal or a "no
+        readable text" statement, so the empty-result recovery re-reads that image.
+
+        Provider-native refusals are emptied by the providers themselves; this is the
+        deterministic multilingual check plus the optional ``non_content_judge`` (see
+        :mod:`doc2mark.ocr.refusal`). Answers with tables or fields are content.
+        """
+        from doc2mark.ocr.refusal import non_content_reason
+        judge = self._non_content_judge()
+        for index, result in enumerate(results):
+            doc = result.document
+            if doc is not None and (doc.raw.tables or doc.raw.fields):
+                continue
+            reason = non_content_reason(result.text or "", judge)
+            if reason:
+                results[index] = self._without_content(result, non_content=reason)
+
+    def _screen_free_form_answers(self, results: List[OCRResult]) -> None:
+        """Free-form answers have no recovery behind them: a refusal becomes empty text
+        with ``metadata["ocr_refusal"] = True`` right away."""
+        from doc2mark.ocr.refusal import non_content_reason
+        judge = self._non_content_judge()
+        for index, result in enumerate(results):
+            reason = non_content_reason(result.text or "", judge)
+            if reason:
+                results[index] = replace(
+                    result, text="", metadata={**(result.metadata or {}), "non_content": reason, "ocr_refusal": True})
+
     def _apply_recovered(
+        self,
         results: List[OCRResult],
         empty_idx: List[int],
         recovered: List[OCRResult],
@@ -333,11 +402,27 @@ class BaseOCR(ABC):
         """Merge free-form-recovered text back into the empty structured results
         (in place), tagging them ``structured_fallback='free_form'``. Shared by the
         OpenAI and Vertex recovery paths; the provider-specific part is only the
-        free-form re-OCR call that produces ``recovered``."""
-        from doc2mark.ocr.schema import OCRPage, RawExtraction
+        free-form re-OCR call that produces ``recovered``.
+
+        ``recovered`` holds the raw free-form answers (the recovery call passes
+        ``_recovery=True`` so they are not sanitized yet): the verbatim answer goes to
+        ``document.raw.text`` and its sanitized Markdown to ``text``. A recovered
+        answer that is itself only a refusal / "no readable text" statement is not
+        applied. When either answer was one, the result stays
+        empty and is flagged ``metadata["ocr_refusal"] = True``, so a refusal is
+        never indexed as page content.
+        """
+        from doc2mark.ocr.refusal import non_content_reason
+        from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
+        judge = self._non_content_judge()
         for j, i in enumerate(empty_idx):
             text = (recovered[j].text or "").strip()
+            recovered_refused = bool((recovered[j].metadata or {}).get("ocr_refusal"))
+            if text and not recovered_refused and non_content_reason(text, judge):
+                recovered_refused, text = True, ""
             if not text:
+                if recovered_refused or (results[i].metadata or {}).get("non_content"):
+                    results[i] = self._without_content(results[i], ocr_refusal=True)
                 continue
             doc = results[i].document
             if doc is not None:
@@ -346,13 +431,77 @@ class BaseOCR(ABC):
                 doc = OCRPage(raw=RawExtraction(text=text))
             meta = dict(results[i].metadata or {})
             meta["structured_fallback"] = "free_form"
+            meta.pop("non_content", None)
             results[i] = OCRResult(
-                text=text,
+                text=_sanitize_markdown(text),
                 confidence=results[i].confidence,
                 language=results[i].language,
                 metadata=meta,
                 document=doc,
             )
+        return results
+
+    # --- runtime router firewall (shared by the LLM providers) ---
+    def _enforce_router_firewall(
+        self,
+        results: List[OCRResult],
+        context_attached: List[bool],
+        redo_verbatim: Callable[[List[int]], List[OCRResult]],
+    ) -> List[OCRResult]:
+        """Redo, with an explicit verbatim task, every structured result that
+        withholds printed values against the router policy
+        (:func:`doc2mark.ocr.schema.withholding_violations`, e.g. an illustrative
+        table on a ``document_type="table"`` page, or any withholding while no
+        neighbor-page context was attached).
+
+        ``redo_verbatim(indices)`` re-OCRs those images and returns one result per
+        index. A clean redo replaces the result (``metadata["router_fallback"] =
+        "verbatim"``). Otherwise the original stays, flagged ``"unresolved"``; its
+        Markdown then carries the visible ``[N illustrative rows not transcribed]``
+        marker. Both keep the violations in ``metadata["router_violations"]`` and
+        the token usage of both calls.
+        """
+        from doc2mark.ocr.schema import OCRPage, withholding_violations
+        violations: Dict[int, List[str]] = {}
+        for index, result in enumerate(results):
+            page = result.document
+            if isinstance(page, OCRPage):
+                found = withholding_violations(page, context_attached=context_attached[index])
+                if found:
+                    violations[index] = found
+        if not violations:
+            return results
+        indices = sorted(violations)
+        logger.warning(
+            f"Router firewall: {len(indices)}/{len(results)} OCR result(s) withheld printed values "
+            f"({'; '.join(violations[indices[0]])}); redoing them verbatim"
+        )
+        try:
+            redone: Optional[List[OCRResult]] = redo_verbatim(indices)
+        except Exception as exc:  # keep the original results, flagged
+            logger.warning(f"Router firewall: verbatim redo failed: {exc}")
+            redone = None
+        for position, index in enumerate(indices):
+            original = results[index]
+            candidate = redone[position] if redone is not None and position < len(redone) else None
+            usage = _sum_token_usage(
+                (original.metadata or {}).get("token_usage"),
+                (candidate.metadata or {}).get("token_usage") if candidate is not None else None,
+            )
+            clean = (
+                candidate is not None
+                and isinstance(candidate.document, OCRPage)
+                and not self._is_empty_structured(candidate)
+                and not (candidate.metadata or {}).get("ocr_refusal")
+                and not withholding_violations(candidate.document, context_attached=context_attached[index])
+            )
+            chosen = candidate if clean else original
+            meta = dict(chosen.metadata or {})
+            meta.update(router_violations=violations[index], router_fallback="verbatim" if clean else "unresolved",
+                        token_usage=usage)
+            if "batch_index" in (original.metadata or {}):
+                meta["batch_index"] = original.metadata["batch_index"]
+            results[index] = replace(chosen, metadata=meta)
         return results
 
     @property
@@ -365,6 +514,23 @@ class BaseOCR(ABC):
         """Check if this provider requires an API key."""
         # Override in subclasses
         return True
+
+
+def _sum_token_usage(first: Any, second: Any) -> Dict[str, Any]:
+    """Two ``token_usage`` dicts added up key by key (numbers only; other values of
+    ``first`` win), so a result built from two provider calls bills both."""
+    if not isinstance(first, dict) or not first:
+        return dict(second) if isinstance(second, dict) else {}
+    total = dict(first)
+    if isinstance(second, dict):
+        for key, value in second.items():
+            current = total.get(key)
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if numeric and isinstance(current, (int, float)) and not isinstance(current, bool):
+                total[key] = current + value
+            elif key not in total:
+                total[key] = value
+    return total
 
 
 class OCRFactory:

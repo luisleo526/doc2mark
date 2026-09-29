@@ -10,7 +10,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -20,7 +20,7 @@ from doc2mark.ocr.schema import OCRPage
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = "ocr-cache-v4"
+CACHE_SCHEMA_VERSION = "ocr-cache-v5"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 
@@ -40,6 +40,9 @@ FROM_CACHE_METADATA_KEY = "doc2mark_from_cache"
 _NON_LLM_CONFIG_PROVIDERS = {"doc2mark.ocr.tesseract.TesseractOCR"}
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
+# OCRConfig fields that never change a stored result: the optional judge only decides
+# whether an answer is a refusal, and refusals are not cached (see _is_cacheable).
+_UNCACHED_CONFIG_FIELDS = {"non_content_judge"}
 _ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
 _STAT_COUNTERS = (
     "hits",
@@ -149,7 +152,16 @@ def _config_cache_signature(provider: Any) -> Any:
         qualname = f"{provider.__class__.__module__}.{provider.__class__.__qualname__}"
         if qualname not in _NON_LLM_CONFIG_PROVIDERS:
             return _stable_value(_slim_llm_config(config), strict=True)
+        full = {f.name: getattr(config, f.name) for f in fields(config) if f.name not in _UNCACHED_CONFIG_FIELDS}
+        return _stable_value(full, strict=True)
     return _stable_value(config, strict=True)
+
+
+def _is_cacheable(result: OCRResult) -> bool:
+    """A failed image or a refusal is not a stable answer: the next run must retry it
+    rather than replay it from the cache."""
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return not (metadata.get("failed") or metadata.get("ocr_refusal"))
 
 
 def _api_key_hash(provider: Any) -> Optional[str]:
@@ -907,7 +919,8 @@ class CachedOCR(BaseOCR):
         consumer from counting one provider call N times.
         """
         normalized = _normalize_result(provider_result)
-        self.cache.set(key, normalized)
+        if _is_cacheable(normalized):
+            self.cache.set(key, normalized)
         for offset, position in enumerate(positions):
             copied = _copy_result(normalized)
             if offset:

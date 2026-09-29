@@ -2,12 +2,15 @@
 
 import io
 import logging
+import os
+import re
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from doc2mark.core.base import OCRError
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRProvider, OCRResult, OCRFactory
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCREngineError, OCRProvider, OCRResult, OCRFactory
 from doc2mark.ocr.schema import OCRPage, RawExtraction
 from doc2mark.utils.image_utils import (
     detect_image_format,
@@ -16,6 +19,29 @@ from doc2mark.utils.image_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Long language names accepted as aliases (case-insensitive) next to the native
+# Tesseract codes (eng, deu, chi_tra, chi_sim, eng+chi_tra, ...).
+LANGUAGE_ALIASES = {
+    'english': 'eng',
+    'chinese': 'chi_sim+chi_tra',
+    'chinese_simplified': 'chi_sim',
+    'chinese_traditional': 'chi_tra',
+    'spanish': 'spa',
+    'french': 'fra',
+    'german': 'deu',
+    'japanese': 'jpn',
+    'korean': 'kor',
+    'russian': 'rus',
+    'arabic': 'ara',
+}
+# A traineddata name as Tesseract takes it on -l (eng, chi_tra, deu_latf, script/Latin).
+_LANGUAGE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)?$")
+# Messages of a Tesseract run that failed to start at all (no usable language data).
+_ENGINE_FAILURE_MARKERS = (
+    "failed loading language", "could not initialize tesseract", "couldn't load any languages",
+    "error opening data file",
+)
 
 
 class TesseractOCR(BaseOCR):
@@ -31,6 +57,10 @@ class TesseractOCR(BaseOCR):
         super().__init__(api_key, config)
         self._pytesseract = None
         self._pil = None
+        # (requested language, tessdata env, binary) the engine check passed for, and
+        # the language code it resolved to; re-checked when any of them changes.
+        self._engine_checked_for: Optional[Tuple[str, Optional[str], str]] = None
+        self._engine_language: Optional[str] = None
 
         logger.info("📝 Initializing Tesseract OCR (offline mode)")
         if config and config.language:
@@ -85,17 +115,25 @@ class TesseractOCR(BaseOCR):
         logger.debug("✓ Tesseract validation: No API key required")
         return True
 
-    def _process_single_image(self, image_data: bytes, **kwargs) -> OCRResult:
+    def _process_single_image(self, image_data: bytes, language_code: Optional[str] = None, **kwargs) -> OCRResult:
         """Internal method to process a single image using Tesseract.
         
         Args:
             image_data: Image data as bytes
+            language_code: Tesseract ``-l`` value (from :meth:`_ensure_engine`); resolved
+                from the config when omitted
             **kwargs: Additional options
             
         Returns:
             OCRResult with extracted text
+
+        Raises:
+            OCREngineError: Tesseract itself could not start (no usable language data)
+            OCRError: this image could not be read
         """
         image_size = len(image_data)
+        if language_code is None:
+            language_code = self._ensure_engine()
         logger.debug(f"🖼️  Processing image with Tesseract ({image_size} bytes)")
 
         try:
@@ -120,7 +158,6 @@ class TesseractOCR(BaseOCR):
 
             # Configure Tesseract
             config_str = self._build_tesseract_config(**kwargs)
-            language_code = self._get_language_code()
             logger.debug(f"⚙️  Tesseract config: {config_str}")
             logger.debug(f"🌐 Language: {language_code}")
 
@@ -166,7 +203,9 @@ class TesseractOCR(BaseOCR):
 
             logger.debug("✅ Tesseract OCR completed successfully")
 
-            # Build structured document (interpretation-free for non-LLM provider)
+            # Build structured document (interpretation-free for non-LLM provider).
+            # raw.text keeps the verbatim transcription; ``text`` is its Markdown
+            # rendering, escaped like every OCR answer (an image can show markup).
             document = OCRPage(
                 raw=RawExtraction(
                     text=text,
@@ -176,7 +215,7 @@ class TesseractOCR(BaseOCR):
             )
 
             return OCRResult(
-                text=text,
+                text=document.to_markdown(),
                 confidence=confidence,
                 language=self.config.language,
                 metadata={
@@ -192,10 +231,12 @@ class TesseractOCR(BaseOCR):
             )
 
         except Exception as e:
-            logger.error(f"❌ Tesseract OCR failed: {e}")
-            logger.error(f"   Image size: {image_size} bytes")
-            logger.error(f"   Language: {self._get_language_code()}")
-            raise OCRError(f"Failed to process image with Tesseract: {str(e)}")
+            message = str(e)
+            if isinstance(e, self.pytesseract.TesseractNotFoundError) or any(
+                    marker in message.lower() for marker in _ENGINE_FAILURE_MARKERS):
+                raise OCREngineError(self._engine_hint(f"Tesseract could not start: {message}")) from e
+            logger.error(f"❌ Tesseract OCR failed on an image ({image_size} bytes, language {language_code}): {e}")
+            raise OCRError(f"Failed to process image with Tesseract: {message}") from e
 
     def batch_process_images(
             self,
@@ -220,22 +261,18 @@ class TesseractOCR(BaseOCR):
         if total_images == 0:
             return []
 
-        # For small batches, use sequential processing
-        if total_images <= 2:
-            logger.debug("Using sequential processing for small batch")
-            return [self._process_single_image(img, **kwargs) for img in images]
+        # The engine must be usable before any image is read: a missing binary or
+        # missing language data fails the batch loudly (OCREngineError) instead of
+        # turning every image into an empty result.
+        language_code = self._ensure_engine()
 
-        # Prepare image data with indices for proper ordering
-        indexed_images = [(i, image_data) for i, image_data in enumerate(images)]
-        results = [None] * total_images
-
-        def process_single_image(indexed_data):
-            """Process a single image with its index."""
-            index, image_data = indexed_data
+        def process_single_image(index: int, image_data: bytes):
+            """One image; a failure on this image becomes a failed (empty) result."""
             try:
                 logger.debug(f"🔄 Processing image {index + 1}/{total_images} with Tesseract")
-                result = self._process_single_image(image_data, **kwargs)
-                return index, result
+                return index, self._process_single_image(image_data, language_code=language_code, **kwargs)
+            except OCREngineError:
+                raise
             except Exception as e:
                 logger.error(f"❌ Failed to process image {index + 1}: {e}")
                 return index, OCRResult(
@@ -248,34 +285,31 @@ class TesseractOCR(BaseOCR):
                     }
                 )
 
+        results = [None] * total_images
+
+        # For small batches, use sequential processing
+        if total_images <= 2:
+            logger.debug("Using sequential processing for small batch")
+            for index, image_data in enumerate(images):
+                results[index] = process_single_image(index, image_data)[1]
+            return results
+
         # Process images concurrently
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                futures = [executor.submit(process_single_image, indexed_data)
-                           for indexed_data in indexed_images]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_single_image, index, image_data)
+                       for index, image_data in enumerate(images)]
 
-                # Collect results as they complete
-                completed_count = 0
-                for future in as_completed(futures):
-                    try:
-                        index, result = future.result()
-                        results[index] = result
-                        completed_count += 1
+            # Collect results as they complete; an engine failure stops the batch.
+            completed_count = 0
+            for future in as_completed(futures):
+                index, result = future.result()
+                results[index] = result
+                completed_count += 1
 
-                        # Log progress every 10% or every 3 images (Tesseract is slower)
-                        if completed_count % max(1, total_images // 10) == 0 or completed_count % 3 == 0:
-                            progress = completed_count / total_images * 100
-                            logger.info(f"📊 Batch progress: {completed_count}/{total_images} ({progress:.1f}%)")
-
-                    except Exception as e:
-                        logger.error(f"❌ Future execution failed: {e}")
-
-        except Exception as e:
-            logger.error(f"❌ Batch processing failed: {e}")
-            # Fallback to sequential processing
-            logger.info("🔄 Falling back to sequential processing")
-            return self.process_images(images, **kwargs)
+                # Log progress every 10% or every 3 images (Tesseract is slower)
+                if completed_count % max(1, total_images // 10) == 0 or completed_count % 3 == 0:
+                    progress = completed_count / total_images * 100
+                    logger.info(f"📊 Batch progress: {completed_count}/{total_images} ({progress:.1f}%)")
 
         # Count successful results
         successful = sum(1 for r in results if r and not r.metadata.get('failed'))
@@ -328,40 +362,96 @@ class TesseractOCR(BaseOCR):
             return image_data
 
     def _get_language_code(self) -> str:
-        """Convert language to Tesseract language code.
-        
-        Returns:
-            Tesseract language code
+        """Tesseract ``-l`` value for ``config.language``.
+
+        Native Tesseract codes are taken as they are, alone or combined with ``+``
+        (``eng``, ``deu``, ``chi_tra``, ``eng+chi_tra``), and the long names in
+        :data:`LANGUAGE_ALIASES` still map to codes (``chinese_traditional`` ->
+        ``chi_tra``). No language means English. Whether the codes are installed is
+        checked by :meth:`_ensure_engine`.
+
+        Raises:
+            ValueError: a component is empty or not a Tesseract language name.
         """
-        if not self.config.language:
-            logger.debug("🌐 No language specified, using English")
+        requested = (self.config.language or "").strip()
+        if not requested:
             return 'eng'
+        codes: List[str] = []
+        for component in requested.split('+'):
+            component = component.strip()
+            alias = LANGUAGE_ALIASES.get(component.lower())
+            if alias:
+                expanded = alias.split('+')
+            elif component and _LANGUAGE_CODE_RE.match(component):
+                expanded = [component]
+            else:
+                raise ValueError(
+                    f"Invalid Tesseract language {requested!r}: use Tesseract codes such as "
+                    f"'eng', 'chi_tra' or 'eng+chi_tra', or one of: {', '.join(sorted(LANGUAGE_ALIASES))}"
+                )
+            codes.extend(code for code in expanded if code not in codes)
+        logger.debug(f"🌐 Language mapping: '{requested}' -> '{'+'.join(codes)}'")
+        return '+'.join(codes)
 
-        # Map common language names to Tesseract codes
-        language_map = {
-            'english': 'eng',
-            'chinese': 'chi_sim+chi_tra',
-            'chinese_simplified': 'chi_sim',
-            'chinese_traditional': 'chi_tra',
-            'spanish': 'spa',
-            'french': 'fra',
-            'german': 'deu',
-            'japanese': 'jpn',
-            'korean': 'kor',
-            'russian': 'rus',
-            'arabic': 'ara',
-        }
+    def _installed_languages(self) -> Tuple[Optional[str], List[str]]:
+        """``tesseract --list-langs``: the tessdata directory and the installed codes."""
+        command = self.pytesseract.pytesseract.tesseract_cmd
+        try:
+            listing = subprocess.run([command, "--list-langs"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise OCREngineError(self._engine_hint(
+                f"Tesseract is not installed or not runnable ({command!r}): {exc}")) from exc
+        lines = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
+        directory = None
+        if lines and lines[0].lower().startswith("list of available languages"):
+            match = re.search(r'"([^"]*)"', lines[0])
+            directory = match.group(1) if match else None
+            lines = lines[1:]
+        if listing.returncode != 0 and not lines:
+            raise OCREngineError(self._engine_hint(
+                f"'tesseract --list-langs' failed: {(listing.stderr or '').strip() or listing.returncode}"))
+        return directory, lines
 
-        lang_lower = self.config.language.lower()
-        tesseract_code = language_map.get(lang_lower, 'eng')
+    @staticmethod
+    def _engine_hint(message: str) -> str:
+        prefix = os.environ.get("TESSDATA_PREFIX")
+        where = f"TESSDATA_PREFIX={prefix}" if prefix else "TESSDATA_PREFIX is not set"
+        return f"{message} ({where}; install the tessdata language packs or point TESSDATA_PREFIX at them)"
 
-        if tesseract_code != 'eng' and lang_lower not in language_map:
-            logger.warning(f"⚠️  Language '{self.config.language}' not in mapping, using English")
-            tesseract_code = 'eng'
-        else:
-            logger.debug(f"🌐 Language mapping: '{self.config.language}' -> '{tesseract_code}'")
+    def _ensure_engine(self) -> str:
+        """Check once (per language and environment) that Tesseract can run with the
+        requested language data, and return the ``-l`` value to use.
 
-        return tesseract_code
+        Raises:
+            OCREngineError: Tesseract is missing, the language value is invalid, or
+                language data is not installed (e.g. an unknown code or a broken
+                ``TESSDATA_PREFIX``). Every image would fail, so the batch fails.
+        """
+        try:
+            requested = self._get_language_code()
+            command = str(self.pytesseract.pytesseract.tesseract_cmd)
+        except (ValueError, ImportError) as exc:
+            raise OCREngineError(str(exc)) from exc
+        key = (requested, os.environ.get("TESSDATA_PREFIX"), command)
+        if self._engine_checked_for == key and self._engine_language:
+            return self._engine_language
+        directory, installed = self._installed_languages()
+        by_name = {code.lower(): code for code in installed}
+        resolved, missing = [], []
+        for code in requested.split('+'):
+            if code in installed:
+                resolved.append(code)
+            elif code.lower() in by_name:
+                resolved.append(by_name[code.lower()])
+            else:
+                missing.append(code)
+        if missing:
+            raise OCREngineError(self._engine_hint(
+                f"Tesseract language data not found for {', '.join(repr(m) for m in missing)} "
+                f"(tessdata directory: {directory or 'unknown'}; installed: {', '.join(installed) or 'none'}; "
+                f"long names accepted: {', '.join(sorted(LANGUAGE_ALIASES))})"))
+        self._engine_checked_for, self._engine_language = key, '+'.join(resolved)
+        return self._engine_language
 
     def _build_tesseract_config(self, **kwargs) -> str:
         """Build Tesseract configuration string.

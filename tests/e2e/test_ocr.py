@@ -147,6 +147,20 @@ def test_t10_page_markdown_cannot_inject_live_html(run_cli, fake_llm, scan):
     assert "Revenue 1,200 in Q1" in result.markdown
 
 
+def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_llm, scan):
+    """raw.text is a verbatim transcription: a line that happens to start with '#' or '>' is
+    text on the page, not a heading or a quote, so the reader must see the characters."""
+    fake_llm.script(structured=[fake.page("Board memo\n# 3 approved motions\n> Chair: J. Lin\nClosing remarks")])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    rendered = build.render(result.markdown)
+    assert rendered.find(["h1", "h2", "h3", "blockquote"]) is None, result.describe()
+    visible = build.visible_text(result.markdown)
+    assert "# 3 approved motions" in visible and "> Chair: J. Lin" in visible, visible
+
+
 # --------------------------------------------------------------------------- #
 # T19: ragged, nested and decorated OCR tables                                #
 # --------------------------------------------------------------------------- #
@@ -370,8 +384,9 @@ def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, c
 # Tesseract: --ocr-lang                                                       #
 # --------------------------------------------------------------------------- #
 
-_TRADITIONAL = ["繁體中文辨識測試", "營業收入成長"]
-_SIMPLIFIED = ["简体中文识别测试", "营业收入增长"]
+# Lines Tesseract's chi_tra / chi_sim models read exactly at this size (checked on the E2E image).
+_TRADITIONAL = ["台北市政府公告", "客戶服務中心"]
+_SIMPLIFIED = ["北京市人民政府", "今天天气很好"]
 
 
 @pytest.mark.parametrize("ocr_lang, script, lines", [
@@ -393,13 +408,13 @@ def test_tesseract_reads_cjk_with_the_requested_language(run_cli, require_tool, 
 def test_tesseract_combined_language_codes_read_both_scripts(run_cli, require_tool, e2e_dir):
     require_tool("tesseract")
     font = build.cjk_font("TC")
-    pdf = build.text_scan_pdf(e2e_dir / "mixed.pdf", ["INVOICE 2026", "繁體中文辨識測試"], font)
+    pdf = build.text_scan_pdf(e2e_dir / "mixed.pdf", ["INVOICE 2026", "台北市政府公告"], font)
 
     result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", "--ocr-lang", "eng+chi_tra")
 
     assert result.exit_code == 0, result.describe()
     assert "INVOICE2026" in build.squash(result.markdown), result.describe()
-    assert "繁體中文辨識測試" in build.squash(result.markdown), result.describe()
+    assert "台北市政府公告" in build.squash(result.markdown), result.describe()
 
 
 def test_tesseract_unknown_language_fails_loudly(run_cli, require_tool, e2e_dir):
@@ -454,13 +469,14 @@ def test_tesseract_engine_failure_in_a_batch_is_reported_and_skipped(run_cli, re
 
 
 def test_tesseract_real_ocr_path_keeps_every_line(run_cli, require_tool, e2e_dir):
+    """Real OCR, no mocks: the sanitised Tesseract path still delivers every line."""
     require_tool("tesseract")
-    pdf = pdfgen.image_pdf(e2e_dir / "report.pdf", "QUARTERLY REVIEW 2026\n1. Budget approved\n- Revenue up 12%")
+    pdf = pdfgen.image_pdf(e2e_dir / "report.pdf", "QUARTERLY REVIEW 2026\n1. Budget approved\nRevenue up 12%")
 
     result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
 
     assert result.exit_code == 0, result.describe()
     text = build.visible_text(result.markdown)
-    for expected in ("QUARTERLY REVIEW 2026", "1. Budget approved", "- Revenue up 12%"):
+    for expected in ("QUARTERLY REVIEW 2026", "1. Budget approved", "Revenue up 12%"):
         assert expected in text, result.describe()
     assert not ocr_issues(result), result.json

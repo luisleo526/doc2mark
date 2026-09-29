@@ -14,13 +14,22 @@ and source family — into a single dict the loader stamps onto
 ``ProcessedDocument.metadata.extra["token_usage"]``. Zero usage (OCR off, or a
 usage-less provider like Tesseract) leaves the running total empty so the loader
 can leave ``extra`` untouched.
+
+The same wrapper also keeps the per-load OCR *issues* (:meth:`UsageAggregatingOCR.
+pop_document_issues`): images whose answer was only a refusal (emitted empty),
+images that failed, images whose withheld values the router firewall could not
+recover, and an engine that could not run at all (``OCREngineError``) -- which the
+loader re-raises instead of returning a placeholder-only document.
 """
 
 import threading
 from typing import Any, Dict, Iterable, List, Optional
 
-from doc2mark.ocr.base import BaseOCR, OCRResult
+from doc2mark.ocr.base import BaseOCR, OCREngineError, OCRResult
 from doc2mark.ocr.cache import FROM_CACHE_METADATA_KEY
+
+# Distinct error messages kept per document in ``ocr_issues["errors"]``.
+_MAX_ISSUE_ERRORS = 5
 
 # Read-side key aliases: the LLM providers emit LangChain's ``usage_metadata``
 # (input_tokens/output_tokens/total_tokens), but be defensive about the common
@@ -55,6 +64,11 @@ def _first_present(usage: Dict[str, Any], keys: Iterable[str]) -> int:
         if key in usage:
             return _coerce_int(usage[key])
     return 0
+
+
+def new_issue_sink() -> Dict[str, Any]:
+    """A fresh per-document OCR issue record (see ``pop_document_issues``)."""
+    return {"refused": 0, "failed": 0, "withheld": 0, "errors": [], "engine_error": None}
 
 
 def merge_usage_into(sink: Dict[str, int], usage: Optional[Dict[str, Any]]) -> None:
@@ -147,8 +161,47 @@ class UsageAggregatingOCR(BaseOCR):
 
     # --- per-load accumulation ----------------------------------------------
     def begin_document_usage(self) -> None:
-        """Start (or reset) the token-usage accumulator for the current thread."""
+        """Start (or reset) the token-usage and OCR-issue accumulators for the current thread."""
         self._usage_local.sink = new_usage_sink()
+        self._usage_local.issues = new_issue_sink()
+
+    def pop_document_issues(self) -> Optional[Dict[str, Any]]:
+        """Return this load's OCR issues and clear them, or ``None`` when there were none.
+
+        The dict counts images whose answer was only a refusal / "no readable text"
+        statement (``refused``, emitted as empty text), images that failed
+        (``failed``) and images that still withhold values after the router
+        firewall's verbatim redo (``withheld``), plus up to five distinct error
+        messages (``errors``).
+
+        Raises:
+            OCREngineError: the OCR engine could not run at all during this load
+                (e.g. Tesseract without its language data). The pipelines degrade
+                such a failure to placeholders; the loader must not report that as
+                a successful conversion.
+        """
+        issues = getattr(self._usage_local, "issues", None)
+        self._usage_local.issues = None
+        if not issues:
+            return None
+        if issues["engine_error"] is not None:
+            raise issues["engine_error"]
+        issues.pop("engine_error")
+        if not (issues["refused"] or issues["failed"] or issues["withheld"] or issues["errors"]):
+            return None
+        return issues
+
+    def _note_error(self, exc: BaseException) -> None:
+        issues = getattr(self._usage_local, "issues", None)
+        if issues is None:
+            return
+        if isinstance(exc, OCREngineError):
+            if issues["engine_error"] is None:
+                issues["engine_error"] = exc
+            return
+        message = f"{type(exc).__name__}: {exc}"
+        if message not in issues["errors"] and len(issues["errors"]) < _MAX_ISSUE_ERRORS:
+            issues["errors"].append(message)
 
     def pop_document_usage(self) -> Optional[Dict[str, int]]:
         """Return the accumulated usage and clear it, or ``None`` when no OCR
@@ -162,7 +215,9 @@ class UsageAggregatingOCR(BaseOCR):
         return None
 
     def _record(self, results: Iterable[Any]) -> None:
-        """Fold the usage of each *fresh* result into the active sink.
+        """Fold the usage of each *fresh* result into the active sink, and count the
+        OCR issues every result's metadata reports (``ocr_refusal``, ``failed``,
+        ``router_fallback="unresolved"``) into the active issue record.
 
         Results that :class:`CachedOCR` served from a cache hit or an intra-batch
         dedup fan-out carry the ``FROM_CACHE_METADATA_KEY`` flag — they represent
@@ -172,19 +227,32 @@ class UsageAggregatingOCR(BaseOCR):
         never spent (cache hit) or spent only once (dedup). No-op when no sink is
         active."""
         sink = getattr(self._usage_local, "sink", None)
-        if sink is None:
-            return
+        issues = getattr(self._usage_local, "issues", None)
         for result in results:
             metadata = getattr(result, "metadata", None)
             if not isinstance(metadata, dict):
                 continue
-            if metadata.get(FROM_CACHE_METADATA_KEY):
+            if issues is not None:
+                if metadata.get("ocr_refusal"):
+                    issues["refused"] += 1
+                if metadata.get("failed"):
+                    issues["failed"] += 1
+                    error = metadata.get("error")
+                    if error and error not in issues["errors"] and len(issues["errors"]) < _MAX_ISSUE_ERRORS:
+                        issues["errors"].append(str(error))
+                if metadata.get("router_fallback") == "unresolved":
+                    issues["withheld"] += 1
+            if sink is None or metadata.get(FROM_CACHE_METADATA_KEY):
                 continue
             merge_usage_into(sink, metadata.get("token_usage"))
 
     # --- intercepted OCR calls ----------------------------------------------
     def batch_process_images(self, images: List[bytes], **kwargs) -> List[OCRResult]:
-        results = self.wrapped.batch_process_images(images, **kwargs)
+        try:
+            results = self.wrapped.batch_process_images(images, **kwargs)
+        except Exception as exc:
+            self._note_error(exc)
+            raise
         self._record(results)
         return results
 
@@ -193,10 +261,14 @@ class UsageAggregatingOCR(BaseOCR):
         # (CachedOCR, test doubles); otherwise route through batch_process_images
         # the way CachedOCR does, since the LLM providers expose only the batch API.
         wrapped_process = getattr(self.wrapped, "process_image", None)
-        if callable(wrapped_process):
-            result = wrapped_process(image, **kwargs)
-            self._record([result] if result is not None else [])
-            return result
-        results = self.wrapped.batch_process_images([image], **kwargs)
+        try:
+            if callable(wrapped_process):
+                result = wrapped_process(image, **kwargs)
+                self._record([result] if result is not None else [])
+                return result
+            results = self.wrapped.batch_process_images([image], **kwargs)
+        except Exception as exc:
+            self._note_error(exc)
+            raise
         self._record(results)
         return results[0] if results else OCRResult(text="")
