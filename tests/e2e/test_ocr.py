@@ -95,6 +95,28 @@ def test_t9_huge_colspan_does_not_bloat_the_output(run_cli, fake_llm, scan):
     assert grid == [["Title"]] + [[f"row {i}"] for i in range(20)]
 
 
+def _implied_grid_cells(markdown: str) -> int:
+    """How many grid slots the emitted tables claim (sum of rowspan x colspan)."""
+    total = 0
+    for cell in re.finditer(r"<t[dh]\b([^>]*)>", markdown):
+        spans = dict(re.findall(r'(rowspan|colspan)="(\d+)"', cell.group(1)))
+        total += int(spans.get("rowspan", 1)) * int(spans.get("colspan", 1))
+    return total
+
+
+def test_t9_many_wide_and_tall_spans_do_not_stall_the_conversion(run_cli, fake_llm, scan):
+    """700 cells of colspan=700 rowspan=3000 over 3000 rows: each span alone is within the
+    caps, together they claim a 490,000 x 3,000 grid."""
+    html = "<table><tr>" + "<td colspan='700' rowspan='3000'>x</td>" * 700 + "</tr>" + "<tr></tr>" * 2999 + "</table>"
+    fake_llm.script(structured=[fake.page("Span wall", tables=[fake.table(html)])])
+
+    result = run_llm(run_cli, scan, fake_llm, timeout=30)
+
+    assert result.exit_code == 0, result.describe()
+    assert result.markdown.count(">x<") == 700, "every cell's text must survive"
+    assert _implied_grid_cells(result.markdown) <= 100_000, "the emitted table must not be a table bomb"
+
+
 # --------------------------------------------------------------------------- #
 # T10: every OCR text field that reaches Markdown is sanitised                #
 # --------------------------------------------------------------------------- #
@@ -150,7 +172,9 @@ def test_t10_page_markdown_cannot_inject_live_html(run_cli, fake_llm, scan):
 def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_llm, scan):
     """raw.text is a verbatim transcription: a line that happens to start with '#' or '>' is
     text on the page, not a heading or a quote, so the reader must see the characters."""
-    fake_llm.script(structured=[fake.page("Board memo\n# 3 approved motions\n> Chair: J. Lin\nClosing remarks")])
+    fake_llm.script(structured=[fake.page(
+        "Board memo\n# 3 approved motions\n> Chair: J. Lin\nTotal\n==\n[1]: https://example.com/minutes\nClosing remarks"
+    )])
 
     result = run_llm(run_cli, scan, fake_llm)
 
@@ -158,7 +182,34 @@ def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_
     rendered = build.render(result.markdown)
     assert rendered.find(["h1", "h2", "h3", "blockquote"]) is None, result.describe()
     visible = build.visible_text(result.markdown)
-    assert "# 3 approved motions" in visible and "> Chair: J. Lin" in visible, visible
+    for line in ("# 3 approved motions", "> Chair: J. Lin", "Total ==", "[1]: https://example.com/minutes"):
+        assert line in visible, visible
+
+
+def test_t10_text_removed_by_sanitizing_page_markdown_is_still_indexed(run_cli, fake_llm, scan):
+    """The sanitizer drops an <svg> with its text; that text must still reach the output
+    (the verbatim coverage check has to judge the sanitized rendering)."""
+    page_markdown = "## Costs\n\n<table><tr><td>Unit cost</td><td><svg><text>800</text></svg></td></tr></table>"
+    fake_llm.script(structured=[fake.page(
+        "Costs\nUnit cost 800", interpretation=fake.interpretation(page_markdown=page_markdown))])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    assert "800" in result.markdown and "<svg" not in result.markdown, result.describe()
+
+
+def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
+    """A free-form answer cut off inside a table (max_tokens) still yields a sanitized table,
+    not the table's markup as escaped text."""
+    answer = "Invoice\n\n<table><tr><th>Item</th><th>Cost</th></tr><tr><td>Paper</td><td>12</td></tr><tr><td>Toner"
+    fake_llm.script(free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured")
+
+    assert result.exit_code == 0, result.describe()
+    assert build.html_tables(result.markdown) == [[["Item", "Cost"], ["Paper", "12"], ["Toner", ""]]], result.describe()
+    assert "&lt;t" not in result.markdown, result.describe()
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +405,16 @@ def test_multilingual_no_text_answers_are_not_indexed(run_cli, fake_llm, scan, a
     assert ocr_issues(result).get("refused") == 1, result.json
 
 
+def test_free_form_refusal_is_reported(run_cli, fake_llm, scan):
+    fake_llm.script(free_form=[fake.refusal(REFUSAL)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert "sorry" not in result.markdown.lower(), result.describe()
+    assert ocr_issues(result).get("refused") == 1, result.json
+
+
 def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_llm, scan):
     fake_llm.script(structured=[fake.page(REFUSAL)], free_form=[fake.text("Board minutes 2026\nBudget approved")])
 
@@ -369,6 +430,11 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "No text? No problem.\nOur OCR engine reads handwriting, stamps and faded scans.",
     "This page intentionally left blank.",
     "Dear Mr. Chen,\nI am sorry to inform you that your application was not successful.",
+    "We're sorry, we are unable to process your payment at this time.",
+    "Unable to read the file.\nError code 0x80070570\nContact your administrator",
+    "無法讀取檔案內容，請稍後再試。",
+    "As an AI-first company, we ship faster.",
+    "This page is intentionally left blank.",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])
