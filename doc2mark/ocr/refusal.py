@@ -52,12 +52,17 @@ _I_NEG = (
     rf"|(?:am|{_APOS}m)\s+(?:unable|not\s+able)\s+to|do(?:n{_APOS}t|\s+not)\s+have\s+the\s+ability\s+to)"
 )
 _IMAGE_NOUN = r"(?:image|picture|photo(?:graph)?|scan|screenshot)s?"
-# The object of a refused reading action: the image, its text or content, a page or a
-# document ("the text in this image", "copyrighted book pages") -- not "your payment",
-# "the file" or "your handwriting".
-_READING_OBJECT = (
-    r"(?:(?:the|this|that|these|those|your|any|its)\s+)?(?:\w+\s+){0,2}?"
-    rf"(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
+_DETERMINER = r"(?:(?:the|this|that|these|those|your|any|its)\s+)?"
+# What a model refuses to read: the image itself, or the text in it ("the text in this
+# image") -- not "the document you sent", "the file" or "your handwriting".
+_IMAGE_OBJECT = (
+    rf"(?:{_DETERMINER}(?:\w+\s+){{0,2}}?{_IMAGE_NOUN}\b"
+    rf"|{_DETERMINER}(?:text|content|contents|writing)\s+(?:in|on|from|of)\s+(?:the|this|that|your)\s+{_IMAGE_NOUN}\b)"
+)
+# What a model refuses to transcribe (a verb people rarely use about themselves): also
+# pages, documents or text ("copyrighted book pages").
+_TRANSCRIPTION_OBJECT = (
+    rf"{_DETERMINER}(?:\w+\s+){{0,2}}?(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
 )
 # What a refusal refuses ("I can't help falling in love" and "I can't do this alone" are
 # not refusals).
@@ -66,16 +71,17 @@ _REFUSED = (
     r"|identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing|describing)\b|\s*[.!]?\s*$)"
     r"|comply(?:\s+with\s+(?:that|this|your|the)\s+request)?\s*(?:[.!]|$)"
     r"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?\s*[.!]?\s*$"
-    rf"|(?:transcribe|read|process|extract|identify|recogni[sz]e|analy[sz]e|interpret|describe)\s+{_READING_OBJECT}"
+    rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
+    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e|interpret|describe)\s+{_IMAGE_OBJECT}"
     r"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)\b)"
 )
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
+# Absence of text, not quality ("The photo is blurry." is also an app's hint to the user).
 _BLANK = (
-    r"(?:(?:mostly|completely|entirely|totally|largely|almost\s+entirely|too|very)\s+)?"
-    r"(?:blank|empty|illegible|unreadable|blurry|blurred|out\s+of\s+focus|low[\s-]resolution|low\s+quality"
-    r"|not\s+(?:legible|readable|clear))"
+    r"(?:(?:mostly|completely|entirely|totally|largely|almost\s+entirely)\s+)?"
+    r"(?:blank|empty|illegible|unreadable|not\s+(?:legible|readable))"
 )
-_ZH_IMAGE = r"(?:圖|图|影像|照片|畫面|画面)"
+_ZH_IMAGE = r"(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
 _ZH_READ = r"(?:辨識|辨识|識別|识别|讀取|读取|處理|处理|轉錄|转录|解析|看清|判讀|判读)"
 
 # Patterns anchored at the start of the (normalized) answer. Case-insensitive. Each one
@@ -90,10 +96,7 @@ _START_PATTERNS = [
     rf"(?:\w+\s+){{0,3}}?{_REFUSED}",
     # "I can't transcribe copyrighted book pages", "I am unable to read the text in this image"
     rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_REFUSED}",
-    # "Unable to process the image."
-    r"(?:unable|not\s+able)\s+to\s+(?:process|read|transcribe|extract|recogni[sz]e|identify|analy[sz]e|interpret"
-    rf"|decode)\s+(?:the\s+|this\s+|that\s+|your\s+)?(?:provided\s+|uploaded\s+|attached\s+|given\s+)?{_IMAGE_NOUN}\b",
-    r"as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,",
+    r"as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,\s*i\b",
     # "The image appears to be blank", "The page seems to be mostly empty" (a page or
     # document only with the hedge: "This page is intentionally left blank." is page text)
     r"(?:the\s+|this\s+)?(?:provided\s+|uploaded\s+|attached\s+|given\s+)?"
@@ -112,9 +115,11 @@ _START_PATTERNS = [
     r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\][.!]?$",
     r"(?:no\s+(?:readable\s+)?text(?:\s+(?:found|detected|available))?|illegible|unreadable)[.!]?$",
     # Chinese: an apology or "cannot" + a reading verb, about the image
-    rf"(?=[^。\n]*{_ZH_IMAGE})(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
+    # (spoken by the model: "我", or at least not addressed to a user with 您/你/請)
+    rf"(?=[^。\n]*{_ZH_IMAGE})(?:(?=[^。\n]*我)|(?![^\n]*(?:您|你|請|请)))"
+    rf"(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
     rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n]{{0,6}}?{_ZH_READ}",
-    rf"(?=[^。\n]*{_ZH_IMAGE})(?:我)?(?:目前)?(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}",
+    rf"我(?:目前)?(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}[^。\n]{{0,12}}?{_ZH_IMAGE}",
     r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
     r"(?:中|裡|里|上|內|内)?(?:並|并)?(?:沒有|没有|無|无|不含|未包含|未發現|未发现|找不到|未能找到)"
     r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)",
@@ -150,7 +155,7 @@ _START_RE = re.compile("|".join(f"(?:{p})" for p in _START_PATTERNS), re.IGNOREC
 _ANYWHERE_RE = re.compile(
     rf"\bi\s*(?:won{_APOS}?t|will\s+not|can(?:no|{_APOS})?t|can\s+not|(?:am|{_APOS}m)\s+(?:unable|not\s+able)\s+to)\s+"
     r"(?:transcribe|provide\s+(?:a\s+)?transcription\s+of|extract\s+(?:the\s+)?text\s+from|read\s+the\s+text\s+(?:in|on|from))"
-    r"\s+(?:it|this|that|the|these|those|any)\b",
+    rf"\s+(?:it|this|that)(?:\s+{_IMAGE_NOUN})?\s*(?:[.!,]|$)",
     re.IGNORECASE,
 )
 # Wrappers a model puts around a bare answer: quotes, emphasis, a code fence (``` is

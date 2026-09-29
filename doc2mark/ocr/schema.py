@@ -66,6 +66,10 @@ _MAX_COLSPAN = 1000
 _MAX_GRID_CELLS = 250_000
 # Column slots a table layout may visit; spans that claim more are dropped.
 _MAX_LAYOUT_WORK = 500_000
+# Padding may add at most this many empty cells per cell the model wrote (plus a small
+# allowance), so a small table cannot be padded into megabytes.
+_MAX_PADS_PER_CELL = 8
+_PAD_ALLOWANCE = 64
 # The pad-alignment search: rows longer than this, or past this many column slots per
 # table, are padded at the end.
 _MAX_ALIGNED_ROW_CELLS = 256
@@ -207,18 +211,18 @@ def _add_lines(parent, lines: List[str], *, at_start: bool = False) -> None:
     if not lines:
         return
     if at_start:
-        old_text = parent.text
+        old_text, existing = parent.text, list(parent)
         parent.text = lines[0]
-        index = 0
+        children = []
         for line in lines[1:]:
             br = parent.makeelement("br", {})
             br.tail = line
-            parent.insert(index, br)
-            index += 1
-        if (old_text and old_text.strip()) or len(parent) > index:
+            children.append(br)
+        if (old_text and old_text.strip()) or existing:
             br = parent.makeelement("br", {})
             br.tail = old_text
-            parent.insert(index, br)
+            children.append(br)
+        parent[:] = children + existing  # one pass, not one insert per line
         return
     for line in lines:
         if len(parent) == 0 and not (parent.text or "").strip():
@@ -580,9 +584,11 @@ def _layout_work(groups: List[list], cells: dict, spans: dict) -> int:
     return work
 
 
-def _normalize_table(table) -> bool:
+def _normalize_table(table, pad_budget: List[int]) -> bool:
     """Make one table a rectangular grid; return whether it changed. See
-    :func:`normalize_table_html`."""
+    :func:`normalize_table_html`. ``pad_budget`` holds the empty cells the whole field
+    may still add; padding is skipped (the table stays ragged) when it would exceed
+    that or :data:`_MAX_PADS_PER_CELL` per written cell."""
     groups = _row_groups(table)
     rows = [row for group in groups for row in group]
     if not rows:
@@ -643,8 +649,12 @@ def _normalize_table(table) -> bool:
 
     layout = _lay_out(groups, cells, spans, drop_double_counts)
     width = max(occupancy for occupancy, _ in layout.values())
-    if width * len(rows) > _MAX_GRID_CELLS:
+    pads_needed = sum(width - occupancy for occupancy, _ in layout.values())
+    written = sum(len(row_cells) for row_cells in cells.values())
+    if (width * len(rows) > _MAX_GRID_CELLS or pads_needed > pad_budget[0]
+            or pads_needed > _MAX_PADS_PER_CELL * written + _PAD_ALLOWANCE):
         return changed
+    pad_budget[0] -= pads_needed
 
     # 4. Column profiles from the complete (full-width) data rows.
     kind_votes = [Counter() for _ in range(width)]
@@ -726,8 +736,14 @@ def normalize_table_html(html: str) -> str:
     except Exception:
         return html
     changed = False
+    pad_budget = [_MAX_GRID_CELLS]  # empty cells all tables of this field may add
     for table in list(frag.iter("table")):
-        changed = _normalize_table(table) or changed
+        # Repeat until nothing changes (at most 3 rounds): dropping a double-counted
+        # cell can lower the colspan cap, so the result is stable on re-validation.
+        for _ in range(3):
+            if not _normalize_table(table, pad_budget):
+                break
+            changed = True
     return _serialize(frag) if changed else html
 
 
@@ -787,6 +803,7 @@ def _escape_cell(text: str) -> str:
 
 
 _TABLE_TAG_RE = re.compile(r"<(/?)table\b[^>]*>", re.I)
+_ROW_MARKUP_RE = re.compile(r"<(?:tr|td|th)\b", re.I)
 
 
 def _sanitize_markdown(text: str) -> str:
@@ -808,10 +825,11 @@ def _sanitize_markdown(text: str) -> str:
                 out.append(_neutralize_html(text[last:start], keep_breaks=True))
                 out.append(normalize_table_html(sanitize_table_html(text[start:match.end()])))
                 last = match.end()
-    if depth:  # a table still open at the end (e.g. an answer cut off at max_tokens)
+    if depth and _ROW_MARKUP_RE.search(text, start):
+        # A table still open at the end, with rows in it: an answer cut off at max_tokens.
         out.append(_neutralize_html(text[last:start], keep_breaks=True))
         out.append(normalize_table_html(sanitize_table_html(text[start:])))
-    else:
+    else:  # no table left open, or a "<table>" merely mentioned in the prose
         out.append(_neutralize_html(text[last:], keep_breaks=True))
     return "".join(out)
 
