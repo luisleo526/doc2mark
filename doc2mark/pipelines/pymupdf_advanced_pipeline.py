@@ -1271,7 +1271,9 @@ class PDFLoader:
         for table in tables:
             try:
                 data = table.extract()
-                markdown_table = renderer.render(TableData.from_2d_array(data)) if data else ""
+                if not any((cell or "").strip() for row in data or [] for cell in row):
+                    continue  # no text found: leave the region to the text path
+                markdown_table = renderer.render(TableData.from_2d_array(data))
             except Exception as e:
                 logger.debug(f"Plain table extraction failed: {e}")
                 continue

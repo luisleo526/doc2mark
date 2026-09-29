@@ -155,10 +155,10 @@ From ``TableData`` to clean HTML
 * pad ragged rows to a rectangle,
 * clamp every span to the table bounds (a ``rowspan`` can never run past the last
   row),
-* never let a span cover a non-empty cell or another span: such a span is shrunk
-  to the widest run of empty cells in its first row, then to as many rows as stay
-  empty across that width, so no value is ever hidden (a warning is logged the
-  first time this happens),
+* never let a span cover a non-empty cell: such a span is shrunk to the widest run
+  of empty cells in its first row, then to as many rows as stay empty across that
+  width, so no value is ever hidden (a warning is logged the first time this
+  happens),
 * mark the positions covered by a span as *continuation* cells, and
 * auto-set ``is_complex = True`` when any span is present.
 

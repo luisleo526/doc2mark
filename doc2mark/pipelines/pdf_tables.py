@@ -428,13 +428,15 @@ class TableGrid:
 
     def has_overlapping_cells(self) -> bool:
         for band in self._bands:
-            for i in range(len(band)):
-                a = band[i].bbox
-                for j in range(i + 1, len(band)):
-                    b = band[j].bbox
-                    overlap = (max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-                               * max(0.0, min(a[3], b[3]) - max(a[1], b[1])))
-                    if overlap > 0.25 * min(band[i].area, band[j].area):
+            band = sorted(band, key=lambda cell: cell.bbox[0])
+            for i, first in enumerate(band):
+                a = first.bbox
+                for second in band[i + 1:]:
+                    b = second.bbox
+                    if b[0] >= a[2]:
+                        break  # sorted by left edge: no later cell reaches back into this one
+                    overlap = (min(a[2], b[2]) - b[0]) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+                    if overlap > 0.25 * min(first.area, second.area):
                         return True
         return False
 
@@ -450,11 +452,14 @@ class TableGrid:
         return {(cell.row, cell.col): (cell.rowspan, cell.colspan) for cell in self.cells
                 if cell.rowspan > 1 or cell.colspan > 1}
 
-    def row_is_bold(self, r: int) -> Optional[bool]:
-        """True when every glyph in row ``r`` is bold, False when some is not, None if the row
-        has no text."""
-        ink = [char for cell in self.all_cells() if cell.row == r for char in cell.chars if not char.text.isspace()]
-        return all(char.bold for char in ink) if ink else None
+    def bold_rows(self) -> List[Optional[bool]]:
+        """Per row: True when every glyph is bold, False when some is not, None without text."""
+        bold: Dict[int, bool] = {}
+        for cell in self.all_cells():
+            for char in cell.chars:
+                if not char.text.isspace():
+                    bold[cell.row] = bold.get(cell.row, True) and char.bold
+        return [bold.get(r) for r in range(self.n_rows)]
 
 
 def assign_chars(chars: Sequence[Char], grids: Sequence[TableGrid]) -> List[Char]:
@@ -618,8 +623,7 @@ class PageTable:
 
     @classmethod
     def from_grid(cls, grid: TableGrid) -> "PageTable":
-        return cls(grid.text_rows(), grid.spans(), grid.bbox, list(grid.col_edges),
-                   [grid.row_is_bold(r) for r in range(grid.n_rows)])
+        return cls(grid.text_rows(), grid.spans(), grid.bbox, list(grid.col_edges), grid.bold_rows())
 
     @property
     def n_cols(self) -> int:
@@ -924,17 +928,19 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
     except Exception as e:
         logger.debug(f"Text-strategy table search failed: {e}")
         return [], chars
-    tables = []
+    tables: List[PageTable] = []
     for candidate in candidates:
         try:
             grid = TableGrid(candidate)
         except Exception:
             continue
-        if any(_overlaps(grid.bbox, box) for box in exclude):
+        if any(_overlaps(grid.bbox, box) for box in list(exclude) + [t.grid_bbox for t in tables]):
             continue
         table = _text_table(grid, chars, words, _ruled_rows(grid.bbox, segments()[0]))
         if table is not None:
             tables.append(table)
+            x0, y0, x1, y1 = table.grid_bbox
+            chars = [char for char in chars if not (x0 <= char.cx < x1 and y0 <= char.cy < y1)]
     return tables, chars
 
 
