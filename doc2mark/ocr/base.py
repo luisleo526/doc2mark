@@ -85,6 +85,18 @@ _RAW_DISCIPLINE = (
 # trend/structure in interpretation. Embeds _RAW_DISCIPLINE as the VERBATIM body.
 # (Phase 1: photo/logo/stamp/mixed ride VERBATIM; screenshot is the only route
 #  that may withhold printed values.)
+# Part of the router prompt on every auto-routed request, and appended again (after
+# _CONTEXT_PDF_INSTRUCTION) when a neighbor-page PDF is attached: neighbors are read
+# only to judge host-document purpose, every non-verbatim policy is gated behind
+# confidence + legibility, and context absent -> VERBATIM.
+_ROUTER_CONFIDENCE_CLAUSE = (
+    "When neighbor pages are attached, use them ONLY to judge the host document's purpose "
+    "(e.g. marketing/module-intro vs financial report) and for terminology; never "
+    "transcribe them. The describe and screenshot policies may be used ONLY when your "
+    "self_confidence >= 0.7 AND legibility is \"high\". Otherwise, and whenever context "
+    "is absent or conflicting, use VERBATIM."
+)
+
 _ROUTER_PREAMBLE = (
     "First CLASSIFY this image into exactly ONE type, then APPLY that type's policy "
     "in this same response. Do not write your reasoning; just produce the result.\n\n"
@@ -112,19 +124,9 @@ _ROUTER_PREAMBLE = (
     "\"screenshot\" may NEVER omit printed text. A ruled grid of irregular, varied-precision, "
     "or internally-consistent (subtotals that sum) numbers is a REAL table → transcribe it "
     "(table), regardless of any surrounding app chrome. Monospace code/terminal is \"code\" "
-    "→ transcribe, never \"screenshot\"."
+    "→ transcribe, never \"screenshot\".\n\n" + _ROUTER_CONFIDENCE_CLAUSE
 )
 
-# Appended (after _CONTEXT_PDF_INSTRUCTION) by the providers when a neighbor-page
-# PDF context is attached: read neighbors only to judge host-document purpose, and
-# gate every non-verbatim policy behind confidence + legibility.
-_ROUTER_CONFIDENCE_CLAUSE = (
-    "Use the attached neighbor pages ONLY to judge the host document's purpose "
-    "(e.g. marketing/module-intro vs financial report) and for terminology; never "
-    "transcribe them. The describe and screenshot policies may be used ONLY when your "
-    "self_confidence >= 0.7 AND legibility is \"high\". Otherwise, and whenever context "
-    "is absent or conflicting, use VERBATIM."
-)
 
 # Sent with every auto-routed request that carries NO neighbor-page PDF: context is
 # absent, so the router's third gate cannot hold and nothing may be withheld. The
@@ -445,36 +447,31 @@ class BaseOCR(ABC):
     def _enforce_router_firewall(
         self,
         results: List[OCRResult],
-        context_attached: List[bool],
         redo_verbatim: Callable[[List[int]], List[OCRResult]],
     ) -> List[OCRResult]:
-        """Redo, with an explicit verbatim task, every structured result that
-        withholds printed values against the router policy
+        """Runtime router firewall: redo, with an explicit verbatim task, every
+        structured result that withholds printed values against the router policy.
+
+        The result builders run the withholding subset of ``router_invariants``
         (:func:`doc2mark.ocr.schema.withholding_violations`, e.g. an illustrative
         table on a ``document_type="table"`` page, or any withholding while no
-        neighbor-page context was attached).
-
-        ``redo_verbatim(indices)`` re-OCRs those images and returns one result per
-        index. A clean redo replaces the result (``metadata["router_fallback"] =
-        "verbatim"``). Otherwise the original stays, flagged ``"unresolved"``; its
-        Markdown then carries the visible ``[N illustrative rows not transcribed]``
-        marker. Both keep the violations in ``metadata["router_violations"]`` and
-        the token usage of both calls.
+        neighbor-page context was attached) and record what they find in
+        ``metadata["router_violations"]``. ``redo_verbatim(indices)`` re-OCRs those
+        images and returns one result per index. A clean redo replaces the result
+        (``metadata["router_fallback"] = "verbatim"``); otherwise the original stays,
+        flagged ``"unresolved"``, and its Markdown carries the visible
+        ``[N illustrative rows not transcribed]`` marker. Either way the violations
+        stay in ``metadata["router_violations"]`` and the token usage of both calls
+        is kept.
         """
-        from doc2mark.ocr.schema import OCRPage, withholding_violations
-        violations: Dict[int, List[str]] = {}
-        for index, result in enumerate(results):
-            page = result.document
-            if isinstance(page, OCRPage):
-                found = withholding_violations(page, context_attached=context_attached[index])
-                if found:
-                    violations[index] = found
-        if not violations:
+        from doc2mark.ocr.schema import OCRPage
+        indices = [i for i, r in enumerate(results) if (r.metadata or {}).get("router_violations")]
+        if not indices:
             return results
-        indices = sorted(violations)
+        first = results[indices[0]].metadata["router_violations"]
         logger.warning(
             f"Router firewall: {len(indices)}/{len(results)} OCR result(s) withheld printed values "
-            f"({'; '.join(violations[indices[0]])}); redoing them verbatim"
+            f"({'; '.join(first)}); redoing them verbatim"
         )
         try:
             redone: Optional[List[OCRResult]] = redo_verbatim(indices)
@@ -484,22 +481,22 @@ class BaseOCR(ABC):
         for position, index in enumerate(indices):
             original = results[index]
             candidate = redone[position] if redone is not None and position < len(redone) else None
-            usage = _sum_token_usage(
-                (original.metadata or {}).get("token_usage"),
-                (candidate.metadata or {}).get("token_usage") if candidate is not None else None,
-            )
+            candidate_meta = (candidate.metadata or {}) if candidate is not None else {}
             clean = (
                 candidate is not None
                 and isinstance(candidate.document, OCRPage)
                 and not self._is_empty_structured(candidate)
-                and not (candidate.metadata or {}).get("ocr_refusal")
-                and not withholding_violations(candidate.document, context_attached=context_attached[index])
+                and not candidate_meta.get("ocr_refusal")
+                and not candidate_meta.get("router_violations")
             )
             chosen = candidate if clean else original
             meta = dict(chosen.metadata or {})
-            meta.update(router_violations=violations[index], router_fallback="verbatim" if clean else "unresolved",
-                        token_usage=usage)
-            if "batch_index" in (original.metadata or {}):
+            meta.update(
+                router_violations=original.metadata["router_violations"],
+                router_fallback="verbatim" if clean else "unresolved",
+                token_usage=_sum_token_usage(original.metadata.get("token_usage"), candidate_meta.get("token_usage")),
+            )
+            if "batch_index" in original.metadata:
                 meta["batch_index"] = original.metadata["batch_index"]
             results[index] = replace(chosen, metadata=meta)
         return results

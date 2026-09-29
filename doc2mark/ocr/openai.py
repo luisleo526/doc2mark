@@ -24,7 +24,7 @@ from doc2mark.ocr.base import (
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
+from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
 
 try:
     from pydantic import BaseModel
@@ -788,22 +788,6 @@ class OpenAIOCR(BaseOCR):
             available = [t.value for t in Task]
             raise ValueError(f"Unknown OCR task: {task}. Available: {available}")
 
-    def _resolve_tasks(
-            self,
-            n_images: int,
-            task: Optional[Union[str, Task]],
-            tasks: Optional[List[Union[str, Task]]],
-    ) -> List[Task]:
-        """Per-image tasks: ``tasks`` wins over ``task``, which falls back to config.task."""
-        if tasks is not None:
-            if len(tasks) != n_images:
-                raise ValueError(
-                    f"tasks length ({len(tasks)}) must match number of images ({n_images})"
-                )
-            return [self._coerce_task(t) for t in tasks]
-        single = self._coerce_task(task) if task is not None else self.config.task
-        return [single] * n_images
-
     def _resolve_task_prompts(
             self,
             n_images: int,
@@ -820,7 +804,15 @@ class OpenAIOCR(BaseOCR):
         raw-mode instruction is appended when ``detail == "raw"``, and the
         page-markdown synthesis instruction when ``synthesis_markdown`` is set.
         """
-        resolved_tasks = self._resolve_tasks(n_images, task, tasks)
+        if tasks is not None:
+            if len(tasks) != n_images:
+                raise ValueError(
+                    f"tasks length ({len(tasks)}) must match number of images ({n_images})"
+                )
+            resolved_tasks = [self._coerce_task(t) for t in tasks]
+        else:
+            single = self._coerce_task(task) if task is not None else self.config.task
+            resolved_tasks = [single] * n_images
 
         lang = language if language is not None else (self.config.language if self.config else None)
         prompts: List[str] = []
@@ -909,7 +901,12 @@ class OpenAIOCR(BaseOCR):
             if structured:
                 prompts = self._resolve_task_prompts(
                     len(images), task, tasks, language, detail, synthesis_markdown=synthesis_markdown)
-                routed = [t == Task.AUTO for t in self._resolve_tasks(len(images), task, tasks)]
+                # Which images go through the auto router (for the no-context note).
+                if tasks is not None:
+                    routed = [self._coerce_task(t) == Task.AUTO for t in tasks]
+                else:
+                    single = self._coerce_task(task) if task is not None else self.config.task
+                    routed = [single == Task.AUTO] * len(images)
             else:
                 legacy_kwargs = dict(kwargs)
                 if language is not None:
@@ -921,7 +918,6 @@ class OpenAIOCR(BaseOCR):
             # Absent when the feature is off -> off-by-default byte-identical path.
             context_pdfs = kwargs.get('context_pdfs')
             context_enabled = getattr(self._vision_agent, '_context_pdf_enabled', False)
-            attached = [bool(context_pdfs and context_pdfs[i]) and context_enabled for i in range(len(images))]
 
             # Prepare input data for VisionAgent
             input_dicts = []
@@ -952,8 +948,7 @@ class OpenAIOCR(BaseOCR):
                 results = self._recover_empty_structured(results, images, language=language, **kwargs)
                 if not kwargs.get('_firewall_retry'):
                     results = self._enforce_router_firewall(
-                        results, attached,
-                        lambda indices: self._redo_verbatim(indices, images, language, detail, kwargs))
+                        results, lambda indices: self._redo_verbatim(indices, images, language, detail, kwargs))
             elif not kwargs.get('_recovery'):
                 self._screen_free_form_answers(results)
 
@@ -987,6 +982,8 @@ class OpenAIOCR(BaseOCR):
         # page_markdown is an image-strategy-only synthesis; null it everywhere else so
         # to_markdown() stays byte-identical for normal docs / embedded-figure OCR.
         synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
+        context_pdfs = kwargs.get('context_pdfs')
+        context_enabled = getattr(getattr(self, '_vision_agent', None), '_context_pdf_enabled', False)
         results: List[OCRResult] = []
 
         for i, item in enumerate(batch_results):
@@ -1025,6 +1022,11 @@ class OpenAIOCR(BaseOCR):
                 }
                 if refusal:
                     metadata.update(refusal=refusal, non_content="provider_refusal")
+                # Runtime router firewall (redo happens in _batch_process_with_vision_agent).
+                violations = withholding_violations(
+                    page, context_attached=bool(context_pdfs and context_pdfs[i]) and context_enabled)
+                if violations:
+                    metadata["router_violations"] = violations
                 results.append(OCRResult(
                     text=page.to_markdown(),
                     confidence=(page.interpretation.self_confidence if page.interpretation else None),

@@ -21,7 +21,7 @@ from doc2mark.ocr.base import (
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
+from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -494,23 +494,6 @@ class VertexAIOCR(BaseOCR):
         """Resolve the effective detail level (per-call override > config)."""
         return kwargs.get("detail") or (self.config.detail if self.config else "full")
 
-    def _resolve_tasks(self, n: int, **kwargs) -> List[Task]:
-        """Per-image tasks: ``tasks`` wins over ``task``, which falls back to config.task."""
-        tasks = kwargs.get("tasks")
-        if tasks is not None:
-            if len(tasks) != n:
-                raise OCRError(
-                    f"tasks length ({len(tasks)}) does not match images length ({n})"
-                )
-            return [self._coerce_task(t) for t in tasks]
-        task = kwargs.get("task")
-        single = (
-            self._coerce_task(task)
-            if task is not None
-            else (self.config.task if self.config else Task.AUTO)
-        )
-        return [single] * n
-
     def _build_structured_prompts(self, images: List[bytes], **kwargs) -> List[str]:
         """Build one schema-aligned prompt per image.
 
@@ -519,7 +502,21 @@ class VertexAIOCR(BaseOCR):
         ``add_language_instruction`` mechanism, exactly as the free-form path does.
         """
         n = len(images)
-        task_list = self._resolve_tasks(n, **kwargs)
+        tasks = kwargs.get("tasks")
+        if tasks is not None:
+            if len(tasks) != n:
+                raise OCRError(
+                    f"tasks length ({len(tasks)}) does not match images length ({n})"
+                )
+            task_list = [self._coerce_task(t) for t in tasks]
+        else:
+            task = kwargs.get("task")
+            single = (
+                self._coerce_task(task)
+                if task is not None
+                else (self.config.task if self.config else Task.AUTO)
+            )
+            task_list = [single] * n
 
         custom = kwargs.get("instructions")
         if custom:
@@ -591,16 +588,21 @@ class VertexAIOCR(BaseOCR):
         try:
             if structured:
                 prompts = self._build_structured_prompts(images, **kwargs)
-                routed = (
-                    [False] * len(images) if kwargs.get("instructions")
-                    else [t == Task.AUTO for t in self._resolve_tasks(len(images), **kwargs)]
-                )
+                # Which images go through the auto router (for the no-context note).
+                if kwargs.get("instructions"):
+                    routed = [False] * len(images)
+                elif kwargs.get("tasks") is not None:
+                    routed = [self._coerce_task(t) == Task.AUTO for t in kwargs["tasks"]]
+                else:
+                    task = kwargs.get("task")
+                    single = self._coerce_task(task) if task is not None else (
+                        self.config.task if self.config else Task.AUTO)
+                    routed = [single == Task.AUTO] * len(images)
             else:
                 prompts = [self._build_prompt(**kwargs)] * len(images)
                 routed = [False] * len(images)
 
             context_pdfs = kwargs.get("context_pdfs")  # Optional[List[Optional[str]]], len == len(images)
-            attached = [bool(context_pdfs and context_pdfs[i]) for i in range(len(images))]
 
             input_dicts = []
             for i, image_data in enumerate(images):
@@ -636,7 +638,7 @@ class VertexAIOCR(BaseOCR):
                 results = self._recover_empty_structured(results, images, **kwargs)
                 if not kwargs.get("_firewall_retry"):
                     results = self._enforce_router_firewall(
-                        results, attached, lambda indices: self._redo_verbatim(indices, images, kwargs))
+                        results, lambda indices: self._redo_verbatim(indices, images, kwargs))
                 return results
 
             results = self._build_legacy_results(batch_results, images, **kwargs)
@@ -699,6 +701,7 @@ class VertexAIOCR(BaseOCR):
         """
         detail = self._resolve_detail(**kwargs)
         on_parse_error = self.config.on_parse_error if self.config else "raw_text"
+        context_pdfs = kwargs.get("context_pdfs")
 
         results: List[OCRResult] = []
         for i, payload in enumerate(batch_results):
@@ -724,9 +727,12 @@ class VertexAIOCR(BaseOCR):
                 text = VertexAIVisionAgent._extract_text(getattr(aimsg, "content", ""))
                 page = OCRPage(raw=RawExtraction(text=text), interpretation=None)
 
+            violations: List[str] = []
             if isinstance(page, OCRPage):
                 if detail == "raw":
                     page.interpretation = None
+                # Runtime router firewall (redo happens in _batch_process_with_vision_agent).
+                violations = withholding_violations(page, context_attached=bool(context_pdfs and context_pdfs[i]))
                 # page_markdown is image-strategy-only; null it elsewhere so to_markdown
                 # stays byte-identical for normal docs / embedded-figure OCR.
                 if not kwargs.get("synthesis_markdown") and page.interpretation is not None:
@@ -763,6 +769,7 @@ class VertexAIOCR(BaseOCR):
                         "parse_error": str(parsing_error) if parsing_error else None,
                         "token_usage": usage,
                         **({"refusal": blocked, "non_content": "provider_refusal"} if blocked else {}),
+                        **({"router_violations": violations} if violations else {}),
                     },
                     document=page if isinstance(page, OCRPage) else None,
                 )
