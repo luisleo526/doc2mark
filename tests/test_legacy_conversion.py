@@ -182,90 +182,121 @@ class TestCheckLibreOfficeInstalled:
 # _convert_with_libreoffice  --  command-line construction
 # ---------------------------------------------------------------------------
 
+def _fake_popen(on_start=None, returncode=0, stdout="", stderr="", communicate_side_effect=None):
+    """A stand-in for ``subprocess.Popen``: records every call, runs ``on_start(cmd)``
+    (e.g. to create the converted file) and returns a process whose ``communicate``
+    yields ``(stdout, stderr)``."""
+    calls = []
+
+    def popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if on_start is not None:
+            on_start(cmd)
+        process = MagicMock()
+        process.returncode = returncode
+        process.pid = 999999
+        if communicate_side_effect is not None:
+            process.communicate.side_effect = communicate_side_effect
+        else:
+            process.communicate.return_value = (stdout, stderr)
+        return process
+
+    return popen, calls
+
+
 class TestConvertCommandLine:
     """Assert the exact soffice command line that gets built."""
 
     @pytest.mark.parametrize("target_format", ["docx", "xlsx", "pptx"])
     def test_command_structure(self, tmp_path, target_format):
+        """Each conversion runs with its own throwaway user profile, so concurrent
+        conversions cannot hand their work to one another (a shared profile made 2 of 4
+        parallel conversions fail)."""
         proc = _make_processor()
-        input_file = tmp_path / f"input.doc"
+        input_file = tmp_path / "input.doc"
         input_file.touch()
         outdir = str(tmp_path / "out")
-
-        expected_cmd = [
-            FAKE_SOFFICE,
-            "--headless",
-            "--convert-to", target_format,
-            "--outdir", outdir,
-            str(input_file),
-        ]
-
-        # Make conversion produce the expected output file
         converted = Path(outdir) / f"input.{target_format}"
 
-        def fake_run(cmd, **kw):
-            # Verify the command before returning success
-            assert cmd == expected_cmd, f"Unexpected command: {cmd}"
+        def make_output(cmd):
             Path(outdir).mkdir(parents=True, exist_ok=True)
             converted.touch()
-            m = MagicMock()
-            m.returncode = 0
-            m.stderr = ""
-            m.stdout = ""
-            return m
 
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, calls = _fake_popen(make_output)
+        with patch("subprocess.Popen", side_effect=popen):
             result = proc._convert_with_libreoffice(input_file, target_format, outdir)
         assert result == converted
+        cmd = calls[0][0]
+        assert cmd[0] == FAKE_SOFFICE
+        assert cmd[1].startswith("-env:UserInstallation=file://")
+        assert cmd[2:] == ["--headless", "--norestore", "--convert-to", target_format,
+                           "--outdir", outdir, str(input_file)]
+
+    def test_each_conversion_gets_a_fresh_profile(self, tmp_path):
+        proc = _make_processor()
+        input_file = tmp_path / "input.doc"
+        input_file.touch()
+        outdir = str(tmp_path / "out")
+        profiles = []
+
+        def make_output(cmd):
+            profile = Path(cmd[1].split("file://", 1)[1])
+            assert profile.is_dir()  # exists while soffice runs
+            profiles.append(profile)
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+            (Path(outdir) / "input.docx").touch()
+
+        popen, _ = _fake_popen(make_output)
+        with patch("subprocess.Popen", side_effect=popen):
+            proc._convert_with_libreoffice(input_file, "docx", outdir)
+            proc._convert_with_libreoffice(input_file, "docx", outdir)
+        assert len(set(profiles)) == 2
+        assert not any(profile.exists() for profile in profiles)  # removed afterwards
 
     def test_timeout_is_60_seconds(self, tmp_path):
-        """subprocess.run is called with timeout=60."""
+        """The conversion waits at most 60 seconds (the helper's default)."""
+        proc = _make_processor()
+        input_file = tmp_path / "input.doc"
+        input_file.touch()
+        outdir = str(tmp_path / "out")
+        processes = []
+
+        def make_output(cmd):
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+            (Path(outdir) / "input.docx").touch()
+
+        popen, _ = _fake_popen(make_output)
+
+        def recording_popen(cmd, **kwargs):
+            process = popen(cmd, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch("subprocess.Popen", side_effect=recording_popen):
+            proc._convert_with_libreoffice(input_file, "docx", outdir)
+
+        assert processes[0].communicate.call_args.kwargs.get("timeout") == 60
+
+    def test_output_captured_as_text_in_own_process_group(self, tmp_path):
+        """stdout/stderr are captured as text; soffice runs in its own session so a
+        timeout can stop the wrapper script and soffice.bin together."""
         proc = _make_processor()
         input_file = tmp_path / "input.doc"
         input_file.touch()
         outdir = str(tmp_path / "out")
 
-        captured_kwargs = {}
-
-        def fake_run(cmd, **kw):
-            captured_kwargs.update(kw)
+        def make_output(cmd):
             Path(outdir).mkdir(parents=True, exist_ok=True)
             (Path(outdir) / "input.docx").touch()
-            m = MagicMock()
-            m.returncode = 0
-            m.stderr = ""
-            m.stdout = ""
-            return m
 
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, calls = _fake_popen(make_output)
+        with patch("subprocess.Popen", side_effect=popen):
             proc._convert_with_libreoffice(input_file, "docx", outdir)
 
-        assert captured_kwargs.get("timeout") == 60
-
-    def test_capture_output_and_text_flags(self, tmp_path):
-        """subprocess.run is called with capture_output=True and text=True."""
-        proc = _make_processor()
-        input_file = tmp_path / "input.doc"
-        input_file.touch()
-        outdir = str(tmp_path / "out")
-
-        captured_kwargs = {}
-
-        def fake_run(cmd, **kw):
-            captured_kwargs.update(kw)
-            Path(outdir).mkdir(parents=True, exist_ok=True)
-            (Path(outdir) / "input.docx").touch()
-            m = MagicMock()
-            m.returncode = 0
-            m.stderr = ""
-            m.stdout = ""
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
-            proc._convert_with_libreoffice(input_file, "docx", outdir)
-
-        assert captured_kwargs.get("capture_output") is True
-        assert captured_kwargs.get("text") is True
+        kwargs = calls[0][1]
+        assert kwargs.get("stdout") == subprocess.PIPE and kwargs.get("stderr") == subprocess.PIPE
+        assert kwargs.get("text") is True
+        assert kwargs.get("start_new_session") is True
 
 
 # ---------------------------------------------------------------------------
@@ -280,16 +311,29 @@ class TestConvertFailures:
         input_file.touch()
         outdir = str(tmp_path / "out")
 
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 1
-            m.stderr = "segfault in filter"
-            m.stdout = ""
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, _ = _fake_popen(returncode=1, stderr="segfault in filter")
+        with patch("subprocess.Popen", side_effect=popen):
             with pytest.raises(ConversionError, match="LibreOffice conversion failed"):
                 proc._convert_with_libreoffice(input_file, "docx", outdir)
+
+    def test_failed_conversion_is_retried_once(self, tmp_path):
+        proc = _make_processor()
+        input_file = tmp_path / "input.doc"
+        input_file.touch()
+        outdir = str(tmp_path / "out")
+        attempts = []
+
+        def succeed_second_time(cmd):
+            attempts.append(cmd)
+            if len(attempts) == 2:
+                Path(outdir).mkdir(parents=True, exist_ok=True)
+                (Path(outdir) / "input.docx").touch()
+
+        popen, calls = _fake_popen(succeed_second_time)
+        with patch("subprocess.Popen", side_effect=popen):
+            result = proc._convert_with_libreoffice(input_file, "docx", outdir)
+        assert result == Path(outdir) / "input.docx"
+        assert len(calls) == 2
 
     def test_stderr_included_in_error_message(self, tmp_path):
         proc = _make_processor()
@@ -297,14 +341,8 @@ class TestConvertFailures:
         input_file.touch()
         outdir = str(tmp_path / "out")
 
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 1
-            m.stderr = "specific error detail"
-            m.stdout = ""
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, _ = _fake_popen(returncode=1, stderr="specific error detail")
+        with patch("subprocess.Popen", side_effect=popen):
             with pytest.raises(ConversionError, match="specific error detail"):
                 proc._convert_with_libreoffice(input_file, "docx", outdir)
 
@@ -314,26 +352,26 @@ class TestConvertFailures:
         input_file.touch()
         outdir = str(tmp_path / "out")
 
-        def fake_run(cmd, **kw):
-            m = MagicMock()
-            m.returncode = 1
-            m.stderr = ""
-            m.stdout = "stdout error info"
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, _ = _fake_popen(returncode=1, stdout="stdout error info")
+        with patch("subprocess.Popen", side_effect=popen):
             with pytest.raises(ConversionError, match="stdout error info"):
                 proc._convert_with_libreoffice(input_file, "docx", outdir)
 
     def test_timeout_raises_conversion_error(self, tmp_path):
+        """A timed-out attempt stops the whole soffice process group and is not retried."""
         proc = _make_processor()
         input_file = tmp_path / "input.doc"
         input_file.touch()
         outdir = str(tmp_path / "out")
 
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="soffice", timeout=60)):
+        popen, calls = _fake_popen(communicate_side_effect=[
+            subprocess.TimeoutExpired(cmd="soffice", timeout=60), ("", "")])
+        with patch("subprocess.Popen", side_effect=popen), \
+                patch("doc2mark.utils.libreoffice._kill_group") as kill_group:
             with pytest.raises(ConversionError, match="timed out"):
                 proc._convert_with_libreoffice(input_file, "docx", outdir)
+        assert kill_group.call_count == 1
+        assert len(calls) == 1
 
     def test_converted_file_not_found_raises(self, tmp_path):
         """When soffice exits 0 but produces no output file, ConversionError."""
@@ -343,37 +381,22 @@ class TestConvertFailures:
         outdir = str(tmp_path / "out")
         Path(outdir).mkdir(parents=True, exist_ok=True)
 
-        def fake_run(cmd, **kw):
-            # Return success but produce no file
-            m = MagicMock()
-            m.returncode = 0
-            m.stderr = ""
-            m.stdout = ""
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, _ = _fake_popen()  # success, but no file
+        with patch("subprocess.Popen", side_effect=popen):
             with pytest.raises(ConversionError, match="Converted file not found"):
                 proc._convert_with_libreoffice(input_file, "docx", outdir)
 
     def test_fallback_glob_when_expected_name_missing(self, tmp_path):
-        """If the expected filename is absent but another file with the right
-        extension exists, the converter picks it up (current behaviour)."""
+        """If the expected filename is absent but exactly one file with the right
+        extension exists, the converter picks it up."""
         proc = _make_processor()
         input_file = tmp_path / "input.doc"
         input_file.touch()
         outdir = str(tmp_path / "out")
         Path(outdir).mkdir(parents=True, exist_ok=True)
 
-        def fake_run(cmd, **kw):
-            # Produce a file with a different stem
-            (Path(outdir) / "different_name.docx").touch()
-            m = MagicMock()
-            m.returncode = 0
-            m.stderr = ""
-            m.stdout = ""
-            return m
-
-        with patch("subprocess.run", side_effect=fake_run):
+        popen, _ = _fake_popen(lambda cmd: (Path(outdir) / "different_name.docx").touch())
+        with patch("subprocess.Popen", side_effect=popen):
             result = proc._convert_with_libreoffice(input_file, "docx", outdir)
         assert result.suffix == ".docx"
         assert result.name == "different_name.docx"

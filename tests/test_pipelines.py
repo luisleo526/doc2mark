@@ -183,7 +183,7 @@ class TestPipelines:
 
     @pytest.mark.requires_api_key
     def test_xlsx_ocr_embeds_in_cell(self, sample_documents_dir):
-        """XLSX: OCR result should be embedded in the table cell placeholder (first occurrence only)."""
+        """XLSX: a picture's OCR result is embedded in the table cell it is anchored to."""
         xlsx = sample_documents_dir / 'sample_spreadsheet.xlsx'
         if not xlsx.exists():
             pytest.skip("sample_spreadsheet.xlsx not found")
@@ -205,9 +205,8 @@ class TestPipelines:
         # Ensure no literal placeholder remains
         assert '#VALUE!' not in result.content
 
-        # Ensure at least one OCR analysis div injected (first occurrence replacement)
-        injected = result.content.count('📷 OCR Analysis:')
-        assert injected >= 1
+        # The picture anchored in the table carries its OCR text in its own cell
+        assert '[Image: ' in result.content
 
     def test_pptx_ocr_uses_self_ocr_not_visionagent(self, sample_documents_dir):
         """PPTX: OCR should run when self.ocr is configured, regardless of VisionAgent availability."""
