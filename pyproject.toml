@@ -189,6 +189,7 @@ markers = [
     "slow: Tests that take a long time to run",
     "ocr: Tests specifically for OCR functionality",
     "requires_api_key: Tests that require OPENAI_API_KEY to be set",
+    "e2e: End-to-end tests that drive the real CLI as a subprocess (need tesseract/soffice; see docs/development.rst)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
