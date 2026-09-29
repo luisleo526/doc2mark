@@ -803,7 +803,9 @@ def _escape_cell(text: str) -> str:
 
 
 _TABLE_TAG_RE = re.compile(r"<(/?)table\b[^>]*>", re.I)
-_ROW_MARKUP_RE = re.compile(r"<(?:tr|td|th)\b", re.I)
+# What follows an opening <table> tag in real markup (prose that merely mentions
+# "<table>" goes on with words).
+_TABLE_BODY_START_RE = re.compile(r"\s*<(?:tr|thead|tbody|tfoot|caption|colgroup|col)\b", re.I)
 
 
 def _sanitize_markdown(text: str) -> str:
@@ -813,11 +815,11 @@ def _sanitize_markdown(text: str) -> str:
     HTML except the inert ``<br>`` is neutralized. Apply it once, to the final text."""
     text = _clean_controls(text)
     out: List[str] = []
-    depth, start, last = 0, 0, 0
+    depth, start, opened, last = 0, 0, 0, 0
     for match in _TABLE_TAG_RE.finditer(text):
         if not match.group(1):
             if depth == 0:
-                start = match.start()
+                start, opened = match.start(), match.end()
             depth += 1
         elif depth:
             depth -= 1
@@ -825,8 +827,9 @@ def _sanitize_markdown(text: str) -> str:
                 out.append(_neutralize_html(text[last:start], keep_breaks=True))
                 out.append(normalize_table_html(sanitize_table_html(text[start:match.end()])))
                 last = match.end()
-    if depth and _ROW_MARKUP_RE.search(text, start):
-        # A table still open at the end, with rows in it: an answer cut off at max_tokens.
+    if depth and _TABLE_BODY_START_RE.match(text, opened):
+        # A table still open at the end whose markup goes straight on into rows: an
+        # answer cut off at max_tokens.
         out.append(_neutralize_html(text[last:start], keep_breaks=True))
         out.append(normalize_table_html(sanitize_table_html(text[start:])))
     else:  # no table left open, or a "<table>" merely mentioned in the prose

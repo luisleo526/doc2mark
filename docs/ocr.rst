@@ -239,10 +239,14 @@ indexes such an answer as page content:
 1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
    when a structured answer ignores the schema), and Gemini answers stopped for
    ``SAFETY``, ``RECITATION``, ``BLOCKLIST``, ``PROHIBITED_CONTENT`` or ``SPII``.
-2. A short answer that starts with a refusal or "no readable text" phrase (English,
-   Chinese, Japanese, Korean, German, Spanish, French) counts as no content too. The
-   check is conservative: real text that merely mentions an apology ("Sorry we missed
-   you!", "This page intentionally left blank.") is kept.
+2. A short answer in which the model speaks about itself or about its input image
+   counts as no content too: "I'm sorry, but I can't assist with that request.",
+   "I can't read the text in this image.", "The image appears to be blank.", "No text
+   detected.", and the same statements in Chinese, Japanese, Korean, German, Spanish
+   and French. The check is conservative. Text that addresses a reader (a request to
+   resend or retake, "your photo", "please"), talks about a file, folder or system, or
+   merely mentions an apology ("Sorry we missed you!", "This page intentionally left
+   blank.") is kept; what the check cannot decide is left to the judge below.
 3. A structured answer with no content goes to the free-form recovery, as an empty
    one always did. If the recovered answer is a refusal as well, the result is empty
    text with ``metadata["ocr_refusal"] = True``.

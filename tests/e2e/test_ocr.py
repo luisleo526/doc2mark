@@ -214,9 +214,13 @@ def test_t10_text_removed_by_sanitizing_page_markdown_is_still_indexed(run_cli, 
     assert "800" in result.markdown and "<svg" not in result.markdown, result.describe()
 
 
-def test_t10_model_markdown_that_mentions_a_table_tag_keeps_its_structure(run_cli, fake_llm, scan):
+@pytest.mark.parametrize("sentence", [
+    "The <table> element represents tabular data.",
+    "The <table> element holds <tr> rows, which hold <td> cells.",
+])
+def test_t10_model_markdown_that_mentions_a_table_tag_keeps_its_structure(run_cli, fake_llm, scan, sentence):
     """A literal "<table>" in prose is not a truncated table: the Markdown after it stays."""
-    answer = ("The <table> element represents tabular data.\n\n## Attributes\n\n"
+    answer = (sentence + "\n\n## Attributes\n\n"
               "- border: width of the frame\n- summary: deprecated\n\n1. Step one\n2. Step two")
     fake_llm.script(free_form=[fake.text(answer)])
 
@@ -226,7 +230,7 @@ def test_t10_model_markdown_that_mentions_a_table_tag_keeps_its_structure(run_cl
     rendered = build.render(result.markdown)
     assert [h.get_text() for h in rendered.find_all("h2")] == ["Attributes"], result.describe()
     assert len(rendered.find_all("li")) == 4, result.describe()
-    assert "The <table> element represents tabular data." in build.visible_text(result.markdown)
+    assert sentence in build.visible_text(result.markdown)
 
 
 def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
@@ -471,6 +475,9 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "Unable to process the uploaded image. Please upload a JPG or PNG under 10 MB.",
     "The photo is blurry.\nHold the camera steady and retake it.",
     "As an AI assistant, Aria answers customer questions 24/7.",
+    "I can't read the picture, it's too blurry. Can you retake it?",
+    "There is no visible content in this folder.",
+    "Leider kann ich Ihre Bildungsnachweise nicht verarbeiten, da die Unterschrift fehlt.",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])
