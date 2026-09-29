@@ -85,7 +85,7 @@ class PDFLoader:
         self._legibility_judge = legibility_judge
         self._page_measures: Dict[int, "pdf_routing.PageMeasure"] = {}
         self._page_routes: Dict[int, Tuple[str, str]] = {}
-        self._render_fallback_pages: set = set()  # image-routed pages whose render OCR'd to nothing
+        self._rendered_pages: set = set()  # pages whose content is the OCR of their render
 
         # Neighbor-page PDF context (off by default). Resolve the context tier
         # once from the OCR instance's config (NOT self.config, which does not
@@ -253,7 +253,7 @@ class PDFLoader:
             "content": []  # Simple array of content items
         }
 
-        self._render_fallback_pages = set()
+        self._rendered_pages = set()
 
         # OCR needs the images: asking for OCR implies extracting them for it.
         if ocr_images and self.ocr is None:
@@ -709,6 +709,7 @@ class PDFLoader:
                 and (page_num, _PAGE_RENDER_XREF) in ocr_results_map):
             render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
             if render_text:
+                self._rendered_pages.add(page_num)
                 return [{
                     "type": "text:image_description",
                     "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
@@ -719,7 +720,6 @@ class PDFLoader:
             # (verbatim first) rather than drop the page.
             fallback = self._process_page(page_num, extract_images=False, ocr_images=False)
             if fallback:
-                self._render_fallback_pages.add(page_num)
                 logger.warning(f"{self.pdf_path.name} page {page_num + 1}: OCR of the page render returned "
                                f"no text; keeping the page's own text layer")
             return fallback
@@ -807,14 +807,11 @@ class PDFLoader:
             return
         name = self.pdf_path.name
         signals = [self._page_signals(i) for i in range(n)]
-        image_pages = set()
         if ocr_active:
             doc_route = self._document_image_strategy()
             overrides = []
             for i in range(n):
                 route, reason = self._page_route(i)
-                if route == "image":
-                    image_pages.add(i)
                 if route != doc_route:
                     overrides.append({"page": i + 1, "route": route, "reason": reason})
             document["ocr_routing"] = {"document_route": doc_route, "overrides": overrides}
@@ -823,7 +820,7 @@ class PDFLoader:
         for i, page in enumerate(signals):
             if not page.text_layer_illegible:
                 continue
-            ocrd = i in image_pages and i not in self._render_fallback_pages
+            ocrd = i in self._rendered_pages
             layer = page.text_layer
             quality.append({
                 "page": i + 1,
@@ -856,9 +853,9 @@ class PDFLoader:
         elif not ocr_active:
             missing = _pages_without_text(signals)
             if missing:
-                logger.warning(f"{name} {pdf_routing.describe_pages(missing)}: little or no text layer (scanned "
-                               f"or drawn content), so their content was not extracted; enable OCR (an OCR provider "
-                               f"with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read them")
+                logger.warning(f"{name} {pdf_routing.describe_pages(missing)}: little or no text layer; content "
+                               f"shown only as scanned images or drawn outlines was not extracted; enable OCR (an "
+                               f"OCR provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read it")
 
     def _extract_text_as_markdown(self, page, page_num: int, table_bboxes: List[tuple] = None) -> List[SimpleContent]:
         """Extract text blocks and convert to markdown format with text type classification"""

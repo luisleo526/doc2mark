@@ -344,11 +344,6 @@ def document_signals(pages: Sequence[PageSignals]) -> Tuple[float, float, float]
     )
 
 
-def decide_document_route(pages: Sequence[PageSignals]) -> Route:
-    """The document route (:func:`decide_doc_strategy`) from its pages' signals."""
-    return decide_doc_strategy(*document_signals(pages))
-
-
 def decide_page_route(page: PageSignals, document_route: Route) -> Tuple[Route, str]:
     """Route one page when an OCR provider is active: ``(route, reason)``.
 

@@ -15,7 +15,7 @@ that text is not the page's content.
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pymupdf
 
@@ -289,8 +289,9 @@ def measure_page(page, *, legibility_judge: Optional[LegibilityJudge] = None,
     verdict = judge_text_layer(legibility_judge, signals.text_layer, layer_text)
     if verdict is not None:
         signals = replace(signals, judge_legibility=verdict)
-    return PageMeasure(signals=signals, has_invisible_text=bool(invisible),
-                       trace_origins=trace_origins if invisible else None)
+    has_invisible = any(text.strip() for text, _, _ in invisible)
+    return PageMeasure(signals=signals, has_invisible_text=has_invisible,
+                       trace_origins=trace_origins if has_invisible else None)
 
 
 def describe_pages(page_numbers: Sequence[int], limit: int = 10) -> str:
@@ -302,8 +303,3 @@ def describe_pages(page_numbers: Sequence[int], limit: int = 10) -> str:
     if len(shown) == 1:
         return f"page {shown[0]}"
     return f"pages {', '.join(shown[:-1])} and {shown[-1]}"
-
-
-def pages_dict(entries: Dict[int, dict]) -> List[dict]:
-    """Per-page metadata entries (keyed by 0-based index) as a list ordered by page, with 1-based numbers."""
-    return [{"page": index + 1, **entry} for index, entry in sorted(entries.items())]
