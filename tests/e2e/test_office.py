@@ -286,6 +286,128 @@ def test_t14_xlsx_picture_ocr_text_lands_in_its_cell_once(run_cli, require_tool,
     assert result.markdown.count("5831") == 1, result.describe()
 
 
+# Negative numbers under formats whose negative section conveys the sign only by colour, or
+# whose sections are picked by conditions: the displayed text must still carry the sign.
+NEGATIVE_FORMATS = [
+    ("#,##0.00;[Red]#,##0.00", -1234.5, "-1,234.50"),
+    ("#,##0;[Red]#,##0", -1234.5, "-1,235"),
+    ("[Blue]#,##0.00;[Red]#,##0.00", -1234.5, "-1,234.50"),
+    ("[Color10]0.0;[Color3]0.0", -2.5, "-2.5"),
+    ('"$"#,##0.00;[Red]"$"#,##0.00', -42, "-$42.00"),
+    ("General;[Red]General", -1234.5, "-1234.5"),
+    ("#,##0_);[Red](#,##0)", -1234, "(1,234)"),
+    ("#,##0;-#,##0", -7, "-7"),
+    ("[Red][<0]#,##0.00;[Blue][>0]#,##0.00;0.00", -1234.5, "-1,234.50"),
+    ("[Red][<0]#,##0.00;[Blue][>0]#,##0.00;0.00", 1234.5, "1,234.50"),
+    ("[<=100]0;[>100]#,##0", -50, "-50"),
+    ("[<=100]0;[>100]#,##0", 1500, "1,500"),
+]
+
+
+def test_xlsx_negative_numbers_keep_their_sign_under_colour_and_condition_sections(run_cli, e2e_dir):
+    rows = [["Case", "Value"]] + [[f"case {i}", value] for i, (_, value, _) in enumerate(NEGATIVE_FORMATS)]
+    formats = {f"B{i + 2}": number_format for i, (number_format, _, _) in enumerate(NEGATIVE_FORMATS)}
+    path = office.workbook(e2e_dir / "signs.xlsx", [{"title": "Signs", "rows": rows, "formats": formats}])
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    shown = {row[0]: row[1] for row in only_table(result.markdown, result.describe).grid[1:]}
+    wrong = {number_format: (shown.get(f"case {i}"), expected)
+             for i, (number_format, _, expected) in enumerate(NEGATIVE_FORMATS) if shown.get(f"case {i}") != expected}
+    assert not wrong, f"format: (shown, expected) -> {wrong}"
+
+
+def test_xlsx_pictures_in_the_table_keep_their_image_data_without_ocr(run_cli, e2e_dir):
+    """--extract-images without OCR: the cell says [Image] and the picture itself is still returned."""
+    path = office.workbook(e2e_dir / "photos.xlsx", [{
+        "title": "Photos",
+        "rows": [["Name", "Photo", "Score"], ["alice", None, 90], ["bob", None, 80]],
+        "images": {"B2": office.optional_png("ALICE"), "B3": office.optional_png("BOB")},
+    }])
+
+    result = run_cli(path, "--ocr", "none", "--extract-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    grid = only_table(result.markdown, result.describe).grid
+    assert [grid[1][1], grid[2][1]] == ["[Image]", "[Image]"], grid
+    assert result.markdown.count("data:image/png;base64,") == 2, result.describe()[:3000]
+    assert len(result.json["images"] or []) == 2, result.json["metadata"]
+
+
+def test_xlsx_picture_placed_in_a_cell_keeps_its_image_data_without_ocr(run_cli, sample_documents_dir):
+    """Excel's "Place in Cell" picture (a rich value behind a #VALUE! cell) in the tracked sample."""
+    result = run_cli(sample_documents_dir / "sample_spreadsheet_incell.xlsx", "--ocr", "none", "--extract-images")
+
+    assert result.exit_code == 0, result.describe()
+    assert "#VALUE!" not in result.markdown, result.describe()[:3000]
+    assert "Sample Image: [Image]" in result.markdown, result.describe()[:3000]
+    assert result.markdown.count("data:image/png;base64,") == 1, result.describe()[:3000]
+
+
+def test_xlsx_uncached_formulas_in_prefixed_sheet_xml_show_their_formula(run_cli, e2e_dir):
+    """Sheet XML written with a namespace prefix (<x:c><x:f>), as the Open XML SDK writes it."""
+    path = office.workbook(e2e_dir / "prefixed.xlsx", [{
+        "title": "Calc",
+        "rows": [["a", "b", "sum"], [1, 2, "=A2+B2"], [3, 4, "=A3+B3"]],
+    }])
+    office.prefix_sheet_namespace(path, 1)
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    grid = only_table(result.markdown, result.describe).grid
+    assert grid == [["a", "b", "sum"], ["1", "2", "=A2+B2"], ["3", "4", "=A3+B3"]], grid
+
+
+def test_xlsx_single_header_cell_right_above_the_data_stays_in_the_table(run_cli, e2e_dir):
+    """A lone header cell over two-column data is a header, not a title (no blank row, no merge)."""
+    path = office.workbook(e2e_dir / "clients.xlsx", [{
+        "title": "Clients",
+        "rows": [["Customer"], ["alice", 30], ["bob", 40]],
+    }])
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    table = only_table(result.markdown, result.describe)
+    assert table.grid == [["Customer", ""], ["alice", "30"], ["bob", "40"]], table
+    assert result.markdown.find("Customer") > table.start, result.describe()
+
+
+def test_xlsx_logo_beside_the_title_keeps_the_title_above_the_table(run_cli, e2e_dir):
+    """A picture anchored next to a title (blank row before the table) must not pull the title
+    into the table; the picture itself is still returned."""
+    path = office.workbook(e2e_dir / "report.xlsx", [{
+        "title": "Report",
+        "rows": [[None, "ACME Corp Sales Report"], [], ["Region", "Sales"], ["North", 100], ["South", 250]],
+        "images": {"A1": office.optional_png("LOGO")},
+    }])
+
+    result = run_cli(path, "--ocr", "none", "--extract-images")
+
+    assert result.exit_code == 0, result.describe()
+    table = only_table(result.markdown, result.describe)
+    assert table.grid == [["Region", "Sales"], ["North", "100"], ["South", "250"]], table
+    assert 0 <= result.markdown.find("ACME Corp Sales Report") < table.start, result.describe()[:3000]
+    assert result.markdown.count("data:image/png;base64,") == 1, result.describe()[:3000]
+
+
+def test_xlsx_title_merged_across_the_table_is_text_above_it(run_cli, e2e_dir):
+    path = office.workbook(e2e_dir / "quarterly.xlsx", [{
+        "title": "Quarterly",
+        "rows": [["Quarterly Sales FY2026", None, None], ["Region", "Q1", "Q2"], ["North", 1, 2]],
+        "merges": ["A1:C1"],
+    }])
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    table = only_table(result.markdown, result.describe)
+    assert table.grid == [["Region", "Q1", "Q2"], ["North", "1", "2"]] and not table.spans, table
+    assert 0 <= result.markdown.find("Quarterly Sales FY2026") < table.start, result.describe()
+
+
 # --------------------------------------------------------------------------- DOCX (T2, T7, H-F16)
 
 
@@ -387,6 +509,19 @@ def test_hf16_docx_heading_levels_and_list_markers(run_cli, e2e_dir):
     missing = [line for line, at in zip(expected, positions) if at < 0]
     assert not missing, f"missing lines {missing}\n{result.describe()}"
     assert positions == sorted(positions), f"out of order: {list(zip(expected, positions))}"
+
+
+def test_docx_body_text_outline_level_is_not_a_heading(run_cli, e2e_dir):
+    """w:outlineLvl 9 means body text, even on a paragraph whose style is a heading."""
+    path = office.docx_body_text_outline(e2e_dir / "demoted.docx")
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    lines = [line.rstrip() for line in result.markdown.split("\n") if line.strip()]
+    assert "Demoted by the paragraph" in lines, result.describe()
+    assert "Demoted by its style" in lines, result.describe()
+    assert "## Real section" in lines, result.describe()
 
 
 # --------------------------------------------------------------------------- PPTX (T22)

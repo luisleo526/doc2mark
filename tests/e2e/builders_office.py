@@ -143,6 +143,26 @@ def set_cached_formula_value(path: Path, sheet_index: int, coordinate: str, cach
     return Path(path)
 
 
+def prefix_sheet_namespace(path: Path, sheet_index: int, prefix: str = "x") -> Path:
+    """Rewrite one worksheet part so SpreadsheetML elements carry a namespace prefix
+    (``<x:c r="C2"><x:f>A2+B2</x:f>``), as the Open XML SDK writes them, instead of openpyxl's
+    default namespace. The workbook still means exactly the same thing."""
+    part = f"xl/worksheets/sheet{sheet_index}.xml"
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    with zipfile.ZipFile(path) as source:
+        members = {name: source.read(name) for name in source.namelist()}
+    xml = members[part].decode("utf-8")
+    if f'xmlns="{namespace}"' not in xml:
+        raise ValueError(f"{part} does not use the SpreadsheetML default namespace")
+    xml = xml.replace(f'xmlns="{namespace}"', f'xmlns:{prefix}="{namespace}"', 1)
+    xml = re.sub(r"<(/?)([A-Za-z][\w.-]*)(?=[\s/>])", rf"<\1{prefix}:\2", xml)
+    members[part] = xml.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, data in members.items():
+            target.writestr(name, data)
+    return Path(path)
+
+
 # --------------------------------------------------------------------------- DOCX
 
 
@@ -302,6 +322,23 @@ def docx_headings_and_lists(path: Path) -> Path:
     document.add_paragraph("Nested bullet", style="List Bullet 2")
     document.add_paragraph("Second bullet", style="List Bullet")
     document.add_paragraph("Figure 1: Revenue by quarter", style="Caption")
+    document.save(str(path))
+    return Path(path)
+
+
+def docx_body_text_outline(path: Path) -> Path:
+    """Paragraphs whose outline level says body text (``w:outlineLvl w:val="9"``) although
+    their style is a heading: one set on the paragraph itself, one on a custom style based on
+    Heading 2; plus an ordinary Heading 2 as a control."""
+    document = Document()
+    document.add_paragraph("Opening paragraph.")
+    demoted = document.add_heading("Demoted by the paragraph", level=2)
+    demoted._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {W_NS} w:val="9"/>'))
+    style = document.styles.add_style("Body Heading", 1)  # 1 = WD_STYLE_TYPE.PARAGRAPH
+    style.base_style = document.styles["Heading 2"]
+    style.element.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {W_NS} w:val="9"/>'))
+    document.add_paragraph("Demoted by its style", style="Body Heading")
+    document.add_heading("Real section", level=2)
     document.save(str(path))
     return Path(path)
 

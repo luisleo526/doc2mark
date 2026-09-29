@@ -373,6 +373,52 @@ class TestConvertFailures:
         assert kill_group.call_count == 1
         assert len(calls) == 1
 
+    def test_wait_after_kill_is_bounded(self, tmp_path):
+        """A timed-out soffice that does not go away after the kill cannot hang the caller:
+        the post-kill wait has a timeout too, and the caller gets a ConversionError."""
+        proc = _make_processor()
+        input_file = tmp_path / "input.doc"
+        input_file.touch()
+        outdir = str(tmp_path / "out")
+        processes = []
+        popen, _ = _fake_popen(communicate_side_effect=[
+            subprocess.TimeoutExpired(cmd="soffice", timeout=60),
+            subprocess.TimeoutExpired(cmd="soffice", timeout=10)])
+
+        def recording_popen(cmd, **kwargs):
+            process = popen(cmd, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch("subprocess.Popen", side_effect=recording_popen), \
+                patch("doc2mark.utils.libreoffice._kill_group"):
+            with pytest.raises(ConversionError, match="timed out"):
+                proc._convert_with_libreoffice(input_file, "docx", outdir)
+        waits = processes[0].communicate.call_args_list
+        assert len(waits) == 2 and waits[1].kwargs.get("timeout") is not None
+
+    def test_profile_cleanup_errors_do_not_escape(self, tmp_path):
+        """A profile directory that cannot be removed is logged; the conversion result (or its
+        ConversionError) is what the caller sees, never an OSError from the cleanup."""
+        proc = _make_processor()
+        input_file = tmp_path / "input.doc"
+        input_file.touch()
+        outdir = str(tmp_path / "out")
+
+        def make_output(cmd):
+            Path(outdir).mkdir(parents=True, exist_ok=True)
+            (Path(outdir) / "input.docx").touch()
+
+        popen, _ = _fake_popen(make_output)
+        with patch("subprocess.Popen", side_effect=popen), patch("shutil.rmtree", side_effect=OSError("busy")):
+            assert proc._convert_with_libreoffice(input_file, "docx", outdir) == Path(outdir) / "input.docx"
+
+        popen, _ = _fake_popen(communicate_side_effect=[subprocess.TimeoutExpired(cmd="soffice", timeout=60), ("", "")])
+        with patch("subprocess.Popen", side_effect=popen), patch("shutil.rmtree", side_effect=OSError("busy")), \
+                patch("doc2mark.utils.libreoffice._kill_group"):
+            with pytest.raises(ConversionError, match="timed out"):
+                proc._convert_with_libreoffice(input_file, "docx", outdir)
+
     def test_converted_file_not_found_raises(self, tmp_path):
         """When soffice exits 0 but produces no output file, ConversionError."""
         proc = _make_processor()

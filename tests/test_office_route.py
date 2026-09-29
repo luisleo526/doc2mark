@@ -124,3 +124,65 @@ def test_route_failure_is_recorded(image_pptx):
         assert p._maybe_route_image_dominant(
             image_pptx, 100, route_info=route_info, ocr_images=True, extract_images=True) is None
     assert route_info == {"routed_via": "native", "route_error": "soffice crashed"}
+
+
+def _text_and_image_pdfs(tmp_path):
+    """A PDF page with a real text layer and a PDF page that is one full-page picture."""
+    pymupdf = pytest.importorskip("pymupdf")
+    Image = pytest.importorskip("PIL.Image")
+    text_pdf, image_pdf = tmp_path / "text.pdf", tmp_path / "scan.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "\n".join(f"Line {i}: quarterly revenue grew in every region." for i in range(12)))
+    doc.save(str(text_pdf))
+    doc.close()
+    buf = io.BytesIO()
+    Image.new("RGB", (850, 1100), "white").save(buf, format="PNG")
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_image(page.rect, stream=buf.getvalue())
+    doc.save(str(image_pdf))
+    doc.close()
+    return text_pdf, image_pdf
+
+
+def test_pdf_route_adapter_contract(tmp_path):
+    """The Office route takes the converted PDF's decision through ONE adapter over
+    PDFLoader._document_image_strategy (owned by the PDF route). If that method changes
+    shape, this test fails loudly; at runtime the adapter answers None and the document
+    stays on native extraction."""
+    from doc2mark.formats.office import _pdf_document_route
+    from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
+
+    text_pdf, image_pdf = _text_and_image_pdfs(tmp_path)
+    assert callable(getattr(PDFLoader, "_document_image_strategy", None))
+    assert _pdf_document_route(text_pdf) == "text"
+    assert _pdf_document_route(image_pdf) == "image"
+
+
+def test_pdf_route_adapter_answers_none_when_the_pdf_side_changes_shape(tmp_path):
+    from doc2mark.formats.office import _pdf_document_route
+    from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
+
+    text_pdf, _ = _text_and_image_pdfs(tmp_path)
+    with patch.object(PDFLoader, "_document_image_strategy", None):
+        assert _pdf_document_route(text_pdf) is None
+    with patch.object(PDFLoader, "_document_image_strategy", return_value="per-page"):
+        assert _pdf_document_route(text_pdf) is None
+
+
+def test_unanswered_pdf_route_goes_native(tmp_path, image_pptx):
+    """Fail closed: when the converted PDF's route is unknown the document is not handed to
+    the PDF pipeline (which would re-decide on its own) but stays native, and that is recorded."""
+    converted = tmp_path / "converted.pdf"
+    converted.write_bytes(b"%PDF-1.4\n")
+    p = OfficeProcessor(ocr=_StubOCR())
+    route_info = {}
+    with patch("doc2mark.utils.libreoffice.convert_office_to", return_value=converted), \
+            patch("doc2mark.formats.office._pdf_document_route", return_value=None), \
+            patch("doc2mark.formats.pdf.PDFProcessor.process") as pdf_process:
+        routed = p._maybe_route_image_dominant(
+            image_pptx, 100, route_info=route_info, ocr_images=True, extract_images=True)
+    assert routed is None
+    pdf_process.assert_not_called()
+    assert route_info == {"routed_via": "native", "route_reason": "converted PDF route unavailable"}
