@@ -1224,497 +1224,137 @@ class PDFLoader:
         return True
 
     def _extract_tables_as_markdown(self, page, page_num: int) -> Tuple[List[SimpleContent], List[Tuple]]:
-        """Extract tables and convert to markdown format"""
-        table_items = []
-        table_bboxes = []
+        """Extract the page's tables as Markdown/HTML (see :mod:`doc2mark.pipelines.pdf_tables`).
+
+        Returns the rendered tables and their bounding boxes (a header row drawn above
+        the ruled cells included); the text path skips text inside those boxes. Grids
+        that are not tables (logo shapes, page frames) are not returned, so their text
+        stays with the text path. Borderless tables with clear numeric columns are found
+        too. A table that continues from the previous page gets that page's header row
+        instead of promoting its first data row.
+        """
+        from doc2mark.pipelines import pdf_tables
 
         try:
-            tables = page.find_tables()
-            if hasattr(tables, 'tables'):
-                for table_idx, table in enumerate(tables.tables):
-                    # Store table bbox for excluding from text extraction
-                    table_bboxes.append(tuple(table.bbox))
-
-                    # Extract table content with enhanced cell analysis
-                    markdown_table = self._convert_table_to_markdown_enhanced(table)
-
-                    if markdown_table.strip():
-                        table_items.append(SimpleContent(
-                            type="table",  # Table type for better identification
-                            content=markdown_table,
-                            page=page_num + 1,
-                            position_y=table.bbox[1]
-                        ))
-
-        except AttributeError as e:
-            logger.debug("Table extraction not available in this PyMuPDF version")
+            finder = page.find_tables()
+            found = list(getattr(finder, "tables", None) or [])
         except Exception as e:
-            logger.warning(f"Failed to extract tables: {e}")
-
-        return table_items, table_bboxes
-
-    def _convert_table_to_markdown_enhanced(self, table) -> str:
-        """Enhanced table conversion with better merged cell detection using cell boundaries"""
-        if not table:
-            return ""
+            logger.warning(f"Failed to find tables on page {page_num + 1}: {e}")
+            finder, found = None, []
 
         try:
-            # Try to extract with manual cell-by-cell extraction to avoid overlapping text issues
-            extracted_data = self._extract_table_with_dedup(table)
-            
-            # Fallback to standard extract if manual extraction fails
-            if not extracted_data or not any(extracted_data):
-                extracted_data = table.extract()
-                if not extracted_data or not any(extracted_data):
-                    return ""
-            
-            # Use boundary-based analysis for better merge detection
-            table_data = self._analyze_table_with_boundaries(table, extracted_data)
-
+            tables, outside = pdf_tables.extract_page_tables(page, found, getattr(finder, "textpage", None))
+            self._table_carry = pdf_tables.continue_table(
+                tables, outside, page_num, page.rect.height, getattr(self, "_table_carry", None))
             renderer = TableRenderer(self.table_style)
-            return renderer.render(table_data)
-
+            table_items, table_bboxes = [], []
+            for table in tables:
+                markdown_table = renderer.render(table.table_data())
+                if markdown_table.strip():
+                    table_items.append(SimpleContent(
+                        type="table",
+                        content=markdown_table,
+                        page=page_num + 1,
+                        position_y=table.bbox[1]
+                    ))
+                    table_bboxes.append(tuple(table.bbox))
+            return table_items, table_bboxes
         except Exception as e:
-            logger.warning(f"Failed to convert table to markdown: {e}")
-            # Fallback: extract and render as simple markdown
+            logger.warning(f"Failed to extract tables on page {page_num + 1}, using PyMuPDF's plain cell text: {e}")
+            self._table_carry = None
+            return self._extract_tables_plain(found, page_num)
+
+    def _extract_tables_plain(self, tables, page_num: int) -> Tuple[List[SimpleContent], List[Tuple]]:
+        """Last resort: PyMuPDF's own cell text, no merged cells."""
+        renderer = TableRenderer(self.table_style)
+        table_items, table_bboxes = [], []
+        for table in tables:
             try:
                 data = table.extract()
-                if data:
-                    table_data = TableData.from_2d_array(data)
-                    renderer = TableRenderer(self.table_style)
-                    return renderer.render(table_data)
-            except Exception:
-                pass
-            return ""
+                markdown_table = renderer.render(TableData.from_2d_array(data)) if data else ""
+            except Exception as e:
+                logger.debug(f"Plain table extraction failed: {e}")
+                continue
+            if markdown_table.strip():
+                table_items.append(SimpleContent(type="table", content=markdown_table, page=page_num + 1,
+                                                 position_y=table.bbox[1]))
+                table_bboxes.append(tuple(table.bbox))
+        return table_items, table_bboxes
 
     def _extract_table_with_dedup(self, table) -> List[List]:
-        """
-        Extract table data cell-by-cell with deduplication of overlapping text spans.
-        
-        Some PDFs (especially from design software like Adobe Illustrator) have overlapping 
-        text layers, which causes garbled text extraction. For example:
-        - '3853 8/ 54 9/ 11 /4 015 405' instead of '385 / 491 / 1 405'
-        - '11 119933--112 24488' instead of '1 193-1 248'
-        
-        This method extracts text from each cell's bbox individually and deduplicates 
-        overlapping text spans by keeping the longest/most complete version.
-        
-        Returns:
-            Cleaned table data or None if extraction fails (triggers fallback)
-        """
+        """Cell text of one found table, row by row; None where a merged cell covers the
+        position. Every character goes to exactly one cell and text runs that only redraw
+        another run (overprint) are merged; see :mod:`doc2mark.pipelines.pdf_tables`."""
+        from doc2mark.pipelines import pdf_tables
+
         try:
-            # Get the standard extraction first to know the table structure
-            standard_data = table.extract()
-            if not standard_data:
-                return []
-            
-            # Get the page object to extract text
-            if not hasattr(table, 'page'):
-                # Can't get page, fallback to standard extraction
-                return standard_data
-            
-            page = table.page
-            
-            # Check if we have rows with cell bbox info
-            if not hasattr(table, 'rows') or not table.rows:
-                # No row info available, fallback
-                return standard_data
-            
-            # Extract text cell-by-cell with deduplication
-            cleaned_data = []
-            for row_idx, table_row in enumerate(table.rows):
-                row_data = []
-                
-                # Get the standard row data
-                std_row = standard_data[row_idx] if row_idx < len(standard_data) else []
-                
-                # Get cells for this row
-                if hasattr(table_row, 'cells') and table_row.cells:
-                    for col_idx, cell_bbox in enumerate(table_row.cells):
-                        # Get the standard cell value
-                        std_value = std_row[col_idx] if col_idx < len(std_row) else None
-                        
-                        # If cell_bbox is None, it's part of a merged cell
-                        if cell_bbox is None:
-                            row_data.append(std_value)
-                        elif std_value and isinstance(std_value, str) and std_value.strip():
-                            # Extract text from this bbox and deduplicate
-                            clean_text = self._extract_text_from_bbox_dedup(page, cell_bbox)
-                            row_data.append(clean_text if clean_text else std_value)
-                        else:
-                            row_data.append(std_value)
-                else:
-                    # No cell bbox info for this row, use standard data
-                    row_data = std_row
-                
-                cleaned_data.append(row_data)
-            
-            return cleaned_data
-            
+            grid = pdf_tables.TableGrid(table)
+            pdf_tables.assign_chars(pdf_tables.table_chars(table), [grid])
+            return grid.text_rows()
         except Exception as e:
-            logger.debug(f"Failed to extract table with deduplication: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            # Return None to trigger fallback
-            return None
-    
+            logger.debug(f"Failed to extract table cells: {e}")
+            return table.extract()
+
     def _extract_text_from_bbox_dedup(self, page, bbox: tuple) -> str:
-        """
-        Extract text from a bbox and deduplicate overlapping text spans.
-        
-        When multiple text spans overlap in the same position (common in PDFs with 
-        multiple text layers), this method keeps only the longest/most complete version.
-        
-        Args:
-            page: PyMuPDF page object
-            bbox: Bounding box tuple (x0, y0, x1, y1)
-            
-        Returns:
-            Deduplicated text string
-        """
+        """Text inside ``bbox`` (in the coordinates ``find_tables()`` reports), assembled like a
+        table cell: words left to right, lines separated by ``\\n``, overprinted duplicates
+        merged, different overlapping texts all kept."""
+        from doc2mark.pipelines import pdf_tables
+
         try:
-            # Get text dict for this bbox region
-            text_dict = page.get_text("dict", clip=bbox)
-            
-            if not text_dict or 'blocks' not in text_dict:
-                return ""
-            
-            # Collect all text spans with their bboxes
-            all_spans = []
-            for block in text_dict['blocks']:
-                if block['type'] == 0:  # Text block
-                    for line in block['lines']:
-                        for span in line['spans']:
-                            text = span['text'].strip()
-                            if text:
-                                all_spans.append({
-                                    'text': text,
-                                    'bbox': span['bbox'],
-                                    'size': span['size']
-                                })
-            
-            if not all_spans:
-                return ""
-            
-            # Deduplicate overlapping spans - keep the longest/most complete one
-            deduplicated = self._deduplicate_spans(all_spans)
-            
-            # Join the deduplicated text
-            return ' '.join(deduplicated)
-            
+            return pdf_tables.region_text(pdf_tables.page_chars(page), tuple(bbox))
         except Exception as e:
             logger.debug(f"Failed to extract text from bbox: {e}")
             return ""
-    
-    def _deduplicate_spans(self, spans: List[Dict]) -> List[str]:
-        """
-        Deduplicate overlapping text spans, keeping the most complete version.
-        
-        Groups spans by vertical position (same line) and checks for horizontal overlap.
-        When spans overlap significantly (≥50% overlap), keeps only the longest text.
-        
-        This solves the problem of PDFs with multiple text layers where the same 
-        content appears multiple times at slightly different positions.
-        
-        Args:
-            spans: List of span dicts with 'text', 'bbox', 'size' keys
-            
-        Returns:
-            List of deduplicated text strings
-        """
-        if not spans:
-            return []
-        
-        # Group spans by approximate Y position (same line)
-        from collections import defaultdict
-        lines = defaultdict(list)
-        
-        for span in spans:
-            bbox = span['bbox']
-            y_pos = (bbox[1] + bbox[3]) / 2  # Middle Y
-            # Round to nearest 5 pixels to group similar Y positions
-            y_key = round(y_pos / 5) * 5
-            lines[y_key].append(span)
-        
-        # For each line, deduplicate spans
-        result_texts = []
-        for y_key in sorted(lines.keys()):
-            line_spans = lines[y_key]
-            
-            # Sort by X position
-            line_spans.sort(key=lambda s: s['bbox'][0])
-            
-            # Check for overlapping spans (same/similar X range)
-            deduped_line = []
-            i = 0
-            while i < len(line_spans):
-                current = line_spans[i]
-                current_text = current['text']
-                current_bbox = current['bbox']
-                
-                # Look ahead for overlapping spans
-                j = i + 1
-                overlapping = [current]
-                while j < len(line_spans):
-                    next_span = line_spans[j]
-                    next_bbox = next_span['bbox']
-                    
-                    # Check if bboxes overlap horizontally
-                    if self._bbox_overlaps_horizontally(current_bbox, next_bbox, threshold=0.5):
-                        overlapping.append(next_span)
-                        j += 1
-                    else:
-                        break
-                
-                # If we have overlapping spans, choose the longest text
-                if len(overlapping) > 1:
-                    # Choose the one with the longest text (most complete)
-                    best = max(overlapping, key=lambda s: len(s['text']))
-                    deduped_line.append(best['text'])
-                    logger.debug(f"Deduplicated {len(overlapping)} overlapping spans, kept: '{best['text']}'")
-                else:
-                    deduped_line.append(current_text)
-                
-                i = j if j > i else i + 1
-            
-            # Join texts from this line
-            if deduped_line:
-                result_texts.extend(deduped_line)
-        
-        return result_texts
-    
-    def _bbox_overlaps_horizontally(self, bbox1: tuple, bbox2: tuple, threshold: float = 0.5) -> bool:
-        """Check if two bboxes overlap horizontally by at least threshold ratio."""
-        x0_1, y0_1, x1_1, y1_1 = bbox1
-        x0_2, y0_2, x1_2, y1_2 = bbox2
-        
-        # Calculate horizontal overlap
-        overlap_start = max(x0_1, x0_2)
-        overlap_end = min(x1_1, x1_2)
-        
-        if overlap_end <= overlap_start:
-            return False
-        
-        overlap_width = overlap_end - overlap_start
-        min_width = min(x1_1 - x0_1, x1_2 - x0_2)
-        
-        if min_width <= 0:
-            return False
-        
-        overlap_ratio = overlap_width / min_width
-        return overlap_ratio >= threshold
 
     def _analyze_table_with_boundaries(self, table, extracted_data: List[List]) -> TableData:
-        """Analyze table using cell boundaries if available. Returns TableData."""
+        """Build the TableData for a found table: cell text from ``extracted_data``, merged
+        cells from the drawn cell boxes (:meth:`_get_cell_boundaries`)."""
         if not extracted_data:
             return TableData.empty()
-
-        row_count = len(extracted_data)
-        col_count = max(len(row) for row in extracted_data) if extracted_data else 0
-        
-        # Normalize table data
-        normalized = []
-        for row in extracted_data:
-            normalized_row = list(row) + [None] * (col_count - len(row))
-            normalized.append(normalized_row)
-        
-        # Try to get cell boundaries
         boundaries = self._get_cell_boundaries(table)
-        
-        if boundaries:
-            # Use boundary-based detection
-            merge_info = self._detect_merges_from_boundaries(boundaries, normalized)
-            return TableData.from_raw(normalized, merge_info)
-        else:
-            # Fallback to pattern-based detection with conservative heuristics
-            # to reduce false positives on legitimately sparse tables
-            cell_spans = {}
-            merged_cells = []
-            is_complex = False
-
-            # Pre-compute column emptiness ratio to avoid treating sparse columns as merges
-            col_empty_count = [0] * col_count
-            for r in range(row_count):
-                for c in range(col_count):
-                    if self._is_cell_empty(normalized[r][c]):
-                        col_empty_count[c] += 1
-            col_mostly_empty = [count > row_count * 0.5 for count in col_empty_count]
-
-            # Track cells that are part of a horizontal merge to avoid false rowspan detection
-            cells_in_colspan = set()
-
-            # First pass: detect colspans (only when trailing empty cells are NOT in a mostly-empty column)
-            for row_idx in range(row_count):
-                for col_idx in range(col_count):
-                    cell = normalized[row_idx][col_idx]
-                    if cell is None or self._is_cell_empty(cell):
-                        continue
-
-                    colspan = 1
-                    for check_col in range(col_idx + 1, col_count):
-                        if (check_col < len(normalized[row_idx]) and
-                                self._is_cell_empty(normalized[row_idx][check_col]) and
-                                not col_mostly_empty[check_col]):
-                            colspan += 1
-                            cells_in_colspan.add((row_idx, check_col))
-                        else:
-                            break
-
-                    if colspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (1, colspan)
-                        is_complex = True
-
-            # Second pass: detect rowspans (only for cells not part of a colspan)
-            for row_idx in range(row_count):
-                for col_idx in range(col_count):
-                    cell = normalized[row_idx][col_idx]
-                    if (row_idx, col_idx) in cells_in_colspan:
-                        continue
-                    if cell is None or self._is_cell_empty(cell):
-                        continue
-                    if (row_idx, col_idx) in cell_spans:
-                        continue
-                    # Skip if this column is mostly empty (sparse data, not merges)
-                    if col_mostly_empty[col_idx]:
-                        continue
-
-                    rowspan = 1
-                    for check_row in range(row_idx + 1, row_count):
-                        if (check_row < len(normalized) and
-                                col_idx < len(normalized[check_row]) and
-                                self._is_cell_empty(normalized[check_row][col_idx]) and
-                                (check_row, col_idx) not in cells_in_colspan):
-                            rowspan += 1
-                        else:
-                            break
-
-                    if rowspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (rowspan, 1)
-                        is_complex = True
-
-            # Build merged cells list
-            for (row_idx, col_idx), (rowspan, colspan) in cell_spans.items():
-                merged_cells.append({
-                    'row': row_idx,
-                    'col': col_idx,
-                    'rowspan': rowspan,
-                    'colspan': colspan,
-                    'content': str(normalized[row_idx][col_idx])
-                })
-
-            return TableData.from_raw(normalized, {
-                'is_complex': is_complex,
-                'cell_spans': cell_spans,
-            })
+        row_count = max(len(extracted_data), max((b['row'] + b['rowspan'] for b in boundaries), default=0))
+        col_count = max(max(len(row) for row in extracted_data),
+                        max((b['col'] + b['colspan'] for b in boundaries), default=0))
+        normalized = [[None] * col_count for _ in range(row_count)]
+        for r, row in enumerate(extracted_data):
+            for c, value in enumerate(row):
+                normalized[r][c] = value
+        merge_info = self._detect_merges_from_boundaries(boundaries, normalized)
+        return TableData.from_raw(normalized, merge_info)
 
     def _get_cell_boundaries(self, table) -> List[Dict]:
-        """Extract cell boundary information from table if available"""
-        boundaries = []
+        """The drawn cells of a found table on PyMuPDF's grid: ``bbox``, ``row``, ``col`` and the
+        ``rowspan``/``colspan`` the box covers (a span never covers another drawn cell)."""
+        from doc2mark.pipelines import pdf_tables
+
         try:
-            # Try to access table cells with boundary info (newer PyMuPDF)
-            if hasattr(table, 'cells'):
-                for cell in table.cells:
-                    if len(cell) >= 7:  # Has position info
-                        boundaries.append({
-                            'bbox': (cell[0], cell[1], cell[2], cell[3]),
-                            'text': cell[4],
-                            'row': cell[5],
-                            'col': cell[6]
-                        })
-        except (AttributeError, IndexError, TypeError) as e:
+            grid = pdf_tables.TableGrid(table)
+        except Exception as e:
             logger.debug(f"Failed to get cell boundaries: {e}")
-        return boundaries
+            return []
+        return [{'bbox': cell.bbox, 'row': cell.row, 'col': cell.col,
+                 'rowspan': cell.rowspan, 'colspan': cell.colspan}
+                for cell in sorted(grid.cells, key=lambda cell: (cell.row, cell.col))]
 
     def _detect_merges_from_boundaries(self, boundaries: List[Dict], normalized_data: List[List]) -> Dict:
-        """Detect merged cells using boundary information"""
+        """Merge info (``cell_spans`` etc.) from :meth:`_get_cell_boundaries`."""
         cell_spans = {}
         merged_cells = []
-        
-        # Group cells by position
-        cell_map = {}
         for bound in boundaries:
-            key = (bound['row'], bound['col'])
-            cell_map[key] = bound
-        
-        # Analyze overlapping boundaries
-        for (row, col), cell in cell_map.items():
-            bbox = cell['bbox']
-            rowspan = 1
-            colspan = 1
-            
-            # Check how many cells this bbox covers
-            for (other_row, other_col), other_cell in cell_map.items():
-                if (other_row, other_col) == (row, col):
-                    continue
-                    
-                other_bbox = other_cell['bbox']
-                
-                # Check if bboxes overlap significantly
-                if self._bboxes_overlap_significantly(bbox, other_bbox):
-                    # This indicates a merged cell
-                    if other_row > row:
-                        rowspan = max(rowspan, other_row - row + 1)
-                    if other_col > col:
-                        colspan = max(colspan, other_col - col + 1)
-            
-            if rowspan > 1 or colspan > 1:
-                cell_spans[(row, col)] = (rowspan, colspan)
-                merged_cells.append({
-                    'row': row,
-                    'col': col,
-                    'rowspan': rowspan,
-                    'colspan': colspan,
-                    'content': normalized_data[row][col] if row < len(normalized_data) and col < len(normalized_data[row]) else ""
-                })
-        
-        row_count = len(normalized_data)
-        col_count = max(len(r) for r in normalized_data) if normalized_data else 0
+            if bound['rowspan'] > 1 or bound['colspan'] > 1:
+                row, col = bound['row'], bound['col']
+                cell_spans[(row, col)] = (bound['rowspan'], bound['colspan'])
+                content = normalized_data[row][col] if row < len(normalized_data) and col < len(normalized_data[row]) else ""
+                merged_cells.append({'row': row, 'col': col, 'rowspan': bound['rowspan'],
+                                     'colspan': bound['colspan'], 'content': content})
         return {
-            'is_complex': len(merged_cells) > 0,
+            'is_complex': bool(cell_spans),
             'cell_spans': cell_spans,
             'merged_cells': merged_cells,
-            'row_count': row_count,
-            'col_count': col_count
+            'row_count': len(normalized_data),
+            'col_count': max((len(r) for r in normalized_data), default=0)
         }
-
-    def _bboxes_overlap_significantly(self, bbox1: tuple, bbox2: tuple, threshold: float = 0.8) -> bool:
-        """Check if two bboxes overlap significantly (indicating merged cells)"""
-        x0_1, y0_1, x1_1, y1_1 = bbox1
-        x0_2, y0_2, x1_2, y1_2 = bbox2
-        
-        # Calculate intersection
-        x0_int = max(x0_1, x0_2)
-        y0_int = max(y0_1, y0_2)
-        x1_int = min(x1_1, x1_2)
-        y1_int = min(y1_1, y1_2)
-        
-        if x1_int < x0_int or y1_int < y0_int:
-            return False
-        
-        # Calculate overlap area
-        intersection_area = (x1_int - x0_int) * (y1_int - y0_int)
-        area1 = (x1_1 - x0_1) * (y1_1 - y0_1)
-        area2 = (x1_2 - x0_2) * (y1_2 - y0_2)
-        
-        # Check if overlap is significant relative to smaller cell
-        min_area = min(area1, area2)
-        if min_area > 0:
-            overlap_ratio = intersection_area / min_area
-            return overlap_ratio >= threshold
-        
-        return False
-
-    def _is_cell_empty(self, cell) -> bool:
-        """Enhanced check if a cell is truly empty: only '' (empty string) and None are considered empty."""
-        if cell is None:
-            return True
-        
-        cell_str = str(cell).strip()
-        # Only treat '' as empty (None is already handled above)
-        empty_patterns = ['']
-        if cell_str in empty_patterns:
-            return True
-        return False
 
     def _extract_images_simple(self, page, page_num: int, ocr_images: bool = False,
                                ocr_results_map: Dict[tuple, str] = None) -> List[SimpleContent]:

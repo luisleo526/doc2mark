@@ -207,7 +207,10 @@ def test_t3_text_drawn_over_text_is_kept_and_true_duplicates_are_merged(run_cli,
     assert table.rows[4] == ["No No", "10 10"], table.rows
 
 
-@pytest.mark.parametrize("baseline,fontsize", [(115, 20), (131, 20), (152, 30), (176, 30), (213, 48), (298, 20)])
+# Baselines at which the old span de-duplication wiped a row (probe_watermark_sweep: about a quarter of
+# all positions), plus two where it did not.
+@pytest.mark.parametrize("baseline,fontsize", [(137, 20), (178, 20), (298, 20), (142, 30), (262, 30), (149, 48),
+                                               (309, 48), (115, 20), (213, 48)])
 def test_t3_watermark_crossing_a_row_loses_nothing(run_cli, e2e_dir, baseline, fontsize):
     """A light-grey horizontal watermark line crossing the table must not wipe the row it crosses."""
     result = convert(run_cli, B.watermark_table_pdf(e2e_dir / "wm.pdf", baseline, fontsize))
@@ -288,7 +291,7 @@ def test_t4_sample_spec_sheet_merges_and_overprint(run_cli, sample_documents_dir
 
     [table] = tables(result)
     assert len(table.rows[0]) == 7, table.rows[0]
-    for section in ("Transmission", "Outside dimensions", "Weights", "Liquids"):
+    for section in ("Outside dimensions", "Inside dimensions", "Weights", "Liquids"):
         assert table.spans.get(_find(table, section)) == (1, 7), section
     assert table.spans.get(_find(table, "Front Wheel Drive")) == (1, 6)
     assert table.spans.get(_find(table, "1.0 TSI/85 kW")) == (1, 3)
@@ -326,14 +329,26 @@ def _employee_rows(first, last):
 
 @pytest.mark.parametrize("bold_header", [False, True], ids=["plain_header", "bold_header"])
 def test_t11_continued_table_does_not_promote_a_data_row(run_cli, e2e_dir, bold_header):
+    """The page-2 part of a table whose header is not repeated keeps Emp8 as a data row. A header
+    known to be one (bold over plain rows) is carried over; a plain first row could equally be
+    the first pair of a key/value form, so it is not duplicated and the header row stays empty."""
     result = convert(run_cli, B.split_table_pdf(e2e_dir / "split.pdf", repeat_header=False, bold_header=bold_header))
 
     first, second = tables(result)
     assert first.rows == [B.SPLIT_HEADER] + _employee_rows(1, 8), result.markdown
-    assert second.rows[0] == B.SPLIT_HEADER, f"page-2 header should repeat the column names: {second.rows}"
+    assert second.rows[0] == (B.SPLIT_HEADER if bold_header else ["", "", ""]), second.rows
     assert second.rows[1:] == _employee_rows(8, 14), result.markdown
     for i in range(1, 14):
         assert occurrences(result, f"Emp{i} ") == 1, result.markdown
+
+
+def test_t11_key_value_table_continued_on_next_page_is_not_duplicated(run_cli, e2e_dir):
+    result = convert(run_cli, B.key_value_split_pdf(e2e_dir / "form.pdf"))
+
+    first, second = tables(result)
+    assert first.rows == B.KEY_VALUE_PAGES[0], result.markdown
+    assert second.rows == [["", ""]] + B.KEY_VALUE_PAGES[1], result.markdown
+    assert occurrences(result, "Plan name") == 1 and occurrences(result, "Image assistant") == 1, result.markdown
 
 
 def test_t11_repeated_header_is_not_doubled(run_cli, e2e_dir):
@@ -351,6 +366,38 @@ def test_t11_header_row_without_borders_is_the_header(run_cli, e2e_dir):
     assert table.rows == [B.SPLIT_HEADER] + _employee_rows(1, 6), result.markdown
     for name in B.SPLIT_HEADER:
         assert occurrences(result, name) == 1, result.markdown
+
+
+# --- T12: tables drawn without vertical rules -----------------------------------------------------------
+
+@pytest.mark.parametrize("rules", [True, False], ids=["booktabs", "borderless"])
+def test_t12_aligned_numeric_table_without_vertical_rules_is_a_table(run_cli, e2e_dir, rules):
+    result = convert(run_cli, B.booktabs_pdf(e2e_dir / "segments.pdf", rules=rules))
+
+    assert [grid.rows for grid in tables(result)] == [B.SEGMENT_ROWS], result.markdown
+    # the caption above and the sentence below stay text, once each
+    for text in ("Table 2. Segment results (USD m)", "Growth was driven by Cloud."):
+        assert occurrences(result, text) == 1, result.markdown
+
+
+def test_t12_borderless_statement_keeps_each_line_item_with_its_numbers(run_cli, e2e_dir):
+    result = convert(run_cli, B.borderless_statement_pdf(e2e_dir / "statement.pdf"))
+
+    assert [grid.rows for grid in tables(result)] == [B.STATEMENT_ROWS], result.markdown
+    for text in ("Statement of income (USD thousands)", "The notes on pages 12-30 are part of these statements."):
+        assert occurrences(result, text) == 1, result.markdown
+
+
+def test_t12_aligned_text_that_is_not_a_table_stays_text(run_cli, e2e_dir):
+    prose = convert(run_cli, B.prose_pages_pdf(e2e_dir / "prose.pdf"))
+    layouts = convert(run_cli, B.aligned_non_tables_pdf(e2e_dir / "layouts.pdf"))
+
+    assert tables(prose) == [], prose.markdown
+    assert tables(layouts) == [], layouts.markdown
+    for text in ("INV-2026-0042", "Management response"):
+        assert occurrences(prose, text) == 1, prose.markdown
+    for text in ("Revenue up 20%", "Findings", "Senior Analyst", "Chen Mei-Ling", "0912-345-678"):
+        assert occurrences(layouts, text) == 1, layouts.markdown
 
 
 # --- T15: nested and overlapping cells ------------------------------------------------------------------
@@ -434,7 +481,8 @@ def test_t1_sparse_sheet_keeps_every_value_in_its_row(run_cli, e2e_dir, rows):
         rendered = " ".join(text for text in table.row_starting(row[0]) if text)
         for value in row[1:]:
             if value is not None:
-                assert re.search(rf"(?<![\d.]){value}(\.0)?(?![\d])", rendered), f"{value!r} missing from row {row[0]}: {table.rows}"
+                found = re.search(rf"(?<![\d.]){value}(\.0)?(?![\d])", rendered)
+                assert found, f"{value!r} not in row {row[0]}: {table.rows}"
 
 
 # --- T21: dense tables cost about what PyMuPDF's own extraction costs ------------------------------------

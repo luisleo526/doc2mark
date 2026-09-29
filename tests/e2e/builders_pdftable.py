@@ -185,7 +185,9 @@ def split_table_pdf(path: Path, *, repeat_header: bool, bold_header: bool = Fals
     for page_no, (first, last) in enumerate([(1, 8), (8, 14)]):
         page = doc.new_page(width=A4[0], height=A4[1])
         with_header = page_no == 0 or repeat_header
-        rows = ([SPLIT_HEADER] if with_header else []) + [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(first, last)]
+        rows = [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(first, last)]
+        if with_header:
+            rows.insert(0, SPLIT_HEADER)
         if page_no == 0:
             page.insert_text((50, 620), "Staff list", fontsize=10)
         ruled_table(page, 50, 60 if page_no else 650, [100, 80, 80], [18] * len(rows), grid(rows),
@@ -227,7 +229,8 @@ def logo_deck_pdf(path: Path, titles: Sequence[str], brand: str = "by ACME Analy
         page.insert_text((60, 160), f"Slide {index + 1} body: {title.lower()} overview for the board.", fontsize=18)
         if index == 1:
             ruled_table(page, 60, 220, [220, 160, 160], [26] * 3,
-                        grid([["Module", "Users", "Uptime"], ["Meetings", "1,204", "99.9%"], ["Voice", "860", "99.7%"]]),
+                        grid([["Module", "Users", "Uptime"], ["Meetings", "1,204", "99.9%"],
+                              ["Voice", "860", "99.7%"]]),
                         fontsize=14)
     doc.save(str(path))
     doc.close()
@@ -272,7 +275,8 @@ def l_shape_pdf(path: Path) -> Path:
     page.draw_rect(pymupdf.Rect(xs[1], ys[1], xs[2], ys[2]), width=0.6)
     page.draw_rect(pymupdf.Rect(xs[2], ys[1], xs[3], ys[2]), width=0.6)
     page.draw_rect(pymupdf.Rect(xs[2], ys[2], xs[3], ys[3]), width=0.6)
-    for r, c, text in [(0, 0, "H1"), (0, 1, "H2"), (0, 2, "H3"), (1, 0, "L-shape"), (1, 1, "a"), (1, 2, "b"), (2, 2, "c")]:
+    labels = [(0, 0, "H1"), (0, 1, "H2"), (0, 2, "H3"), (1, 0, "L-shape"), (1, 1, "a"), (1, 2, "b"), (2, 2, "c")]
+    for r, c, text in labels:
         page.insert_text((xs[c] + 3, ys[r] + 11), text, fontsize=9)
     doc.save(str(path))
     doc.close()
@@ -429,7 +433,8 @@ def dense_rows(page_no: int) -> List[List[str]]:
     header = ["Account", "2021", "2022", "2023", "2024", "2025", "Chg", "Note"]
     rows = [header]
     for i in range(1, 50):
-        rows.append([f"Line {page_no}-{i}", *[f"{(i * 37 + j * 11) % 9999:,}" for j in range(5)], f"{i % 7}.{i % 9}%", "n"])
+        amounts = [f"{(i * 37 + j * 11) % 9999:,}" for j in range(5)]
+        rows.append([f"Line {page_no}-{i}", *amounts, f"{i % 7}.{i % 9}%", "n"])
     return rows
 
 
@@ -442,6 +447,98 @@ def dense_tables_pdf(path: Path, pages: int, *, ruled: bool = True) -> Path:
         rows = dense_rows(page_no)
         ruled_table(page, 30, 30, [140, 60, 60, 60, 60, 60, 50, 40], [15.5] * len(rows), grid(rows), fontsize=7,
                     draw=ruled)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+STATEMENT_ROWS = [["", "2025", "2024"], ["Revenue", "12,345", "11,210"], ["Cost of sales", "(7,890)", "(7,120)"],
+                  ["Gross profit", "4,455", "4,090"], ["Operating expenses", "", ""], ["Selling", "(1,200)", "(1,150)"],
+                  ["Administrative", "(800)", "(760)"], ["Operating income", "2,455", "2,180"]]
+
+
+def borderless_statement_pdf(path: Path) -> Path:
+    """An income statement laid out with tab stops only: a bold title, a label column (sub-items
+    indented), two right-aligned number columns and a note under it -- no rules at all."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), "Statement of income (USD thousands)", fontname="hebo", fontsize=12)
+    y = 80
+    for label, *values in STATEMENT_ROWS:
+        if label:
+            indent = 10 if label in ("Selling", "Administrative") else 0
+            page.insert_text((50 + indent, y), label, fontsize=10)
+        for right, value in zip((330, 430), values):
+            if value:
+                page.insert_text((right - pymupdf.get_text_length(value, fontsize=10), y), value, fontsize=10)
+        y += 16
+    page.insert_text((50, y + 20), "The notes on pages 12-30 are part of these statements.", fontsize=9)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+def aligned_non_tables_pdf(path: Path) -> Path:
+    """Layouts with column-aligned text that are not tables: slide text boxes side by side (short
+    items with numbers), a table of contents, a CV timeline, label/value form pairs and three
+    justified newspaper columns."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=SLIDE[0], height=SLIDE[1])
+    page.insert_text((60, 60), "Quarterly highlights", fontsize=32)
+    boxes = [["Revenue up 20%", "1,200 new users", "Churn 3.1%", "NPS 62"],
+             ["Costs down 5%", "Headcount 118", "Opex 4.2M", "Capex 0.8M"],
+             ["Cloud 45%", "Devices 30%", "Services 25%", "Other 0%"]]
+    for i, items in enumerate(boxes):
+        for j, item in enumerate(items):
+            page.insert_text((80 + i * 440, 200 + j * 40), f"- {item}", fontsize=22)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), "Contents", fontsize=16)
+    contents = [("1", "Introduction", "3"), ("1.1", "Scope", "4"), ("2", "Findings", "7"), ("2.1", "Revenue", "8"),
+                ("3", "Outlook", "12")]
+    for i, (number, title, page_no) in enumerate(contents):
+        page.insert_text((50, 90 + i * 18), number, fontsize=11)
+        page.insert_text((90, 90 + i * 18), title, fontsize=11)
+        page.insert_text((500, 90 + i * 18), page_no, fontsize=11)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    jobs = [("2019 - 2024", "Senior Analyst", "ACME Corp"), ("2016 - 2019", "Analyst", "Globex"),
+            ("2014 - 2016", "Intern", "Initech")]
+    for i, (dates, role, company) in enumerate(jobs):
+        page.insert_text((50, 80 + i * 40), dates, fontsize=11)
+        page.insert_text((180, 80 + i * 40), role, fontsize=11)
+        page.insert_text((380, 80 + i * 40), company, fontsize=11)
+        page.insert_text((180, 94 + i * 40), "Built forecasting models and reporting pipelines.", fontsize=9)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    pairs = [("Name:", "Chen Mei-Ling", "Date:", "2026-03-31"), ("ID:", "A123456789", "Phone:", "0912-345-678"),
+             ("Dept:", "Finance", "Ext:", "4421")]
+    for i, pair in enumerate(pairs):
+        for x, value in zip([50, 110, 320, 380], pair):
+            page.insert_text((x, 80 + i * 20), value, fontsize=11)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    news = "In 2025 the council approved 12 new projects worth 4.5 million while 3 were deferred to 2026. "
+    for i in range(3):
+        page.insert_textbox(pymupdf.Rect(40 + i * 180, 60, 200 + i * 180, 780), news * 12, fontsize=9,
+                            align=pymupdf.TEXT_ALIGN_JUSTIFY)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+KEY_VALUE_PAGES = [[["Plan name", "Image assistant"], ["Price", "5,000 per 6 months"], ["Industry", "Services"],
+                    ["Users", "9 to 50 staff"], ["Channel", "Web and LINE"], ["Launch", "2026-01"],
+                    ["Owner", "Chen Mei-Ling"]],
+                   [["Support", "Email and phone"], ["Training", "2 workshops"], ["Contract", "12 months"]]]
+
+
+def key_value_split_pdf(path: Path) -> Path:
+    """A plain two-column key/value form table (no header row) running from the bottom of page 1
+    to the top of page 2."""
+    doc = pymupdf.open()
+    for page_no, rows in enumerate(KEY_VALUE_PAGES):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        top = 60 if page_no else 842 - 48 - 18 * len(rows)
+        if page_no == 0:
+            page.insert_text((50, top - 20), "Application details", fontsize=10)
+        ruled_table(page, 50, top, [140, 240], [18] * len(rows), grid(rows))
     doc.save(str(path))
     doc.close()
     return Path(path)

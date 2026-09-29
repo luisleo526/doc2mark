@@ -149,11 +149,24 @@ class TestTableData:
     def test_continuation_marking(self):
         cells = [
             [Cell.merged("X", rowspan=2), Cell(text="A")],
-            [Cell(text="B"), Cell(text="C")],
+            [Cell(), Cell(text="C")],
         ]
         table = TableData(cells=cells)
         assert table.cell(1, 0).is_continuation is True
         assert table.cell(1, 1).is_continuation is False
+
+    def test_span_never_hides_a_value(self):
+        # a 2x2 span over "B", "D" and "E" would silently drop them: it shrinks instead
+        table = TableData.from_raw([["A", "B", "C"], ["D", "E", "F"]], {"cell_spans": {(0, 0): (2, 2)}})
+        assert [[c.text for c in row] for row in table.cells] == [["A", "B", "C"], ["D", "E", "F"]]
+        assert not any(c.is_continuation for row in table.cells for c in row)
+        assert table.cell(0, 0).rowspan == 1 and table.cell(0, 0).colspan == 1
+
+    def test_span_shrinks_to_the_empty_cells(self):
+        # widest run of empty cells in the first row, then as many rows as stay empty
+        table = TableData.from_raw([["A", "", "C"], ["", "", "x"], ["y", "", ""]], {"cell_spans": {(0, 0): (3, 3)}})
+        assert (table.cell(0, 0).rowspan, table.cell(0, 0).colspan) == (2, 2)
+        assert table.cell(0, 2).text == "C" and table.cell(1, 2).text == "x" and table.cell(2, 0).text == "y"
 
     def test_colspan_continuation(self):
         cells = [
@@ -422,7 +435,7 @@ class TestTableRenderer:
     def test_rowspan_in_html(self):
         cells = [
             [Cell.merged("Span", rowspan=2, is_header=True), Cell.header("B")],
-            [Cell(text="placeholder"), Cell(text="D")],
+            [Cell(), Cell(text="D")],
         ]
         table = TableData(cells=cells)
         result = TableRenderer(table_style=TableStyle.MINIMAL_HTML).render(table)
