@@ -82,17 +82,27 @@ MIN_JUDGED_CHARS = 20
 #   with at least IMAGE_PAGE_TEXT_LIMIT * (1 + margin) legible text is a text page.
 PAGE_OVERRIDE_MARGIN = 0.5
 
-# A page with less legible text than this has no usable text layer; if it still shows
-# ink that neither its text layer nor its OCR-able raster images account for (at least
-# MIN_UNCAPTURED_INK of its area: vector-outlined text, inline images) only OCR of the
-# page render can read it.
+# A page with less legible text than this has no usable text layer. If it still shows
+# content the text route cannot capture, only OCR of the page render can read it:
+# pictures the text route does not OCR one by one (inline images, picture tiles too
+# small to count as figures) over at least MIN_UNCAPTURED_RASTER of the page, or ink
+# (vector outlines, any colour) over at least MIN_UNCAPTURED_INK of it. Three short
+# lines of 12 pt outlined text already cover about 0.2 %; a false alarm (a page frame)
+# costs one OCR call, a miss loses the page's words, so the floor is low.
 NO_TEXT_LIMIT = IMAGE_PAGE_TEXT_LIMIT / 4
-MIN_UNCAPTURED_INK = 0.005
+MIN_UNCAPTURED_RASTER = 0.05
+MIN_UNCAPTURED_INK = 0.001
 
-# Invisible (render mode 3) text is the OCR layer of a searchable scan when at least
-# this share of it lies over raster images covering the page; anywhere else it is
-# hidden text and never content.
-SCAN_LAYER_OVER_IMAGES = 0.5
+# Invisible (render mode 3, fully transparent) text is the text of what the page shows
+# (a scanner's OCR layer, the transparent copy of text baked into artwork) when the
+# render shows ink under it: at least this share of the span's area differs from its
+# background, painted text left out. Invisible text over nothing visible is hidden
+# text and never content.
+MIN_LAYER_INK = 0.03
+
+# Bumped whenever routing changes what a page emits for the same input, so caches of
+# converted documents (UnifiedDocumentLoader's cache_dir) do not serve stale output.
+ROUTING_VERSION = 2
 
 # Reasons reported for a page route.
 REASON_DOCUMENT = "document_route"
@@ -120,8 +130,9 @@ def decide_doc_strategy(
       the share of its text pages whose layer is garbled), i.e. the render must be
       trusted instead.
 
-    Otherwise ``"text"``. Garbled pages of a text document are handled page by page
-    (:func:`decide_page_route`), so one bad page never flips a whole document.
+    Otherwise ``"text"``. The PDF route passes no ``text_illegibility``: it checks
+    every page's text layer and OCRs garbled pages one by one
+    (:func:`decide_page_route`), so garbled pages never take clean pages with them.
     """
     if mean_image_coverage >= IMAGE_PAGE_COVERAGE and (
         mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT
@@ -134,13 +145,46 @@ def decide_doc_strategy(
 # --- Measuring text ---------------------------------------------------------
 
 _CID = re.compile(r"\(cid:\d+\)")
-# Mojibake: UTF-8 read as Latin-1 or cp1252, i.e. a UTF-8 lead byte (Latin-1 reading)
-# followed by a continuation byte (Latin-1 or cp1252 reading). The no-break space
-# (0xA0) is not counted: an accented letter before it is ordinary French typography.
-_MOJIBAKE_LEADS = bytes([0xC3, 0xC2, 0xE2, 0xE6, 0xE5, 0xE8, 0xE9, 0xE7, 0xE4]).decode("latin-1")
-_MOJIBAKE_TRAILS = (bytes(b for b in range(0x80, 0xC0) if b != 0xA0).decode("latin-1")
+# Mojibake: UTF-8 bytes shown as Latin-1 or cp1252 characters. A candidate is a UTF-8
+# lead byte followed by a continuation byte (Latin-1 or cp1252 reading); it counts
+# only when the characters, turned back into bytes, form one complete UTF-8 sequence
+# ("\u00c3\u00a9" is "\u00e9"), so an accented letter before punctuation ("\u00e9\u00ae",
+# a French no-break space) is not garbage.
+_MOJIBAKE_LEADS = bytes(range(0xC2, 0xF5)).decode("latin-1")
+_MOJIBAKE_TRAILS = (bytes(range(0x80, 0xC0)).decode("latin-1")
                     + bytes(range(0x80, 0xA0)).decode("cp1252", errors="ignore"))
-_MOJIBAKE = re.compile(f"[{re.escape(_MOJIBAKE_LEADS)}][{re.escape(_MOJIBAKE_TRAILS)}]")
+_MOJIBAKE_CANDIDATE = re.compile(f"[{re.escape(_MOJIBAKE_LEADS)}][{re.escape(_MOJIBAKE_TRAILS)}]")
+
+
+def _byte_of(char: str) -> Optional[int]:
+    """The single Latin-1 or cp1252 byte a character stands for, if any."""
+    if ord(char) < 0x100:
+        return ord(char)
+    try:
+        encoded = char.encode("cp1252")
+    except UnicodeEncodeError:
+        return None
+    return encoded[0] if len(encoded) == 1 else None
+
+
+def _mojibake_positions(text: str) -> set:
+    """Indexes of the characters that are UTF-8 sequences read as Latin-1/cp1252."""
+    positions: set = set()
+    for match in _MOJIBAKE_CANDIDATE.finditer(text):
+        start = match.start()
+        if start in positions:
+            continue
+        lead = ord(text[start])
+        length = 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+        raw = [_byte_of(char) for char in text[start:start + length]]
+        if len(raw) < length or any(b is None or not 0x80 <= b <= 0xBF for b in raw[1:]):
+            continue
+        try:
+            bytes([lead] + raw[1:]).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        positions.update(range(start, start + length))
+    return positions
 
 
 def _is_private_use(code: int) -> bool:
@@ -162,12 +206,10 @@ def _scan_text(text: str) -> Tuple[int, int, float]:
 
     Counted characters are the non-whitespace ones, except a lone private-use glyph
     (an icon or bullet from a symbol font), which is neither text nor garbage.
-    Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, mojibake pairs.
+    Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, mojibake sequences.
     """
     text = _CID.sub("\ufffd", text)
-    mojibake = set()
-    for match in _MOJIBAKE.finditer(text):
-        mojibake.update(range(match.start(), match.end()))
+    mojibake = _mojibake_positions(text)
     garbage = counted = 0
     weight = 0.0
     for index, char in enumerate(text):
@@ -273,7 +315,7 @@ def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, te
         return None
     try:
         verdict = float(verdict)
-    except (TypeError, ValueError):
+    except Exception:  # a judge may return anything; unusable means "cannot judge"
         verdict = math.nan
     if not 0.0 <= verdict <= 1.0:
         logger.warning(f"legibility_judge returned {verdict!r}, not a probability; ignoring it")
@@ -289,27 +331,30 @@ class PageSignals:
     """What a pipeline measured on one page.
 
     ``image_coverage`` is the share of the page covered by raster images (the union of
-    their visible rectangles). ``visible`` / ``invisible`` describe the painted text and
-    the invisible (render mode 3) text. ``invisible_over_images`` is the share of the
-    invisible text lying over raster images. ``uncaptured_ink`` is the share of the page
-    showing ink that neither the text layer nor the OCR-able raster images account for
-    (None when not measured: pages with a usable text layer or image-dominant pages).
-    ``judge_legibility`` is the optional judge's verdict on :attr:`text_layer`.
+    their visible rectangles). ``visible`` describes the painted text; ``invisible`` the
+    invisible text lying over what the page shows (see ``MIN_LAYER_INK``: a scanner's OCR
+    layer, a transparent copy of text baked into artwork). ``hidden_chars`` counts the
+    invisible characters over nothing visible. ``uncaptured_raster`` is the share of the
+    page covered by pictures the text route cannot OCR one by one (inline images,
+    picture tiles), ``uncaptured_ink`` the share showing other ink neither the text layer
+    nor the pictures account for (None when not measured: pages with a usable text layer
+    or image-dominant pages). ``judge_legibility`` is the optional judge's verdict on
+    :attr:`text_layer`.
     """
 
     image_coverage: float = 0.0
     visible: TextLayerStats = field(default_factory=TextLayerStats)
     invisible: TextLayerStats = field(default_factory=TextLayerStats)
-    invisible_over_images: float = 0.0
+    hidden_chars: int = 0
+    uncaptured_raster: float = 0.0
     uncaptured_ink: Optional[float] = None
     judge_legibility: Optional[float] = None
 
     @property
     def searchable_scan(self) -> bool:
-        """An invisible OCR layer over a page-covering scan, with (almost) no painted text."""
+        """An invisible text layer over a page-covering scan, with (almost) no painted text."""
         return (self.invisible.chars > 0
                 and self.image_coverage >= IMAGE_PAGE_COVERAGE
-                and self.invisible_over_images >= SCAN_LAYER_OVER_IMAGES
                 and self.visible.weight < IMAGE_PAGE_TEXT_LIMIT)
 
     @property
@@ -325,10 +370,11 @@ class PageSignals:
 
     @property
     def uncaptured_content(self) -> bool:
-        """No usable text layer, yet ink only OCR of the render can read (vector outlines, inline images)."""
-        return (self.visible.weight < NO_TEXT_LIMIT
-                and self.uncaptured_ink is not None
-                and self.uncaptured_ink >= MIN_UNCAPTURED_INK)
+        """No usable text layer, yet content only OCR of the render can read (inline or
+        tiled pictures, vector outlines)."""
+        return self.visible.weight < NO_TEXT_LIMIT and (
+            self.uncaptured_raster >= MIN_UNCAPTURED_RASTER
+            or (self.uncaptured_ink is not None and self.uncaptured_ink >= MIN_UNCAPTURED_INK))
 
 
 def document_signals(pages: Sequence[PageSignals]) -> Tuple[float, float, float]:

@@ -92,6 +92,15 @@ def test_garbage_classes():
         assert text_layer_stats([(garbage * 4, 11.0)] + body).garbled, garbage
 
 
+def test_accented_letters_before_punctuation_are_not_mojibake():
+    # e-acute + registered sign, e-acute + trade mark, guillemets, low-9 quotes, apostrophe, ellipsis, dash
+    brands = "Nestl\u00e9\u00ae Caf\u00e9\u2122 \u00abperch\u00e9\u00bb \u201eCaf\u00e9\u201c "
+    brands += "Jos\u00e9\u2019s caf\u00e9\u2026 caf\u00e9\u2014 Prezzi 2026"
+    assert text_layer_stats([(brands, 11.0)] * 3).garbage_glyphs == 0
+    # the same characters as real mojibake: UTF-8 bytes of a right single quote and of CJK, read as cp1252
+    assert text_layer_stats([("don\u00e2\u20ac\u2122t \u00e6\u2014\u00a5\u00e6\u0153\u00ac", 11.0)]).garbage_glyphs == 9
+
+
 def test_lone_private_use_icons_and_french_spacing_are_not_garbage():
     bullets = [("\uf0b7 Apples and pears for the canteen", 11.0)] * 30
     assert text_layer_stats(bullets).garbage_glyphs == 0
@@ -124,10 +133,16 @@ def test_judge_failures_mean_cannot_judge():
     def boom(text):
         raise RuntimeError("judge down")
 
+    class Unconvertible:
+        def __float__(self):
+            raise ArithmeticError("no number")
+
     assert judge_text_layer(boom, LEGIBLE, "text") is None
     assert judge_text_layer(lambda text: 1.7, LEGIBLE, "text") is None
     assert judge_text_layer(lambda text: "high", LEGIBLE, "text") is None
     assert judge_text_layer(lambda text: None, LEGIBLE, "text") is None
+    assert judge_text_layer(lambda text: 10 ** 400, LEGIBLE, "text") is None
+    assert judge_text_layer(lambda text: Unconvertible(), LEGIBLE, "text") is None
 
 
 # --- Page routes -----------------------------------------------------------------------------------------------
@@ -156,13 +171,21 @@ def test_quality_and_layer_overrides_win_in_any_document():
     assert decide_page_route(_page(0.0, 0.0, uncaptured_ink=0.001), "text") == ("text", "document_route")
 
 
-def test_invisible_text_is_a_scan_layer_only_over_page_covering_pictures():
+def test_an_invisible_layer_over_a_page_covering_scan_is_a_searchable_scan():
     layer = TextLayerStats(chars=800, weight=800.0)
-    scan = PageSignals(image_coverage=0.95, invisible=layer, invisible_over_images=1.0)
+    scan = PageSignals(image_coverage=0.95, invisible=layer)
     assert scan.searchable_scan and decide_page_route(scan, "text") == ("image", "searchable_scan")
-    hidden = PageSignals(image_coverage=0.95, invisible=layer, invisible_over_images=0.0)
-    assert not hidden.searchable_scan
-    assert not PageSignals(image_coverage=0.1, invisible=layer, invisible_over_images=1.0).searchable_scan
+    assert scan.text_layer is layer
+    assert not PageSignals(image_coverage=0.95, hidden_chars=800).searchable_scan       # hidden text only
+    assert not PageSignals(image_coverage=0.1, invisible=layer).searchable_scan         # not page-covering
+    assert not PageSignals(image_coverage=0.95, invisible=layer,
+                           visible=TextLayerStats(chars=900, weight=900.0)).searchable_scan  # a real text page
+
+
+def test_pictures_the_text_route_cannot_ocr_send_a_textless_page_to_ocr():
+    assert decide_page_route(_page(0.6, 0.0, uncaptured_raster=0.6), "text") == ("image", "no_text_layer")
+    assert decide_page_route(_page(0.6, 0.0, uncaptured_raster=0.01), "text") == ("text", "document_route")
+    assert decide_page_route(_page(0.6, 300.0, uncaptured_raster=0.6), "text") == ("text", "document_route")
 
 
 def test_document_illegibility_is_a_share_of_pages_not_the_worst_page():

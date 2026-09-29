@@ -81,8 +81,9 @@ user-facing:
        density, in Latin-character equivalents.
    * - ``ILLEGIBLE_TEXT_RATIO``
      - ``0.3``
-     - Share of a document's text pages whose text layer is garbled at or above
-       which an image-dominant document routes ``"image"`` as a whole.
+     - ``decide_doc_strategy(..., text_illegibility)``: share of garbled text
+       pages at or above which an image-dominant document routes ``"image"``.
+       The PDF route passes none (it gates every page on its own).
    * - ``GARBAGE_TEXT_RATIO`` / ``MIN_GARBAGE_GLYPHS``
      - ``0.1`` / ``3``
      - A page's text layer is garbled when at least 3 undecodable glyphs make up
@@ -97,11 +98,13 @@ user-facing:
      - An optional legibility judge's probability below which a page counts as
        garbled.
 
-The document rule::
+The document rule (the PDF route)::
 
-   "image"  iff  mean_image_coverage >= 0.55
-                 AND (mean_legible_text < 200  OR  garbled_text_pages >= 0.3)
+   "image"  iff  mean_image_coverage >= 0.55  AND  mean_legible_text < 200
    "text"   otherwise
+
+Garbled text layers do not move the document route: every page is checked on
+its own and a garbled page is OCR'd alone, so it never takes clean pages with it.
 
 Text density is the decisive signal. Coverage alone would misclassify a normal
 text document that merely carries a few large figures; requiring low text
@@ -122,21 +125,24 @@ For a PDF, ``PDFLoader`` measures every page once
 
 - **image coverage** -- the share of the visible page covered by raster images:
   the *union* of the image placements, clipped to the page (CropBox), inline
-  (``BI``/``ID``/``EI``) images included. Parts of a picture outside the page, a
-  picture placed twice or stacked on another, and cropped-away areas are not
-  counted.
+  (``BI``/``ID``/``EI``) images included. Parts of a picture outside the page
+  (CropBox) and a picture placed twice or stacked on another are not counted.
+  Clip paths inside the page are not considered.
 - **legible text** -- ``text_weight`` of the *painted* text. Invisible text
   (render mode 3, fully transparent) is kept apart (see *Invisible text*).
 - **text-layer quality** -- whether the text layer is garbled (see *Text-layer
   quality gate*).
-- **uncaptured ink** -- on a page with (almost) no usable text: the share of the
-  page showing ink that neither the text layer nor the pictures the text route
-  OCRs account for (vector-outlined text, inline images).
+- **uncaptured content** -- on a page with (almost) no usable text: the share of
+  the page covered by pictures the text route does not OCR one by one (inline
+  images, picture tiles too small to count as figures), and the share showing
+  other ink, any colour (vector-outlined text), on a 72 DPI render.
 
 ``_document_image_strategy`` feeds the page means to ``decide_doc_strategy``,
 caches the result and logs it, e.g.::
 
    📑 Document OCR strategy: image (mean coverage 0.94, mean legible text 12/page, garbled text pages 0%)
+
+(the garbled-page share is reported, not used).
 
 Per-page routes
 ~~~~~~~~~~~~~~~
@@ -163,9 +169,9 @@ matching rule wins):
      - The text layer is garbled (detector or legibility judge).
    * - ``no_text_layer``
      - ``image``
-     - Less than 50 legible characters, but at least 0.5 % of the page shows
-       uncaptured ink: text drawn as vector outlines, scans stored as inline
-       images.
+     - Less than 50 legible characters, but pictures the text route cannot OCR
+       cover at least 5 % of the page (scans stored as inline images or tiles),
+       or other ink covers at least 0.1 % of it (text drawn as vector outlines).
    * - ``image_dominant_page``
      - ``image``
      - In a ``"text"`` document: pictures cover at least 0.825 of the page
@@ -243,12 +249,13 @@ glyphs make up at least ``GARBAGE_TEXT_RATIO`` (10 %) of its weighted text.
 - Without one, the text is kept as extracted (there is nothing better), the page
   is listed in ``metadata.extra["text_layer_quality"]`` and a warning names it.
 
-The document route uses the *share* of garbled text pages, never the worst page:
-a brochure whose cover title alone is unreadable keeps its other pages on the
-text path, and only the cover is OCR'd. ``test-table.pdf`` in the sample
+Garbled pages never decide for the document, neither the worst page nor a share
+of them: a brochure whose cover title (or cover and one more page) is unreadable
+keeps its other pages on the text path, and only those pages are OCR'd.
+``test-table.pdf`` in the sample
 documents is such a page: its title "Technical Specifications" extracts as
-U+FFFD, its two pictures lie almost entirely off the page (visible coverage
-0.15), and the quality gate, not the coverage, sends it to OCR.
+U+FFFD, its two pictures lie almost entirely off the page (coverage 0.15), and
+the quality gate, not the coverage, sends it to OCR.
 
 The legibility judge
 ^^^^^^^^^^^^^^^^^^^^
@@ -271,8 +278,9 @@ The contract (``doc2mark.core.strategy.judge_text_layer``):
 - The judge returns the probability that the text is legible content a person
   could read (prose, tables, code, identifiers, any script), or ``None`` when it
   cannot judge.
-- It is consulted once per page, only for layers of at least 20 characters that
-  the deterministic detector did not already flag.
+- It is consulted at most once per page, only for layers of at least 20
+  characters that the deterministic detector did not already flag, and, with
+  OCR on, only for pages that would keep their text layer.
 - Below ``LEGIBILITY_JUDGE_THRESHOLD`` (0.7) the page is treated as garbled.
   ``None``, an exception or a value outside 0..1 mean "cannot judge": the text
   is kept, exactly as without a judge.
@@ -284,14 +292,19 @@ Invisible text
 ~~~~~~~~~~~~~~
 
 Text drawn in render mode 3 (or fully transparent) is not shown on the page.
+Each invisible span is checked against a 72 DPI render with the painted text left
+out:
 
-- On a **searchable scan** -- invisible text lying over pictures that cover the
-  page -- it is the text of those pictures: a scanner's OCR layer, or the
-  transparent copy a slide export keeps of text it baked into the artwork. With
-  an OCR provider the page is OCR'd from its render and the invisible layer
-  dropped. Without one, the invisible layer is emitted as the page's text.
-- On **any other page** it is hidden text -- a known prompt-injection vector in
-  RAG -- and is never emitted. The pages are listed in
+- **Over something the page shows** (at least ``MIN_LAYER_INK``, 3 %, of the
+  span's area differs from its background) it is the text of what is shown: a
+  scanner's OCR layer, or the transparent copy a slide export keeps of text it
+  baked into the artwork. It is emitted when those pictures are not OCR'd (no
+  OCR provider), and dropped when they are, so there is one source, not two. A
+  page that is mostly such a layer over a page-covering scan is a *searchable
+  scan* and is OCR'd from its render.
+- **Over nothing visible** it is hidden text -- a known prompt-injection vector in
+  RAG -- and is never emitted, on any page, in paragraphs or in table cells (the
+  page is read from a copy with that text removed). The pages are listed in
   ``metadata.extra["hidden_text"]`` and a warning names them.
 
 What the output records
@@ -309,7 +322,12 @@ includes them):
 - ``hidden_text``: pages whose invisible text was left out, with its length.
 
 A document that yields no text at all never does so silently: a warning says so
-and, without OCR, points at the pages that need it (scans, vector outlines).
+and, without OCR, points at the pages that need it (scans, vector outlines);
+with OCR, pages that show content but produced no text are named too.
+
+Converted documents cached by ``UnifiedDocumentLoader(cache_dir=...)`` are keyed
+by the legibility judge and by ``strategy.ROUTING_VERSION``, so a new judge or a
+routing change is never answered from an older result.
 
 Layer 2 -- the Office image route
 ---------------------------------

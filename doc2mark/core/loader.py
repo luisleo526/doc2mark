@@ -19,6 +19,7 @@ from doc2mark.core.base import (
     ProcessingError,
     UnsupportedFormatError
 )
+from doc2mark.core.strategy import ROUTING_VERSION
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
@@ -461,6 +462,15 @@ class UnifiedDocumentLoader:
         except ImportError:
             logger.debug("Email processor not available; skipping .eml support")
 
+    def _judge_identity(self) -> Optional[str]:
+        """A stable name for the configured legibility judge (for cache keys)."""
+        judge = getattr(self, "legibility_judge", None)
+        if judge is None:
+            return None
+        target = getattr(judge, "__func__", judge)
+        name = getattr(target, "__qualname__", None) or type(judge).__qualname__
+        return f"{getattr(target, '__module__', type(judge).__module__)}.{name}"
+
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
         """Normalize string output format names to OutputFormat enum values."""
@@ -542,6 +552,10 @@ class UnifiedDocumentLoader:
                 "delimiter": delimiter,
                 "table_style": self.table_style,
                 "ocr_provider": type(self._unwrap_ocr(self.ocr)).__name__ if self.ocr else None,
+                # A different judge, or routing that changed what a page emits, must not
+                # be answered from an older cached result.
+                "legibility_judge": self._judge_identity(),
+                "routing_version": ROUTING_VERSION,
             }
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:

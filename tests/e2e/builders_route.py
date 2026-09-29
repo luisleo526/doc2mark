@@ -64,7 +64,7 @@ def picture_png(lines: Sequence[str], size: Tuple[int, int], *, font_px: int, ba
 
 
 def insert_lines(page, lines: Sequence[str], *, top: float, fontsize: float, fontname: str = "helv",
-                 left: float = MARGIN, leading: float = 1.5, render_mode: int = 0) -> float:
+                 left: float = MARGIN, leading: float = 1.5, render_mode: int = 0, color=(0, 0, 0)) -> float:
     """Write one text line per item starting at ``top``; return the y below the last line.
 
     A line wider than the page raises ``ValueError`` instead of being clipped silently.
@@ -74,7 +74,7 @@ def insert_lines(page, lines: Sequence[str], *, top: float, fontsize: float, fon
         if fontname != BROKEN_FONT and pymupdf.get_text_length(line, fontname=fontname, fontsize=fontsize) > (
                 page.rect.width - left - MARGIN / 2):
             raise ValueError(f"line is wider than the page at fontsize={fontsize}: {line!r}")
-        page.insert_text((left, y), line, fontname=fontname, fontsize=fontsize, render_mode=render_mode)
+        page.insert_text((left, y), line, fontname=fontname, fontsize=fontsize, render_mode=render_mode, color=color)
         y += fontsize * leading
     return y
 
@@ -175,18 +175,26 @@ def text_page(doc, lines: Sequence[str], *, fontsize: float = 11):
     return page
 
 
-def inline_scan_page(doc, text: str):
-    """A4 page whose only content is an INLINE image (BI/ID/EI) of ``text``: no image XObject, no text layer."""
+def inline_scan_page(doc, text: str, *, height_share: float = 1.0, heading: str = ""):
+    """A4 page showing a picture of ``text`` as an INLINE image (BI/ID/EI) only: no image XObject.
+
+    The picture spans the full width and the top ``height_share`` of the page (cropped to that
+    part of the scan). ``heading`` (optional) is a line of real text below it.
+    """
     page = doc.new_page(width=A4[0], height=A4[1])
     gray = Image.open(io.BytesIO(pdfgen.text_png(text))).convert("L")
+    gray = gray.crop((0, 0, gray.width, round(gray.height * height_share)))
     data = binascii.hexlify(zlib.compress(gray.tobytes(), 9)).decode()
     width, height = gray.size
-    content = (f"q {A4[0]} 0 0 {A4[1]} 0 0 cm\n"
+    shown = A4[1] * height_share
+    content = (f"q {A4[0]} 0 0 {shown:.2f} 0 {A4[1] - shown:.2f} cm\n"
                f"BI /W {width} /H {height} /BPC 8 /CS /G /F [/AHx /Fl] ID\n{data}>\nEI Q\n")
     xref = doc.get_new_xref()
     doc.update_object(xref, "<<>>")
     doc.update_stream(xref, content.encode())
     doc.xref_set_key(page.xref, "Contents", f"{xref} 0 R")
+    if heading:
+        insert_lines(page, [heading], top=shown + 30, fontsize=12)
     return page
 
 
@@ -204,11 +212,11 @@ def tiled_scan_page(doc, text: str, *, grid: int = 12):
     return page
 
 
-def vector_page(doc, lines: Sequence[str], *, fontsize: float = 36):
+def vector_page(doc, lines: Sequence[str], *, fontsize: float = 36, color=(0, 0, 0)):
     """A4 page with ``lines`` drawn as glyph OUTLINES (vector paths): no text layer, no raster image."""
     source = pymupdf.open()
     page = source.new_page(width=A4[0], height=A4[1])
-    insert_lines(page, lines, top=MARGIN + fontsize, fontsize=fontsize)
+    insert_lines(page, lines, top=MARGIN + fontsize, fontsize=fontsize, color=color)
     svg = page.get_svg_image(text_as_path=True)
     source.close()
     outlined = pymupdf.open("pdf", pymupdf.open(stream=svg.encode(), filetype="svg").convert_to_pdf())
@@ -362,4 +370,78 @@ def page_number_title_pdf(path: Path, number: str, title: str, body: Sequence[st
     insert_lines(page, [title], top=MARGIN + 80, fontsize=24, fontname=BROKEN_FONT)
     insert_lines(page, body, top=MARGIN + 130, fontsize=11)
     garble(doc, "fffd")
+    return _save(doc, path)
+
+
+def table_with_hidden_text_pdf(path: Path, intro: Sequence[str], rows: Sequence[Sequence[str]],
+                               hidden_in_cell: str, hidden_below: str) -> Path:
+    """A text page with a ruled table; one INVISIBLE word sits inside the last column of the second
+    row, and an invisible line sits below the table."""
+    doc = pymupdf.open()
+    page = text_page(doc, intro)
+    x0, y0, col_w, row_h = MARGIN, 300, 150, 30
+    for r in range(len(rows) + 1):
+        page.draw_line((x0, y0 + r * row_h), (x0 + len(rows[0]) * col_w, y0 + r * row_h))
+    for c in range(len(rows[0]) + 1):
+        page.draw_line((x0 + c * col_w, y0), (x0 + c * col_w, y0 + len(rows) * row_h))
+    for r, row in enumerate(rows):
+        for c, value in enumerate(row):
+            page.insert_text((x0 + c * col_w + 5, y0 + r * row_h + 20), value, fontsize=10)
+    page.insert_text((x0 + (len(rows[0]) - 1) * col_w + 70, y0 + row_h + 20), hidden_in_cell, fontsize=5,
+                     render_mode=3)
+    insert_lines(page, [hidden_below], top=y0 + len(rows) * row_h + 60, fontsize=10, render_mode=3)
+    return _save(doc, path)
+
+
+def letterhead_pdf(path: Path, lines: Sequence[str], hidden: str) -> Path:
+    """A short letter on a full-page letterhead picture (light, blank where the text goes), plus one
+    INVISIBLE line over a blank part of the letterhead."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_image(page.rect, stream=picture_png(["ACME PUMPS"], (1240, 1754), font_px=60, background="ivory"))
+    insert_lines(page, lines, top=250, fontsize=12)
+    insert_lines(page, [hidden], top=600, fontsize=11, render_mode=3)
+    return _save(doc, path)
+
+
+def receipt_with_ocr_layer_pdf(path: Path, report: Sequence[str], receipt: Sequence[str]) -> Path:
+    """A born-digital report page carrying a scanned receipt (a picture of ``receipt`` over about a
+    quarter of the page) with an INVISIBLE OCR layer of the receipt's lines placed over them, as
+    ``ocrmypdf --redo-ocr`` leaves it."""
+    doc = pymupdf.open()
+    page = text_page(doc, report)
+    size, font_px = (1200, 600), 56
+    image = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=font_px)
+    boxes, y = [], font_px // 2
+    for line in receipt:
+        box = draw.textbbox((font_px // 2, y), line, font=font)
+        draw.text((font_px // 2, y), line, fill="black", font=font)
+        boxes.append(box)
+        y = box[3] + font_px // 3
+    frame = pymupdf.Rect(MARGIN, 450, MARGIN + 400, 650)
+    page.insert_image(frame, stream=_png(image), keep_proportion=False)
+    scale = frame.width / size[0], frame.height / size[1]
+    for line, (left, top, right, bottom) in zip(receipt, boxes):
+        height = (bottom - top) * scale[1]
+        page.insert_text((frame.x0 + left * scale[0], frame.y0 + bottom * scale[1]), line,
+                         fontsize=height * 1.1, render_mode=3)
+    return _save(doc, path)
+
+
+def report_with_exhibit_pdf(path: Path, report: Sequence[str], scan_text: str, heading: str) -> Path:
+    """A text page, then a page showing a scan as an inline image over its top 60 % with only a short
+    real ``heading`` below it."""
+    doc = pymupdf.open()
+    text_page(doc, report)
+    inline_scan_page(doc, scan_text, height_share=0.6, heading=heading)
+    return _save(doc, path)
+
+
+def report_with_outlined_notice_pdf(path: Path, report: Sequence[str], notice: Sequence[str]) -> Path:
+    """A text page, then a page whose only content is ``notice`` as small grey vector OUTLINES (12 pt)."""
+    doc = pymupdf.open()
+    text_page(doc, report)
+    vector_page(doc, notice, fontsize=12, color=(0.45, 0.45, 0.45))
     return _save(doc, path)
