@@ -161,10 +161,10 @@ def _save(doc, path: Path) -> Path:
 # ------------------------------------------------------------------- page makers
 
 
-def scan_page(doc, text: str):
+def scan_page(doc, text: str, *, font_px: int = 110):
     """A4 page that is one full-page picture of ``text`` (no text layer)."""
     page = doc.new_page(width=A4[0], height=A4[1])
-    page.insert_image(page.rect, stream=pdfgen.text_png(text))
+    page.insert_image(page.rect, stream=pdfgen.text_png(text, font_size=font_px))
     return page
 
 
@@ -239,11 +239,13 @@ def mixed_pdf(path: Path, pages: Sequence[Tuple[str, str]]) -> Path:
 
 def searchable_scan_pdf(path: Path, pages: Sequence[Tuple[str, str]]) -> Path:
     """Searchable scan (Acrobat / ocrmypdf style): per ``(scan_text, layer_text)``, a full-page picture of
-    ``scan_text`` under an INVISIBLE (render mode 3) text layer holding ``layer_text``."""
+    ``scan_text`` under an INVISIBLE (render mode 3) text layer holding ``layer_text``, line by line where the
+    picture shows it."""
     doc = pymupdf.open()
     for scan_text, layer_text in pages:
-        page = scan_page(doc, scan_text)
-        insert_lines(page, layer_text.split("\n"), top=MARGIN + 11, fontsize=11, render_mode=3)
+        page = scan_page(doc, scan_text, font_px=56)
+        insert_lines(page, layer_text.split("\n"), top=MARGIN / 2 + 20, fontsize=20, left=MARGIN / 2,
+                     leading=1.6, render_mode=3)
     return _save(doc, path)
 
 

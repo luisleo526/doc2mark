@@ -81,15 +81,22 @@ def clause_lines(page, count=6):
 # R-F1 searchable scans, H-F15 hidden text
 
 
-SEARCHABLE_SCAN = [
-    ("POLICY 4471 2290\nCLAIM APPROVED", "P0L1CY 4471 229O CLA1M APPR0VED"),
-    ("INVOICE 8812 5530\nTOTAL 912 EUR", "1NV01CE 8812 553O T0TAL 912 EUR"),
+SCANNED_PAGES = [
+    ["POLICY 4471 2290 CLAIM APPROVED", "The insured vehicle was inspected", "on 14 March 2026 at the Leiden depot.",
+     "Damage to the front bumper and the", "left headlamp was assessed at EUR", "2,340 excluding labour costs.",
+     "Repairs are authorised at garage 17.", "Payment follows within 30 days."],
+    ["INVOICE 8812 5530 TOTAL 912 EUR", "Delivered to the Rotterdam depot on", "2 April 2026 in three pallets.",
+     "The consignee signed for all boxes", "and reported no transport damage.", "VAT is charged at the standard rate.",
+     "Please quote the invoice number", "on every remittance you send us."],
 ]
+# What a poor scanner OCR puts in the invisible layer: confusable letters, digits intact.
+BAD_OCR = str.maketrans({"O": "0", "I": "1", "o": "0", "i": "1", "e": "c", "l": "1"})
+SEARCHABLE_SCAN = [("\n".join(lines), "\n".join(line.translate(BAD_OCR) for line in lines)) for lines in SCANNED_PAGES]
 
 
 def test_searchable_scan_with_ocr_emits_each_page_once(run_cli, require_tool, e2e_dir):
-    """R-F1: a full-page scan under an invisible (render mode 3) OCR layer gives ONE source per page. With OCR on,
-    the page render is OCR'd and the invisible layer (here a bad scanner OCR) is dropped, not emitted as well."""
+    """R-F1: a full-page scan under a dense invisible (render mode 3) OCR layer gives ONE source per page. With OCR
+    on, the page render is OCR'd and the invisible layer (here a poor scanner OCR) is dropped, not emitted as well."""
     require_tool("tesseract")
     pdf = builders_route.searchable_scan_pdf(e2e_dir / "searchable_scan.pdf", SEARCHABLE_SCAN)
 
@@ -111,8 +118,9 @@ def test_searchable_scan_without_ocr_emits_the_invisible_layer_once(run_cli, e2e
 
     assert result.exit_code == 0, result.describe()
     text = words(result.markdown)
-    for _, layer in SEARCHABLE_SCAN:
-        assert text.count(layer) == 1, result.describe()
+    for lines in SCANNED_PAGES:
+        for line in lines:
+            assert text.count(line.translate(BAD_OCR)) == 1, result.describe()
 
 
 def test_hidden_text_on_a_normal_page_is_not_emitted(run_cli, e2e_dir):
