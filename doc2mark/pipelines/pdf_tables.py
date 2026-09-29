@@ -532,12 +532,21 @@ def rule_segments(page) -> Tuple[List[Tuple[float, float, float]], List[Tuple[fl
     return horizontal, vertical
 
 
-def _edge_drawn(position: float, start: float, end: float, segments) -> bool:
+def _by_position(segments) -> Dict[int, list]:
+    buckets: Dict[int, list] = {}
+    for segment in segments:
+        buckets.setdefault(int(segment[0] // EDGE_TOLERANCE), []).append(segment)
+    return buckets
+
+
+def _edge_drawn(position: float, start: float, end: float, buckets: Dict[int, list]) -> bool:
     """Do segments on this line cover at least 60% of the edge from ``start`` to ``end``?"""
     length = end - start
     if length <= 0:
         return False
-    pieces = sorted((max(s0, start), min(s1, end)) for p, s0, s1 in segments
+    key = int(position // EDGE_TOLERANCE)
+    nearby = [segment for k in (key - 1, key, key + 1) for segment in buckets.get(k, ())]
+    pieces = sorted((max(s0, start), min(s1, end)) for p, s0, s1 in nearby
                     if abs(p - position) <= EDGE_TOLERANCE and s1 > start and s0 < end)
     covered, reach = 0.0, start
     for s0, s1 in pieces:
@@ -549,7 +558,7 @@ def _edge_drawn(position: float, start: float, end: float, segments) -> bool:
 
 def is_ruled(grid: TableGrid, segments) -> bool:
     """Are at least two of the grid's cell borders drawn as lines?"""
-    horizontal, vertical = segments
+    horizontal, vertical = (_by_position(segments[0]), _by_position(segments[1]))
     edges = set()
     for cell in grid.cells:
         x0, y0, x1, y1 = cell.bbox
