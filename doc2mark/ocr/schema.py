@@ -64,6 +64,8 @@ _ASCII_DIGITS_RE = re.compile(r"[0-9]+")  # str.isdigit() also accepts "²", whi
 # grid is left unpadded rather than materialized.
 _MAX_COLSPAN = 1000
 _MAX_GRID_CELLS = 250_000
+# Rows longer than this are padded at the end without the alignment search.
+_MAX_ALIGNED_ROW_CELLS = 256
 
 
 def _clean_controls(text: str) -> str:
@@ -254,21 +256,23 @@ def _split_newlines_into_breaks(cell) -> None:
 
 
 def _tidy_breaks(cell) -> None:
-    """Drop <br> at the start or end of a cell and repeated ones."""
-    changed = True
-    while changed:
-        changed = False
-        kids = list(cell)
-        for index, kid in enumerate(kids):
-            if _tag(kid) != "br":
-                continue
-            leading = index == 0 and not (cell.text or "").strip()
-            repeated = index > 0 and _tag(kids[index - 1]) == "br" and not (kids[index - 1].tail or "").strip()
-            trailing = index == len(kids) - 1 and not (kid.tail or "").strip()
-            if leading or repeated or trailing:
+    """Keep a <br> only between two pieces of content: drop leading, trailing and
+    repeated ones (one pass; their text is kept)."""
+    content_since_break = bool((cell.text or "").strip())
+    last_kept = None
+    for kid in list(cell):
+        has_tail_text = bool((kid.tail or "").strip())
+        if _tag(kid) == "br":
+            if content_since_break:
+                last_kept, content_since_break = kid, False
+            else:
                 _remove_keep_tail(kid)
-                changed = True
-                break
+        else:
+            content_since_break = True
+        if has_tail_text:
+            content_since_break = True
+    if last_kept is not None and not content_since_break:
+        _remove_keep_tail(last_kept)
 
 
 def _tidy_table(table) -> None:
@@ -497,8 +501,9 @@ def _pad_position(cells: list, carried: set, spans: dict, deficit: int,
     """Where a short row lost its cell(s): the insertion point for ``deficit`` empty
     cells that best lines the row's cells up with their columns (numbers under number
     columns, labels under label columns, <td> under <td>). Ties keep the pads at the
-    end of the row, the historical behaviour; header rows are always padded at the end."""
-    if not cells or all(_tag(cell) == "th" for cell in cells):
+    end of the row, the historical behaviour; header rows (and very long rows) are
+    always padded at the end."""
+    if not cells or len(cells) > _MAX_ALIGNED_ROW_CELLS or all(_tag(cell) == "th" for cell in cells):
         return len(cells)
     cell_kinds = [_cell_kind(cell) for cell in cells]
     best, best_score = len(cells), -1
