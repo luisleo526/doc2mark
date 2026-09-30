@@ -182,9 +182,9 @@ else applies by default.
   need OCR, and empty or partly unextractable PDFs. (#14, #18, #19, #21, #22)
 
 - **PyMuPDF 1.27.1 or later is required** (the declared `>=1.23.0` could not even import `pymupdf`);
-  with an older PyMuPDF forced in, each missing capability is logged once. Importing the PDF pipeline
-  turns off PyMuPDF's process-wide `pymupdf_layout` recommendation, so it no longer lands in Markdown or
-  JSON written to stdout. (#25)
+  with an older PyMuPDF forced in, each missing capability is logged once. The CLI turns off PyMuPDF's
+  `pymupdf_layout` recommendation and logs MuPDF's messages on stderr, so neither lands in Markdown or
+  JSON written to stdout; the library leaves PyMuPDF's own output as PyMuPDF sets it. (#25, #26)
 
 ### Added
 - **Optional quality judge (TypeSafe/Jev).** `pip install 'doc2mark[typesafe]'`, then `--judge
@@ -436,6 +436,35 @@ else applies by default.
   markup or with other words between, nor running headers, footers or page numbers; table text is
   emitted once on rotated hidden-text pages whose CropBox is the MediaBox; reading order measures
   figures without decoding images (slide decks back to their pre-#23 speed). (#25)
+- **A refused recovery counts as the provider's refusal.** When a structured OCR answer came back empty
+  and the provider refused or blocked the free-form recovery (OpenAI `message.refusal`, a Gemini safety
+  block), the empty result was flagged `ocr_refusal` but not as the provider's own refusal: the OCR cache
+  replayed it for its full TTL, `ocr_issues["provider_refused"]` did not count it and `cache_dir` stored
+  the document for good. It now carries `non_content="provider_refusal"` and the reason, like a refused
+  first answer. (#26)
+- **Refusals cached before the short refusal TTL are not replayed.** The OCR cache key version is now
+  `ocr-cache-v6` (default Redis prefix `doc2mark:ocr:ocr-cache-v6`): entries written by earlier versions
+  are never read, so each image cached before is sent to the provider once more after upgrading. (#26)
+- **The verbatim tail no longer loses a printed line to the words of another.** One OCR word stands for
+  one printed line: a page printing `Total` twice where the OCR read it once keeps its second copy.
+  Longer lines claim their words first whatever the line order, so a missed `Tax 1,200` is appended even
+  when the OCR read `Net loss before tax 1,200` as a table row with a `Note 4` cell in between; a line of
+  three words or fewer must appear in one piece; a line matched with gaps may gain or miss only max(2, a
+  fifth of its words), so `Revenue 2024 up 12 percent` is no longer taken for reproduced by a chart's
+  `Revenue by year 2024 up from 2023 12 percent growth`; and a line without CJK characters is not
+  matched inside CJK text (`AI` in `財務AI使用介面`). (#26)
+- **The verbatim tail is fast again on CJK pages whose OCR answer holds the layer's characters in another
+  order:** 25 lines of 200 characters took 87 s per page (50 lines of 100: 6 s), now 0.06 s, below the
+  0.4 s of the matcher before #25. (#26)
+- **The CLI's stdout holds only the document for damaged PDFs too.** MuPDF's errors (`MuPDF error:
+  library error: zlib error: ...` for a stream that does not inflate) went to stdout, so the Markdown
+  carried them and `--format json` did not parse; they are logged as warnings on stderr instead (shown
+  by default and with `-v`, not with `-q`). (#26)
+- **Importing doc2mark leaves PyMuPDF's own output alone.** The PDF pipeline switched PyMuPDF's
+  `pymupdf_layout` recommendation off for the whole process when imported; now only the CLI does. (#26)
+- **One clip-path warning per PDF.** When MuPDF's clipped image extents do not pair up with a page's
+  images, the warning that its pictures are measured without their clip paths is logged once per
+  document instead of twice per page. (#26)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is
