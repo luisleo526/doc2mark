@@ -2513,13 +2513,18 @@ class PDFLoader:
         for item, box in zip(images, self._image_item_boxes(page, images) if images else []):
             regions[id(item)] = pdf_layout.Region(box, kind="image")
 
+        rotated = bool(page.rotation % 360)
+
         def region(item) -> pdf_layout.Region:
             layout = getattr(item, "layout", None) or regions.get(id(item)) or pdf_layout.Region(None)
+            if layout.box is None and not rotated:
+                # unknown place (a picture whose placement was not found): placed by its height
+                layout = replace(layout, box=(0.0, item.position_y, 0.0, item.position_y), anchored=True)
             if item.type == "text:footnote" and not layout.anchored:
                 layout = replace(layout, anchored=True)   # footnotes close the page, never a column
             return layout
 
-        if page.rotation % 360:
+        if rotated:
             group_tops: Dict[Any, float] = {}
             for item in items:
                 layout = region(item)
@@ -3882,9 +3887,13 @@ class PDFLoader:
                 runs = _drop_prefix(line.runs, indent + marker.length)
             items.append((line.bbox[0] if line.bbox else None, prefix, [runs], [2], [line]))
 
+        def list_kind(marker: str) -> str:
+            return marker.rstrip()[-1] if marker[:1].isdigit() else "-"
+
         output: List[str] = []
         stack: List[Tuple[Optional[float], str, str]] = []   # open levels: (x0, indent, marker prefix)
         joins = getattr(self, "_hyphen_joins", None)
+        previous = None   # marker prefix of the item above
         for x0, prefix, item_lines, item_wraps, item_views in items:
             while len(stack) > 1 and x0 is not None and stack[-1][0] is not None and x0 < stack[-1][0] - 2:
                 stack.pop()
@@ -3893,7 +3902,7 @@ class PDFLoader:
             # does not start at 1, goes after a blank line: without one it reads as a lazy
             # continuation of the item above in renderers that keep list types apart (Python-Markdown's
             # sane_lists) and, nested, in CommonMark too.
-            kind = prefix.rstrip()[-1] if prefix[:1].isdigit() else "-"
+            kind = list_kind(prefix)
             if not stack:
                 indent, new_list = "", False
             elif x0 is not None and stack[-1][0] is not None and x0 > stack[-1][0] + 2:
@@ -3902,10 +3911,11 @@ class PDFLoader:
             else:
                 sibling = stack.pop()
                 indent = sibling[1]
-                new_list = kind != (sibling[2].rstrip()[-1] if sibling[2][:1].isdigit() else "-")
+                new_list = kind != list_kind(sibling[2]) or kind != list_kind(previous)
             if new_list and output:
                 output.append("")
             stack.append((x0, indent, prefix))
+            previous = prefix
             physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
             lines = [_render_runs(runs) for runs in physical] or [""]
             output.append(indent + prefix + escape_line_start(lines[0]))
