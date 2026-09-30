@@ -562,8 +562,11 @@ def test_word_report_keeps_repeated_table_header_and_drops_running_chrome(run_cl
     assert not re.search(r"Page \d+ of \d+", result.markdown), result.describe()
     paragraphs = re.findall(r"Paragraph (\d+):", result.markdown)
     assert sorted(map(int, paragraphs)) == list(range(38)), result.describe()
-    # LibreOffice may wrap the cell after "INV-", so allow a line break inside the number.
-    assert len(set(re.findall(r"INV-?\s*(\d+)", result.markdown))) == 240, result.describe()
+    # Every invoice row once. LibreOffice may wrap the description after "INV-", and may break a row
+    # across a page, after "INV-" (the number then opens the next page's table): the number always
+    # stays with "payment". A line break inside a table cell reads <br>.
+    invoices = re.findall(r"(\d+)(?:\s|<br>)*payment\b", result.markdown)
+    assert sorted(map(int, invoices)) == list(range(7000, 7240)), result.describe()
 
 
 # ------------------------------------------------------------------------------------------------
