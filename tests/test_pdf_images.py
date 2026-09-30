@@ -85,11 +85,57 @@ def test_placements_are_listed_once_and_off_page_ones_are_not_shown():
     page.insert_image(pymupdf.Rect(50, 200, 250, 260), xref=xref)
     page.insert_image(pymupdf.Rect(50, -300, 250, -100), stream=_png(_text_image("OFF")), keep_proportion=False)
     page.insert_image(pymupdf.Rect(50, 836, 250, 1036), stream=_png(_text_image("SLIVER")), keep_proportion=False)
-    shown = [placement for placement in pdf_images.placements(page) if placement.shown]
-    assert [placement.xref for placement in shown] == [xref, xref]
+    assert len(pdf_images.placements(page)) == 4
     pictures, skipped = pdf_images.page_pictures(page)
     assert [(picture.key, len(picture.rects)) for picture in pictures] == [(xref, 2)]
-    assert skipped == {"not_shown": 2}
+    assert skipped == {"not_shown": 2, "no_content": 0}
+
+
+def test_thin_bands_and_thin_lines_are_pictures():
+    """Printer drivers store a figure as bands a few points tall, and a line of text stored as an image can be
+    10 pt tall: neither is a sliver. Bands are joined first; the whole figure shows."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    for band in range(25):
+        rect = pymupdf.Rect(72, 300 + band * 8, 522, 308 + band * 8)
+        page.insert_image(rect, stream=_png(_text_image(f"B{band}", (1500, 27))), keep_proportion=False)
+    line = page.insert_image(pymupdf.Rect(72, 600, 402, 610), stream=_png(_text_image("LINE", (1375, 42))),
+                             keep_proportion=False)
+    pictures, skipped = pdf_images.page_pictures(page)
+    assert [picture.region for picture in pictures if not picture.xref] == [pymupdf.Rect(72, 300, 522, 500)]
+    assert [picture.key for picture in pictures if picture.xref] == [line]
+    assert skipped == {"not_shown": 0, "no_content": 0}
+
+
+def test_a_poster_tile_cropped_from_a_large_picture_shows():
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(pymupdf.Rect(0, 0, 4 * 595, 4 * 842), stream=_png(_text_image("POSTER", (800, 600))),
+                      keep_proportion=False)   # 1/16 of it (6 %) on the page, filling the page
+    pictures, _ = pdf_images.page_pictures(page)
+    assert [picture.rects for picture in pictures] == [[pymupdf.Rect(0, 0, 595, 842)]]
+
+
+def test_the_content_check_leaves_the_image_intact():
+    """The check samples a copy: the image MuPDF caches (and extraction reads) keeps its full size."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    xref = page.insert_image(pymupdf.Rect(72, 72, 522, 297), stream=_png(_text_image("WIDE", (3000, 1500))))
+    assert max(pdf_images.image_grey(doc, xref).shape) <= pdf_images.CLASSIFY_SIDE
+    assert (doc.extract_image(xref)["width"], pymupdf.Pixmap(doc, xref).width) == (3000, 3000)
+
+
+def test_stencil_masks_are_judged_by_their_ink():
+    """A stencil mask (/ImageMask) decodes to alpha only (coverage): ink where opaque, paper elsewhere."""
+    import zlib
+    doc = pymupdf.open()
+    doc.new_page()
+    xref = doc.get_new_xref()
+    doc.update_object(xref, "<</Type/XObject/Subtype/Image/Width 64/Height 64/ImageMask true"
+                            "/BitsPerComponent 1/Filter/FlateDecode>>")
+    doc.update_stream(xref, zlib.compress(bytes([0x00] * 4 + [0xFF] * 4) * 64), compress=False)
+    coverage = np.frombuffer(pymupdf.Pixmap(doc, xref).samples, dtype=np.uint8).reshape(64, 64)
+    assert (pdf_images.image_grey(doc, xref) == 255 - coverage.astype(np.int16)).all()
 
 
 def test_abutting_tiles_are_one_picture_but_spaced_and_stacked_pictures_are_not():

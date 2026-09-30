@@ -192,3 +192,37 @@ def transparent_picture_pdf(path: Path, body: Sequence[str], lines: Sequence[str
     page = text_page(doc, body)
     page.insert_image(pymupdf.Rect(MARGIN, 400, MARGIN + 400, 500), stream=_png(image))
     return _save(doc, path)
+
+
+def banded_figure_pdf(path: Path, body: Sequence[str], figure: Sequence[str], line: Sequence[str]) -> Path:
+    """An A4 text page with a figure of ``figure`` stored as 25 horizontal bands 8 pt tall (as printer drivers
+    write images), and ``line`` stored as one image 11 pt tall (a line of text kept as a picture)."""
+    doc = pymupdf.open()
+    page = text_page(doc, body)
+    picture = Image.open(io.BytesIO(_picture(figure, (1500, 667), font_px=90)))
+    bands, area = 25, pymupdf.Rect(MARGIN, 300, MARGIN + 450, 500)
+    band_px = picture.height / bands
+    for band in range(bands):
+        box = (0, round(band * band_px), picture.width, round((band + 1) * band_px))
+        rect = pymupdf.Rect(area.x0, area.y0 + band * 8, area.x1, area.y0 + (band + 1) * 8)
+        page.insert_image(rect, stream=_png(picture.crop(box)), keep_proportion=False)
+    strip = Image.new("RGB", (1500, 50), "white")
+    ImageDraw.Draw(strip).text((10, 4), " ".join(line), fill="black", font=ImageFont.load_default(size=40))
+    page.insert_image(pymupdf.Rect(MARGIN, 560, MARGIN + 330, 571), stream=_png(strip), keep_proportion=False)
+    return _save(doc, path)
+
+
+def screenshot_pdf(path: Path, body: Sequence[str], lines: Sequence[str]) -> Path:
+    """An A4 text page with a 3000 x 1500 px PNG screenshot of ``lines`` in small type (26 px), shown 450 pt
+    wide: legible at its own resolution, not at a quarter of it."""
+    image = Image.new("RGB", (3000, 1500), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=26)
+    y = 60
+    for line in lines:
+        draw.text((60, y), line, fill="black", font=font)
+        y += 40
+    doc = pymupdf.open()
+    page = text_page(doc, body)
+    page.insert_image(pymupdf.Rect(MARGIN, 330, MARGIN + 450, 555), stream=_png(image))
+    return _save(doc, path)

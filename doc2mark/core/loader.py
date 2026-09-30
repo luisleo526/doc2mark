@@ -1195,12 +1195,15 @@ class UnifiedDocumentLoader:
 
     @staticmethod
     def _ocr_incomplete(result: ProcessedDocument) -> bool:
-        """Whether the document's OCR is not a final answer: images the provider did not answer, or
-        pages showing content whose OCR returned nothing (``metadata.extra["ocr_images"]``), or OCR
-        issues reported by the provider (``ocr_issues``). Such a result is not cached."""
+        """Whether the document's OCR is not a final answer: images the provider did not answer or
+        answered with no text, pages showing content whose OCR returned nothing
+        (``metadata.extra["ocr_images"]``), or OCR issues reported by the provider (``ocr_issues``).
+        An empty answer looks the same as a per-image timeout or rate limit, so such a result is not
+        cached (a picture with nothing to read is not sent to OCR in the first place)."""
         extra = getattr(result.metadata, "extra", None) or {}
         images = extra.get("ocr_images") or {}
-        return bool(images.get("failed") or images.get("unread_pages") or extra.get("ocr_issues"))
+        return bool(images.get("failed") or images.get("empty") or images.get("unread_pages")
+                    or extra.get("ocr_issues"))
 
     def _get_cached(
             self,

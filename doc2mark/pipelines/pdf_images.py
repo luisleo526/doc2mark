@@ -25,13 +25,17 @@ import pymupdf
 logger = logging.getLogger(__name__)
 
 # --- What the page shows --------------------------------------------------------
-# A placement shows on the page when at least MIN_VISIBLE_SHARE of it lies on the
-# visible page (CropBox) and that part measures at least MIN_PICTURE_POINTS on both
-# sides: a picture placed off the page, or bleeding onto it by a sliver, shows nothing
-# a reader could read. Smaller than MIN_PICTURE_POINTS or MIN_PICTURE_PIXELS on a side
-# (rules, bullets, spacers), nothing legible fits in a picture either.
+# A picture shows on the page when it lies on the visible page (CropBox) entirely, or,
+# when only part of it does, when that part is at least MIN_VISIBLE_SHARE of it and
+# measures at least MIN_PICTURE_POINTS on both sides, or fills at least FILLS_PAGE of
+# the page (a poster cut into page-sized tiles by CropBoxes). A picture placed off the
+# page, clipped away by the CropBox, or bleeding onto the page by a sliver shows
+# nothing a reader could read. A picture of fewer than MIN_PICTURE_PIXELS pixels on a
+# side holds nothing legible (rules, bullets, spacers). These rules apply to whole
+# pictures, after tiles are joined: a figure stored as thin bands shows as the figure.
 MIN_VISIBLE_SHARE = 0.1
 MIN_PICTURE_POINTS = 12.0
+FILLS_PAGE = 0.5
 MIN_PICTURE_PIXELS = 12
 
 # --- Tiles ------------------------------------------------------------------------
@@ -93,16 +97,22 @@ class Placement:
     height: int = 0
 
     @property
-    def shown(self) -> bool:
-        """Whether a reader sees enough of it to read (see MIN_VISIBLE_SHARE)."""
-        if self.visible.is_empty or min(self.visible.width, self.visible.height) < MIN_PICTURE_POINTS:
-            return False
-        area = abs(self.bbox.width * self.bbox.height)
-        return area > 0 and abs(self.visible.width * self.visible.height) >= MIN_VISIBLE_SHARE * area
-
-    @property
     def tiny(self) -> bool:
         return 0 < min(self.width, self.height) < MIN_PICTURE_PIXELS
+
+
+def _area(rect: pymupdf.Rect) -> float:
+    return 0.0 if rect.is_empty else abs(rect.width * rect.height)
+
+
+def shows(visible: pymupdf.Rect, whole: pymupdf.Rect, page) -> bool:
+    """Whether a picture drawn at ``whole`` of which ``visible`` is on the page shows (see MIN_VISIBLE_SHARE)."""
+    shown, drawn = _area(visible), _area(whole)
+    if not shown:
+        return False
+    if shown >= 0.99 * drawn or shown >= FILLS_PAGE * _area(page_area(page)):
+        return True
+    return shown >= MIN_VISIBLE_SHARE * drawn and min(visible.width, visible.height) >= MIN_PICTURE_POINTS
 
 
 def placements(page) -> List[Placement]:
@@ -137,9 +147,13 @@ def _abut(a: pymupdf.Rect, b: pymupdf.Rect) -> bool:
         and along >= 0.5 * min(a.width, b.width)
 
 
-def tile_groups(shown: Sequence[Placement]) -> List[List[Placement]]:
-    """``shown`` split into groups of tiles (see :func:`_abut`); a placement abutting no other is a group of one."""
-    parent = list(range(len(shown)))
+_CELL = 36.0   # points: tile candidates are looked up in a grid of cells this size
+
+
+def tile_groups(placed: Sequence[Placement]) -> List[List[Placement]]:
+    """``placed`` split into groups of tiles (see :func:`_abut`); a placement abutting no other is a group of
+    one. Only placements sharing a grid cell are compared, so thousands of bands stay cheap."""
+    parent = list(range(len(placed)))
 
     def root(index: int) -> int:
         while parent[index] != index:
@@ -147,17 +161,23 @@ def tile_groups(shown: Sequence[Placement]) -> List[List[Placement]]:
             index = parent[index]
         return index
 
-    order = sorted(range(len(shown)), key=lambda index: shown[index].bbox.x0)
-    for position, i in enumerate(order):
-        a = shown[i].bbox
-        for j in order[position + 1:]:
-            b = shown[j].bbox
-            if b.x0 > a.x1 + TILE_GAP:
-                break
-            if _abut(a, b):
-                parent[root(i)] = root(j)
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    for index, placement in enumerate(placed):
+        box = placement.bbox
+        for cx in range(math.floor((box.x0 - TILE_GAP) / _CELL), math.floor((box.x1 + TILE_GAP) / _CELL) + 1):
+            for cy in range(math.floor((box.y0 - TILE_GAP) / _CELL), math.floor((box.y1 + TILE_GAP) / _CELL) + 1):
+                cells.setdefault((cx, cy), []).append(index)
+    compared = set()
+    for members in cells.values():
+        for position, i in enumerate(members):
+            for j in members[position + 1:]:
+                if (i, j) in compared:
+                    continue
+                compared.add((i, j))
+                if root(i) != root(j) and _abut(placed[i].bbox, placed[j].bbox):
+                    parent[root(i)] = root(j)
     groups: Dict[int, List[Placement]] = {}
-    for index, placement in enumerate(shown):
+    for index, placement in enumerate(placed):
         groups.setdefault(root(index), []).append(placement)
     return sorted(groups.values(), key=lambda group: min((p.bbox.y0, p.bbox.x0) for p in group))
 
@@ -182,23 +202,31 @@ def _native_dpi(group: Sequence[Placement]) -> float:
 
 def page_pictures(page) -> Tuple[List[Picture], Dict[str, int]]:
     """The pictures of ``page`` in reading order (top to bottom), before any pixel check, and how many
-    placements were left out because the page does not show them (``{"not_shown": n}``)."""
+    placements were left out: the page does not show them (``not_shown``), or they are too small to hold
+    anything legible (``no_content``). Tiles are joined first; the rules then judge whole pictures."""
     everything = placements(page)
-    shown = [p for p in everything if p.shown and not p.tiny]
-    skipped = {"not_shown": len(everything) - len(shown)}
+    skipped = {"not_shown": 0, "no_content": 0}
     pictures: List[Picture] = []
     by_xref: Dict[int, Picture] = {}
     regions = 0
-    for group in tile_groups(shown):
+    skipped["not_shown"] = sum(1 for p in everything if p.visible.is_empty)
+    for group in tile_groups([p for p in everything if not p.visible.is_empty]):
+        region, whole = pymupdf.Rect(), pymupdf.Rect()
+        for placement in group:
+            region |= placement.visible
+            whole |= placement.bbox
+        if not shows(region, whole, page):
+            skipped["not_shown"] += len(group)
+            continue
         if len(group) > 1 or not group[0].xref:
-            region = pymupdf.Rect()
-            for placement in group:
-                region |= placement.visible
             pictures.append(Picture(key=f"region-{regions}", rects=[region], region=region,
                                     dpi=_native_dpi(group), placements=list(group)))
             regions += 1
             continue
         placement = group[0]
+        if placement.tiny:
+            skipped["no_content"] += 1
+            continue
         picture = by_xref.get(placement.xref)
         if picture is None:
             picture = by_xref[placement.xref] = Picture(key=placement.xref, rects=[], xref=placement.xref)
@@ -230,12 +258,17 @@ def is_small(rect: pymupdf.Rect, page) -> bool:
 
 
 def _grey_samples(pix: pymupdf.Pixmap) -> np.ndarray:
-    """A pixmap as a grey array (rows x columns), alpha flattened onto white, at most CLASSIFY_SIDE a side."""
-    while max(pix.width, pix.height) > CLASSIFY_SIDE:
-        pix.shrink(1)
+    """A pixmap as a grey array (rows x columns), alpha flattened onto white, sampled down to at most
+    CLASSIFY_SIDE pixels a side (every n-th pixel: thin strokes keep their contrast). ``pix`` is never
+    changed: a pixmap made from an image XObject is MuPDF's cached copy of that image, and shrinking it
+    in place would shrink the image everywhere else it is read (extraction, renders)."""
+    step = max(1, math.ceil(max(pix.width, pix.height) / CLASSIFY_SIDE))
+    buffer = getattr(pix, "samples_mv", None) or pix.samples
+    rows = np.frombuffer(buffer, dtype=np.uint8).reshape(pix.height, pix.stride)[::step, :pix.width * pix.n]
+    samples = rows.reshape(rows.shape[0], pix.width, pix.n)[:, ::step, :].astype(np.float32)
+    if pix.colorspace is None:   # a stencil mask (/ImageMask): alpha only, painted where opaque
+        return (255.0 - samples[:, :, -1]).astype(np.int16)
     alpha = pix.alpha
-    samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width * pix.n]
-    samples = samples.reshape(pix.height, pix.width, pix.n).astype(np.float32)
     colour = samples[:, :, :pix.n - 1] if alpha else samples
     if colour.shape[2] >= 3:
         grey = colour[:, :, 0] * 0.299 + colour[:, :, 1] * 0.587 + colour[:, :, 2] * 0.114

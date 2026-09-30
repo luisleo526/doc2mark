@@ -264,17 +264,21 @@ rule looks at what the page shows, never at the file's structure alone:
 - **Placements.** An image counts once per place the page draws it
   (``get_image_info``): an image listed twice in the page's resources (directly
   and through a Form XObject) is drawn once and counts once.
-- **Shown.** A placement the page does not show is no picture: less than 10 % of
-  it on the visible page (CropBox), or less than 12 pt of it on either side
-  (placed off the page, or bleeding onto it by a sliver). Neither is an image of
-  fewer than 12 pixels a side.
 - **Tiles.** Placements that abut edge to edge (at most 1 pt apart, overlapping by
   at most 5 % of the smaller one, alongside each other for at least half the
-  shorter side) are tiles of one picture, like a scan cut into strips or a grid.
-  Their region is rendered at the resolution the tiles carry (150 to 300 DPI),
-  without the text painted over it (the text layer already emits that text), and
-  OCR'd as one picture, so words are not cut at tile edges. An inline image
-  (``BI``/``ID``/``EI``, it has no xref) is rendered the same way.
+  shorter side) are tiles of one picture, like a scan cut into strips or a grid,
+  or a figure a printer driver wrote as thin bands. Their region is rendered at
+  the resolution the tiles carry (150 to 300 DPI), without the text painted over
+  it (the text layer already emits that text), and OCR'd as one picture, so words
+  are not cut at tile edges. An inline image (``BI``/``ID``/``EI``, it has no
+  xref) is rendered the same way.
+- **Shown.** Once tiles are joined, a picture the page does not show is left out:
+  one lying on the visible page (CropBox) only in part, when that part is less
+  than 10 % of it or less than 12 pt on a side (placed off the page, clipped away
+  by the CropBox, or bleeding onto the page by a sliver) -- unless what shows
+  fills half the page or more (a poster cut into page-sized tiles by CropBoxes).
+  A picture wholly on the page always shows, however thin (a line of text kept as
+  an image). An image of fewer than 12 pixels a side holds nothing legible.
 - **Content.** A picture is judged on a grey copy of at most 1024 pixels a side:
 
   * *plain* -- fewer than 24 edge pixels (neighbours at least 16 grey levels
@@ -293,7 +297,10 @@ rule looks at what the page shows, never at the file's structure alone:
   page's unrotated frame, or under 48 pt on both sides) is OCR'd only when it
   reads as text; a larger one unless it is plain. A picture whose pixels cannot
   be decoded is OCR'd (when unsure, keep). A 130 x 75 pt chart with printed
-  numbers on a 1440 x 810 pt slide is therefore OCR'd, a 40 pt icon is not.
+  numbers on a 1440 x 810 pt slide is therefore OCR'd, a 40 pt icon is not. The
+  check samples a copy of the pixels (a stencil mask by its coverage, a
+  transparent image with its soft mask applied); what OCR reads is the picture at
+  its full resolution.
 - **One request per content.** An image shown on many pages or at several places
   is sent to OCR once (the same pixels under another xref too), and its text is
   emitted once per place the page shows it, at that place. With neighbour-page
@@ -315,9 +322,11 @@ reads one by one; tiles and inline images are not, so a page without a text laye
 that shows a tiled or inline-image scan is OCR'd from its render.
 
 Neither an OCR result with no text or flagged ``failed`` is ever cached
-(``ocr_cache``), nor a converted document with unanswered images or unread pages
-(``cache_dir``): an empty answer looks the same as an outage or a refusal, so the
-next run asks the provider again.
+(``ocr_cache``), nor a converted document with unanswered images, images
+answered with no text, or unread pages (``cache_dir``): an empty answer looks
+the same as an outage, a per-image timeout or a refusal, so the next run asks
+the provider again. (Pictures with nothing to read are not sent to OCR at all,
+so this costs little.)
 
 Text-layer quality gate
 ~~~~~~~~~~~~~~~~~~~~~~~

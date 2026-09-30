@@ -142,6 +142,34 @@ def test_figure_made_of_small_tiles_is_read_as_one_picture(run_cli, require_tool
     assert all(line in text for line in BODY), result.describe()
 
 
+def test_figure_stored_as_thin_bands_and_a_thin_text_line_are_ocrd(run_cli, require_tool, e2e_dir):
+    """Review round (images lane): a figure stored as 8 pt bands (as printer drivers write images) and a line
+    of text stored as an image 11 pt tall are pictures, not slivers: the bands are joined into the figure
+    first, and the line is OCR'd."""
+    require_tool("tesseract")
+    pdf = builders_images.banded_figure_pdf(e2e_dir / "bands.pdf", BODY, ["BANDED FIGURE 5", "PUMP 7702"],
+                                            ["Signed for receipt 3318"])
+
+    result = run_ocr(run_cli, pdf)
+
+    text = words(result.markdown)
+    assert "BANDED FIGURE 5" in text and "7702" in text and "3318" in text, result.describe()
+    assert ocr_stats(result).get("ocr_requests") == 2, ocr_stats(result)
+
+
+def test_large_picture_reaches_ocr_at_full_resolution(run_cli, require_tool, e2e_dir):
+    """Review round (images lane): the content check must not shrink the picture OCR reads. A 3000 x 1500 px
+    screenshot with 26 px type is legible at its own resolution only."""
+    require_tool("tesseract")
+    lines = ["Invoice 55120 approved by the controller", "Total amount due 18,940.00 EUR"]
+    pdf = builders_images.screenshot_pdf(e2e_dir / "screenshot.pdf", BODY, lines)
+
+    result = run_ocr(run_cli, pdf)
+
+    text = words(result.markdown)
+    assert "55120" in text and "18,940.00" in text, result.describe()
+
+
 def test_picture_on_a_rotated_page_is_ocrd(run_cli, require_tool, e2e_dir):
     """F9: on a page shown rotated, the picture's unrotated size was compared with the rotated page, so an
     80 x 55 pt picture counted as under 10 % of the page and was dropped."""
@@ -299,18 +327,28 @@ FLAKY_SCRIPT = (
 
 
 @pytest.mark.parametrize("cache", ["ocr_cache", "cache_dir"])
-def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_tool, e2e_dir, cache):
+@pytest.mark.parametrize("shown_as", ["scanned page", "picture on a text page"])
+def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_tool, e2e_dir, cache, shown_as):
     """F3: a scanned page whose OCR came back empty (a failing provider) was dropped without a trace, and the
     empty answer was cached (by an OCR cache, ``ocr_cache=``, or with the whole converted document, ``cache_dir=``),
     so a re-run with a healthy provider dropped the page again. The empty answer is not cached, the second run
-    reads the page, and the first run marks the page it could not read."""
+    reads the page, and the first run marks the page it could not read. The same for a picture on a text page
+    (review round: an empty per-picture answer, which is how a per-image timeout comes back, let the whole
+    document into ``cache_dir``)."""
     require_tool("tesseract")
-    pdf = pdfgen.image_pdf(e2e_dir / "scan.pdf", "INVOICE 8812\nTOTAL EUR 912")
+    if shown_as == "scanned page":
+        pdf = pdfgen.image_pdf(e2e_dir / "scan.pdf", "INVOICE 8812\nTOTAL EUR 912")
+    else:
+        pdf = builders_images.transparent_picture_pdf(e2e_dir / "picture.pdf", BODY, ["INVOICE 8812"])
 
     proc = run_api(e2e_dir, FLAKY_SCRIPT, pdf, cache, e2e_dir / "document-cache")
 
     output = json.loads(proc.stdout.strip().splitlines()[-1])
     first, second = (words(run) for run in output["runs"])
     assert output["calls"] == 2, output
-    assert "8812" not in first and re.search(r"page 1\b.*OCR returned no content", first), output
-    assert "INVOICE 8812" in second and "TOTAL EUR 912" in second, output
+    assert "8812" not in first, output
+    if shown_as == "scanned page":
+        assert re.search(r"page 1\b.*OCR returned no content", first), output
+        assert "INVOICE 8812" in second and "TOTAL EUR 912" in second, output
+    else:
+        assert "INVOICE 8812" in second and all(line in second for line in BODY), output

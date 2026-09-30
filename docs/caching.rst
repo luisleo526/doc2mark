@@ -19,8 +19,8 @@ Only final answers are cached: a result with no text, or flagged ``failed`` in
 its metadata, is never stored, because an empty answer looks the same as an
 outage, a timeout or a refusal. The next run asks the provider again. Likewise
 ``cache_dir`` (the loader's cache of converted documents) does not store a
-document whose OCR left images unanswered or pages unread (see
-``metadata.extra["ocr_images"]`` in :doc:`ocr_policy`).
+document whose OCR left images unanswered or answered with no text, or pages
+unread (see ``metadata.extra["ocr_images"]`` in :doc:`ocr_policy`).
 
 Quick start
 -----------
