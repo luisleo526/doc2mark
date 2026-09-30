@@ -182,6 +182,20 @@ def test_t10_page_markdown_cannot_inject_live_html(run_cli, fake_llm, scan):
     assert "Revenue 1,200 in Q1" in result.markdown
 
 
+def test_t10_text_before_a_sanitized_table_cannot_complete_a_tag(run_cli, fake_llm, scan):
+    """A "<" right before table-like markup the sanitizer unwraps to plain text
+    (<table-x> is not a table) must not join that text into a live tag."""
+    page_markdown = "## Notes\n\nHello <<table-x><caption>img src=x onerror=alert(1)//</caption></table>>"
+    fake_llm.script(structured=[fake.page(
+        "Notes\nHello", interpretation=fake.interpretation(page_markdown=page_markdown))])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    assert build.active_html(result.markdown) == [], result.describe()
+    assert "Hello" in result.markdown, result.describe()
+
+
 def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_llm, scan):
     """raw.text is a verbatim transcription: a line that happens to start with '#' or '>' is
     text on the page, not a heading or a quote, so the reader must see the characters."""
@@ -494,18 +508,20 @@ def test_multilingual_no_text_answers_are_not_indexed(run_cli, fake_llm, scan, a
 
 @pytest.mark.parametrize("answer", [
     "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
-    "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
-    "If you could provide a clearer image, I'd be happy to help!",
     "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
 ])
-def test_refusal_with_a_stock_follow_up_is_not_indexed(run_cli, fake_llm, scan, answer):
-    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text(answer)])
+def test_refusal_followed_by_more_sentences_is_left_to_the_judge(run_cli, fake_llm, scan, answer):
+    """The deterministic check is high-precision: a refusal that goes on reads the same as
+    a note that starts with one, so it is left to OCRConfig.non_content_judge; the CLI
+    has no judge, so the answer is kept (verbatim first)."""
+    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text("unused")])
 
     result = run_llm(run_cli, scan, fake_llm, fmt="both")
 
     assert result.exit_code == 0, result.describe()
-    assert build.squash(answer.split(".")[0]) not in build.squash(result.markdown), result.describe()
-    assert ocr_issues(result).get("refused") == 1, result.json
+    assert build.normalize(answer) in build.normalize(result.markdown), result.describe()
+    assert not ocr_issues(result), result.json
+    assert fake_llm.requests_of("free_form") == [], "kept content must not be re-OCR'd"
 
 
 def test_free_form_refusal_is_reported(run_cli, fake_llm, scan):
@@ -553,6 +569,9 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "Sorry, I can't help with reading the contract until Monday.",
     "I'm sorry, I can't provide a transcription of the hearing until the judge approves it.",
     "Sorry, I can't read the scans. It seems Dr. Lee has them.",
+    "I can't help. It is too late to change the order. Ref #4411",
+    "Sorry, I can't help with that. However, I can ask Mark tomorrow.",
+    "I can't read the scan. It seems to have been corrupted. Total: $500",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])

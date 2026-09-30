@@ -169,6 +169,13 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "I'm sorry, I can't provide a transcription of the hearing until the judge approves it.",
     "I'm sorry, I can't help with reading the text in your photo.",
     "Sorry, I can't read the scans. It seems Dr. Lee has them.",
+    # notes and chats whose refusal-like first sentence is followed by more
+    "I can't help. It is too late to change the order. Ref #4411",
+    "Sorry, I can't help with that. However, I can ask Mark tomorrow.",
+    "I can't read the scan. It seems to have been corrupted. Total: $500",
+    "I'm sorry, I can't do that. It involves the budget for Q3, see attached.",
+    "I can't help. If you need the keys, ask Tom at reception.",
+    "I cannot assist. Let me know if the meeting moves to 3pm.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -183,14 +190,6 @@ def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     "I'm sorry, but I can't do that.",
     "I'm sorry, I can't help with identifying people in images.",
     "Sorry, I can't provide a transcription of copyrighted material.",
-    # with a model's stock follow-up
-    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
-    "I'm sorry, but I can't assist with that.\nIf you have any other questions, feel free to ask!",
-    "I'm sorry, I can't help with that. Is there anything else I can do for you?",
-    "I'm sorry, but I can't read the text in this image. It appears to be too blurry.",
-    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
-    "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
-    "I can't read the text in this image. It looks to be too dark.",
     "Illegible",
     "[Blank]",
     "No readable text",
@@ -200,6 +199,24 @@ def test_canonical_refusals_and_bare_placeholders_count_as_no_content(answer):
     """Ambiguous by nature -- a slide could say it -- but these are what models answer
     instead of a transcription, so they are not indexed."""
     assert matches_non_content_pattern(answer)
+
+
+@pytest.mark.parametrize("answer", [
+    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
+    "I'm sorry, but I can't assist with that.\nIf you have any other questions, feel free to ask!",
+    "I'm sorry, I can't help with that. Is there anything else I can do for you?",
+    "I'm sorry, but I can't read the text in this image. It appears to be too blurry.",
+    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
+    "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
+    "I can't read the text in this image. It looks to be too dark.",
+])
+def test_refusals_followed_by_more_sentences_are_left_to_the_judge(answer):
+    """A model's refusal with a stock follow-up reads the same as a note or a chat that
+    starts with a refusal ("I can't help. It is too late to change the order."), so the
+    high-precision patterns keep it and a judge decides."""
+    assert not matches_non_content_pattern(answer)
+    assert non_content_reason(answer) is None
+    assert non_content_reason(answer, lambda text: 0.9) == "judge"
 
 
 def test_patterns_ignore_long_answers_that_start_with_an_apology():
