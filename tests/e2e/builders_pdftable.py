@@ -542,3 +542,237 @@ def key_value_split_pdf(path: Path) -> Path:
     doc.save(str(path))
     doc.close()
     return Path(path)
+
+
+# --- Review round 1: the reviewer's adversarial pages (d2m-review-pdftable/gen_adv*.py), normal leading ---
+
+def _right_aligned(page, right: float, y: float, text: str, fontsize: float = 10) -> None:
+    page.insert_text((right - pymupdf.get_text_length(text, fontsize=fontsize), y), text, fontsize=fontsize)
+
+
+PROJECT_ROWS = [["Project", "Budget", "Spent", "Comment"], ["Apollo", "1,200", "1,050", "On track"],
+                ["Borealis", "800", "910", "Over budget due to vendor delay"], ["Cygnus", "430", "120", "Paused"],
+                ["Draco", "95", "90", "Closing in May, final audit pending"]]
+
+
+def free_text_column_pdf(path: Path) -> Path:
+    """A borderless status table (16 pt row pitch) whose last column is free text of different lengths,
+    under a title and above a closing sentence (reviewer page p12)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), "Project status", fontsize=12)
+    y = 80
+    for project, budget, spent, comment in PROJECT_ROWS:
+        page.insert_text((50, y), project, fontsize=10)
+        _right_aligned(page, 210, y, budget)
+        _right_aligned(page, 280, y, spent)
+        page.insert_text((310, y), comment, fontsize=10)
+        y += 16
+    page.insert_text((50, y + 20), "Next review in June.", fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+SIDEBAR_LINES = ["Key takeaways from the quarter:", "revenue beat guidance by 4%", "and margins expanded again",
+                 "thanks to lower input costs", "and a better product mix."]
+SIDEBAR_ROWS = SEGMENT_ROWS + [["Other", "95", "101", "6%"]]
+
+
+def table_with_sidebar_pdf(path: Path) -> Path:
+    """A 9 pt borderless table on the left and a sidebar sentence on the same lines to its right
+    (reviewer page p6)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    y = 80
+    for row, side in zip(SIDEBAR_ROWS, SIDEBAR_LINES):
+        for x, value in zip([50, 130, 180, 230], row):
+            page.insert_text((x, y), value, fontsize=9)
+        page.insert_text((330, y), side, fontsize=9)
+        y += 14
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+REGION_ROWS = [["Region", "Q1", "Q2", "Q3"], ["North", "120", "135", "150"], ["South", "98", "101", "110"],
+               ["East", "77", "80", "95"], ["West", "60", "66", "71"]]
+REGION_LEAD = "Our regional results improved across the board this year, as summarised here."
+REGION_CLOSE = "All regions beat their targets except the West, which missed by 2%."
+
+
+def borderless_in_paragraph_pdf(path: Path) -> Path:
+    """A borderless table set inside a paragraph at the paragraph's own 13 pt leading: one sentence
+    above, one below (reviewer page p10)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), REGION_LEAD, fontsize=10)
+    y = 63
+    for row in REGION_ROWS:
+        for x, value in zip([50, 200, 260, 320], row):
+            page.insert_text((x, y), value, fontsize=10)
+        y += 13
+    page.insert_text((50, y), REGION_CLOSE, fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+CASH_FLOW_TITLE = "Statement of cash flows (USD thousands)"
+CASH_FLOW_ROWS = [["Operating activities", "2023", "2024"], ["Net income", "2,455", "2,180"],
+                  ["Depreciation", "310", "295"], ["Working capital", "(120)", "85"],
+                  ["Net cash from operations", "2,645", "2,560"]]
+CASH_FLOW_NOTES = ["Figures for 2023 were restated after the merger with Globex.",
+                   "See note 7 for the reconciliation of operating cash flow."]
+
+
+def statement_with_notes_pdf(path: Path) -> Path:
+    """A borderless statement whose title and two notes sit at the rows' own 12 pt pitch (reviewer
+    page p2)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), CASH_FLOW_TITLE, fontsize=10)
+    y = 64
+    for label, *values in CASH_FLOW_ROWS:
+        page.insert_text((50, y), label, fontsize=10)
+        for right, value in zip((330, 430), values):
+            _right_aligned(page, right, y, value)
+        y += 12
+    for note in CASH_FLOW_NOTES:
+        page.insert_text((50, y), note, fontsize=10)
+        y += 12
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+BOOKTABS_TIGHT_LINES = ["Revenue grew in every segment during the year as shown below in detail.",
+                        "Table 3. Segment revenue by year (USD m)",
+                        "Source: company filings. Growth figures are rounded to whole percent.",
+                        "Management expects Cloud to remain the main driver next year."]
+
+
+def booktabs_tight_pdf(path: Path) -> Path:
+    """A booktabs table at 13 pt row pitch with a paragraph and caption right above it and a source
+    line and a paragraph right under it (reviewer page p1)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 60), BOOKTABS_TIGHT_LINES[0], fontsize=10)
+    page.insert_text((50, 74), BOOKTABS_TIGHT_LINES[1], fontsize=10)
+    y = 80
+    page.draw_line((50, y), (420, y), width=1.0)
+    for i, row in enumerate(SIDEBAR_ROWS):
+        y += 13
+        for x, value in zip([50, 190, 270, 350], row):
+            page.insert_text((x, y), value, fontsize=10)
+        if i == 0:
+            page.draw_line((50, y + 3), (420, y + 3), width=0.5)
+    page.draw_line((50, y + 4), (420, y + 4), width=1.0)
+    page.insert_text((50, y + 16), BOOKTABS_TIGHT_LINES[2], fontsize=10)
+    page.insert_text((50, y + 30), BOOKTABS_TIGHT_LINES[3], fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+LEDGER_ROWS = [["Account", "Amount"], ["Revenue from services", "1,250,000"], ["Cost of goods sold", "640,000"],
+               ["Operating income", "610,000"]]
+LEDGER_OCR = [["Acc0unt", "Arnount"], ["Revenue frorn services", "1,25O,OOO"], ["Cost of qoods sold", "640,0O0"],
+              ["Operatinq income", "61O,000"]]
+
+
+def ocr_layer_table_pdf(path: Path) -> Path:
+    """A ruled table whose cells also carry an invisible OCR text layer (render mode 3) with typical
+    recognition errors, drawn at the same positions (reviewer page p11)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    for r, (row, ocr_row) in enumerate(zip(LEDGER_ROWS, LEDGER_OCR)):
+        for c, (text, ocr_text) in enumerate(zip(row, ocr_row)):
+            x0, y0 = 50 + c * 200, 100 + r * 20
+            page.draw_rect(pymupdf.Rect(x0, y0, x0 + 200, y0 + 20), color=(0, 0, 0), width=0.5)
+            page.insert_text((x0 + 3, y0 + 14), text, fontsize=10)
+            page.insert_text((x0 + 3, y0 + 14), ocr_text, fontsize=10, render_mode=3)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+CONTENTS = [("1", "Introduction", "3"), ("2", "Market overview", "5"), ("3", "Financial results", "9"),
+            ("4", "Risk factors", "14"), ("5", "Outlook", "18"), ("6", "Appendix", "21")]
+
+
+def contents_pdf(path: Path) -> Path:
+    """Two table-of-contents pages: number / title / right-aligned page, and ``Chapter N`` / title /
+    ``p. N`` / page (reviewer page p3)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), "Contents", fontsize=16)
+    for i, (number, title, page_no) in enumerate(CONTENTS):
+        page.insert_text((50, 90 + i * 18), number, fontsize=11)
+        page.insert_text((80, 90 + i * 18), title, fontsize=11)
+        _right_aligned(page, 520, 90 + i * 18, page_no, fontsize=11)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 50), "Contents", fontsize=16)
+    for i, (number, title, page_no) in enumerate(CONTENTS):
+        page.insert_text((50, 90 + i * 18), f"Chapter {number}", fontsize=11)
+        page.insert_text((140, 90 + i * 18), title, fontsize=11)
+        page.insert_text((400, 90 + i * 18), f"p. {page_no}", fontsize=11)
+        page.insert_text((470, 90 + i * 18), page_no, fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+DIRECTORY_WORDS = "alpha beta gamma delta 12 345 6,789 epsilon zeta eta theta 2024 iota kappa".split()
+
+
+def columnar_directory_pdf(path: Path, pages: int, *, as_prose: bool = False) -> Path:
+    """A dense directory: four columns of 110 short 6 pt entries (three words each) per page --
+    column-aligned text with numbers but no table (reviewer's perf_4col_directory). ``as_prose`` writes
+    the same entries as one paragraph per page instead, the no-columns baseline."""
+    doc = pymupdf.open()
+    index = 0
+    for _ in range(pages):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        entries = []
+        for _ in range(4 * 110):
+            entries.append(" ".join(DIRECTORY_WORDS[(index + k * 5) % len(DIRECTORY_WORDS)] for k in range(3)))
+            index += 1
+        if as_prose:
+            page.insert_textbox(pymupdf.Rect(30, 30, 565, 812), " ".join(entries), fontsize=6)
+        else:
+            for column in range(4):
+                for row in range(110):
+                    page.insert_text((30 + column * 140, 30 + row * 7.2), entries[column * 110 + row], fontsize=6)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+BONUS_ROWS = [["Region", "Pool", "Paid"], ["North", "40k", "38k"], ["South", "35k", "35k"], ["East", "20k", "18k"]]
+
+
+def page_top_table_pdf(path: Path, *, heading: bool, running_header: bool) -> Path:
+    """Page 1 ends with a ruled staff table whose header row is bold. Page 2 starts with a table with
+    the same columns right under the top 8% of the page. With ``heading`` that is a new table
+    (``BONUS_ROWS``) under a bold heading set inside the top 8%; without it, the staff table continues
+    (Emp8-Emp10, no repeated header). ``running_header`` puts the same running header line at the very
+    top of both pages."""
+    doc = pymupdf.open()
+    for page_no in range(2):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        if running_header:
+            page.insert_text((50, 24), "ACME Annual Report 2025", fontsize=8)
+        if page_no == 0:
+            rows = [SPLIT_HEADER] + [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(1, 8)]
+            page.insert_text((50, 620), "Staff list", fontsize=10)
+            ruled_table(page, 50, 650, [100, 80, 80], [18] * len(rows), grid(rows), bold_rows=[0])
+        elif heading:
+            page.insert_text((50, 44), "Bonus pool by region", fontname="hebo", fontsize=11)
+            ruled_table(page, 50, 56, [100, 80, 80], [18] * len(BONUS_ROWS), grid(BONUS_ROWS))
+        else:
+            rows = [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(8, 11)]
+            ruled_table(page, 50, 56, [100, 80, 80], [18] * len(rows), grid(rows))
+    doc.save(str(path))
+    doc.close()
+    return Path(path)

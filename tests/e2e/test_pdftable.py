@@ -510,3 +510,103 @@ def test_t21_dense_tables_convert_near_pymupdf_speed(run_cli, e2e_dir):
     assert overhead < 3 * pymupdf_seconds + 1.0, (
         f"table extraction took {overhead:.2f}s over CLI start-up; PyMuPDF's own find_tables+extract "
         f"takes {pymupdf_seconds:.2f}s for the same pages")
+
+
+# --- Review round 1 (PR #15): the reviewer's adversarial pages, at their normal leading ---------------------
+
+def test_r1_b1_free_text_last_column_is_never_cut(run_cli, e2e_dir):
+    """A borderless table's last column holds free text longer than the column the text strategy
+    finds; no comment may be cut and the rest dropped."""
+    result = convert(run_cli, B.free_text_column_pdf(e2e_dir / "status.pdf"))
+
+    for text in [row[3] for row in B.PROJECT_ROWS] + ["Project status", "Next review in June."]:
+        assert occurrences(result, text) == 1, f"{text!r}:\n{result.markdown}"
+    for grid in tables(result):
+        assert [row[-1] for row in grid.rows] == [row[3] for row in B.PROJECT_ROWS], result.markdown
+
+
+def test_r1_b1_sidebar_beside_a_borderless_table_is_never_cut(run_cli, e2e_dir):
+    result = convert(run_cli, B.table_with_sidebar_pdf(e2e_dir / "sidebar.pdf"))
+
+    for text in B.SIDEBAR_LINES:
+        assert occurrences(result, text) == 1, f"{text!r}:\n{result.markdown}"
+    for value in (value for row in B.SIDEBAR_ROWS for value in row):
+        assert value in flat(result.markdown), f"{value!r}:\n{result.markdown}"
+
+
+@pytest.mark.parametrize("case", ["paragraph", "statement"])
+def test_r1_b2_text_next_to_a_borderless_table_is_kept(run_cli, e2e_dir, case):
+    """Caption, lead-in and note lines set at the table rows' own leading end up in the same text
+    block as the rows; claiming the rows must not throw that text away."""
+    if case == "paragraph":
+        pdf = B.borderless_in_paragraph_pdf(e2e_dir / "paragraph.pdf")
+        lines, rows = [B.REGION_LEAD, B.REGION_CLOSE], B.REGION_ROWS
+    else:
+        pdf = B.statement_with_notes_pdf(e2e_dir / "statement.pdf")
+        lines, rows = [B.CASH_FLOW_TITLE] + B.CASH_FLOW_NOTES, B.CASH_FLOW_ROWS
+    result = convert(run_cli, pdf)
+
+    for text in lines:
+        assert occurrences(result, text) == 1, f"{text!r}:\n{result.markdown}"
+    for value in (value for row in rows for value in row):
+        assert value in flat(result.markdown), f"{value!r}:\n{result.markdown}"
+
+
+def test_r1_b2_booktabs_table_between_paragraphs_is_still_a_table(run_cli, e2e_dir):
+    result = convert(run_cli, B.booktabs_tight_pdf(e2e_dir / "booktabs.pdf"))
+
+    assert [grid.rows for grid in tables(result)] == [B.SIDEBAR_ROWS], result.markdown
+    for text in B.BOOKTABS_TIGHT_LINES:
+        assert occurrences(result, text) == 1, f"{text!r}:\n{result.markdown}"
+
+
+def test_r1_m3_invisible_ocr_layer_does_not_garble_table_cells(run_cli, e2e_dir):
+    """An invisible OCR text layer (with recognition errors) drawn over the real cell text: the cells
+    read as the visible text."""
+    result = convert(run_cli, B.ocr_layer_table_pdf(e2e_dir / "ocr_layer.pdf"))
+
+    [table] = tables(result)
+    assert table.rows == B.LEDGER_ROWS, result.markdown
+
+
+def test_r1_6_table_of_contents_is_not_a_table(run_cli, e2e_dir):
+    result = convert(run_cli, B.contents_pdf(e2e_dir / "contents.pdf"))
+
+    assert tables(result) == [], result.markdown
+    for _, title, _ in B.CONTENTS:
+        assert occurrences(result, title) == 2, f"{title!r}:\n{result.markdown}"
+
+
+@pytest.mark.parametrize("running_header", [False, True], ids=["no_running_header", "running_header"])
+def test_r1_9_new_table_under_a_heading_keeps_its_own_first_row(run_cli, e2e_dir, running_header):
+    """A heading inside the top 8% of the page is not a running header: the table under it is a new
+    table, not the previous page's table continued."""
+    result = convert(run_cli, B.page_top_table_pdf(e2e_dir / "top.pdf", heading=True, running_header=running_header))
+
+    first, second = tables(result)
+    assert second.rows == B.BONUS_ROWS, result.markdown
+    assert occurrences(result, "Bonus pool by region") == 1, result.markdown
+
+
+def test_r1_9_running_header_does_not_hide_a_continuation(run_cli, e2e_dir):
+    result = convert(run_cli, B.page_top_table_pdf(e2e_dir / "top.pdf", heading=False, running_header=True))
+
+    first, second = tables(result)
+    assert second.rows == [B.SPLIT_HEADER] + _employee_rows(8, 11), result.markdown
+
+
+def test_r1_5_columnar_pages_without_tables_cost_about_what_prose_costs(run_cli, e2e_dir):
+    """A 12-page four-column directory (numbers, no table) against the same entries set as prose: the
+    borderless-table search must not triple the conversion time."""
+    prose = B.columnar_directory_pdf(e2e_dir / "prose.pdf", 12, as_prose=True)
+    columns = B.columnar_directory_pdf(e2e_dir / "directory.pdf", 12)
+    started = time.perf_counter()
+    convert(run_cli, prose)
+    prose_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    result = convert(run_cli, columns)
+    columns_seconds = time.perf_counter() - started
+
+    assert tables(result) == [], result.markdown[:2000]
+    assert columns_seconds < 1.5 * prose_seconds + 0.5, (
+        f"four-column pages took {columns_seconds:.2f}s, the same text as prose {prose_seconds:.2f}s")

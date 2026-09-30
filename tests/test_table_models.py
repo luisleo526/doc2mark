@@ -170,6 +170,18 @@ class TestTableData:
         assert (table.cell(1, 0).rowspan, table.cell(1, 0).colspan) == (1, 3)
         assert table.cell(1, 3).text == "$55,000" and not table.cell(1, 3).is_continuation
 
+    def test_covered_cells_repeating_the_merged_value_are_absorbed(self):
+        # "fill merged cells": every position of a merged range carries the merged value
+        data = [["Region", "Q1", "Q2"], ["North", "10", "20"], ["North", "11", "21"]]
+        table = TableData.from_raw(data, {"cell_spans": {(1, 0): (2, 1)}, "is_complex": True})
+        assert table.cell(1, 0).rowspan == 2
+        assert table.cell(2, 0).is_continuation
+
+    def test_table_whose_spans_were_all_shrunk_is_simple(self):
+        table = TableData.from_raw([["A", "B"], ["C", "D"]], {"cell_spans": {(0, 0): (2, 2)}, "is_complex": True})
+        assert table.is_complex is False
+        assert "<table>" not in TableRenderer().render(table)
+
     def test_span_shrinks_to_the_empty_cells(self):
         # widest run of empty cells in the first row, then as many rows as stay empty
         table = TableData.from_raw([["A", "", "C"], ["", "", "x"], ["y", "", ""]], {"cell_spans": {(0, 0): (3, 3)}})
