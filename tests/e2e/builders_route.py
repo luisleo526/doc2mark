@@ -376,9 +376,11 @@ def page_number_title_pdf(path: Path, number: str, title: str, body: Sequence[st
 
 
 def table_with_hidden_text_pdf(path: Path, intro: Sequence[str], rows: Sequence[Sequence[str]],
-                               hidden_in_cell: str, hidden_below: str, *, render_mode: int = 3) -> Path:
+                               hidden_in_cell: str, hidden_below: str, *, render_mode: int = 3,
+                               rotation: int = 0) -> Path:
     """A text page with a ruled table; one INVISIBLE word (``render_mode`` 3, or 7: clip only) sits
-    inside the last column of the second row, and an invisible line sits below the table."""
+    inside the last column of the second row, and an invisible line sits below the table. The page is
+    shown rotated by ``rotation`` degrees (a landscape table)."""
     doc = pymupdf.open()
     page = text_page(doc, intro)
     x0, y0, col_w, row_h = MARGIN, 300, 150, 30
@@ -392,6 +394,7 @@ def table_with_hidden_text_pdf(path: Path, intro: Sequence[str], rows: Sequence[
     page.insert_text((x0 + (len(rows[0]) - 1) * col_w + 70, y0 + row_h + 20), hidden_in_cell, fontsize=5,
                      render_mode=render_mode)
     insert_lines(page, [hidden_below], top=y0 + len(rows) * row_h + 60, fontsize=10, render_mode=render_mode)
+    page.set_rotation(rotation)
     return _save(doc, path)
 
 

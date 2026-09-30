@@ -30,12 +30,14 @@ import pymupdf
 from doc2mark.core.strategy import (
     GLYPH_INK_SHARE,
     GLYPH_SPREAD,
+    GLYPH_TRANSITIONS,
     IMAGE_PAGE_COVERAGE,
     INK_CONTRAST,
     LAYER_BLANK_CONTRAST,
     LAYER_BLANK_SHARE,
     LAYER_DPI,
     MIN_LAYER_INK,
+    MIN_UNCAPTURED_INK,
     NO_TEXT_LIMIT,
     PageSignals,
     legible_lines,
@@ -131,11 +133,17 @@ def _overlaps(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.clip(width, 0, None) * np.clip(height, 0, None)
 
 
-def _any_overlap(a: np.ndarray, b: np.ndarray, chunk: int = 256) -> np.ndarray:
-    """Whether each rectangle of ``a`` overlaps one of ``b`` (in chunks, for pages with many spans)."""
+_PAIRS = 1_000_000   # rectangle pairs compared at a time (memory stays in the tens of MB)
+
+
+def _any_overlap(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Whether each rectangle of ``a`` overlaps one of ``b``."""
     result = np.zeros(len(a), dtype=bool)
-    if len(b):
-        for start in range(0, len(a), chunk):
+    if len(a) and len(b):
+        low, high = a.min(axis=0), a.max(axis=0)
+        b = b[(b[:, 0] < high[2]) & (b[:, 2] > low[0]) & (b[:, 1] < high[3]) & (b[:, 3] > low[1])]
+        chunk = max(1, _PAIRS // max(1, len(b)))
+        for start in range(0, len(a) if len(b) else 0, chunk):
             result[start:start + chunk] = (_overlaps(a[start:start + chunk], b) > 0).any(axis=1)
     return result
 
@@ -212,9 +220,13 @@ class VisibleTextPage:
         return result
 
     def find_tables(self, *args, **kwargs):
+        rotated = bool(self._page.rotation)
         tables = self._page.find_tables(*args, **kwargs)
-        if self._redact is not None and any(pymupdf.Rect(table.bbox).intersects(rect)
-                                            for table in getattr(tables, "tables", ()) for rect in self._drop_rects):
+        found = getattr(tables, "tables", ())
+        # Table boxes come in the displayed frame: on a rotated page any table may hold the text to drop.
+        meets = bool(found) if rotated else any(pymupdf.Rect(table.bbox).intersects(rect)
+                                                for table in found for rect in self._drop_rects)
+        if self._redact is not None and meets:
             copy, self._redact = self._redact(), None
             if copy is not None:
                 self._page = copy
@@ -235,12 +247,23 @@ class PageCopies:
         self._doc = None
 
     def copy(self, number: int):
+        """A full copy of page ``number``; raises when the copy does not match the page."""
         if self._doc is None:
             name = self._source.name
             self._doc = (pymupdf.open(name) if name and os.path.exists(name)
                          else pymupdf.open("pdf", self._source.tobytes()))
+        # The copy lands under another page-tree node: what the page inherits from its own
+        # node (resources, boxes, rotation) is written into the page first.
+        flatten = getattr(getattr(pymupdf, "mupdf", None), "pdf_flatten_inheritable_page_items", None)
+        if flatten is not None:
+            flatten(pymupdf.mupdf.pdf_lookup_page_obj(pymupdf._as_pdf_document(self._doc), number))
         self._doc.fullcopy_page(number)
-        return self._doc[-1]
+        copy, page = self._doc[-1], self._source[number]
+        if (copy.rotation, tuple(copy.cropbox), len(copy.get_images()), len(copy.get_fonts())) != (
+                page.rotation, tuple(page.cropbox), len(page.get_images()), len(page.get_fonts())):
+            self.discard()
+            raise RuntimeError(f"the copy of page {number + 1} lost what the page shows")
+        return copy
 
     def discard(self) -> None:
         if self._doc is not None and len(self._doc) > len(self._source):
@@ -350,43 +373,59 @@ def _blank(region: np.ndarray) -> bool:
 
 
 def _glyph_like(region: np.ndarray) -> bool:
-    """Ink spread over the rows and the columns of the region, as glyphs are (not a rule or a box edge)."""
+    """Ink spread over the rows and the columns of the region and broken into strokes along its
+    rows, as glyphs are (not a rule, the edge of a box or a chart line)."""
     ink = _deviation(region) > INK_CONTRAST
-    return (float(ink.mean()) >= GLYPH_INK_SHARE and float(ink.any(axis=1).mean()) >= GLYPH_SPREAD
-            and float(ink.any(axis=0).mean()) >= GLYPH_SPREAD)
+    rows = ink.any(axis=1)
+    if (float(ink.mean()) < GLYPH_INK_SHARE or float(rows.mean()) < GLYPH_SPREAD
+            or float(ink.any(axis=0).mean()) < GLYPH_SPREAD):
+        return False
+    return float(np.abs(np.diff(ink[rows].astype(np.int8), axis=1)).sum(axis=1).mean()) >= GLYPH_TRANSITIONS
 
 
 def _ink_share(region: np.ndarray) -> float:
     return float((_deviation(region) > INK_CONTRAST).mean())
 
 
-def _edges(rect: pymupdf.Rect, pad: float) -> List[pymupdf.Rect]:
-    return [pymupdf.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y0 + pad),
-            pymupdf.Rect(rect.x0 - pad, rect.y1 - pad, rect.x1 + pad, rect.y1 + pad),
-            pymupdf.Rect(rect.x0 - pad, rect.y0 - pad, rect.x0 + pad, rect.y1 + pad),
-            pymupdf.Rect(rect.x1 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad)]
+def _edges(x0: float, y0: float, x1: float, y1: float, pad: float) -> List[Bbox]:
+    return [(x0 - pad, y0 - pad, x1 + pad, y0 + pad), (x0 - pad, y1 - pad, x1 + pad, y1 + pad),
+            (x0 - pad, y0 - pad, x0 + pad, y1 + pad), (x1 - pad, y0 - pad, x1 + pad, y1 + pad)]
 
 
-def _line_art(page) -> List[pymupdf.Rect]:
-    """Where the page draws rules, frames and grids: horizontal and vertical strokes, rectangle
-    and quad outlines, and fills thinner than 2 pt. Not content by themselves."""
-    rects = []
-    for path in page.get_drawings():
+def _line_art(page) -> np.ndarray:
+    """Where the page draws rules, frames and grids, as an (n, 4) array: horizontal and vertical
+    strokes, rectangle and quad outlines, and fills thinner than 2 pt. Not content by themselves.
+
+    Paths are streamed one by one where PyMuPDF allows it, so a drawing of hundreds of
+    thousands of paths is never held in memory.
+    """
+    boxes: List[Bbox] = []
+
+    def add(path: dict) -> None:
         kind = path.get("type") or ""
-        bbox = pymupdf.Rect(path.get("rect") or (0, 0, 0, 0))
+        x0, y0, x1, y1 = path.get("rect") or (0, 0, 0, 0)
         if "f" in kind:
-            if min(bbox.width, bbox.height) <= 2:
-                rects.append(bbox + (-1, -1, 1, 1))
-            continue
+            if min(x1 - x0, y1 - y0) <= 2:
+                boxes.append((x0 - 1, y0 - 1, x1 + 1, y1 + 1))
+            return
         pad = (path.get("width") or 1) / 2 + 1
-        for item in path.get("items", []):
-            if item[0] == "l" and (abs(item[1].x - item[2].x) <= 1 or abs(item[1].y - item[2].y) <= 1):
-                rects.append(pymupdf.Rect(item[1], item[2]).normalize() + (-pad, -pad, pad, pad))
+        for item in path.get("items", ()):
+            if item[0] == "l":
+                (ax, ay), (bx, by) = item[1], item[2]
+                if abs(ax - bx) <= 1 or abs(ay - by) <= 1:
+                    boxes.append((min(ax, bx) - pad, min(ay, by) - pad, max(ax, bx) + pad, max(ay, by) + pad))
             elif item[0] == "re":
-                rects.extend(_edges(pymupdf.Rect(item[1]), pad))
+                boxes.extend(_edges(*item[1][:4], pad))
             elif item[0] == "qu":
-                rects.extend(_edges(item[1].rect, pad))
-    return rects
+                xs, ys = [point[0] for point in item[1]], [point[1] for point in item[1]]
+                boxes.extend(_edges(min(xs), min(ys), max(xs), max(ys), pad))
+
+    try:
+        page.get_cdrawings(callback=add)
+    except TypeError:   # a PyMuPDF without the callback
+        for path in page.get_cdrawings():
+            add(path)
+    return _array(boxes)
 
 
 def _pixel_boxes(bboxes: np.ndarray, to_pixels: pymupdf.Matrix, shape: Tuple[int, ...]) -> np.ndarray:
@@ -402,15 +441,18 @@ def _pixel_boxes(bboxes: np.ndarray, to_pixels: pymupdf.Matrix, shape: Tuple[int
 
 def uncaptured_ink(page, blank: Iterable[Sequence[float]]) -> float:
     """Share of the page showing ink (any colour) outside ``blank`` (areas the text route already
-    captures) and outside line art, measured on a grey render."""
+    captures) and outside line art, measured on a grey render. Line art is only looked at when
+    the other ink reaches MIN_UNCAPTURED_INK."""
     pixels, to_pixels = _grey(page, _INK_DPI)
-    pixels = pixels.copy()
     background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
-    for bbox in list(blank) + _line_art(page):
-        box = (pymupdf.Rect(bbox) * to_pixels).irect & pymupdf.IRect(0, 0, pixels.shape[1], pixels.shape[0])
-        if not box.is_empty:
-            pixels[box.y0:box.y1, box.x0:box.x1] = background
-    return float((np.abs(pixels.astype(np.int16) - background) > INK_CONTRAST).mean())
+    ink = np.abs(pixels.astype(np.int16) - background) > INK_CONTRAST
+    for x0, y0, x1, y1 in _pixel_boxes(_array(blank), to_pixels, pixels.shape):
+        ink[y0:y1, x0:x1] = False
+    if float(ink.mean()) < MIN_UNCAPTURED_INK:
+        return float(ink.mean())
+    for x0, y0, x1, y1 in _pixel_boxes(_line_art(page), to_pixels, pixels.shape):
+        ink[y0:y1, x0:x1] = False
+    return float(ink.mean())
 
 
 # --- Invisible text ---------------------------------------------------------------
@@ -437,11 +479,10 @@ def _same_text(row: Row, under: Sequence[Row]) -> bool:
         last = min(len(painted), math.ceil((x1 - box[0]) / width * len(painted)) + margin)
         parts.append(painted[first:last])
     painted = _norm("".join(parts))
-    return bool(painted) and (text in painted or (painted in text and len(painted) >= 0.5 * len(text)))
+    return bool(painted) and (text in painted or (painted in text and len(painted) >= 0.9 * len(text)))
 
 
-def _duplicates(invisible: Sequence[Row], visible: Sequence[Row], rows: np.ndarray, shown: np.ndarray,
-                chunk: int = 256) -> np.ndarray:
+def _duplicates(invisible: Sequence[Row], visible: Sequence[Row], rows: np.ndarray, shown: np.ndarray) -> np.ndarray:
     """Whether each invisible span repeats the painted text it lies on (an invisible duplicate): painted
     spans on the same line (sharing half the taller one's height, so not a big stamp or a rotated
     watermark) that read the same text where it lies."""
@@ -449,6 +490,7 @@ def _duplicates(invisible: Sequence[Row], visible: Sequence[Row], rows: np.ndarr
     if not len(shown):
         return result
     shown_height = shown[:, 3] - shown[:, 1]
+    chunk = max(1, _PAIRS // len(shown))
     for start in range(0, len(invisible), chunk):
         part = rows[start:start + chunk]
         width = np.minimum(part[:, None, 2], shown[None, :, 2]) - np.maximum(part[:, None, 0], shown[None, :, 0])
@@ -472,14 +514,12 @@ def _without_text(page, copies: "PageCopies"):
 _PAINTING = ("fill-path", "stroke-path", "fill-image", "fill-imgmask", "fill-shade")
 
 
-def _erase(region: np.ndarray, box: pymupdf.IRect, rects: Iterable[pymupdf.Rect], to_pixels: pymupdf.Matrix,
-           background: int) -> np.ndarray:
-    """``region`` (the pixels of ``box``) with ``rects`` painted over in ``background``."""
+def _erase(region: np.ndarray, origin: Tuple[int, int], boxes: np.ndarray, background: int) -> np.ndarray:
+    """``region`` (pixels from ``origin``) with the pixel ``boxes`` painted over in ``background``."""
     region = region.copy()
-    for rect in rects:
-        part = (rect * to_pixels).irect & box
-        if not part.is_empty:
-            region[part.y0 - box.y0:part.y1 - box.y0, part.x0 - box.x0:part.x1 - box.x0] = background
+    left, top = origin
+    for x0, y0, x1, y1 in boxes:
+        region[max(0, y0 - top):max(0, y1 - top), max(0, x0 - left):max(0, x1 - left)] = background
     return region
 
 
@@ -544,13 +584,13 @@ def _by_what_shows(page, invisible: Sequence[Row], rows: np.ndarray, shown: np.n
             continue
         if art is None:
             art = _line_art(page)
-        rect = pymupdf.Rect(row[2])
-        inside = rect + (-1, -1, 1, 1)
-        crossing = [piece for piece in art if piece.intersects(rect) and not inside.contains(piece)]
-        if crossing:
-            if background is None:
-                background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
-            region = _erase(region, pymupdf.IRect(x0, y0, x1, y1), crossing, to_pixels, background)
+            background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
+        a0, b0, a1, b1 = row[2]
+        meets = (art[:, 0] < a1) & (art[:, 2] > a0) & (art[:, 1] < b1) & (art[:, 3] > b0)
+        inside = (art[:, 0] >= a0 - 1) & (art[:, 1] >= b0 - 1) & (art[:, 2] <= a1 + 1) & (art[:, 3] <= b1 + 1)
+        crossing = art[meets & ~inside]
+        if len(crossing):
+            region = _erase(region, (x0, y0), _pixel_boxes(crossing, to_pixels, pixels.shape), background)
         (layer if _glyph_like(region) else hidden).append(row)
     return layer, hidden
 

@@ -124,11 +124,33 @@ def test_icon_font_glyphs_and_short_private_use_rows_are_icons():
     stars = chr(0xE02A) * 5
     cards = [("Pump P-200", 18.0), (stars, 14.0), ("Rated 4.8 by 312 customers", 11.0)] * 2
     assert text_layer_stats(cards).garbage_glyphs == 0
-    icons = [(chr(0xF005) * 12, 14.0, "FontAwesome5Free-Solid"), ("Rated by 312 customers", 11.0, "Helvetica")]
-    assert text_layer_stats(icons).garbage_glyphs == 0
-    # a long private-use run in a text font, or a row on a page with (almost) no letters, is a broken layer
-    assert text_layer_stats([(chr(0xE02A) * 12, 14.0, "Tiro"), ("Rated by 312 customers", 11.0)]).garbage_glyphs == 12
+    rating = [("Rated by 312 customers", 11.0, "Helvetica")]
+    for font in ("ABCDEF+FontAwesome5Free-Solid", "Wingdings-Regular", "ZapfDingbats", "SymbolMT", "MaterialIcons-Regular"):
+        assert text_layer_stats([(chr(0xF005) * 12, 14.0, font)] + rating).garbage_glyphs == 0, font
+    # a long private-use run in a text font, a row of different glyphs, or a row on a page with (almost) no letters
+    # is a broken layer
+    assert text_layer_stats([(chr(0xE02A) * 12, 14.0, "Tiro")] + rating).garbage_glyphs == 12
+    assert text_layer_stats([(chr(0xE02A) * 4 + chr(0xE02B), 14.0)] + rating).garbage_glyphs == 5
     assert text_layer_stats([(stars, 14.0), ("4.8", 11.0)]).garbage_glyphs == 5
+
+
+def test_names_that_only_contain_an_icon_word_are_text_fonts():
+    line = "".join(chr(0xE100 + n) for n in range(40))
+    for font in ("ZapfChancery-MediumItalic", "GlyphLessFont", "LexiconNo1-RomanA", "MaterialSans-Regular"):
+        stats = text_layer_stats([(line, 18.0, font), ("Certificate of completion awarded to", 11.0, "Helvetica")])
+        assert stats.garbled, font
+
+
+def test_adobe_private_use_figures_are_garbage_even_alone():
+    # old-style figures a font maps to U+F730-U+F739 instead of 0-9: an income statement, one span per cell
+    def figures(text):
+        return "".join(chr(0xF730 + int(char)) if char.isdigit() else char for char in text)
+
+    spans = [("Consolidated income statement", 14.0)]
+    for label, value in (("Revenue", "4812"), ("Cost of sales", "2917"), ("Gross profit", "1895"), ("Tax", "7")):
+        spans += [(label, 9.0), (figures(value), 9.0)]
+    stats = text_layer_stats(spans)
+    assert stats.garbage_glyphs == 13 and stats.garbled
 
 
 def test_legible_lines_judges_each_line_in_the_context_of_its_page():

@@ -105,10 +105,12 @@ MIN_UNCAPTURED_INK = 0.001
 #   LAYER_BLANK_SHARE of its pixels differ from the region's background (its most common
 #   grey) by more than LAYER_BLANK_CONTRAST levels, at LAYER_DPI, so faint and
 #   low-contrast scans count.
-# - Elsewhere only glyph-like ink counts (outlined text), not a rule or a box edge: rules
-#   and frames crossing the span left out, at least GLYPH_INK_SHARE of the region is ink
-#   (INK_CONTRAST levels off its background), spread over at least GLYPH_SPREAD of its
-#   rows and of its columns.
+# - Elsewhere only glyph-like ink counts (outlined text), not a rule, a box edge or a chart
+#   line: rules and frames crossing the span left out, at least GLYPH_INK_SHARE of the
+#   region is ink (INK_CONTRAST levels off its background), spread over at least
+#   GLYPH_SPREAD of its rows and of its columns, and broken into strokes: on average at
+#   least GLYPH_TRANSITIONS ink/background changes along each inked pixel row (an
+#   outlined heading has about 28, the edge of a filled box none, a chart line 2).
 # A painted line of the verbatim tail (below) counts as shown when at least
 # MIN_LAYER_INK of its box is ink on the page render.
 LAYER_DPI = 100
@@ -117,6 +119,7 @@ LAYER_BLANK_SHARE = 0.01
 INK_CONTRAST = 48
 GLYPH_INK_SHARE = 0.05
 GLYPH_SPREAD = 0.3
+GLYPH_TRANSITIONS = 4
 MIN_LAYER_INK = 0.03
 
 # Bumped whenever routing changes what a page emits for the same input, so caches of
@@ -241,13 +244,21 @@ def _mangled(sequences: set) -> bool:
 
 
 # Icon and symbol fonts put their glyphs in the private-use area: stars, bullets,
-# arrows. Their glyphs are icons, not garbage; so are the private-use glyphs of any
-# font when a span holds only a short row of them (MAX_ICON_GLYPHS) on a page that
-# otherwise reads as text (MIN_PAGE_LETTERS letters).
-_ICON_FONT = re.compile(r"awesome|icon|glyph|symbol|wingding|webding|dingbat|material|emoji|zapf|fontello|"
-                        r"entypo|octicon", re.IGNORECASE)
+# arrows. In a known icon or symbol font family (_ICON_FONT, matched at the start of the
+# font name) they are icons, not garbage. In other fonts only a lone glyph (a bullet) or
+# a short row of one repeated glyph (a star rating: at most MAX_ICON_GLYPHS, on a page
+# that otherwise reads as text: MIN_PAGE_LETTERS letters) is. Adobe's private-use letters
+# and figures (U+F6BE-U+F7FF: old-style digits, small capitals) are text a font failed to
+# map: always garbage.
+_ICON_FONT = re.compile(r"(?:^|\+)(?:font ?awesome|wingdings|webdings|(?:itc ?)?(?:zapf ?)?dingbats|"
+                        r"material ?(?:icons|symbols)|fontello|entypo|octicons|icomoon|glyphicons|"
+                        r"symbol(?:mt)?(?:$|[-,])|[\w ]*emoji)", re.IGNORECASE)
 MAX_ICON_GLYPHS = 5
 MIN_PAGE_LETTERS = 10
+
+
+def _is_adobe_text(code: int) -> bool:
+    return 0xF6BE <= code <= 0xF7FF
 
 
 def _is_private_use(code: int) -> bool:
@@ -275,8 +286,8 @@ def _scan_text(text: str, *, mojibake: bool = True, icons: bool = False) -> Tupl
 
     Counted characters are the non-whitespace ones, except private-use glyphs that are
     icons or bullets (a lone one; all of them when ``icons``), which are neither text
-    nor garbage. Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, and
-    mojibake sequences when ``mojibake``.
+    nor garbage. Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, Adobe's
+    private-use letters and figures, and mojibake sequences when ``mojibake``.
     """
     if text.isascii() and not _ASCII_CONTROL.search(text) and "(cid:" not in text:
         counted = len("".join(text.split()))   # plain ASCII: all legible, weight 1 each
@@ -290,9 +301,10 @@ def _scan_text(text: str, *, mojibake: bool = True, icons: bool = False) -> Tupl
             continue
         code = ord(char)
         if _is_private_use(code):
-            neighbours = (text[index - 1] if index else "", text[index + 1] if index + 1 < len(text) else "")
-            if icons or not any(n and _is_private_use(ord(n)) for n in neighbours):
-                continue
+            if not _is_adobe_text(code):
+                neighbours = (text[index - 1] if index else "", text[index + 1] if index + 1 < len(text) else "")
+                if icons or not any(n and _is_private_use(ord(n)) for n in neighbours):
+                    continue
             garbage += 1
         elif char == "\ufffd" or code < 0x20 or 0x7F <= code <= 0x9F or index in mangled:
             garbage += 1
@@ -334,9 +346,9 @@ def _layer_runs(spans: Iterable[Sequence]) -> List[Tuple[float, int, int, float]
     letters = sum(len(_LETTER.findall(text)) for text, _, _ in spans) if has_private else 0
     runs = []
     for text, size, font in spans:
-        private = len(_PRIVATE.findall(text)) if has_private else 0
-        icons = bool(private) and (bool(_ICON_FONT.search(font or ""))
-                                   or (private <= MAX_ICON_GLYPHS and letters >= MIN_PAGE_LETTERS))
+        private = _PRIVATE.findall(text) if has_private else []
+        icons = bool(private) and (bool(_ICON_FONT.search(font or "")) or (
+            len(private) <= MAX_ICON_GLYPHS and len(set(private)) == 1 and letters >= MIN_PAGE_LETTERS))
         runs.append((size,) + _scan_text(text, mojibake=mojibake, icons=icons))
     return runs
 
@@ -348,7 +360,8 @@ def text_layer_stats(spans: Iterable[Sequence]) -> TextLayerStats:
     The body size is the character-weighted median font size; a character's
     prominence is ``min(size / body size, MAX_PROMINENCE) ** 2``. Mojibake counts only
     in a mangled layer (see ``MIN_MOJIBAKE_SEQUENCES``); private-use glyphs of icon
-    fonts, and short private-use rows on a page that otherwise reads as text, are icons.
+    fonts, and short rows of one repeated private-use glyph on a page that otherwise
+    reads as text, are icons (see ``MAX_ICON_GLYPHS``).
     """
     runs = [run for run in _layer_runs(spans) if run[2]]
     if not runs:

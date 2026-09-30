@@ -255,8 +255,12 @@ The deterministic detector (``text_layer_stats``) counts as garbage glyphs:
 - control codes (raw character IDs);
 - runs of private-use characters, except icons, which count as neither text nor
   garbage: a lone private-use glyph (a bullet), the private-use glyphs of icon
-  and symbol fonts (Font Awesome, Wingdings, Symbol and the like), and a short
-  row of up to 5 of them on a page that otherwise reads as text (a star rating);
+  and symbol font families (Font Awesome, Wingdings, Webdings, Zapf Dingbats,
+  Symbol, Material Icons and the like, recognised by the start of the font
+  name), and a row of up to 5 of one repeated glyph on a page that otherwise
+  reads as text (a star rating). Adobe's private-use letters and figures
+  (U+F6BE-U+F7FF: old-style digits, small capitals) are text a font failed to
+  map, and always count as garbage;
 - mojibake sequences (UTF-8 read as Latin-1 or cp1252), in a layer that has a
   typical one -- a Latin-1 letter read back as two characters (``Ã©``) or
   typographic punctuation (``â€™``) -- or at least two distinct ones: mojibake
@@ -332,7 +336,9 @@ without OCR:
   of the page with its text removed. A watermark or stamp painted over a scan
   therefore does not hide the scan, and faint or low-contrast scans still count.
 - **Over other ink** it is the text of glyph-like ink (text drawn as vector
-  outlines); rules, box edges and table grids crossing the span do not count.
+  outlines): ink spread over the span and broken into strokes along its rows.
+  Rules, table grids, the edges of filled boxes and bands, and chart lines
+  crossing the span do not count.
 - **Over nothing but painted text, or over nothing**, it is hidden text -- a
   known prompt-injection vector in RAG.
 
@@ -352,8 +358,9 @@ the table finder reads a copy of the page with that text removed); the pages are
 listed in ``metadata.extra["hidden_text"]`` and a warning names them.
 
 What this cannot catch: invisible text laid over a region of a picture that
-shows something (a photo, scanned text) or over outlined glyphs looks exactly
-like an OCR layer and is kept as the page's text. With PyMuPDF older than 1.27,
+shows something (a photo, scanned text) or over outlined glyphs (or other ink
+broken into strokes, such as a dense hatching) looks exactly like an OCR layer
+and is kept as the page's text. With PyMuPDF older than 1.27,
 which cannot remove only the invisible glyphs where they touch painted text,
 hidden text touching painted text inside a table can reach that table's cells
 (paragraphs are not affected).
