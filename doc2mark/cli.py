@@ -726,13 +726,14 @@ Supported formats:
             # Get list of files to process, filter and sort them
             files = collect_files(input_path, args.pattern, args.recursive)
             if output_path:
-                output_root = output_path.resolve()
-                if output_root == input_path.resolve():
+                output_root, input_root = output_path.resolve(), input_path.resolve()
+                if output_root == input_root:
                     parser.error(f"-o {output_path} is the input folder: the converted files would be written "
                                  f"among their sources (and converted again by the next run); choose another "
                                  f"output folder")
-                # What an earlier run wrote into an output folder inside the input folder is not input
-                files = [path for path in files if not path.resolve().is_relative_to(output_root)]
+                if output_root.is_relative_to(input_root):
+                    # What an earlier run wrote into an output folder inside the input folder is not input
+                    files = [path for path in files if not path.resolve().is_relative_to(output_root)]
             files = filter_files(files, args.exclude, args.max_files, args.sort)
             
             if not files:
