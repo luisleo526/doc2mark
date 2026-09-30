@@ -207,8 +207,9 @@ characters from disappearing, the same way in every style:
 
 * Line breaks of every kind (``\r\n``, ``\r``, vertical tab -- a soft line break in
   PowerPoint --, form feed, U+2028/U+2029) become ``<br>`` in HTML and in Markdown
-  cells (a GFM pipe table has no other way to break a line; blank lines at the start
-  and end of a cell are dropped); other C0 control characters (except tab) are
+  cells (a GFM pipe table has no other way to break a line; in Markdown cells ASCII
+  spaces around a break and blank lines at the start and end of a cell are dropped,
+  full-width indentation stays); other C0 control characters (except tab) are
   removed.
 * HTML cells escape ``&``, ``<`` and ``>`` (``styled_html`` also ``"``); backslashes
   are kept as they are.

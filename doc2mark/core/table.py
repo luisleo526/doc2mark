@@ -35,12 +35,12 @@ def _plain_cell_text(text: str) -> str:
 
 
 def markdown_cell(text: str) -> str:
-    """Cell text for a pipe table: line breaks as ``<br>`` (GFM; blank lines at the ends
-    dropped), ``|`` escaped as ``\\|``, a backslash doubled where a Markdown renderer would
-    consume it (before ASCII punctuation, before a line break, at the end of the cell), and
-    ``<`` / ``&`` escaped only where they would start an HTML tag or an entity.
-    ``x < 5 & y`` stays as is."""
-    lines = [line.strip() for line in _plain_cell_text(text).split("\n")]
+    """Cell text for a pipe table: line breaks as ``<br>`` (GFM; ASCII spaces around them and
+    blank lines at the ends dropped, full-width indentation kept), ``|`` escaped as ``\\|``, a
+    backslash doubled where a Markdown renderer would consume it (before ASCII punctuation,
+    before a line break, at the end of the cell), and ``<`` / ``&`` escaped only where they
+    would start an HTML tag or an entity. ``x < 5 & y`` stays as is."""
+    lines = [line.strip(" \t") for line in _plain_cell_text(text).split("\n")]
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:
