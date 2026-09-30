@@ -510,7 +510,8 @@ else applies by default.
   script shows it without `-W`. (#29)
 - **`.tsv` files convert.** Every `.tsv` failed with `got multiple values for argument 'delimiter'`. A TSV is
   now a tab-separated table like a CSV (`metadata.delimiter` is `"\t"`; the `delimiter` argument is the CSV
-  option and does not apply to it). (#28)
+  option and does not apply to it). It has no quoting, so `5" pipe` and `"Best" seller` keep their quote
+  characters and a quote never swallows the rows after it. (#28)
 - **An explicit CSV `delimiter=` is honoured.** `load("semi.csv", delimiter=",")` and the batch methods used
   the sniffed delimiter whatever was passed. The delimiter is sniffed only when none is given, and one that is
   not a single character is an error. (#28)
@@ -519,15 +520,20 @@ else applies by default.
   converted now and `-r` decides whether the files inside sub-folders match. The output was flat by file stem
   (`2024/report.md` and `report.txt` both wrote `report.md`, one was lost): `-o DIR` now mirrors the input tree
   (`DIR/2024/report.md`), and each document is written as soon as it is converted, so a failure that stops the
-  run keeps what was written before it. Files of one folder that would write the same name (`report.txt` and
-  `report.md`), or an output that would replace an input file (`-o` naming the input folder), are written as
-  `report.txt.md` with a warning. (#28)
+  run keeps what was written before it, and a file is written whole or not at all (a document `--encoding`
+  cannot hold is a failed file, not an empty `.md`). Files of one folder that would write the same name
+  (`report.txt` and `report.md`) are written as `report.txt.md` with a warning. `-o` may not be the input
+  folder (usage error, exit code 2: the outputs would sit among their sources and be converted again by the
+  next run); an output folder inside the input folder is left out of the input files, so a run can be
+  repeated. (#28)
 - **`--timeout` stops a slow file.** It was only passed to `future.result()` after a file had finished, so
   it never applied. Every file of a folder run (also without `-p`) is now converted in a worker process that
-  is killed when the file takes longer than `--timeout` seconds (default 300, retries included; `0` for no
-  limit) together with what it started (LibreOffice); the file counts as failed (`timed out after 300 s`),
-  like any failure (the run stops unless `--skip-errors`). A worker that dies (out of memory, a crash in a
-  native library) is a failed file too, no longer a broken pool. A single-file run is not limited. (#28)
+  is stopped when the file takes longer than `--timeout` seconds (retries included), together with the
+  LibreOffice it started; the file counts as failed (`timed out after 600 s (--timeout)`), like any failure
+  (the run stops unless `--skip-errors`). The default is `0`, no limit, so a slow scan is never cut off
+  (the help said 300, which never applied). A worker that dies (out of memory, a crash in a native library)
+  is a failed file too, no longer a broken pool, and terminating the CLI (SIGTERM, hang-up) stops its
+  workers and their LibreOffice. A single-file run is not limited. `--retry` must be 0 or more. (#28)
 - **`--preserve-structure` is deprecated.** It was parsed and never read. A folder run always mirrors the
   input tree now, so the flag has nothing left to do: it is still accepted, with a deprecation warning. (#28)
 - **The CLI `--help` is true.** The example `--max-files 10 --sort size` says it processes the 10 smallest
@@ -536,14 +542,18 @@ else applies by default.
 - **`batch_process()` finds every file `load()` accepts.** It globbed lower-case extensions only and not
   `.htm`, so `report.PDF`, `Notes.TXT` and `page.htm` were skipped. One walk now takes every supported
   extension in any case (`.htm` and `.markdown` too), in path order. (#28)
-- **`batch_process()` keeps the dots of a file name in its output.** The output name was made with
-  `with_suffix` on the stem, so `v1.2.txt` and `v1.3.txt` both wrote `v1.md` and one conversion was lost;
-  they write `v1.2.md` and `v1.3.md` (also for `batch_process_files()` and JSON output). (#28)
+- **`batch_process()` outputs no longer overwrite each other.** The output name was made with `with_suffix`
+  on the stem, so `v1.2.txt` and `v1.3.txt` both wrote `v1.md` and one conversion was lost; they write
+  `v1.2.md` and `v1.3.md` (also for JSON output). With an `output_dir` of its own, `batch_process()` and
+  `batch_process_files()` also name files that would share an output (`report.txt` and `report.csv`, or
+  `q1.pdf` of two folders) by their whole file name (`report.txt.md`, `q1.pdf-2.md`), as the CLI does; without
+  one (outputs next to the inputs) an output still replaces the one of an earlier run. (#28)
 - **`ProcessedDocument.tables` and `.sections` are filled.** No processor set them, so a batch result's
   `tables_found` was always 0 and the JSON output had `"tables": null`. They are read from the content
   items: one `{"page", "format", "content"}` per `table` item and one `{"level", "title", "page"}` per
-  heading (`text:title`, `text:section`), for PDF, Office and image files (`None` for formats without content
-  items); `tables_found` counts them. (#28)
+  heading (`text:title`, `text:section`, titled as the Markdown shows it, with its number), for PDF, Office and
+  image files (`None` for formats without content items); `tables_found` counts them. A document replayed
+  from `cache_dir` has what was stored. (#28)
 - **The convenience functions take loader settings.** `load(path, table_style=...)` and `cache_dir=` raised
   `TypeError` because every extra keyword went to `loader.load()`. Loader settings now reach the loader, the
   options of `load()` / the batch method (`encoding`, `delimiter`, `max_workers`, ...) reach that call, and a
@@ -555,10 +565,11 @@ else applies by default.
 - **A Markdown file that starts with a `---` rule keeps its text.** The first block (prose, a list, anything
   between two `---` lines) went to `metadata.frontmatter` and out of the content. Only a `---` line, YAML
   that parses to a mapping and a closing `---` line are front matter now; everything else is left as
-  written, and so is the text after the front matter (only the blank lines right after it go). (#28)
-- **Dates in Markdown front matter no longer break JSON output.** YAML reads `date: 2024-05-01` as a date,
-  which `--format json`, `output_format="json"` and `cache_dir` could not write; they are ISO strings there
-  (`datetime.date` objects in `metadata.frontmatter`). (#28)
+  written, and so is the text after the front matter (only the blank lines right after it go). A date that
+  does not exist (`2024-02-30`) no longer fails the whole file: it is not front matter, the text is kept. (#28)
+- **Dates and sets in Markdown front matter no longer break JSON output.** YAML reads `date: 2024-05-01` as a
+  date (and `!!set` as a set), which `--format json`, `output_format="json"` and `cache_dir` could not write;
+  they are ISO strings (sorted lists) there (`datetime.date` objects in `metadata.frontmatter`). (#28)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is

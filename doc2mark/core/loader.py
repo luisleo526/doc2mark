@@ -8,7 +8,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
@@ -27,6 +27,7 @@ from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache, ocr_settings_identity
 from doc2mark.ocr.prompts import PromptTemplate
 from doc2mark.ocr.usage import UsageAggregatingOCR
+from doc2mark.utils.output_paths import plan_output_names
 
 logger = logging.getLogger(__name__)
 
@@ -736,7 +737,6 @@ class UnifiedDocumentLoader:
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
-                self._fill_structure(cached)
                 return cached
         else:
             cache_options = {}
@@ -1058,6 +1058,15 @@ class UnifiedDocumentLoader:
             for fmt, files in files_by_format.items():
                 logger.info(f"   {fmt.value.upper()}: {len(files)} files")
 
+        # Into an output folder of its own, files that would share an output name (report.txt and report.md)
+        # keep their whole file name (report.txt.md). Next to the inputs (the default) each output replaces the
+        # one an earlier run wrote, so a run can be repeated.
+        output_names = None
+        suffixes = {OutputFormat.MARKDOWN: (".md",), OutputFormat.JSON: (".json",)}.get(output_format)
+        if save_files and suffixes and output_dir.resolve() != input_dir.resolve():
+            output_names = plan_output_names(
+                all_files, {path: path.relative_to(input_dir) for path in all_files}, output_dir, suffixes)
+
         # Build the ordered work list and pre-create output directories on the main
         # thread (so concurrent workers never race on mkdir).
         items = []
@@ -1066,7 +1075,8 @@ class UnifiedDocumentLoader:
                 continue
             rel_path = file_path.relative_to(input_dir)
             if save_files:
-                output_path = output_dir / rel_path.parent / file_path.stem
+                output_path = output_dir / (output_names[file_path] if output_names
+                                            else rel_path.parent / file_path.stem)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 output_path = None
@@ -1190,12 +1200,20 @@ class UnifiedDocumentLoader:
         logger.info(f"📄 Starting batch processing of {total_files} files")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
+        # Files that would share an output name (q1.pdf of two folders, report.txt and report.md) keep their whole
+        # file name (q1.pdf.md, q1.pdf-2.md) instead of overwriting each other
+        output_names = None
+        suffixes = {OutputFormat.MARKDOWN: (".md",), OutputFormat.JSON: (".json",)}.get(output_format)
+        if save_files and output_dir and suffixes:
+            output_names = plan_output_names(
+                file_paths, {path: PurePath(path.name) for path in file_paths}, Path(output_dir), suffixes)
+
         # Build the ordered work list and pre-create output directories on the main
         # thread (so concurrent workers never race on mkdir).
         items = []
         for file_path in file_paths:
             if save_files and output_dir:
-                output_path = Path(output_dir) / file_path.stem
+                output_path = Path(output_dir) / (output_names[file_path] if output_names else file_path.stem)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 output_path = None
@@ -1497,6 +1515,8 @@ class UnifiedDocumentLoader:
             return str(value)
         if isinstance(value, (datetime.date, datetime.time)):  # e.g. dates in Markdown front matter
             return value.isoformat()
+        if isinstance(value, (set, frozenset)):
+            return [cls._json_cache_safe(item) for item in sorted(value, key=str)]
         if isinstance(value, dict):
             return {str(key): cls._json_cache_safe(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):

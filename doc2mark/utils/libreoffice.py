@@ -124,6 +124,12 @@ def _convert_once(soffice: str, input_path: Path, target_format: str, output_dir
             _kill_group(proc)
             _reap(proc)
             raise _Timeout(f"LibreOffice conversion timed out after {timeout}s")
+        except BaseException:
+            # The caller is being stopped (a CLI worker told to terminate, Ctrl-C): soffice has a session of its
+            # own, so nothing else would end it, and the profile folder below is removed either way
+            _kill_group(proc)
+            _reap(proc)
+            raise
         if proc.returncode != 0:
             raise ConversionError(f"LibreOffice conversion failed: {stderr or stdout or 'unknown error'}")
     finally:

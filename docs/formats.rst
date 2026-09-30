@@ -146,7 +146,8 @@ Text and data
   is found). The first row is the header of a Markdown table. Cell text is not escaped.
   Metadata: ``row_count`` (header included), ``column_count``, ``delimiter``.
 - **.tsv**: the same table and metadata, always tab separated (``delimiter`` is the CSV option
-  and does not apply).
+  and does not apply). A TSV has no quoting: ``5" pipe`` and ``"Best" seller`` keep their quote
+  characters, and a quote never joins rows.
 - **.json**: objects become ``**key**: value`` lines, lists ``-`` items, nested with indentation.
   Metadata: ``data_type`` (``dict``, ``list``, ...), ``item_count``.
 - **.jsonl**: ``# JSONL Data (N records)`` and one ``## Record i`` per valid line; invalid lines are
@@ -173,8 +174,8 @@ Markup
   PyYAML is installed (it comes with the ``ocr`` and ``vertex_ai`` extras). It is front matter
   only when the file starts with a ``---`` line, a closing ``---`` line follows and the lines
   between them are YAML that parses to a mapping; everything else that starts with a rule
-  (prose or a list between two rules, invalid YAML, no closing rule) stays in the text, which
-  is never changed. The text after the front matter is kept as written, except for the blank
+  (prose or a list between two rules, invalid YAML, a date that does not exist, no closing rule)
+  stays in the text, which is never changed. The text after the front matter is kept as written, except for the blank
   lines right after the closing rule. Dates in front matter are ``datetime.date`` objects in
   ``metadata.frontmatter`` and ISO strings in ``to_dict()`` and the CLI's JSON. Metadata:
   ``header_count``, ``link_count``, ``image_count``, ``line_count``.

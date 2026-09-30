@@ -104,6 +104,8 @@ def _json_safe(value: Any) -> Any:
         return base64.b64encode(value).decode("ascii")
     if isinstance(value, (datetime.date, datetime.time)):  # also datetime; YAML front matter reads dates as these
         return value.isoformat()
+    if isinstance(value, (set, frozenset)):  # a YAML !!set
+        return [_json_safe(item) for item in sorted(value, key=str)]
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

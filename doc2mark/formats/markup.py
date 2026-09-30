@@ -362,7 +362,7 @@ class MarkupProcessor(BaseProcessor):
             return None, content
         try:
             frontmatter = yaml.safe_load('\n'.join(lines[1:closing]))
-        except yaml.YAMLError as e:
+        except Exception as e:  # YAMLError, but also ValueError for a date that does not exist (2024-02-30)
             logger.warning(f"Not treating the leading --- block as front matter, it is not valid YAML: {e}")
             return None, content
         if not isinstance(frontmatter, dict):

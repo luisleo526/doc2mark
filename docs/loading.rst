@@ -117,9 +117,11 @@ Folders and file lists
 whatever the case of its extension (``.PDF``, ``.htm`` and ``.markdown`` included; folders are
 never converted themselves), in path order, and converts it. With ``save_files=True`` (the
 default) it writes ``<name>.md`` (or ``.json``), keeping the folder structure and the dots of the
-file name (``v1.2.txt`` gives ``v1.2.md``); two files of one folder with the same stem, such as
-``report.txt`` and ``report.md``, write the same output file and the later one wins (the CLI
-names them apart). When pictures were extracted it also writes a ``<name>_images/`` folder (a
+file name (``v1.2.txt`` gives ``v1.2.md``). With an ``output_dir`` of its own, files that would
+share an output name (``report.txt`` and ``report.md``) are written as ``report.txt.md`` and
+``report.md.md``, as in the CLI; without one (next to the inputs) an output replaces the one an
+earlier run wrote, so the run can be repeated, and two files of one folder with the same stem
+write the same file. When pictures were extracted it also writes a ``<name>_images/`` folder (a
 known issue: a PDF whose pictures were extracted without OCR is then reported as failed although
 its ``.md`` was written). With ``output_format="text"`` no file is written. Without
 ``output_dir`` the files are written next to the inputs. One file failing does not stop the
@@ -139,8 +141,9 @@ The returned dict maps each input path (a string, in input order) to a result:
 :doc:`output`); it is 0 for files without content items (text, data, markup and e-mail files).
 
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process_files` takes a list of paths instead. It
-writes only when ``output_dir`` is given, as ``output_dir/<file stem>.md`` (two inputs with the
-same stem overwrite each other), and its results have no ``pages``.
+writes only when ``output_dir`` is given, as ``output_dir/<file stem>.md`` (inputs with the same
+stem, such as ``q1.pdf`` of two folders, are written as ``q1.pdf.md`` and ``q1.pdf-2.md``), and
+its results have no ``pages``.
 
 ``max_workers`` above 1 converts that many files at once in threads (``None``, the default,
 converts them one after the other); results keep the input order. It is separate from the OCR

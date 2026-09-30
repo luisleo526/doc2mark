@@ -59,15 +59,17 @@ after 1,000 characters; use ``-v`` or ``-o FILE``.
 ``.svg`` or ``.DS_Store``, fails the run. Pass ``--pattern "*.pdf"`` (or similar) or
 ``--skip-errors``.
 
-**A file in a folder run fails with ``timed out after 300 s (--timeout)``.** ``--timeout`` limits the time one
-file may take (300 seconds, retries included); a slow conversion, a hung OCR service or a stuck
-LibreOffice is stopped and the file counts as failed. Raise the limit (``--timeout 900``) for big
-scans, or pass ``--timeout 0`` for no limit.
+**A file in a folder run fails with ``timed out after 600 s (--timeout)``.** You passed
+``--timeout 600``, which limits the time one file may take (retries included); a slow conversion,
+a hung OCR service or a stuck LibreOffice is stopped and the file counts as failed. Raise the
+limit for big scans, or leave the option out (the default is no limit).
 
 **An output file is named ``report.txt.md``.** Two inputs of one folder would have written the
 same output (``report.txt`` and ``report.md`` both give ``report.md``), or the output would have
 replaced an input file. Each of them is named after its whole file name instead, and a warning
 names them. Files in different folders never clash: the output folder mirrors the input tree.
+``-o`` cannot be the input folder (the outputs would be converted again by the next run); use a
+folder of its own, inside the input folder if you like.
 
 **Batch processing skips a file.** ``batch_process`` only takes files whose extension doc2mark
 reads (:doc:`formats`; any case, ``.htm`` and ``.markdown`` included); anything else, such as

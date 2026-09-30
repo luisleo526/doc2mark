@@ -9,7 +9,8 @@ def tables_and_sections(json_content: List[Dict[str, Any]]) -> Tuple[List[Dict[s
     A table is one ``table`` item: ``{"page", "format", "content"}``, ``content`` being the table as the
     Markdown output has it (``format`` ``"html"`` or ``"markdown"``). A section is one heading item
     (``text:title``, ``text:section``): ``{"level", "title", "page"}``, the level being the one the Markdown
-    heading has (a title is 1, a section without a level 2) and the title the heading text on one line.
+    heading has (a title is 1, a section without a level 2) and the title the heading as the Markdown shows it,
+    on one line, with its number (``1.2 Scope``) when the document numbers its headings.
     """
     tables: List[Dict[str, Any]] = []
     sections: List[Dict[str, Any]] = []
@@ -25,6 +26,8 @@ def tables_and_sections(json_content: List[Dict[str, Any]]) -> Tuple[List[Dict[s
         elif kind in ("text:title", "text:section"):
             title = " ".join(part.strip() for part in content.split("\n") if part.strip())
             if title:
+                if item.get("marker"):
+                    title = f"{item['marker']} {title}"
                 sections.append({
                     "level": int(item.get("level") or (1 if kind == "text:title" else 2)),
                     "title": title,

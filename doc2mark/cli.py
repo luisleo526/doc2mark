@@ -1,6 +1,6 @@
 """Command line interface for doc2mark."""
 
-from collections import Counter, deque
+from collections import deque
 from contextlib import closing, suppress
 from datetime import datetime
 from pathlib import Path
@@ -13,11 +13,13 @@ import multiprocessing.connection
 import os
 import signal
 import sys
+import threading
 import time
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRConfig, Task
 from doc2mark.pipelines import pymupdf_compat
+from doc2mark.utils.output_paths import plan_output_names
 
 logger = logging.getLogger(__name__)
 
@@ -96,61 +98,29 @@ def collect_files(directory, pattern="*", recursive=False):
     return [path for path in matches if path.is_file()]
 
 
-def plan_output_names(files, input_root, output_root, suffixes):
-    """The output name of every file of a folder run: ``{file: path relative to the output folder, no extension}``.
-
-    The input tree is mirrored (``2024/report.md`` -> ``2024/report``), so files of different folders never
-    share a name. Files of one folder that still would (``report.txt`` and ``report.md`` both give
-    ``report.md``), or whose output would be an input file itself (``note.md`` converted into its own folder),
-    keep their whole file name instead: ``report.txt`` is written as ``report.txt.md``. Every other file keeps
-    its stem. The plan depends only on the set of files, never on the order they are converted in, and each
-    clash is logged as a warning. ``suffixes`` are the extensions written (``(".md",)``, ``(".json",)`` or both).
-    """
-    def key(path):  # one name on a case-insensitive file system
-        return path.as_posix().casefold()
-
-    def overwrites_a_source(base):
-        return any(key((output_root / base.with_name(base.name + suffix)).resolve()) in sources
-                   for suffix in suffixes)
-
-    relative = {path: path.relative_to(input_root) for path in files}
-    natural = {path: rel.with_name(rel.stem) for path, rel in relative.items()}
-    sources = {key(path.resolve()) for path in files}
-    sharing = Counter(key(base) for base in natural.values())
-    clashing = {path for path, base in natural.items() if sharing[key(base)] > 1 or overwrites_a_source(base)}
-
-    names = {path: natural[path] for path in files if path not in clashing}
-    taken = {key(base) for base in names.values()}
-    for path in sorted(clashing, key=lambda p: relative[p].as_posix()):
-        candidate, number = relative[path], 1
-        while key(candidate) in taken or overwrites_a_source(candidate):
-            number += 1
-            candidate = relative[path].with_name(f"{relative[path].name}-{number}")
-        taken.add(key(candidate))
-        names[path] = candidate
-
-    for base_key in sorted({key(natural[path]) for path in clashing}):
-        group = sorted((p for p in clashing if key(natural[p]) == base_key), key=lambda p: relative[p].as_posix())
-        inputs = ", ".join(relative[p].as_posix() for p in group)
-        shown = natural[group[0]].as_posix() + suffixes[0]
-        outputs = ", ".join(names[p].as_posix() + suffixes[0] for p in group)
-        if len(group) > 1:
-            logger.warning(f"{inputs} would all be written as {shown}; writing {outputs} instead")
-        else:
-            logger.warning(f"{inputs} would overwrite an input file ({shown}); writing {outputs} instead")
-    return names
-
-
 def write_outputs(doc, base, output_format, encoding):
     """Write a converted document as ``<base>.md`` and/or ``<base>.json``. ``base`` has no extension added by
-    ``with_suffix``: a dot in a file name (``v1.2``) is part of the name."""
+    ``with_suffix``: a dot in a file name (``v1.2``) is part of the name. A file is written whole or not at all."""
     base.parent.mkdir(parents=True, exist_ok=True)
     if output_format in ("markdown", "both"):
-        with open(base.parent / f"{base.name}.md", 'w', encoding=encoding) as f:
-            f.write(doc.content)
+        write_text_file(base.parent / f"{base.name}.md", doc.content, encoding)
     if output_format in ("json", "both"):
-        with open(base.parent / f"{base.name}.json", 'w', encoding=encoding) as f:
-            json.dump(document_json_payload(doc), f, ensure_ascii=False, indent=2)
+        payload = json.dumps(document_json_payload(doc), ensure_ascii=False, indent=2)
+        write_text_file(base.parent / f"{base.name}.json", payload, encoding)
+
+
+def write_text_file(path, text, encoding):
+    """Write ``text`` to ``path`` through a temporary file, so a failure (an encoding that cannot hold the text, a
+    full disk) leaves no empty or half-written file behind."""
+    temporary = path.with_name(path.name + ".part")
+    try:
+        with open(temporary, 'w', encoding=encoding) as f:
+            f.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(OSError):
+            temporary.unlink()
+        raise
 
 
 def print_progress(current, total, style="bar", no_color=False):
@@ -221,16 +191,36 @@ def process_single_file(file_path, loader_config, processing_config):
                 retry_count += 1
                 if retry_count > processing_config['retry']:
                     return ('error', file_path, str(e))
+                logger.warning(f"Retry {retry_count}/{processing_config['retry']} for {file_path}: {e}")
     
     except Exception as e:
         return ('error', file_path, str(e))
 
 
-def _worker_main(connection, loader_config, processing_config):
+def _terminate(signum, frame):
+    """Signal handler: end the process the way ``sys.exit`` does, so ``finally`` blocks and ``except BaseException``
+    clean-up (the workers of a run, the LibreOffice of a conversion) run."""
+    raise SystemExit(128 + signum)
+
+
+def _exit_when_orphaned(parent_pid):
+    """Watchdog of a worker: when the parent is gone (even killed with SIGKILL) the worker stops the way a
+    terminate does, then for certain."""
+    while os.getppid() == parent_pid:
+        time.sleep(1)
+    with suppress(OSError):
+        os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(3)
+    os._exit(1)
+
+
+def _worker_main(connection, loader_config, processing_config, parent_pid):
     """Entry point of a conversion worker: convert every file it is sent until the parent hangs up."""
     if hasattr(os, "setsid"):
         with suppress(OSError):
-            os.setsid()  # a process group of its own: stopping the worker stops what it started (LibreOffice, ...)
+            os.setsid()  # a process group of its own: the parent can stop the worker and what it started
+    signal.signal(signal.SIGTERM, _terminate)
+    threading.Thread(target=_exit_when_orphaned, args=(parent_pid,), daemon=True).start()
     with suppress(OSError):
         connection.send('ready')  # the imports are done: a file's time limit starts now, not at process start
     while True:
@@ -254,8 +244,8 @@ class ConversionWorker:
     def __init__(self, loader_config, processing_config):
         context = multiprocessing.get_context()
         self.connection, child_connection = context.Pipe()
-        self.process = context.Process(target=_worker_main, args=(child_connection, loader_config, processing_config),
-                                       daemon=True)
+        self.process = context.Process(
+            target=_worker_main, args=(child_connection, loader_config, processing_config, os.getpid()), daemon=True)
         self.process.start()
         child_connection.close()
         self.file_path = None
@@ -275,8 +265,12 @@ class ConversionWorker:
         with suppress(OSError):  # a worker that died meanwhile is found out by the next wait()
             self.connection.send(file_path)
 
-    def stop(self):
-        """Kill the worker, and what it started if it leads its own process group."""
+    def stop(self, grace=3):
+        """Stop the worker: ask it to terminate, so the conversion unwinds and takes a LibreOffice with it, then
+        kill it, and what is left of its process group, when it has not gone within ``grace`` seconds."""
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(grace)
         if hasattr(os, "killpg") and self.process.is_alive():
             with suppress(OSError):
                 os.killpg(self.process.pid, signal.SIGKILL)
@@ -353,7 +347,7 @@ Examples:
   doc2mark docs/ -r --pattern "*.pdf" -p 4        # Parallel processing with 4 workers
   doc2mark docs/ --exclude "*.tmp" --exclude test*  # Exclude patterns
   doc2mark docs/ --max-files 10 --sort size       # Process the 10 smallest files (sorts are ascending)
-  doc2mark docs/ --retry 3 --timeout 600          # Retry failed files; stop a file after 600 s
+  doc2mark docs/ --retry 3 --timeout 600          # Retry failed files; stop a file after 600 s (folders)
   
   # Output options
   doc2mark file.pdf --format json                 # JSON output
@@ -552,9 +546,9 @@ Supported formats:
     proc_group.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=0,
         help="Timeout per file in seconds for folder runs, its retries included: a file that takes longer is "
-             "stopped and counts as failed; 0 means no limit (default: 300)"
+             "stopped and counts as failed (default: 0, no limit)"
     )
     
     proc_group.add_argument(
@@ -610,6 +604,8 @@ Supported formats:
 
     if args.timeout < 0:
         parser.error("--timeout must be 0 (no limit) or a number of seconds")
+    if args.retry < 0:
+        parser.error("--retry must be 0 or more")
     if args.preserve_structure:
         logger.warning("--preserve-structure is deprecated and has no effect: a folder run always writes "
                        "the input folder tree under -o")
@@ -729,6 +725,14 @@ Supported formats:
             
             # Get list of files to process, filter and sort them
             files = collect_files(input_path, args.pattern, args.recursive)
+            if output_path:
+                output_root = output_path.resolve()
+                if output_root == input_path.resolve():
+                    parser.error(f"-o {output_path} is the input folder: the converted files would be written "
+                                 f"among their sources (and converted again by the next run); choose another "
+                                 f"output folder")
+                # What an earlier run wrote into an output folder inside the input folder is not input
+                files = [path for path in files if not path.resolve().is_relative_to(output_root)]
             files = filter_files(files, args.exclude, args.max_files, args.sort)
             
             if not files:
@@ -739,7 +743,8 @@ Supported formats:
             output_names = {}
             if output_path:
                 suffixes = {"markdown": (".md",), "json": (".json",), "both": (".md", ".json")}[args.format]
-                output_names = plan_output_names(files, input_path, output_path, suffixes)
+                output_names = plan_output_names(files, {path: path.relative_to(input_path) for path in files},
+                                                 output_path, suffixes)
                 output_path.mkdir(parents=True, exist_ok=True)
 
             # Prepare configs for the conversion workers
@@ -776,21 +781,32 @@ Supported formats:
             show_progress = not args.quiet and args.progress != "none"
             if show_progress:
                 print_progress(0, len(files), args.progress, args.no_color)
-            with closing(convert_files(files, loader_config, processing_config, workers, args.timeout)) as outcomes:
-                for done, (status, file_path, result_or_error) in enumerate(outcomes, 1):
-                    if status == 'success':
-                        if output_path:
-                            write_outputs(result_or_error, output_path / output_names[file_path], args.format,
-                                          args.encoding)
-                        converted.append((file_path.relative_to(input_path),
-                                          len(result_or_error.content) if result_or_error.content else 0))
-                    elif args.skip_errors:
-                        logger.error(f"Failed to process {file_path}: {result_or_error}")
-                        failed_files.append((file_path, result_or_error))
-                    else:
-                        raise RuntimeError(f"Failed to process {file_path}: {result_or_error}")
-                    if show_progress:
-                        print_progress(done, len(files), args.progress, args.no_color)
+            # A terminate or hang-up ends the run the way Ctrl-C does, so the workers (and a LibreOffice) stop too
+            stop_signals = [sig for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)) if sig is not None]
+            previous_handlers = {sig: signal.signal(sig, _terminate) for sig in stop_signals}
+            try:
+                with closing(convert_files(files, loader_config, processing_config, workers,
+                                           args.timeout)) as outcomes:
+                    for done, (status, file_path, result_or_error) in enumerate(outcomes, 1):
+                        if status == 'success' and output_path:
+                            try:
+                                write_outputs(result_or_error, output_path / output_names[file_path], args.format,
+                                              args.encoding)
+                            except Exception as e:  # a file is whole or not there: failing to write it fails it
+                                status, result_or_error = 'error', f"could not write its output: {e}"
+                        if status == 'success':
+                            converted.append((file_path.relative_to(input_path),
+                                              len(result_or_error.content) if result_or_error.content else 0))
+                        elif args.skip_errors:
+                            logger.error(f"Failed to process {file_path}: {result_or_error}")
+                            failed_files.append((file_path, result_or_error))
+                        else:
+                            raise RuntimeError(f"Failed to process {file_path}: {result_or_error}")
+                        if show_progress:
+                            print_progress(done, len(files), args.progress, args.no_color)
+            finally:
+                for sig, handler in previous_handlers.items():
+                    signal.signal(sig, handler)
 
             if show_progress:
                 print()  # New line after progress

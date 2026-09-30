@@ -101,14 +101,17 @@ class TextProcessor(BaseProcessor):
     def _process_csv(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
         """Process CSV file: its cells are separated by ``delimiter`` (one character) when that is given,
         else by the delimiter sniffed from the start of the file (a comma when nothing is found)."""
-        return self._process_delimited(file_path, 'CSV', kwargs.get('delimiter'), kwargs.get('encoding', 'utf-8'))
+        return self._process_delimited(file_path, 'CSV', kwargs.get('delimiter'), kwargs.get('encoding', 'utf-8'),
+                                       csv.QUOTE_MINIMAL)
 
     def _process_tsv(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
-        """Process TSV file: always tab separated (``delimiter`` is the CSV option and does not apply)."""
-        return self._process_delimited(file_path, 'TSV', '\t', kwargs.get('encoding', 'utf-8'))
+        """Process TSV file: always tab separated (``delimiter`` is the CSV option and does not apply), and
+        without quoting: a TSV field is read as written, so ``5" pipe`` and ``"Best" seller`` keep their quotes
+        (read with CSV rules they lost them, and an unclosed quote swallowed the rows after it)."""
+        return self._process_delimited(file_path, 'TSV', '\t', kwargs.get('encoding', 'utf-8'), csv.QUOTE_NONE)
 
     def _process_delimited(self, file_path: Path, kind: str, delimiter: Optional[str],
-                           encoding: str) -> Tuple[str, dict]:
+                           encoding: str, quoting: int) -> Tuple[str, dict]:
         """Process a CSV/TSV file; ``delimiter`` None means sniff it."""
         if delimiter is not None and len(delimiter) != 1:
             raise ProcessingError(f"{kind} delimiter must be a single character, got {delimiter!r}")
@@ -122,7 +125,7 @@ class TextProcessor(BaseProcessor):
                     except csv.Error:
                         delimiter = ','
 
-                rows = list(csv.reader(f, delimiter=delimiter))
+                rows = list(csv.reader(f, delimiter=delimiter, quoting=quoting))
 
             if not rows:
                 return "", {'row_count': 0, 'column_count': 0}

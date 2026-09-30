@@ -28,10 +28,13 @@ Output
 - **A folder**: with ``-o DIR`` every converted document is written to the same relative path
   under ``DIR`` with ``.md`` (or ``.json``) in place of its extension (``docs/2024/report.pdf``
   becomes ``DIR/2024/report.md``), as soon as it is converted: a failure that stops the run
-  keeps what was written before it. Files of one folder that would write the same name
-  (``report.txt`` and ``report.md``) are written as ``report.txt.md`` and ``report.md.md``, and
-  so is a file whose output would replace an input file (``-o`` naming the input folder); a
-  warning names them. Without ``-o`` only a summary is printed.
+  keeps what was written before it; a file is written whole or not at all (a document the
+  ``--encoding`` cannot hold is a failed file). Files of one folder that would write the same
+  name (``report.txt`` and ``report.md``) are written as ``report.txt.md`` and ``report.md.md``;
+  a warning names them. ``-o`` must not be the input folder (usage error, exit code 2: the outputs
+  would sit among their sources and be converted again by the next run); an output folder inside
+  the input folder is left out of the input files, so the run can be repeated. Without ``-o`` only a
+  summary is printed.
 
 The JSON is :meth:`ProcessedDocument.to_dict() <doc2mark.ProcessedDocument.to_dict>`: ``content``
 (the Markdown), ``metadata`` (with ``extra``), ``images``, ``tables``, ``sections`` and
@@ -106,12 +109,12 @@ Folders
    Report a file that fails and go on (the command then exits 0); without it the first failure
    stops the run.
 ``--retry N``
-   Try a failing file ``N`` more times (default ``1``).
+   Try a failing file ``N`` more times (default ``1``; ``0`` or more).
 ``--timeout SECONDS``
-   The longest time one file of a folder run may take, its retries included (default ``300``;
-   ``0``: no limit). A file that takes longer is stopped (its worker process is killed, and on
-   Linux and macOS what it started too, such as LibreOffice) and counts as failed: ``timed out
-   after 300 s (--timeout)``. A single-file run is not limited.
+   The longest time one file of a folder run may take, its retries included (default ``0``: no
+   limit, so a slow scan is never cut off). A file that takes longer is stopped (its worker
+   process is terminated, and with it a LibreOffice it started) and counts as failed: ``timed
+   out after 600 s (--timeout)``. A single-file run is not limited.
 
 Messages
 ~~~~~~~~
