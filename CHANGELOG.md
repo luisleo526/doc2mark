@@ -181,6 +181,11 @@ else applies by default.
   in their `metadata`. Warnings are logged for garbled layers kept without OCR, hidden text, pages that
   need OCR, and empty or partly unextractable PDFs. (#14, #18, #19, #21, #22)
 
+- **PyMuPDF 1.27.1 or later is required** (the declared `>=1.23.0` could not even import `pymupdf`);
+  with an older PyMuPDF forced in, each missing capability is logged once. Importing the PDF pipeline
+  turns off PyMuPDF's process-wide `pymupdf_layout` recommendation, so it no longer lands in Markdown or
+  JSON written to stdout. (#25)
+
 ### Added
 - **Optional quality judge (TypeSafe/Jev).** `pip install 'doc2mark[typesafe]'`, then `--judge
   typesafe`, `UnifiedDocumentLoader(judge="typesafe")` or `DOC2MARK_JUDGE=typesafe`, with the key in
@@ -274,6 +279,9 @@ else applies by default.
   xdist saved at most a few seconds there, within run-to-run noise. `scripts/run_e2e_docker.sh` installs
   the extras named in `$D2M_E2E_EXTRAS`, and the `dev` extra gains `markdown-it-py` (the CommonMark
   parser the tests use). (#16, #20, #22, #24)
+
+- Requires PyMuPDF 1.27.1 or later; `metadata.extra["ocr_issues"]` gains `suspected` and
+  `provider_refused` counts (always present, 0 when none) and `suspected` locations. (#25)
 
 ### Fixed
 - **Word, Excel and PowerPoint conversion no longer drops text.** XLSX: sheets without merged ranges no
@@ -418,6 +426,16 @@ else applies by default.
   engine that cannot run fails the conversion as soon as there is something to OCR (non-zero CLI exit;
   `--skip-errors` reports the file as failed and continues) instead of writing placeholder Markdown;
   Tesseract output is escaped like any OCR text. (#19)
+
+- **Review follow-ups:** a default `--judge typesafe` run no longer prints a log line per TypeSafe
+  request (`-v` shows request lines, never bodies); OCR answers kept although the non-content judge
+  suspected them are counted in `ocr_issues["suspected"]` with their page, slide or sheet; a provider's
+  own refusal or safety block is cached for `refusal_ttl_seconds` (10 minutes, not extended by hits)
+  and keeps the document out of `cache_dir`; Office pictures OCR'd one at a time report their slide or
+  sheet; the verbatim tail of an OCR'd page no longer re-adds a printed line the OCR returned inside
+  markup or with other words between, nor running headers, footers or page numbers; table text is
+  emitted once on rotated hidden-text pages whose CropBox is the MediaBox; reading order measures
+  figures without decoding images (slide decks back to their pre-#23 speed). (#25)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is
