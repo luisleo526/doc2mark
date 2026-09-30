@@ -1,9 +1,9 @@
-"""PyMuPDF capabilities newer than the declared floor (``pymupdf>=1.25.3``) that the PDF pipeline uses
-when this PyMuPDF has them.
+"""PyMuPDF capabilities the PDF pipeline relies on that arrived in PyMuPDF 1.27.1, the declared floor
+(``pymupdf>=1.27.1``).
 
-Without one, the pipeline falls back to a weaker measure and says so, once per process, through
-:func:`missing`: a warning when the output can differ, an INFO record when only speed does. Every
-capability here arrived in PyMuPDF 1.27.1:
+An install that forces an older PyMuPDF still converts: without one of them the pipeline falls back
+to a weaker measure and says so, once per process, through :func:`missing` (a warning when the output
+can differ, an INFO record when only speed does):
 
 - ``TEXT_CLIP`` (``pdf_images``): what part of a picture its clip paths let the page show;
 - ``PDF_REDACT_TEXT_REMOVE_INVISIBLE`` (``pdf_routing``): removing only the invisible glyphs of an

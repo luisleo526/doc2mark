@@ -314,8 +314,8 @@ def test_without_the_table_finders_text_page_tables_come_out_the_same(tmp_path, 
     with caplog.at_level(logging.INFO, logger=pymupdf_compat.__name__):
         content = UnifiedDocumentLoader(ocr_provider=None).load(str(path)).content
     assert content == expected and "Pumps" in content
-    notes = [record for record in caplog.records if record.name == pymupdf_compat.__name__]
-    assert len(notes) == 1 and notes[0].levelno == logging.INFO and "TableFinder.textpage" in notes[0].getMessage()
+    notes = [record for record in caplog.records if "TableFinder.textpage" in record.getMessage()]
+    assert len(notes) == 1 and notes[0].levelno == logging.INFO and notes[0].name == pymupdf_compat.__name__
 
 
 @pytest.mark.parametrize("inherited", ["Resources", "MediaBox"])
