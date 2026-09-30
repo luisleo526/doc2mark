@@ -14,7 +14,8 @@ from typing import Callable, Dict, List, Any, Union, Optional, Tuple
 import pymupdf
 
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
-from doc2mark.utils.markdown import escape_heading_closing, escape_inline_pieces, escape_line_start
+from doc2mark.utils.markdown import (escape_heading_closing, escape_inline_pieces, escape_line_start,
+                                     escape_markdown_text)
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
 # --- Image-dominant page OCR strategy ---------------------------------------
@@ -39,7 +40,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
     NO_TEXT_LIMIT as _NO_TEXT_LIMIT,
 )
-from doc2mark.pipelines import pdf_images, pdf_routing  # noqa: E402
+from doc2mark.pipelines import pdf_images, pdf_layout, pdf_routing  # noqa: E402
 # OCR requests go to the provider in batches of at most _OCR_BATCH_IMAGES images (twice the
 # provider's concurrency when that is higher) and _OCR_BATCH_BYTES of image data, released
 # once answered: a several-thousand-page scan never holds more than one batch of renders.
@@ -107,8 +108,10 @@ from doc2mark.core.types import SimpleContent  # shared content model
 @dataclass
 class _TextContent(SimpleContent):
     """A text item that may be a heading: ``heading`` is its (font size, outline depth), from
-    which ``PDFLoader._choose_title`` picks the title and ``_finalize_text_items`` the levels."""
+    which ``PDFLoader._choose_title`` picks the title and ``_finalize_text_items`` the levels.
+    ``layout`` is where it stands on the page, for the reading order (``PDFLoader._reading_order``)."""
     heading: Optional[Tuple[float, int]] = None
+    layout: Optional[pdf_layout.Region] = None
 
 
 @dataclass(frozen=True)
@@ -2453,11 +2456,14 @@ class PDFLoader:
             content_items.extend(table_items)
             text_items = self._extract_text_as_markdown(text_page, page_num, table_bboxes)
             content_items.extend(text_items)
+        image_items = []
         if extract_images:
-            content_items.extend(self._extract_images_simple(
-                page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map))
+            image_items = self._extract_images_simple(
+                page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map)
+            content_items.extend(image_items)
 
-        content_items.sort(key=lambda x: x.position_y)
+        content_items = self._reading_order(page, page_num, content_items, list(zip(table_items, table_bboxes)),
+                                            image_items)
 
         simple_content = []
         for item in content_items:
@@ -2492,6 +2498,144 @@ class PDFLoader:
 
         return simple_content
 
+    def _reading_order(self, page, page_num: int, items: List[SimpleContent],
+                       tables: List[Tuple[SimpleContent, tuple]], images: List[SimpleContent]) -> List[SimpleContent]:
+        """The page's items in reading order (see :mod:`doc2mark.pipelines.pdf_layout`).
+
+        The starting point is the order by ``position_y`` (the top of the text block a piece
+        came from, so the pieces of one block stay together). On a ``/Rotate`` page, text,
+        pictures and page chrome are measured unrotated and tables as displayed, so the page is
+        ordered by where each item is displayed instead. Then pdf_layout reads columns column by
+        column when the page clearly shows them. ``tables`` pairs each table item with its box
+        as found; ``images`` are the picture items (their boxes are looked up)."""
+        rotated = bool(page.rotation % 360)
+        # A rotated page's tables were found uncropped: take their boxes as the text path mapped
+        # them (see _table_regions_in_text_space) when it could.
+        text_boxes = getattr(self, "_table_text_boxes", {}).pop(page_num, None)
+        if not rotated or not text_boxes or len(text_boxes) != len(tables):
+            text_boxes = None
+        regions: Dict[int, pdf_layout.Region] = {}
+        for number, (item, bbox) in enumerate(tables):
+            box = tuple(pymupdf.Rect(text_boxes[number]) * page.rotation_matrix) if text_boxes else tuple(bbox)
+            regions[id(item)] = pdf_layout.Region(box, kind="table")
+        for item, box in zip(images, self._image_item_boxes(page, images) if images else []):
+            regions[id(item)] = pdf_layout.Region(box, kind="image")
+
+        def region(item) -> pdf_layout.Region:
+            layout = getattr(item, "layout", None) or regions.get(id(item)) or pdf_layout.Region(None)
+            if layout.box is None and not rotated:
+                # unknown place (a picture whose placement was not found): placed by its height
+                layout = replace(layout, box=(0.0, item.position_y, 0.0, item.position_y), anchored=True)
+            if item.type == "text:footnote" and not layout.anchored:
+                layout = replace(layout, anchored=True, edge=True)   # footnotes close the page
+            return layout
+
+        if rotated:
+            group_tops: Dict[Any, float] = {}
+            for item in items:
+                layout = region(item)
+                if layout.group is not None and layout.box is not None:
+                    top = group_tops.get(layout.group)
+                    group_tops[layout.group] = layout.box[1] if top is None else min(top, layout.box[1])
+
+            def displayed_top(item) -> float:
+                layout = region(item)
+                if layout.group is not None and layout.group in group_tops:
+                    return group_tops[layout.group]
+                return layout.box[1] if layout.box is not None else item.position_y
+
+            items = sorted(items, key=displayed_top)
+        else:
+            items = sorted(items, key=lambda item: item.position_y)
+        try:
+            order = pdf_layout.reading_order([region(item) for item in items], page.rect.height,
+                                             figures=lambda: self._page_figures(page))
+        except Exception as e:   # never lose a page over its layout: keep the top-to-bottom order
+            logger.warning(f"Reading order of page {page.number + 1} failed, keeping top-to-bottom order: {e}")
+            return items
+        return [items[index] for index in order]
+
+    def _lines_region(self, page, lines: List[Dict[str, Any]], group=None, anchored: bool = False) -> pdf_layout.Region:
+        """Where text lines stand on the page as displayed: their box (from the glyphs' baselines,
+        ``_visual_box``) and each line's width, font size, top and bottom. ``anchored`` lines are
+        page chrome: they open or close the page (``pdf_layout.Region.edge``)."""
+        box, measured = None, []
+        try:
+            matrix = page.rotation_matrix if page.rotation % 360 else None
+            for line in lines:
+                if not self._raw_line_text(line).strip():
+                    continue
+                rect = self._visual_box(line)
+                if matrix is not None:
+                    rect = tuple(pymupdf.Rect(rect) * matrix)
+                size = max((span.get("size") or 0.0 for span in line.get("spans", [])), default=0.0)
+                measured.append((rect[2] - rect[0], size, rect[1], rect[3]))
+                box = rect if box is None else (min(box[0], rect[0]), min(box[1], rect[1]),
+                                                max(box[2], rect[2]), max(box[3], rect[3]))
+        except Exception as e:   # unknown place: the item is placed by its height alone
+            logger.debug(f"Line geometry unavailable: {e}")
+            box, measured = None, []
+        return pdf_layout.Region(tuple(box) if box is not None else None, "text", tuple(measured),
+                                 group=group, anchored=anchored, edge=anchored)
+
+    def _image_item_boxes(self, page, items: List[SimpleContent]) -> List[Optional[tuple]]:
+        """The displayed box of each picture item: the part of a picture placement the page shows
+        (see pdf_images.placements, where the items come from) whose top is the item's
+        ``position_y``, taken in drawing order; None when there is none (the item is then placed by
+        its height alone)."""
+        placements = []
+        try:
+            placements = [placement.visible for placement in self._placements_of(page)
+                          if not placement.visible.is_empty]
+        except Exception as e:
+            logger.debug(f"Picture placements of page {page.number + 1} unavailable: {e}")
+        matrix = page.rotation_matrix
+        boxes, used, cursor = [], set(), 0
+        for item in items:
+            candidates = list(range(cursor, len(placements))) + list(range(cursor))
+            match = next((k for k in candidates
+                          if k not in used and abs(placements[k].y0 - item.position_y) <= 0.01), None)
+            if match is None:
+                boxes.append(None)
+                continue
+            used.add(match)
+            cursor = match + 1
+            boxes.append(tuple(placements[match] * matrix))
+        return boxes
+
+    def _page_figures(self, page) -> List[tuple]:
+        """Boxes (as displayed) of what the page draws besides text: the part of each picture it
+        shows and its vector drawings grouped into figures (pdf_layout.cluster_boxes), without
+        invisible white fills and page-sized backgrounds. They separate the column bands of the
+        reading order even when pictures are not extracted; asked for only on pages with a column
+        gutter."""
+        matrix = page.rotation_matrix
+        figures = []
+        try:
+            if page.number in self._placements or page.get_images():   # measuring placements reads the page
+                figures.extend(tuple(placement.visible * matrix) for placement in self._placements_of(page)
+                               if not placement.visible.is_empty)
+        except Exception as e:
+            logger.debug(f"Picture placements of page {page.number + 1} unavailable: {e}")
+        try:
+            area = pdf_images.page_area(page)
+            limit = 0.5 * abs(area.width * area.height)
+            boxes = []
+            for path in page.get_drawings():
+                rect = pymupdf.Rect(path.get("rect") or ())
+                if rect.is_empty and rect.width <= 0 and rect.height <= 0:
+                    continue
+                if abs(rect.width * rect.height) >= limit:
+                    continue   # a page background or frame
+                fill, stroke = path.get("fill"), path.get("color")
+                if stroke is None and (fill is None or min(fill) >= 0.99):
+                    continue   # white on white
+                boxes.append(tuple(rect))
+            figures.extend(tuple(pymupdf.Rect(box) * matrix) for box in pdf_layout.cluster_boxes(boxes))
+        except Exception as e:
+            logger.debug(f"Drawings of page {page.number + 1} unavailable: {e}")
+        return figures
+
     def _extract_text_as_markdown(self, page, page_num: int, table_bboxes: List[tuple] = None) -> List[SimpleContent]:
         """Extract text blocks and convert to markdown format with text type classification.
 
@@ -2505,9 +2649,13 @@ class PDFLoader:
         self._restore_cropbox(page, page_num)
         # find_tables() reports display (rotated) coordinates, get_text() unrotated ones.
         table_bboxes = self._table_regions_in_text_space(page, table_bboxes or [], page_num)
+        if not hasattr(self, "_table_text_boxes"):
+            self._table_text_boxes = {}
+        self._table_text_boxes[page.number if page_num is None else page_num] = table_bboxes  # see _reading_order
 
         # Get text dictionary with formatting info
         text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
+        self._mark_sideways_blocks(page, text_dict)
 
         # Body font size (robust: character-weighted, without superscripts, table cells or
         # chart labels) and the largest real font size on the page
@@ -2524,9 +2672,46 @@ class PDFLoader:
                 block, avg_font_size, max_font_size, page_num, image_bboxes, table_bboxes
             )
             if item is not None:
+                item.layout = self._lines_region(page, block["lines"], group=block.get("number"))
                 text_items.append(item)
 
         return text_items
+
+    @staticmethod
+    def _mark_sideways_blocks(page, text_dict: Dict[str, Any]) -> None:
+        """Mark (``_sideways``) the text blocks that run across the page's reading direction: on a
+        page whose text mostly reads left to right as displayed, the blocks with no line that does
+        (a vertical margin stamp such as arXiv's, a turned axis label, upside-down text). They are
+        never headings and do not set the page's largest font size (``_size_weights``). A page
+        set mostly in vertical lines (vertical CJK) marks nothing."""
+        turns = (page.rotation // 90) % 4
+
+        def upright(line: Dict[str, Any]) -> bool:
+            dx, dy = line.get("dir") or (1.0, 0.0)
+            for _ in range(turns):   # as displayed: each /Rotate quarter turn is clockwise
+                dx, dy = -dy, dx
+            return dx > 0.9 and abs(dy) < 0.2
+
+        if all(upright(line) for block in text_dict.get("blocks", []) if block.get("type", 0) == 0
+               for line in block.get("lines", [])):
+            return
+        measured, upright_chars, total_chars = [], 0, 0
+        for block in text_dict.get("blocks", []):
+            if block.get("type", 0) != 0:
+                continue
+            lines = [(line, sum(1 for char in PDFLoader._raw_line_text(line) if not char.isspace()))
+                     for line in block.get("lines", [])]
+            lines = [(line, chars) for line, chars in lines if chars]
+            if not lines:
+                continue
+            flags = [upright(line) for line, _ in lines]
+            measured.append((block, any(flags)))
+            upright_chars += sum(chars for (_, chars), flag in zip(lines, flags) if flag)
+            total_chars += sum(chars for _, chars in lines)
+        if total_chars and upright_chars * 2 >= total_chars:
+            for block, any_upright in measured:
+                if not any_upright:
+                    block["_sideways"] = True
 
     def _table_regions_in_text_space(self, page, table_bboxes: List[tuple], page_num: Optional[int] = None) -> List[tuple]:
         """Table bboxes mapped into the coordinate space of ``get_text()``.
@@ -2565,7 +2750,8 @@ class PDFLoader:
         * A running header/footer line (``_detect_page_chrome``) becomes its own item with
           its raw text, so it is never classified as a heading, list item or footnote:
           text:header / text:footer, or text:normal for a line kept as content (a running
-          header's first copy, a numbered label, a page number the rule leaves).
+          header's first copy, a numbered label, a page number the rule leaves), escaped like
+          all body text (``doc2mark.utils.markdown``).
         * Overprinted copies of a line are dropped (``_drop_overprinted_lines``).
 
         Returns ``(blocks, header/footer items)``: the text blocks in their original order,
@@ -2587,8 +2773,12 @@ class PDFLoader:
                 if chrome:
                     zone, kept = chrome
                     text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
-                    chrome_items.append(SimpleContent(type="text:normal" if kept else f"text:{zone}", content=text,
-                                                      page=page_num + 1, position_y=line["bbox"][1]))
+                    # a kept copy is emitted as a paragraph: Markdown, escaped like every other text item
+                    chrome_items.append(_TextContent(
+                        type="text:normal" if kept else f"text:{zone}",
+                        content=escape_markdown_text(text) if kept else text,
+                        page=page_num + 1, position_y=line["bbox"][1],
+                        layout=self._lines_region(page, [line], anchored=True)))
                 else:
                     entries.append([index, line])
 
@@ -2879,14 +3069,15 @@ class PDFLoader:
 
     def _size_weights(self, text_dict: Dict[str, Any], table_bboxes: List[tuple] = None,
                       running_only: bool = False) -> Tuple[Dict[float, float], float]:
-        """Characters per font size (superscripts and table cells left out), and the largest size
-        of a span with at least two letters (so drop caps, bullets and KPI numbers do not count).
+        """Characters per font size (superscripts, table cells and sideways blocks left out, see
+        ``_mark_sideways_blocks``), and the largest size of a span with at least two letters (so drop
+        caps, bullets and KPI numbers do not count).
         With ``running_only`` only lines of running text count (at least ``_RUNNING_TEXT_UNITS``
         characters, a CJK character counting twice): table cells, headings and labels are short."""
         weights: Dict[float, float] = defaultdict(float)
         max_size = 0.0
         for block in text_dict.get("blocks", []):
-            if block.get("type", 0) != 0:
+            if block.get("type", 0) != 0 or block.get("_sideways"):
                 continue
             for line in block.get("lines", []):
                 if running_only and _text_units(self._raw_line_text(line)) < _RUNNING_TEXT_UNITS:
@@ -3624,7 +3815,8 @@ class PDFLoader:
             if _CAPTION_LABEL.match(total_text.strip()) and len(view.lines) <= 6:
                 # "Figure 3: …", "Table 2.1 …", "圖1 …"
                 text_type = "text:caption"
-            elif (self._is_probable_heading_features(heading_features, require_layout_signal=True)
+            elif (not block.get("_sideways")
+                  and self._is_probable_heading_features(heading_features, require_layout_signal=True)
                   and heading_features.length <= 100 and not self._starts_mid_row(view.lines)
                   and not self._spread_on_row(view.lines, wraps) and self._may_be_heading(view, markers)):
                 heading = (_size_key(view.size), _outline_depth(heading_features.normalized))
@@ -3782,18 +3974,36 @@ class PDFLoader:
                 runs = _drop_prefix(line.runs, indent + marker.length)
             items.append((line.bbox[0] if line.bbox else None, prefix, [runs], [2], [line]))
 
+        def list_kind(marker: str) -> str:
+            return marker.rstrip()[-1] if marker[:1].isdigit() else "-"
+
         output: List[str] = []
         stack: List[Tuple[Optional[float], str, str]] = []   # open levels: (x0, indent, marker prefix)
         joins = getattr(self, "_hyphen_joins", None)
+        opened, opened_depth = None, 0   # kind and depth of the item after the last blank line
         for x0, prefix, item_lines, item_wraps, item_views in items:
             while len(stack) > 1 and x0 is not None and stack[-1][0] is not None and x0 < stack[-1][0] - 2:
                 stack.pop()
+            # A blank line goes before an item that would otherwise read as a lazy continuation of
+            # the text above it: an item of another kind than its sibling above (numbers after
+            # bullets, bullets after numbers, ``1)`` after ``1.``) or than the list that follows the
+            # last blank line when the item returns to an outer level (renderers that keep list
+            # types apart, like Python-Markdown's sane_lists), and a nested numbered list that does
+            # not start at 1 (CommonMark too).
+            kind = list_kind(prefix)
             if not stack:
-                indent = ""
+                indent, depth, new_list = "", 1, False
             elif x0 is not None and stack[-1][0] is not None and x0 > stack[-1][0] + 2:
-                indent = stack[-1][1] + " " * len(stack[-1][2])
+                indent, depth = stack[-1][1] + " " * len(stack[-1][2]), len(stack) + 1
+                new_list = kind != "-" and prefix.rstrip()[:-1] != "1"
             else:
-                indent = stack.pop()[1]
+                sibling = stack.pop()
+                indent, depth = sibling[1], len(stack) + 1
+                new_list = kind != list_kind(sibling[2]) or (depth < opened_depth and kind != opened)
+            if new_list and output:
+                output.append("")
+            if opened is None or (new_list and output):
+                opened, opened_depth = kind, depth
             stack.append((x0, indent, prefix))
             physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
             lines = [_render_runs(runs) for runs in physical] or [""]
