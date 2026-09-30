@@ -1,0 +1,548 @@
+{
+  "runs": [
+    {
+      "date": "2026-09-30T14:19:37+00:00",
+      "host": {
+        "node": "spark-1693",
+        "platform": "Linux-6.17.0-1031-nvidia-aarch64-with-glibc2.36",
+        "python": "3.12.14"
+      },
+      "command": [
+        "/opt/merged_cells.py",
+        "--tools",
+        "doc2mark",
+        "--json",
+        "/out/merged_cells.doc2mark.json",
+        "--dump",
+        "/out/dump",
+        "--show",
+        "TSI/|\\bMT\\b|colspan|rowspan",
+        "sample_documents/complex-tables/complex_table_test.docx",
+        "sample_documents/complex-tables/complex_table_test.pdf",
+        "sample_documents/complex-tables/complex_table_test.pptx",
+        "sample_documents/complex-tables/complex_table_test.xlsx",
+        "sample_documents/test-table.pdf"
+      ],
+      "skipped": {},
+      "results": [
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "tool": "doc2mark",
+          "column": "doc2mark",
+          "seconds": 0.32,
+          "error": null,
+          "chars": 1296,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "tool": "doc2mark",
+          "column": "doc2mark",
+          "seconds": 0.11,
+          "error": null,
+          "chars": 1278,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "tool": "doc2mark",
+          "column": "doc2mark",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 1306,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "tool": "doc2mark",
+          "column": "doc2mark",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 987,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "tool": "doc2mark",
+          "column": "doc2mark",
+          "seconds": 0.1,
+          "error": null,
+          "chars": 3227,
+          "colspan": 48,
+          "rowspan": 0,
+          "colspan_raw": 48,
+          "rowspan_raw": 0,
+          "tables": 1
+        }
+      ],
+      "shown": [
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "column": "doc2mark",
+          "lines": [
+            "<tr> <th colspan=\"3\">Company Overview</th> <th>Q1</th> <th>Q2</th> <th>Q3</th> <th>Q4</th> </tr>",
+            "<tr> <td rowspan=\"2\">Division</td> <td>Region</td> <td>Product</td> <td colspan=\"2\">First Half</td> <td colspan=\"2\">Second Half</td> </tr>",
+            "<tr> <td rowspan=\"3\">Technology</td> <td>South</td> <td>Widget B</td> <td>$20K</td> <td>$22K</td> <td>$25K</td> <td>$28K</td> </tr>",
+            "<tr> <td>East</td> <td colspan=\"2\">Combined Products</td> <td>$30K</td> <td>$35K</td> <td>$40K</td> </tr>",
+            "<tr> <td colspan=\"2\">All Regions Total</td> <td>$50K</td> <td>$54K</td> <td>$60K</td> <td>$68K</td> </tr>",
+            "<tr> <td colspan=\"3\">Subtotal (All Divisions)</td> <td>$80K</td> <td>$88K</td> <td>$100K</td> <td>$114K</td> </tr>",
+            "<tr> <td colspan=\"4\">Grand Total (All Quarters)</td> <td colspan=\"3\">Annual Total: $382K</td> </tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "column": "doc2mark",
+          "lines": [
+            "<tr> <th colspan=\"3\">Company Overview</th> <th>Q1</th> <th>Q2</th> <th>Q3</th> <th>Q4</th> </tr>",
+            "<tr> <td rowspan=\"2\">Division</td> <td>Region</td> <td>Product</td> <td colspan=\"2\">First Half</td> <td colspan=\"2\">Second Half</td> </tr>",
+            "<tr> <td rowspan=\"3\">Technology</td> <td>South</td> <td>Widget B</td> <td>$20K</td> <td>$22K</td> <td>$25K</td> <td>$28K</td> </tr>",
+            "<tr> <td>East</td> <td colspan=\"2\">Combined Products</td> <td>$30K</td> <td>$35K</td> <td>$40K</td> </tr>",
+            "<tr> <td colspan=\"2\">All Regions Total</td> <td>$50K</td> <td>$54K</td> <td>$60K</td> <td>$68K</td> </tr>",
+            "<tr> <td colspan=\"3\">Subtotal (All Divisions)</td> <td>$80K</td> <td>$88K</td> <td>$100K</td> <td>$114K</td> </tr>",
+            "<tr> <td colspan=\"4\">Grand Total (All Quarters)</td> <td colspan=\"3\">Annual Total: $382K</td> </tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "column": "doc2mark",
+          "lines": [
+            "<tr> <th colspan=\"3\">Company Overview (spans 3 cols)</th> <th>Q1</th> <th>Q2</th> <th>Q3</th> <th>Q4</th> </tr>",
+            "<tr> <td rowspan=\"2\">Division<br>(spans 2 rows)</td> <td>Region</td> <td>Product</td> <td colspan=\"2\">First Half (spans 2 cols)</td> <td colspan=\"2\">Second Half (spans 2 cols)</td> </tr>",
+            "<tr> <td rowspan=\"3\">Technology<br>(spans 3 rows)</td> <td>South</td> <td>Widget B</td> <td>$20K</td> <td>$22K</td> <td>$25K</td> <td>$28K</td> </tr>",
+            "<tr> <td>East</td> <td colspan=\"2\">Combined Products (spans 2 cols)</td> <td>$30K</td> <td>$35K</td> <td>$40K</td> </tr>",
+            "<tr> <td colspan=\"2\">All Regions Total (spans 2 cols)</td> <td>$50K</td> <td>$54K</td> <td>$60K</td> <td>$68K</td> </tr>",
+            "<tr> <td colspan=\"3\">Subtotal (All Divisions) - spans 3 cols</td> <td>$80K</td> <td>$88K</td> <td>$100K</td> <td>$114K</td> </tr>",
+            "<tr> <td colspan=\"4\">Grand Total (All Quarters) - spans 4 cols</td> <td colspan=\"3\">Annual Total: $382K (spans 3 cols)</td> </tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "column": "doc2mark",
+          "lines": [
+            "<tr> <th colspan=\"3\">Company Overview</th> <th>Q1</th> <th>Q2</th> <th>Q3</th> <th>Q4</th> </tr>",
+            "<tr> <td rowspan=\"2\">Division</td> <td>Region</td> <td>Product</td> <td colspan=\"2\">First Half</td> <td colspan=\"2\">Second Half</td> </tr>",
+            "<tr> <td rowspan=\"3\">Technology</td> <td>South</td> <td>Widget B</td> <td>$20K</td> <td>$22K</td> <td>$25K</td> <td>$28K</td> </tr>",
+            "<tr> <td>East</td> <td colspan=\"2\">Combined Products</td> <td>$30K</td> <td>$35K</td> <td>$40K</td> </tr>",
+            "<tr> <td colspan=\"2\">All Regions Total</td> <td>$50K</td> <td>$54K</td> <td>$60K</td> <td>$68K</td> </tr>",
+            "<tr> <td colspan=\"3\">Subtotal (All Divisions)</td> <td>$80K</td> <td>$88K</td> <td>$100K</td> <td>$114K</td> </tr>",
+            "<tr> <td colspan=\"4\">Grand Total (All Quarters)</td> <td colspan=\"3\">Annual Total: $382K</td> </tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "column": "doc2mark",
+          "lines": [
+            "<tr> <th>Technical Description</th> <th colspan=\"3\">1.0 TSI/85 kW</th> <th colspan=\"3\">1.5 TSI/110 kW</th> </tr>",
+            "<tr> <td>Engine</td> <td>MT</td> <td colspan=\"2\">AT</td> <td colspan=\"2\">D</td> <td>SG</td> </tr>",
+            "<tr> <td>Engine type</td> <td colspan=\"3\">1.0 TSI Petrol, in-line, 4-Stroke Positive Ignition<br>Direct Injection Engine</td> <td colspan=\"3\">1.5 TSI Petrol, in-line, 4-Stroke Positive Ignition<br>Direct Injection Engine with Active Cylinder Technology</td> </tr>",
+            "<tr> <td>Clutch</td> <td>Dry Single Plate</td> <td colspan=\"2\">Hydro Dynamic Torque<br>Converter</td> <td colspan=\"3\">Dry Double Clutch</td> </tr>",
+            "<tr> <td>Cylinders</td> <td colspan=\"3\">3</td> <td colspan=\"3\">4</td> </tr>",
+            "<tr> <td>Displacement [cm3]</td> <td colspan=\"3\">999</td> <td colspan=\"3\">1 498</td> </tr>",
+            "<tr> <td>Max. power/revs [kW at rpm]</td> <td colspan=\"3\">85 / 5 000 - 5 500</td> <td colspan=\"3\">110 / 5 000 - 6 000</td> </tr>",
+            "<tr> <td>Max. torque/revs [Nm at rpm]</td> <td colspan=\"3\">178 / 1 750 - 4 500</td> <td colspan=\"3\">250 / 1 600 - 3 500</td> </tr>",
+            "<tr> <td>Fuel consumption - rule 115 of CMVR [KMPL]</td> <td>19.76</td> <td colspan=\"2\">18.09</td> <td colspan=\"3\">18.86</td> </tr>",
+            "<tr> <td colspan=\"7\">Transmission</td> </tr>",
+            "<tr> <td>Wheel drive</td> <td colspan=\"6\">Front Wheel Drive</td> </tr>",
+            "<tr> <td>Transmission</td> <td>6-speed</td> <td colspan=\"2\">6-speed</td> <td colspan=\"3\">7-speed</td> </tr>",
+            "<tr> <td>Chassis</td> <td colspan=\"6\"></td> </tr>",
+            "<tr> <td>Front axle</td> <td colspan=\"6\">McPherson suspension with lower triangular links and stabiliser bar</td> </tr>",
+            "<tr> <td>Rear axle</td> <td colspan=\"6\">Twist Beam Axle</td> </tr>",
+            "<tr> <td>Braking system</td> <td colspan=\"6\">Hydraulic Diagonal Split Vaccum Assisted Braking System</td> </tr>",
+            "<tr> <td>Brake – front</td> <td colspan=\"6\">Disc</td> </tr>",
+            "<tr> <td>Brake – rear</td> <td colspan=\"6\">Drum</td> </tr>",
+            "<tr> <td>Steering system</td> <td colspan=\"6\">Electro-Mechanical Steering (Power Assisted)</td> </tr>",
+            "<tr> <td>Wheels</td> <td colspan=\"6\">Steel wheel 6J x 16\" (Classic/ONYX), Alloy wheel 6J x 16\" (Signature), Alloy wheel 6.5J x 17\" (Prestige/Sportline)</td> </tr>",
+            "<tr> <td>Tyres</td> <td colspan=\"6\">205/60R16-Classic &amp; Signature, 205/55R17-Prestige &amp; Sportline</td> </tr>",
+            "<tr> <td colspan=\"7\">Outside dimensions</td> </tr>",
+            "<tr> <td>Length [mm]</td> <td colspan=\"6\">4 225</td> </tr>",
+            "<tr> <td>Width [mm]</td> <td colspan=\"6\">1 760</td> </tr>",
+            "<tr> <td>Height [mm]</td> <td colspan=\"6\">1 612</td> </tr>",
+            "<tr> <td>Wheel base [mm]</td> <td colspan=\"6\">2 651</td> </tr>",
+            "<tr> <td>Ground clearance (laden condition) [mm]</td> <td colspan=\"6\">155</td> </tr>",
+            "<tr> <td colspan=\"7\">Inside dimensions</td> </tr>",
+            "<tr> <td>Storage capacity [l]</td> <td colspan=\"2\"></td> <td colspan=\"2\">385 / 491 / 1 405</td> <td colspan=\"2\"></td> </tr>",
+            "<tr> <td colspan=\"7\">Weights</td> </tr>",
+            "<tr> <td>Kerb weight [kg]</td> <td>1 193-1 248</td> <td colspan=\"2\">1 245-1 284</td> <td colspan=\"3\">1 278-1 309</td> </tr>",
+            "<tr> <td>Gross weight [kg]</td> <td>1 640</td> <td colspan=\"2\">1 660</td> <td colspan=\"3\">1 696</td> </tr>",
+            "<tr> <td colspan=\"7\">Liquids</td> </tr>",
+            "<tr> <td>Tank capacity [l]</td> <td colspan=\"6\">50 Litres</td> </tr>"
+          ]
+        }
+      ],
+      "versions": {
+        "doc2mark": "0.6.1",
+        "doc2mark.__version__": "0.6.1",
+        "doc2mark_git_sha": "becb74bc46b4aad3090232e5b6f6cee73de86cb6"
+      }
+    },
+    {
+      "date": "2026-09-30T14:21:26+00:00",
+      "host": {
+        "node": "spark-1693",
+        "platform": "Linux-6.17.0-1031-nvidia-aarch64-with-glibc2.36",
+        "python": "3.12.14"
+      },
+      "command": [
+        "/opt/merged_cells.py",
+        "--tools",
+        "markitdown,docling",
+        "--json",
+        "/out/merged_cells.competitors.json",
+        "--dump",
+        "/out/dump",
+        "--show",
+        "TSI/|\\bMT\\b|colspan|rowspan",
+        "sample_documents/complex-tables/complex_table_test.docx",
+        "sample_documents/complex-tables/complex_table_test.pdf",
+        "sample_documents/complex-tables/complex_table_test.pptx",
+        "sample_documents/complex-tables/complex_table_test.xlsx",
+        "sample_documents/test-table.pdf"
+      ],
+      "skipped": {},
+      "results": [
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "tool": "markitdown",
+          "column": "markitdown",
+          "seconds": 0.11,
+          "error": null,
+          "chars": 953,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "tool": "markitdown",
+          "column": "markitdown",
+          "seconds": 0.04,
+          "error": null,
+          "chars": 1569,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "tool": "markitdown",
+          "column": "markitdown",
+          "seconds": 0.02,
+          "error": null,
+          "chars": 762,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "tool": "markitdown",
+          "column": "markitdown",
+          "seconds": 0.02,
+          "error": null,
+          "chars": 736,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "tool": "markitdown",
+          "column": "markitdown",
+          "seconds": 0.06,
+          "error": null,
+          "chars": 3571,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "tool": "docling",
+          "column": "docling:md",
+          "seconds": 0.07,
+          "error": null,
+          "chars": 2036,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "tool": "docling",
+          "column": "docling:html",
+          "seconds": 0.07,
+          "error": null,
+          "chars": 5230,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "tool": "docling",
+          "column": "docling:md",
+          "seconds": 5.8,
+          "error": null,
+          "chars": 1580,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "tool": "docling",
+          "column": "docling:html",
+          "seconds": 5.8,
+          "error": null,
+          "chars": 5172,
+          "colspan": 6,
+          "rowspan": 0,
+          "colspan_raw": 6,
+          "rowspan_raw": 0,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "tool": "docling",
+          "column": "docling:md",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 2649,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "tool": "docling",
+          "column": "docling:html",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 5029,
+          "colspan": 8,
+          "rowspan": 2,
+          "colspan_raw": 8,
+          "rowspan_raw": 2,
+          "tables": 1
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "tool": "docling",
+          "column": "docling:md",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 2150,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "tool": "docling",
+          "column": "docling:html",
+          "seconds": 0.01,
+          "error": null,
+          "chars": 4909,
+          "colspan": 9,
+          "rowspan": 2,
+          "colspan_raw": 9,
+          "rowspan_raw": 2,
+          "tables": 2
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "tool": "docling",
+          "column": "docling:md",
+          "seconds": 7.99,
+          "error": null,
+          "chars": 15744,
+          "colspan": 0,
+          "rowspan": 0,
+          "colspan_raw": 0,
+          "rowspan_raw": 0,
+          "tables": 0
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "tool": "docling",
+          "column": "docling:html",
+          "seconds": 7.99,
+          "error": null,
+          "chars": 7271,
+          "colspan": 8,
+          "rowspan": 0,
+          "colspan_raw": 8,
+          "rowspan_raw": 0,
+          "tables": 1
+        }
+      ],
+      "shown": [
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "column": "markitdown",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "column": "markitdown",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "column": "markitdown",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "column": "markitdown",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "column": "markitdown",
+          "lines": [
+            "| Technical Description |     |     | 1.0 TSI/85 kW |     |     | 1.5 TSI/110 kW |     |",
+            "| Engine                |     | MT  |               | AT  |     |                | DSG |"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "column": "docling:md",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.docx",
+          "column": "docling:html",
+          "lines": [
+            "<tr><th colspan=\"3\">Company Overview</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>",
+            "<tr><td rowspan=\"2\">Division</td><td>Region</td><td>Product</td><td colspan=\"2\">First Half</td><td colspan=\"2\">Second Half</td></tr>",
+            "<tr><td rowspan=\"3\">Technology</td><td>South</td><td>Widget B</td><td>$20K</td><td>$22K</td><td>$25K</td><td>$28K</td></tr>",
+            "<tr><td>East</td><td colspan=\"2\">Combined Products</td><td>$30K</td><td>$35K</td><td>$40K</td></tr>",
+            "<tr><td colspan=\"2\">All Regions Total</td><td>$50K</td><td>$54K</td><td>$60K</td><td>$68K</td></tr>",
+            "<tr><td colspan=\"3\">Subtotal (All Divisions)</td><td>$80K</td><td>$88K</td><td>$100K</td><td>$114K</td></tr>",
+            "<tr><td colspan=\"4\">Grand Total (All Quarters)</td><td colspan=\"3\">Annual Total: $382K</td></tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "column": "docling:md",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pdf",
+          "column": "docling:html",
+          "lines": [
+            "<tr><th colspan=\"3\">Company Overview</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>",
+            "<tr><td>Division</td><td>Region</td><td>Product</td><td colspan=\"2\">First Half</td><td colspan=\"2\">Second Half</td></tr>",
+            "<tr><td></td><td>East</td><td colspan=\"2\">Combined Products</td><td>$30K</td><td>$35K</td><td>$40K</td></tr>",
+            "<tr><td></td><td colspan=\"2\">All Regions Total</td><td>$50K</td><td>$54K</td><td>$60K</td><td>$68K</td></tr>",
+            "<tr><td colspan=\"3\">Subtotal (All Divisions)</td><td>$80K</td><td>$88K</td><td>$100K</td><td>$114K</td></tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "column": "docling:md",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.pptx",
+          "column": "docling:html",
+          "lines": [
+            "<tr><th colspan=\"3\">Company Overview (spans 3 cols)</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>",
+            "<tr><td rowspan=\"2\">Division (spans 2 rows)</td><td>Region</td><td>Product</td><td colspan=\"2\">First Half (spans 2 cols)</td><td colspan=\"2\">Second Half (spans 2 cols)</td></tr>",
+            "<tr><td rowspan=\"3\">Technology (spans 3 rows)</td><td>South</td><td>Widget B</td><td>$20K</td><td>$22K</td><td>$25K</td><td>$28K</td></tr>",
+            "<tr><td>East</td><td colspan=\"2\">Combined Products (spans 2 cols)</td><td>$30K</td><td>$35K</td><td>$40K</td></tr>",
+            "<tr><td colspan=\"2\">All Regions Total (spans 2 cols)</td><td>$50K</td><td>$54K</td><td>$60K</td><td>$68K</td></tr>",
+            "<tr><td colspan=\"3\">Subtotal (All Divisions) - spans 3 cols</td><td>$80K</td><td>$88K</td><td>$100K</td><td>$114K</td></tr>",
+            "<tr><td colspan=\"4\">Grand Total (All Quarters) - spans 4 cols</td><td colspan=\"3\">Annual Total: $382K (spans 3 cols)</td></tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "column": "docling:md",
+          "lines": []
+        },
+        {
+          "file": "sample_documents/complex-tables/complex_table_test.xlsx",
+          "column": "docling:html",
+          "lines": [
+            "<tr><th colspan=\"7\">Complex Table Test Spreadsheet</th></tr>",
+            "<tr><th colspan=\"3\">Company Overview</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>",
+            "<tr><td rowspan=\"2\">Division</td><td>Region</td><td>Product</td><td colspan=\"2\">First Half</td><td colspan=\"2\">Second Half</td></tr>",
+            "<tr><td rowspan=\"3\">Technology</td><td>South</td><td>Widget B</td><td>$20K</td><td>$22K</td><td>$25K</td><td>$28K</td></tr>",
+            "<tr><td>East</td><td colspan=\"2\">Combined Products</td><td>$30K</td><td>$35K</td><td>$40K</td></tr>",
+            "<tr><td colspan=\"2\">All Regions Total</td><td>$50K</td><td>$54K</td><td>$60K</td><td>$68K</td></tr>",
+            "<tr><td colspan=\"3\">Subtotal (All Divisions)</td><td>$80K</td><td>$88K</td><td>$100K</td><td>$114K</td></tr>",
+            "<tr><td colspan=\"4\">Grand Total (All Quarters)</td><td colspan=\"3\">Annual Total: $382K</td></tr>"
+          ]
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "column": "docling:md",
+          "lines": [
+            "| Technical Description - Engine - Engine type - Clutch - Cylinders   |             | 1.0 TSI/85 kW - MT - 1.0 TSI Petrol, in-line, 4-Stroke Positive Ignition Direct Injection Engine - Dry Single Plate - 3   | 1.0 TSI/85 kW - AT - 1.0 TSI Petrol, in-line, 4-Stroke Positive Ignition Direct Injection Engine - Hydro Dynamic Torque Converter - 3   | 1.5 TSI/110 kW - DSG - 1.5 TSI Petrol, in-line, 4-Stroke Positive Ignition Direct Injection Engine with Active Cylinder Technology - Dry Double Clutch - 4   |"
+          ]
+        },
+        {
+          "file": "sample_documents/test-table.pdf",
+          "column": "docling:html",
+          "lines": [
+            "<tr><th>Technical Description</th><td></td><th colspan=\"2\">1.0 TSI/85 kW</th><th>1.5 TSI/110 kW</th></tr>",
+            "<tr><td>Engine</td><td></td><th>MT</th><th>AT</th><th>DSG</th></tr>",
+            "<tr><td>Engine type</td><td></td><th colspan=\"2\">1.0 TSI Petrol, in-line, 4-Stroke Positive Ignition Direct Injection Engine</th><th>1.5 TSI Petrol, in-line, 4-Stroke Positive Ignition Direct Injection Engine with Active Cylinder Technology</th></tr>",
+            "<tr><td>Cylinders</td><td></td><th colspan=\"2\">3</th><th>4</th></tr>",
+            "<tr><td>Displacement</td><td>[cm 3 ]</td><td colspan=\"2\">999</td><td>1 498</td></tr>",
+            "<tr><td>Max. power/revs</td><td>[kW at rpm]</td><td colspan=\"2\">85 / 5 000 - 5 500</td><td>110 / 5 000 - 6 000</td></tr>",
+            "<tr><td>Max. torque/revs</td><td>[Nm at rpm]</td><td colspan=\"2\">178 / 1 750 - 4 500</td><td>250 / 1 600 - 3 500</td></tr>",
+            "<tr><td>Wheels</td><td></td><td colspan=\"3\">Steel wheel 6J x 16&quot; (Classic/ONYX), Alloy wheel 6J x 16&quot; (Signature), Alloy wheel 6.5J x 17&quot; (Prestige/Sportline)</td></tr>",
+            "<tr><td>Tyres</td><td></td><td colspan=\"3\">205/60R16-Classic &amp; Signature, 205/55R17-Prestige &amp; Sportline</td></tr>"
+          ]
+        }
+      ],
+      "versions": {
+        "markitdown": "0.1.8",
+        "docling": "2.131.0",
+        "docling-core": "2.99.0",
+        "docling-ibm-models": "4.0.3",
+        "docling-parse": "7.22.1",
+        "torch": "2.14.0+cpu"
+      }
+    }
+  ]
+}

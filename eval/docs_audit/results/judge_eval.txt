@@ -1,0 +1,165 @@
+# Printed output of eval/docs_audit/run_judge_eval.sh: the optional TypeSafe/Jev judge re-measured on main.
+# Summary and claimed-vs-measured table: judge_eval.md next to this file.
+#
+# host: spark-1693
+# date (UTC): 2026-09-30T14:12:04Z
+# checkout: /home/luis/code/doc2mark-d2m-docs-audit-becb74b
+# sha: becb74bc46b4aad3090232e5b6f6cee73de86cb6 (uncommitted changes: 0 files)
+# judge_sets base: cb0018e (cb0018e6f65730df90e3552a5d2c582c7bac3fa1)
+# image: d2m-e2e:0a3d689002a4 (sha256:8d42cffeaab22041c340c7eb5d3d2ff0878223e5090f825d16e83ff3be982bc2 arm64)
+# command (on spark2): D2M_JUDGE_SETS_BASE=cb0018e eval/docs_audit/run_judge_eval.sh ~/code/doc2mark-d2m-docs-audit-becb74b OUT_DIR
+# eval environment: python 3.12.14 (aarch64); doc2mark 0.6.1, typesafe-sdk 0.7.2, pymupdf 1.28.2, pillow 12.3.0, fonttools (not installed)
+# Both verdict caches started empty: runs 1 and 3 send real requests, run 2 replays run 1's verdicts, and
+# the rebuilds in 4 use no network. The private deck (--deck) was not used. The stderr of every step was empty.
+
+======== 1. python eval/judge_eval.py --calibrate --cache-dir /tmp/judge-cache --json /out/judge_eval.json
+======== (fresh verdict cache: 344 requests)
+
+hook         set      method       acc   prec recall   tp  fp  fn  tn   (action: positive class)
+legibility   train    rule       59.6%  88.9%  28.6%    8   1  20  23   (illegible page; n=52, judge asked 43, threshold 0.8)
+legibility   train    rule+jev   98.1%  96.6%  100%    28   1   0  23   (illegible page; n=52, judge asked 43, threshold 0.8)
+legibility   test     rule       67.4%  100%   37.5%    9   0  15  22   (illegible page; n=46, judge asked 37, threshold 0.8)
+legibility   test     rule+jev   100%   100%   100%    24   0   0  22   (illegible page; n=46, judge asked 37, threshold 0.8)
+legibility   external rule       68.8%  100%   16.7%    1   0   5  10   (illegible page; n=16, judge asked 15, threshold 0.8)
+legibility   external rule+jev   100%   100%   100%     6   0   0  10   (illegible page; n=16, judge asked 15, threshold 0.8)
+boilerplate  train    rule       52.4%    n/a   0.0%    0   0  20  22   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+boilerplate  train    rule+jev   95.2%  100%   90.0%   18   0   2  22   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+             train    output: 83 repeated copies removed, 0 of them wrongly; 11 chrome copies left in
+boilerplate  test     rule       50.0%    n/a   0.0%    0   0  21  21   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+boilerplate  test     rule+jev   95.2%  100%   90.5%   19   0   2  21   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+             test     output: 62 repeated copies removed, 0 of them wrongly; 2 chrome copies left in
+boilerplate  external rule       66.7%    n/a   0.0%    0   0   1   2   (thinned to one copy; n=3, judge asked 3, threshold 0.7)
+boilerplate  external rule+jev   100%   100%   100%     1   0   0   2   (thinned to one copy; n=3, judge asked 3, threshold 0.7)
+             external output: 13 repeated copies removed, 0 of them wrongly; 0 chrome copies left in
+non_content  train    rule       73.6%  100%   45.5%   20   0  24  47   (no content; n=91, judge asked 71, threshold 0.95)
+non_content  train    rule+jev   94.5%  97.6%  90.9%   40   1   4  46   (no content; n=91, judge asked 71, threshold 0.95)
+             train    kept but flagged non_content_suspected: 4 (3 of them refusals)
+non_content  test     rule       76.7%  100%   52.3%   23   0  21  46   (no content; n=90, judge asked 67, threshold 0.95)
+non_content  test     rule+jev   97.8%  97.7%  97.7%   43   1   1  45   (no content; n=90, judge asked 67, threshold 0.95)
+             test     kept but flagged non_content_suspected: 3 (1 of them refusals)
+non_content  external rule       62.5%    n/a   0.0%    0   0   9  15   (no content; n=24, judge asked 24, threshold 0.95)
+non_content  external rule+jev   83.3%  100%   55.6%    5   0   4  15   (no content; n=24, judge asked 24, threshold 0.95)
+             external kept but flagged non_content_suspected: 3 (3 of them refusals)
+
+legibility   calibrated threshold 0.8 (pipeline 0.7); fresh requests 95, p50 211.9 ms, p95 263.9 ms, 684 input tokens, $0.0000287 per request
+boilerplate  calibrated threshold 0.7 (pipeline 0.5); fresh requests 87, p50 207.4 ms, p95 246.9 ms, 573 input tokens, $0.0000241 per request
+    TEST miss bp-ja-notice-pair-1 (copyright): label 1, p=0.61
+    TEST miss bp-stamp-pair-1 (print_timestamp): label 1, p=0.67
+non_content  shipped threshold 0.95 (pipeline 0.5); fresh requests 162, p50 210.0 ms, p95 269.3 ms, 446 input tokens, $0.0000187 per request
+    TEST miss nc-zh-request-refusal (refusal_ml): label 1, p=0.92
+    TEST miss nc-search-no-text (ui_error): label 0, p=0.95
+    EXTERNAL miss f-nc-black (no_content): label 1, p=0.93
+    EXTERNAL miss f-nc-blurred (no_content): label 1, p=0.91
+    EXTERNAL miss f-nc-ja-none (no_content): label 1, p=0.94
+    EXTERNAL miss f-nc-only-photo (no_content): label 1, p=0.85
+
+judge totals: {"asked": 0, "cached": 0, "fresh": 344, "failed": 0, "input_tokens": 187116, "last_error": null, "cost_usd": 0.00785887, "latency_p50_ms": 209.9, "latency_p95_ms": 266.9, "model": "jev-1.13.0"}
+
+======== 2. python eval/judge_eval.py --cache-dir /tmp/judge-cache
+======== (shipped thresholds; replays the verdicts of 1 from its cache: 0 requests)
+
+hook         set      method       acc   prec recall   tp  fp  fn  tn   (action: positive class)
+legibility   train    rule       59.6%  88.9%  28.6%    8   1  20  23   (illegible page; n=52, judge asked 43, threshold 0.8)
+legibility   train    rule+jev   98.1%  96.6%  100%    28   1   0  23   (illegible page; n=52, judge asked 43, threshold 0.8)
+legibility   test     rule       67.4%  100%   37.5%    9   0  15  22   (illegible page; n=46, judge asked 37, threshold 0.8)
+legibility   test     rule+jev   100%   100%   100%    24   0   0  22   (illegible page; n=46, judge asked 37, threshold 0.8)
+legibility   external rule       68.8%  100%   16.7%    1   0   5  10   (illegible page; n=16, judge asked 15, threshold 0.8)
+legibility   external rule+jev   100%   100%   100%     6   0   0  10   (illegible page; n=16, judge asked 15, threshold 0.8)
+boilerplate  train    rule       52.4%    n/a   0.0%    0   0  20  22   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+boilerplate  train    rule+jev   95.2%  100%   90.0%   18   0   2  22   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+             train    output: 83 repeated copies removed, 0 of them wrongly; 11 chrome copies left in
+boilerplate  test     rule       50.0%    n/a   0.0%    0   0  21  21   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+boilerplate  test     rule+jev   95.2%  100%   90.5%   19   0   2  21   (thinned to one copy; n=42, judge asked 42, threshold 0.7)
+             test     output: 62 repeated copies removed, 0 of them wrongly; 2 chrome copies left in
+boilerplate  external rule       66.7%    n/a   0.0%    0   0   1   2   (thinned to one copy; n=3, judge asked 3, threshold 0.7)
+boilerplate  external rule+jev   100%   100%   100%     1   0   0   2   (thinned to one copy; n=3, judge asked 3, threshold 0.7)
+             external output: 13 repeated copies removed, 0 of them wrongly; 0 chrome copies left in
+non_content  train    rule       73.6%  100%   45.5%   20   0  24  47   (no content; n=91, judge asked 71, threshold 0.95)
+non_content  train    rule+jev   94.5%  97.6%  90.9%   40   1   4  46   (no content; n=91, judge asked 71, threshold 0.95)
+             train    kept but flagged non_content_suspected: 4 (3 of them refusals)
+non_content  test     rule       76.7%  100%   52.3%   23   0  21  46   (no content; n=90, judge asked 67, threshold 0.95)
+non_content  test     rule+jev   97.8%  97.7%  97.7%   43   1   1  45   (no content; n=90, judge asked 67, threshold 0.95)
+             test     kept but flagged non_content_suspected: 3 (1 of them refusals)
+non_content  external rule       62.5%    n/a   0.0%    0   0   9  15   (no content; n=24, judge asked 24, threshold 0.95)
+non_content  external rule+jev   83.3%  100%   55.6%    5   0   4  15   (no content; n=24, judge asked 24, threshold 0.95)
+             external kept but flagged non_content_suspected: 3 (3 of them refusals)
+
+legibility   shipped threshold 0.8 (pipeline 0.7); fresh requests 95, p50 211.9 ms, p95 263.9 ms, 684 input tokens, $0.0000287 per request
+boilerplate  shipped threshold 0.7 (pipeline 0.5); fresh requests 87, p50 207.4 ms, p95 246.9 ms, 573 input tokens, $0.0000241 per request
+    TEST miss bp-ja-notice-pair-1 (copyright): label 1, p=0.61
+    TEST miss bp-stamp-pair-1 (print_timestamp): label 1, p=0.67
+non_content  shipped threshold 0.95 (pipeline 0.5); fresh requests 162, p50 210.0 ms, p95 269.3 ms, 446 input tokens, $0.0000187 per request
+    TEST miss nc-zh-request-refusal (refusal_ml): label 1, p=0.92
+    TEST miss nc-search-no-text (ui_error): label 0, p=0.95
+    EXTERNAL miss f-nc-black (no_content): label 1, p=0.93
+    EXTERNAL miss f-nc-blurred (no_content): label 1, p=0.91
+    EXTERNAL miss f-nc-ja-none (no_content): label 1, p=0.94
+    EXTERNAL miss f-nc-only-photo (no_content): label 1, p=0.85
+
+judge totals: {"asked": 0, "cached": 344, "fresh": 0, "failed": 0, "input_tokens": 0, "last_error": null, "cost_usd": 0.0, "latency_p50_ms": null, "latency_p95_ms": null, "model": "jev-1.13.0"}
+
+======== 3. whole documents: judge_eval.document_run (OCR on, an OCR stand-in that returns nothing),
+======== a second fresh verdict cache, then the same from that cache, then without a judge (runner/documents.py)
+Consider using the pymupdf_layout package for a greatly improved page layout analysis.
+12-page text report: 12 pages; asked 13 {'legibility': 12, 'boilerplate': 1}, fresh 13, failed 0, input tokens 6790, cost $0.00028518, wall 1.2 s; re-run: fresh 0, cached 13, wall 0.04 s
+8-slide deck with a brand line: 8 pages; asked 10 {'legibility': 8, 'boilerplate': 2}, fresh 10, failed 0, input tokens 5051, cost $0.00021214, wall 1.02 s; re-run: fresh 0, cached 10, wall 0.05 s
+3-page letter with a letterhead: 3 pages; asked 3 {'legibility': 3}, fresh 3, failed 0, input tokens 1679, cost $7.052e-05, wall 0.41 s; re-run: fresh 0, cached 3, wall 0.02 s
+12-page text report: no judge 0.04 s; added time with the judge +1.16 s
+8-slide deck with a brand line: no judge 0.03 s; added time with the judge +0.99 s
+3-page letter with a letterhead: no judge 0.02 s; added time with the judge +0.39 s
+
+======== 4. labelled sets rebuilt from this checkout (python eval/judge_sets.py --out ..., no network)
+======== and compared item by item with the committed tests/data/judge (runner/compare_sets.py)
+set builder environment, as installed: python 3.12.14 (aarch64); doc2mark 0.6.1, typesafe-sdk 0.7.2, pymupdf 1.28.2, pillow 12.3.0, fonttools 4.66.1
+set builder environment, pinned: python 3.12.14 (aarch64); doc2mark 0.6.1, typesafe-sdk 0.7.2, pymupdf 1.27.2, pillow 12.2.0, fonttools 4.61.1
+
+---- rebuilt with the pinned versions (PyMuPDF 1.27.2, as the committed sets were built), plus the control
+---- rebuilt from cb0018e (the merge of PR #22) in the same environment
+== committed tests/data/judge vs rebuilt from this checkout
+   /work/tests/data/judge
+   /out/judge_sets_rebuild
+legibility: identical (102 items)
+boilerplate: identical (84 items)
+non_content: identical (181 items)
+non_content_ambiguous: identical (42 items)
+external/legibility: identical (16 items)
+external/boilerplate: identical (20 items)
+external/non_content: identical (24 items)
+
+== committed tests/data/judge vs rebuilt from the base commit (control)
+   /work/tests/data/judge
+   /out/judge_sets_rebuild_base
+legibility: identical (102 items)
+boilerplate: identical (84 items)
+non_content: identical (181 items)
+non_content_ambiguous: identical (42 items)
+external/legibility: identical (16 items)
+external/boilerplate: identical (20 items)
+external/non_content: identical (24 items)
+
+== rebuilt from the base commit vs rebuilt from this checkout (code changes only)
+   /out/judge_sets_rebuild_base
+   /out/judge_sets_rebuild
+legibility: identical (102 items)
+boilerplate: identical (84 items)
+non_content: identical (181 items)
+non_content_ambiguous: identical (42 items)
+external/legibility: identical (16 items)
+external/boilerplate: identical (20 items)
+external/non_content: identical (24 items)
+
+---- rebuilt with the versions this checkout installs today (PyMuPDF 1.28.2)
+== committed tests/data/judge vs rebuilt from this checkout
+   /work/tests/data/judge
+   /out/judge_sets_rebuild_installed
+legibility: identical (102 items)
+boilerplate: identical (84 items)
+non_content: identical (181 items)
+non_content_ambiguous: identical (42 items)
+external/legibility: identical (16 items)
+external/boilerplate: identical (20 items)
+external/non_content: identical (24 items)
+
+judge_sets_rebuild: Designed lines the pipeline does not ask about: 184 texts; repeated on 2+ pages: 50, of which the rule keeps exactly one copy: 50 (Counter({'one': 31, 'all': 19}))
+judge_sets_rebuild_base: Designed lines the pipeline does not ask about: 184 texts; repeated on 2+ pages: 50, of which the rule keeps exactly one copy: 50 (Counter({'one': 31, 'all': 19}))
+judge_sets_rebuild_installed: Designed lines the pipeline does not ask about: 184 texts; repeated on 2+ pages: 50, of which the rule keeps exactly one copy: 50 (Counter({'one': 31, 'all': 19}))

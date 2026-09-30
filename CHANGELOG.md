@@ -488,6 +488,15 @@ else applies by default.
   set or the `typesafe_sdk` logger is configured; the key is read from `TYPESAFE_API_KEY`. With the judge
   enabled, text does leave the machine for TypeSafe; see `docs/judge.rst`. (#22)
 
+### Documentation
+- **README and docs checked against the code and rewritten.** The README is a pitch with a quick start,
+  a re-measured merged-cell comparison with markitdown and Docling, and links into the docs; the Sphinx
+  site is reorganised into getting started, user guide and an API reference generated with autodoc, with
+  new pages for installation, a minimal RAG pipeline, loading and batches, the result model and every
+  `metadata.extra` key, PDF text structure (reading order, verbatim-first running headers), images,
+  chunking and troubleshooting. Every code example and CLI command of README.md and docs/ runs in the
+  E2E image (`eval/docs_audit/`), and the judge numbers were re-measured. (#27)
+
 ## [0.6.1] - 2026-07-03
 
 ### Added

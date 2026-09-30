@@ -1,5 +1,5 @@
-Content-aware OCR policy
-========================
+When pages and pictures are OCR'd
+=================================
 
 doc2mark decides *how* to OCR a document from the document's **content**, not
 from its file extension. The same content-based routing applies to PDFs and to
@@ -17,12 +17,13 @@ from the document's structure (selectable text, ruled tables) and emitted
 authoritative source for the BM42 sparse-retrieval index, so every printed token
 is preserved character-for-character.
 
-Only a **true image-page** -- a slide or scan whose content is baked into
-pixels with no usable text layer -- is sent to an LLM vision model. The model is
-asked to transcribe that page verbatim and *also* synthesize a clean Markdown
+Only a **true image page** -- a slide or scan whose content is baked into pixels
+with no usable text layer -- is OCR'd as a whole page. An LLM provider is asked
+to transcribe that page verbatim and *also* synthesize a clean Markdown
 re-layout, but it is never allowed to drop real printed values. A text layer
 that exists but cannot be trusted -- undecodable glyphs, an invisible scanner-OCR
-layer, content drawn as vector outlines -- sends *that page* to OCR as well.
+layer, content drawn as vector outlines -- sends *that page* to OCR as well. On
+the other pages, pictures that carry something to read are OCR'd one by one.
 
 The policy is layered. Each layer narrows the decision:
 
@@ -115,9 +116,9 @@ density as well keeps such documents on the deterministic ``"text"`` path.
 Text density is script-aware: ``text_weight`` counts only non-whitespace,
 legible characters (undecodable glyphs do not count), and a CJK ideograph counts
 three (a kana or hangul syllable two), because one such character carries about
-as much content as three (two) Latin letters. The same six statements measure
-about 290 in English and 260 in Chinese, where a raw character count saw 339
-versus 91 and sent only the Chinese deck to OCR.
+as much content as three (two) Latin letters, so a Chinese deck and its English
+version measure about the same. The page thresholds below (50, 100, 300) are in
+the same units.
 
 Layer 1 -- the document strategy and page routes
 -------------------------------------------------
@@ -204,12 +205,8 @@ not missed.
 
 The margins are hysteresis: a page near a threshold follows its document, so a
 deck or a report keeps one consistent treatment, and only clear outliers switch.
-For example, a Traditional-Chinese product deck with about 82 characters of
-slide labels per page over full-bleed artwork (about 160 legible text units
-per page against the limit of 200) routes ``"image"``; its densest slide (470
-characters, over artwork covering the whole page) stays ``"image"`` with it,
-because its labels sit on artwork that carries text the text layer does not
-have.
+Running headers, footers and page numbers the pipeline removed are not re-added
+to an overridden page.
 
 Without OCR there is nothing to route: every page takes the text path.
 
@@ -223,23 +220,28 @@ whole-page OCR already captures, an invisible scanner-OCR layer, or a garbled
 layer, so the deterministic text layer is *not* also emitted -- emitting it
 would duplicate tokens or add garbage.
 
-If the render's OCR comes back empty (a blank page, a refusal, a failure), the
-page falls back to its own text layer, with a warning, instead of disappearing.
-A page that shows content (ink on its render) also carries the marker
-``[page N: OCR returned no content]``, so a page the OCR could not read never
-vanishes silently; a blank page needs no marker. Such pages are listed in
-``metadata.extra["ocr_images"]["unread_pages"]``.
+If the render's OCR answers with nothing (a blank page, a refusal), the page
+falls back to its own text layer instead of disappearing (with a warning when
+that layer has text). A page that shows content (ink on its render) also carries
+the marker ``[page N: OCR returned no content]``, so a page the OCR could not
+read never vanishes silently; a blank page needs no marker. Such pages are
+listed in ``metadata.extra["ocr_images"]["unread_pages"]``. If the render's OCR
+*failed* (no answer: a timeout, a server error), the page takes the text route
+instead: its text layer is emitted and its pictures show ``[image: OCR
+unavailable]``; the failure is counted in ``ocr_images["failed"]`` and
+``ocr_issues["failed"]``.
 
 These whole-page renders also request ``page_markdown`` synthesis (Layer 4).
 
 Renders are streamed: pages are rendered and sent to the provider in batches of
 at most 32 images (or twice the provider's ``max_concurrency`` when that is
-higher) and 128 MiB of image data, and each batch's images are released once it
-is answered. Memory stays flat whatever the page count: a 400-page scan whose
-renders are about 2.9 MB each peaked at 2.7 GB when every render was held for
-one call, and peaks at 0.26 GB streamed, as a 40-page one does (Linux). The
-output keeps page order. Identical renders (blank pages, repeated slides) are
-one request.
+higher), a batch is sent early once 128 MiB of image data are pending, and each
+batch's images are released once it is answered, so memory does not grow with
+the page count (the E2E suite checks that a 160-page scan stays under 768 MB).
+Renders and pictures go in separate batches. The output keeps page order.
+Identical renders (blank pages, repeated slides) are one request, except with
+neighbour-page context (``context_pages`` 1 or more), where each render carries
+its own context.
 
 The ``"text"`` route
 ~~~~~~~~~~~~~~~~~~~~
@@ -342,18 +344,18 @@ What is cached: an OCR answer is cached (``ocr_cache``) whatever it says,
 including an answer with no text and a refusal or "no readable text" statement
 -- a blank page or a photo without words gets that answer every time, and
 asking again would cost a call (with the LLM providers two: the structured call
-and the free-form recovery behind it) on every run. Only a failed answer, and a
-result that still withholds values after the router firewall's redo, are asked
-again on the next run, never replayed; an entry of either kind already in a
-cache is a miss. A provider's own refusal or safety block (OpenAI's refusal
+and the free-form recovery behind it) on every run. Only a failed answer, a
+result that still withholds values after the router firewall's redo, and an
+answer the non-content judge could not screen are asked again on the next run,
+never replayed; an entry of such a kind already in a cache is a miss. A provider's own refusal or safety block (OpenAI's refusal
 field, a Gemini SAFETY or RECITATION block) may not last: it is replayed for
 ``refusal_ttl_seconds`` only (10 minutes by default; a hit does not extend it).
 A converted document is not written to ``cache_dir`` when its OCR failed
 somewhere (``failed`` requests, ``ocr_issues["failed"]``), left a page showing
 content unread (``unread_pages``), or holds a provider's own refusal or block
-(``ocr_issues["provider_refused"]``); answers with no text and "no readable
-text" statements do not keep it out. A skipped cache write is logged at INFO with the
-reason.
+(``ocr_issues["provider_refused"]``), or, with a judge, when the judge could not
+answer every question; answers with no text and "no readable text" statements do
+not keep it out. A skipped cache write is logged at INFO with the reason.
 
 Text-layer quality gate
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -385,10 +387,11 @@ the body lines it visually outweighs, while one decorative glyph does not tip a
 page. A page is **garbled** when at least ``MIN_GARBAGE_GLYPHS`` (3) garbage
 glyphs make up at least ``GARBAGE_TEXT_RATIO`` (10 %) of its weighted text.
 
-- With an OCR provider, a garbled page is OCR'd from its render
-  (``illegible_text_layer``).
-- Without one, the text is kept as extracted (there is nothing better), the page
-  is listed in ``metadata.extra["text_layer_quality"]`` and a warning names it.
+- With OCR on (a provider and ``ocr_images=True``), a garbled page is OCR'd from
+  its render (``illegible_text_layer``).
+- Without OCR, the text is kept as extracted (there is nothing better), the page
+  is listed in ``metadata.extra["text_layer_quality"]`` with ``"action":
+  "kept"`` and a warning names it.
 
 Garbled pages never decide for the document, neither the worst page nor a share
 of them: a brochure whose cover title (or cover and one more page) is unreadable
@@ -406,6 +409,8 @@ wrong ToUnicode map, a bad invisible OCR layer -- and no character rule can see
 them. For those, pass an optional judge:
 
 .. code-block:: python
+
+   from doc2mark import UnifiedDocumentLoader
 
    def judge(page_text: str) -> float | None:
        ...  # probability (0..1) that page_text is legible, or None
@@ -472,7 +477,7 @@ listed in ``metadata.extra["hidden_text"]`` and a warning names them.
 What this cannot catch: invisible text laid over a region of a picture that
 shows something (a photo, scanned text) or over outlined glyphs (or other ink
 broken into strokes, such as a dense hatching) looks exactly like an OCR layer
-and is kept as the page's text. With PyMuPDF older than 1.27,
+and is kept as the page's text. With PyMuPDF older than 1.27.1,
 which cannot remove only the invisible glyphs where they touch painted text,
 hidden text touching painted text inside a table can reach that table's cells
 (paragraphs are not affected).
@@ -486,15 +491,16 @@ includes them):
 - ``ocr_routing`` (OCR on): ``{"document_route": "text", "overrides": [{"page":
   1, "route": "image", "reason": "illegible_text_layer"}]}`` -- only the pages
   whose route differs from the document's are listed.
-- ``text_layer_quality``: one entry per garbled page, with ``garbage_ratio``,
-  ``garbage_glyphs``, ``judge_legibility`` and ``action`` (``"ocr"`` or
-  ``"kept"``).
+- ``text_layer_quality``: one entry per garbled page, ``{"page", "legible":
+  false, "garbage_ratio", "garbage_glyphs", "judge_legibility", "action": "ocr" |
+  "kept"}``.
 - ``hidden_text``: pages whose hidden text was left out, with its length
   (invisible duplicates of painted text are dropped without being counted).
 
-A document that yields no text at all never does so silently: a warning says so
-and, without OCR, points at the pages that need it (scans, vector outlines);
-with OCR, pages that show content but produced no text are named too.
+A document that yields no text at all never does so silently: a warning says so.
+When some text was extracted, a warning names the pages that need OCR (without
+OCR: scans, vector outlines) or that show content but produced no text (with
+OCR).
 
 Converted documents cached by ``UnifiedDocumentLoader(cache_dir=...)`` are keyed
 by the legibility judge and by ``strategy.ROUTING_VERSION``, so a new judge or a
@@ -507,7 +513,7 @@ Office documents reach the *same* content-based decision, without a separate
 heuristic. ``OfficeProcessor._maybe_route_image_dominant`` runs before native
 extraction and is gated tightly:
 
-- Only ``.docx`` and ``.pptx`` are eligible. **``.xlsx`` never routes** -- a
+- Only ``.docx`` and ``.pptx`` are eligible. An ``.xlsx`` never routes -- a
   spreadsheet is a data grid, always read natively.
 - OCR must be requested (``ocr_images=True``; the loader turns
   ``extract_images`` on for it) and an OCR provider must be configured.
@@ -516,21 +522,27 @@ extraction and is gated tightly:
 structure -- no rendering required -- and calls the same
 ``decide_doc_strategy`` (the OOXML text count is a plain character count):
 
-- **PPTX** (``_pptx_image_signals``): mean picture-shape coverage and mean text
-  characters **per slide**.
-- **DOCX** (``_docx_image_signals``): total inline-picture coverage against one
-  page, and total paragraph text length. Totals suffice because a real
-  multi-page text document easily clears the 200-character limit, and
-  undercounting floating images biases toward ``"text"`` -- the safe direction.
+- **PPTX** (``_pptx_image_signals``): per slide, the union of every visible
+  picture (picture shapes, grouped and placeholder pictures, picture fills, the
+  slide's, layout's or master's background picture, layout and master
+  pictures; hidden shapes excluded) and the text of text frames and table
+  cells; then the means over the slides.
+- **DOCX** (``_docx_image_signals``): the total extent of inline and floating
+  pictures (body, headers, footers, text boxes) against one page, and the total
+  rendered text (body, tables, content controls, text boxes, headers and
+  footers; deleted revisions excluded).
 
-When the decision is ``"image"``, ``_process_as_image_dominant`` converts the
-file to PDF via LibreOffice and runs it through the PDF pipeline, which measures
-the converted pages and routes them (Layer 1: whole-page render OCR +
-``page_markdown`` synthesis for the image pages), then restores the original
-Office identity in the metadata and records ``metadata.extra['routed_via'] =
-'pdf'``. Text/table Office docs stay on the native pipeline. The route never
-raises: any failure (including no LibreOffice on the host) falls back cleanly to
-native extraction.
+These OOXML signals only pre-filter. When they say ``"image"``,
+``_process_as_image_dominant`` converts the file to PDF via LibreOffice, and
+the converted PDF's own document route decides: only when it is ``"image"`` is
+the PDF run through the PDF pipeline (Layer 1: whole-page render OCR +
+``page_markdown`` synthesis), with the original Office identity restored in the
+metadata and ``metadata.extra['routed_via'] = 'pdf'``. The route never raises:
+when the converted PDF routes as text, cannot be measured, or the conversion
+fails (no LibreOffice on the host), the file is read natively and
+``metadata.extra`` records ``routed_via: "native"`` with ``route_reason`` (for
+example ``"converted PDF routes text"``) or ``route_error``. Files the OOXML
+check passes over get no key.
 
 Layer 3 -- the per-image job-router (``task="auto"``)
 -----------------------------------------------------
@@ -601,19 +613,25 @@ Neighbor-page context tightens the gate
 
 When neighbor-page PDF context is attached (``context_pages`` > 0, for any
 PDF-capable model -- OpenAI and Gemini alike), the neighbors are read *only* to
-judge the host document's purpose -- never transcribed. The non-verbatim policies (``describe`` and
-``screenshot``) may then be applied **only** when the model's
-``self_confidence >= 0.7`` *and* ``legibility == "high"``; otherwise, and
-whenever context is absent or conflicting, it falls back to verbatim.
+judge the host document's purpose -- never transcribed. The non-verbatim
+policies (``describe`` and ``screenshot``) may then be applied **only** when the
+model's ``self_confidence >= 0.7`` *and* ``legibility == "high"``; otherwise it
+falls back to verbatim. Without context (the default) every ``auto`` request
+carries a clause that keeps it verbatim, and withholding without context counts
+as a violation, so nothing is withheld.
 
 The ``router_invariants`` firewall
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``doc2mark.ocr.schema.router_invariants(page)`` is a mechanical check (returns a
-list of violation strings; empty means OK) that enforces the policy after the
-fact -- a BM42-safety net intended as a CI / eval assertion over recorded
-structured outputs. It guarantees that **real printed values are never withheld
-except on a high-confidence screenshot.** Among the invariants it checks:
+list of violation strings; empty means OK) of the policy, for CI and evaluation
+over recorded structured outputs. Its withholding part
+(``doc2mark.ocr.schema.withholding_violations``) also runs on every structured
+OCR result at run time: a result that withholds values against the policy is
+redone verbatim (one extra call), so **real printed values are never withheld
+except on a high-confidence screenshot**; withheld values that remain are
+marked ``[N illustrative ... not transcribed]`` and counted in
+``ocr_issues["withheld"]``. Among the invariants ``router_invariants`` checks:
 
 - Illustrative / withheld content (``illustrative=True`` on a table, field,
   metric, or figure) may appear **only** when ``document_type == "screenshot"``.
@@ -665,20 +683,21 @@ Because the routing is automatic, the only thing you do is enable OCR:
 
    from doc2mark import UnifiedDocumentLoader
 
-   loader = UnifiedDocumentLoader(ocr_provider="openai")
+   loader = UnifiedDocumentLoader(ocr_provider="tesseract")
 
-   # A slide deck or scan -> "image" strategy: whole-page render OCR + page_markdown.
-   deck = loader.load("pitch_deck.pdf", ocr_images=True)
+   # A scan or a slide deck of pictures -> "image": whole-page render OCR.
+   scan = loader.load("scan.pdf", ocr_images=True)
+   print(scan.metadata.extra["ocr_routing"])
 
-   # A text report -> "text" strategy: deterministic text/tables, verbatim, with
-   # only its embedded figures sent to the model -- and, page by page, its scanned
-   # appendix, a garbled title page or a vector-outlined flyer OCR'd from the render.
-   report = loader.load("annual_report.pdf", ocr_images=True)
-   print(report.metadata.extra.get("ocr_routing"))
+   # A text report -> "text": its text and tables verbatim, pictures that carry text OCR'd, and,
+   # page by page, a scanned appendix, a garbled title page or an outlined flyer OCR'd from its render.
+   report = loader.load("report.pdf", ocr_images=True)
+   print(report.metadata.extra["ocr_routing"])
 
-   # Same content-based decision for Office; an image-dominant .pptx is routed
-   # through the PDF image strategy, an ordinary .docx stays native.
-   slides = loader.load("slides.pptx", ocr_images=True)
+   # The same decision for Office: an image-dominant .pptx takes the PDF image route,
+   # an ordinary .docx stays native (no "routed_via" key: the route was not tried).
+   docx = loader.load("report.docx", ocr_images=True)
+   print(docx.metadata.extra.get("routed_via"))
 
 See :doc:`/ocr` for the OCR facade, providers, tasks, and the structured-output
 schema, and :doc:`/api/schema` for the full model reference.

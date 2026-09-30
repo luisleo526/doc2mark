@@ -1,10 +1,11 @@
 Structured OCR Schema
 =====================
 
-doc2mark's OCR layer does not return a single free-form markdown blob. Instead,
-every image becomes a structured :class:`~doc2mark.ocr.schema.OCRPage`, carried
-on ``OCRResult.document``. The schema enforces a hard boundary between two
-concerns:
+doc2mark's OCR layer does not return a single free-form markdown blob. In the
+default structured mode, every image becomes a structured
+:class:`~doc2mark.ocr.schema.OCRPage`, carried on ``OCRResult.document``
+(``None`` for ``structured=False`` answers and failed Tesseract images). The schema
+enforces a hard boundary between two concerns:
 
 - **raw** — what is *literally* on the page: a verbatim transcription, any
   tables, label/value fields, and additive verbatim indexes (headings, dates,
@@ -14,13 +15,15 @@ concerns:
   part that requires a language model to reason about the content.
 
 This split is the most important idea in the schema. The ``raw`` half is
-always present and is the trustworthy, auditable record of the page. It is the
-token source for the BM42 sparse index, so everything in it is verbatim. The
-``interpretation`` half is :data:`None` whenever the model was not asked to —
-or could not — reason about the page, specifically:
+always present and is the record of what the page shows; the prompts require it
+to be verbatim (one exception: when a structured answer came back empty and the
+free-form retry answered instead, ``raw.text`` holds that free-form answer). The
+``interpretation`` half is ``None`` when the model was not asked to -- or could
+not -- reason about the page:
 
-- ``detail="raw"`` was requested (raw transcription only),
-- the provider is non-LLM (e.g. Tesseract, which cannot infer), or
+- ``detail="raw"`` was requested (Vertex AI drops the interpretation; OpenAI asks
+  the model to leave it out),
+- the provider is Tesseract, or
 - the structured-output parse failed and the layer fell back gracefully.
 
 Every model on this page is a Pydantic ``BaseModel`` subclass, and **every
@@ -52,9 +55,11 @@ relation's subject — is an additive copy of a string that already appears in
 ``raw.text``. This keeps the sparse index intact (BM42 reads ``raw.text``)
 while making the same facts queryable as typed structure.
 
-That invariant is mechanically enforced. :func:`~doc2mark.ocr.schema.router_invariants`
-returns a list of violations for a page (empty means OK) and is intended as a
-CI / eval assertion over recorded outputs. It checks, among other things, that
+:func:`~doc2mark.ocr.schema.router_invariants` checks that invariant: it returns
+a list of violations for a page (empty means OK), for CI and evaluation over
+recorded outputs. Its withholding part (``withholding_violations``) also runs on
+every structured result at run time and triggers a verbatim redo. It checks,
+among other things, that
 every verbatim figure string is a substring of ``raw.text``, that every
 ``Section.heading`` came from ``raw.headings``, that ``primary_date`` was
 selected from ``raw.dates`` rather than fabricated, that entity names and
@@ -63,8 +68,9 @@ relation subjects/objects are substrings of ``raw.text``, and that withheld
 
 When you read a page, treat ``raw`` as ground truth and ``interpretation`` as
 an *additive overlay* that is safe to ignore. Always check
-``page.interpretation is not None`` before reading interpretive fields — with
-``detail="raw"`` or a Tesseract backend it will be ``None``.
+``page.interpretation is not None`` before reading interpretive fields: it is ``None``
+for Tesseract and for Vertex AI with ``detail="raw"``, and usually for OpenAI with
+``detail="raw"`` (the model is asked to leave it out).
 
 
 ``OCRPage`` — the top-level result
@@ -82,14 +88,15 @@ extraction with the optional ``interpretation``, and exposes one method.
        interpretation: Optional[Interpretation] = None
 
 ``to_markdown() -> str``
-    Render a readable markdown view of the page, used as the back-compatible
-    ``OCRResult.text``. It prefers structured tables/fields over the flat text
-    dump, and renders the additive overlays (real metrics, then figures, then a
-    section outline) degraded-safe. When the interpretation carries a
-    ``page_markdown`` whole-page rendering that verifiably covers the verbatim
-    text, that structured rendering replaces the flat ``raw.text`` dump (with a
-    hidden verbatim tail preserving any uncovered tokens so the index stays
-    complete).
+    Render a readable, escaped markdown view of the page, used as
+    ``OCRResult.text``: the page title (when ``raw.text`` does not start with it),
+    ``raw.text``, each table (``html``, else ``markdown``, else a table built from
+    ``headers`` / ``rows``), a table of the non-illustrative metrics, the figures
+    and, when sections carry summaries, a section outline. ``raw.fields``,
+    headings, dates, entities and the summary are not rendered. When the
+    interpretation carries a ``page_markdown`` whole-page rendering that covers at
+    least 85 % of the verbatim tokens, that rendering replaces ``raw.text`` (with a
+    hidden ``raw-verbatim-tail`` comment keeping any uncovered tokens).
 
 .. autoclass:: doc2mark.ocr.schema.OCRPage
    :members:
@@ -167,9 +174,9 @@ a page's *meaning* — figures, hierarchy, and a knowledge graph. They are
 deliberately **shallow** (max nesting depth 4: ``OCRPage`` → ``interpretation``
 → ``figures`` → ``data_points``), with no recursion, no model-unions, and every
 field defaulted, so they stay fillable under
-``with_structured_output(json_schema)``. They are **additive and BM42-safe**:
-every verbatim string inside them mirrors text already in ``raw.text``, an
-invariant enforced by :func:`~doc2mark.ocr.schema.router_invariants`.
+``with_structured_output(json_schema)``. They are **additive**: every verbatim
+string inside them should mirror text already in ``raw.text``, an invariant
+:func:`~doc2mark.ocr.schema.router_invariants` checks.
 
 - **Metric** (above) — a typed number, in ``raw.metrics``.
 - **Figure** — one chart / diagram / infographic panel, in
@@ -326,3 +333,13 @@ the verbatim ``raw`` half and the model's ``interpretation`` half.
 
    # Single-string markdown view (back-compat OCRResult.text):
    print(page.to_markdown())
+
+
+Helpers
+-------
+
+.. autofunction:: doc2mark.ocr.schema.sanitize_table_html
+
+.. autofunction:: doc2mark.ocr.schema.router_invariants
+
+.. autofunction:: doc2mark.ocr.schema.withholding_violations
