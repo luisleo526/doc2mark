@@ -518,7 +518,8 @@ def test_cache_key_rejects_address_based_unstable_values():
         pass
 
     provider = FakeOCR()
-    provider.model_kwargs = {"client": CustomClient()}
+    # A request setting (client objects such as "client" or "rate_limiter" are not part of the key).
+    provider.model_kwargs = {"stop": CustomClient()}
 
     with pytest.raises(TypeError, match="stable OCR cache key"):
         build_ocr_cache_key(provider, b"image")
