@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr import cache as cache_module
 from doc2mark.ocr.base import TASK_PROMPTS, OCRConfig, OCRResult, Task
-from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache, RedisOCRCache, build_ocr_cache_key, ocr_settings_identity
+from doc2mark.ocr.cache import CachedOCR, RedisOCRCache, build_ocr_cache_key, ocr_settings_identity
 from doc2mark.ocr.openai import OpenAIOCR
 from doc2mark.ocr.refusal import screen_non_content
 from doc2mark.ocr.schema import OCRPage, RawExtraction

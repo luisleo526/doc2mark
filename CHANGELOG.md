@@ -468,6 +468,44 @@ else applies by default.
 - **One clip-path warning per PDF.** When MuPDF's clipped image extents do not pair up with a page's
   images, the warning that its pictures are measured without their clip paths is logged once per
   document instead of twice per page. (#26)
+- **Loader OCR settings reach the requests.** `top_p`, `frequency_penalty` and `presence_penalty` were
+  stored and never sent: they now go into the OpenAI request and to the Vertex AI (Gemini) client when set
+  to another value than the API default (1.0, 0.0, 0.0), so a default request is unchanged. `max_workers`
+  was ignored: it caps how many OCR requests run at once when `OCRConfig.max_concurrency` is not set (its
+  default is now `None`, which keeps LangChain's default). `default_prompt` never reached a model: it is
+  the prompt of free-form requests (`structured=False` and the retry of an empty structured answer), like
+  `prompt_template`. `timeout` and `max_retries` now reach Vertex AI too. (#29)
+- **Vertex AI and Gemini get their settings.** `OCR("vertex_ai", project=..., location=...)` raised
+  `TypeError`: the facade now passes the provider's own arguments (`project`, `location`, `timeout`,
+  `max_retries`, `max_workers`, `prompt_template`, `default_prompt`, the sampling settings) to the
+  provider, so `OCR("openai", timeout=60)` is the request timeout rather than the deprecated, inert
+  `OCRConfig.timeout`. The Vertex AI provider takes `OCRConfig.model`, `temperature` and `max_tokens`
+  (it kept its defaults), and `UnifiedDocumentLoader(ocr_provider="gemini", ...)` gets the same model,
+  project, location and other settings as `"vertex_ai"` (they were dropped). (#29)
+- **The OCR cache no longer answers with a result made under other settings.** Its key left out
+  `OCRConfig.task`, so a shared cache replayed a receipt answer for a table request; it now holds every
+  setting that changes an answer (task, parse-error mode, neighbour-page context tier, the config's model
+  settings, the response model and its schema, and the text of doc2mark's own prompts) and no longer
+  `max_concurrency`, which changes no answer. Key version `ocr-cache-v7` (default Redis prefix
+  `doc2mark:ocr:ocr-cache-v7`): entries of earlier versions are not read. (#29)
+- **`cache_dir` no longer returns OCR text made with other OCR settings.** Its key named only the OCR
+  provider's class, so after a change of model, task, language, detail, structured mode or prompt the
+  old OCR text came back; it now holds the same answer-changing settings as the OCR cache key. The
+  document cache schema is `doc2mark-document-cache-v2`, so files cached by earlier versions are
+  converted again once. (#29)
+- **A `non_content_judge` value that is not a probability is no verdict**, as it already was for the
+  other two hooks: 1.5 or 7 dropped a real OCR answer as "no content", and -1 or NaN counted as a verdict.
+  A value outside [0, 1], NaN or a non-number keeps the answer and, like `None`, is not cached. (#29)
+- **`token_usage` includes the free-form retry of an empty structured answer.** That second request's
+  tokens were missing from the result's and the document's `token_usage`. (#29)
+- **OpenAI with a custom `OCRConfig.response_model` works.** Every image failed with `OCRError:
+  '<Model>' object has no attribute 'interpretation'`; the answer is now parsed into your model, as
+  documented: `OCRResult.document` is that object and `OCRResult.text` its fields as escaped JSON. Vertex
+  AI does the same (it returned `document=None` and the model's `str()`), and the OCR cache, Redis
+  included, returns the parsed model. (#29)
+- **The DeprecationWarning for inert `OCRConfig` fields names your code.** It named a doc2mark line, so
+  Python's default filters hid it; it now names the line that created the provider or the loader, and a
+  script shows it without `-W`. (#29)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is
