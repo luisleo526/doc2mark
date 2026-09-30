@@ -21,10 +21,14 @@ every time. Only a failed answer (flagged ``failed`` in its metadata by the
 provider: a timeout, a rate limit, a server error) and a result that still
 withholds values after the router firewall's redo are asked again on the next
 run; an entry of either kind already in a cache is a miss, and each skipped write
-is logged at INFO. Likewise ``cache_dir`` (the loader's cache of converted
-documents) does not store a document whose OCR failed somewhere or left a page
-showing content unread (see ``metadata.extra["ocr_images"]`` in
-:doc:`ocr_policy`).
+is logged at INFO. The provider's own refusal or safety block (OpenAI's refusal
+field, a Gemini SAFETY or RECITATION block: ``metadata["non_content"] ==
+"provider_refusal"``) may not last, so it is cached for ``refusal_ttl_seconds``
+only (default 600, ten minutes), which a hit does not extend. Likewise
+``cache_dir`` (the loader's cache of converted documents, which never expires)
+does not store a document whose OCR failed somewhere, left a page showing content
+unread, or holds a provider's own refusal or block (see
+``metadata.extra["ocr_images"]`` and ``["ocr_issues"]`` in :doc:`ocr_policy`).
 
 Quick start
 -----------
@@ -126,6 +130,12 @@ Constructor parameters:
     Maximum number of times a hit can extend the TTL. Set to ``None`` for
     unlimited refreshes.
 
+``refusal_ttl_seconds`` (float, default ``600``)
+    How long a provider's own refusal or safety block is replayed. A hit does
+    not extend it (an entry stored with its own ``ttl_seconds`` through
+    ``set(key, result, ttl_seconds=...)`` is never extended by hits).
+    ``create_ocr_cache`` accepts it too.
+
 RedisOCRCache
 -------------
 
@@ -163,6 +173,9 @@ Constructor parameters:
     Same semantics as ``MemoryOCRCache``.
 
 ``max_refreshes`` (int or ``None``, default ``10``)
+    Same semantics as ``MemoryOCRCache``.
+
+``refusal_ttl_seconds`` (float, default ``600``)
     Same semantics as ``MemoryOCRCache``.
 
 ``key_prefix`` (str, default ``"doc2mark:ocr:ocr-cache-v3"``)

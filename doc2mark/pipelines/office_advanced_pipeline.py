@@ -680,8 +680,10 @@ class BaseOfficeLoader:
             return None
         return {"type": "text:image_description", "content": f"<image_ocr_result>{text}</image_ocr_result>", **fields}
 
-    def _ocr_image(self, image_bytes: bytes) -> str:
-        """Use OCR to convert image to text description"""
+    def _ocr_image(self, image_bytes: bytes, location: Optional[Dict[str, Any]] = None) -> str:
+        """Use OCR to convert image to text description. ``location`` is where the picture
+        sits (``{'slide': n}``, ``{'sheet': n, 'sheet_name': name}``), for the loader's OCR
+        issue record (see ``_issue_location``)."""
         if not image_bytes:
             return "No image data"
 
@@ -695,6 +697,9 @@ class BaseOfficeLoader:
                 kwargs['language'] = self.ocr.config.language
 
             result = self.ocr.process_image(image_bytes, **kwargs)
+            label_issues = getattr(self.ocr, "label_last_batch", None)
+            if callable(label_issues) and location:
+                label_issues([_issue_location(location)])
             if hasattr(result, 'text'):
                 self._ocr_cell_texts[_image_hash(image_bytes)] = plain_ocr_text(
                     result.text, getattr(result, 'document', None))
@@ -2386,7 +2391,7 @@ class PptxLoader(BaseOfficeLoader):
             img_hash = _image_hash(image_data)
             ocr_text = (ocr_results_map or {}).get(img_hash)
             if ocr_text is None:
-                ocr_text = self._ocr_image(image_data)
+                ocr_text = self._ocr_image(image_data, {'slide': slide_num})
             return self._ocr_description(ocr_text, page=slide_num)
         return {"type": "image", "content": self._extract_image_as_base64(image_data), "page": slide_num}
 
@@ -2409,7 +2414,7 @@ class PptxLoader(BaseOfficeLoader):
                 # Fallback to individual OCR
                 logger.warning(
                     f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
-                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
+                return self._ocr_description(self._ocr_image(image_data, {'slide': slide_num}), page=slide_num)
             else:
                 base64_data = self._extract_image_as_base64(image_data)
                 return {
@@ -2438,7 +2443,7 @@ class PptxLoader(BaseOfficeLoader):
                     return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
                 # Fallback to individual OCR
                 logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
-                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
+                return self._ocr_description(self._ocr_image(image_data, {'slide': slide_num}), page=slide_num)
             else:
                 # Return base64 encoded image
                 base64_data = self._extract_image_as_base64(image_data)
@@ -2757,27 +2762,30 @@ class XlsxLoader(BaseOfficeLoader):
                              if r1 <= position[0] <= r2 and c1 <= position[1] <= c2), position)
             if not (row_lo <= position[0] <= row_hi and col_lo <= position[1] <= col_hi):
                 continue
-            label = self._picture_label(image_data_cache.get((sheet.title, index)), ocr_images, ocr_results_map)
+            label = self._picture_label(image_data_cache.get((sheet.title, index)), ocr_images, ocr_results_map,
+                                        sheet.title)
             marks.setdefault(position, []).append(label)
             if label != "[Image]":
                 embedded.add(('anchor', index))
         for position, media in pictures.items():
-            label = self._picture_label(self._media_bytes(media), ocr_images, ocr_results_map)
+            label = self._picture_label(self._media_bytes(media), ocr_images, ocr_results_map, sheet.title)
             marks.setdefault(position, []).append(label)
             if label != "[Image]":
                 embedded.add(('media', media))
         return marks
 
-    def _picture_label(self, data: Optional[bytes], ocr_images: bool, ocr_results_map) -> str:
+    def _picture_label(self, data: Optional[bytes], ocr_images: bool, ocr_results_map,
+                       sheet_name: Optional[str] = None) -> str:
         """``[Image: <OCR text>]`` when OCR read the picture, else ``[Image]``. Only a picture
         whose OCR text went into its cell counts as embedded; any other picture is still
-        emitted after the table, so extracted image data is never dropped."""
+        emitted after the table, so extracted image data is never dropped. ``sheet_name``: the
+        picture's sheet, for the loader's OCR issue record."""
         if not (ocr_images and data):
             return "[Image]"
         img_hash = _image_hash(data)
         text = ocr_results_map.get(img_hash)
         if text is None:  # not in the batch: OCR it once, and remember it for the image item
-            text = ocr_results_map[img_hash] = self._ocr_image(data)
+            text = ocr_results_map[img_hash] = self._ocr_image(data, {'sheet': sheet_name} if sheet_name else None)
         # The cell's text is escaped by the table renderer: give it the plain OCR text.
         text = (self._ocr_cell_texts.get(img_hash, text) or "").strip()
         return f"[Image: {text}]" if text else "[Image]"
@@ -2905,7 +2913,7 @@ class XlsxLoader(BaseOfficeLoader):
                     else:
                         # Fallback to individual OCR
                         logger.warning(f"OCR result not found for image on sheet {sheet_name}, using fallback OCR")
-                        ocr_text = self._ocr_image(image_data)
+                        ocr_text = self._ocr_image(image_data, {'sheet': sheet_num, 'sheet_name': sheet_name})
                     item = self._ocr_description(ocr_text, page=sheet_num)
                     if item:
                         images.append(item)
@@ -2945,7 +2953,7 @@ class XlsxLoader(BaseOfficeLoader):
                             ocr_text = ocr_results_map[img_hash]
                         else:
                             logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
-                            ocr_text = self._ocr_image(image_data)
+                            ocr_text = self._ocr_image(image_data, {'sheet': sheet_num, 'sheet_name': sheet_name})
                         item = self._ocr_description(ocr_text, page=sheet_num)
                         if item:
                             images.append(item)

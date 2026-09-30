@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pymupdf
 
+from doc2mark.pipelines import pymupdf_compat
+
 logger = logging.getLogger(__name__)
 
 # --- What the page shows --------------------------------------------------------
@@ -127,6 +129,8 @@ def _clipped_image_boxes(page) -> Optional[List[pymupdf.Rect]]:
     clipped away comes back as an empty box). None when this PyMuPDF cannot tell."""
     clip = getattr(pymupdf, "TEXT_CLIP", None)
     if clip is None:
+        pymupdf_compat.missing("TEXT_CLIP", "pictures are measured without their clip paths, so a picture that "
+                                            "a clip path hides is still taken as shown and one it crops is read whole")
         return None
     try:
         textpage = page.get_textpage(flags=pymupdf.TEXT_PRESERVE_IMAGES | clip)
@@ -138,32 +142,50 @@ def _clipped_image_boxes(page) -> Optional[List[pymupdf.Rect]]:
             for block in blocks]
 
 
+def _shown_parts(page, infos: Sequence[dict]) -> List[pymupdf.Rect]:
+    """The part the page shows of each image of ``infos`` (``get_image_info()``, in its order): its box on
+    the visible page, cut by its clip paths (see :func:`_clipped_image_boxes`) when the clipped extents
+    match the images one to one."""
+    area = page_area(page)
+    clipped = _clipped_image_boxes(page)
+    if clipped is not None and len(clipped) != len(infos):
+        logger.warning(f"Page {page.number + 1}: {len(clipped)} clipped image boxes for {len(infos)} images; "
+                       f"measuring its pictures without their clip paths")
+        clipped = None
+    parts = []
+    for index, info in enumerate(infos):
+        visible = pymupdf.Rect(info["bbox"]) & area
+        if clipped is not None:
+            visible = visible & clipped[index] if not clipped[index].is_empty else pymupdf.Rect()
+        parts.append(visible)
+    return parts
+
+
 def placements(page) -> List[Placement]:
     """Every raster image placement of ``page``, each once (``get_image_info`` walks what the page draws:
     an image listed twice in the resources, directly and through a Form XObject, is drawn once), with the
-    part the page shows (see :func:`_clipped_image_boxes`; the box on the visible page when the clipped
-    extents cannot be matched to the placements one to one)."""
-    area = page_area(page)
+    part the page shows (see :func:`_shown_parts`). Telling images apart by xref reads every image of the
+    page; see :func:`shown_boxes` for the boxes alone."""
     infos = page.get_image_info(xrefs=True)
-    clipped = _clipped_image_boxes(page)
-    if clipped is not None and len(clipped) != len(infos):
-        logger.debug(f"Page {page.number + 1}: {len(clipped)} clipped image boxes for {len(infos)} images; "
-                     f"measuring the images unclipped")
-        clipped = None
     seen = set()
     result = []
-    for index, info in enumerate(infos):
+    for info, visible in zip(infos, _shown_parts(page, infos)):
         bbox = pymupdf.Rect(info["bbox"])
         key = (info.get("xref") or 0, tuple(round(value, 1) for value in bbox))
         if key in seen or bbox.is_empty:
             continue
         seen.add(key)
-        visible = bbox & area
-        if clipped is not None:
-            visible = visible & clipped[index] if not clipped[index].is_empty else pymupdf.Rect()
         result.append(Placement(xref=info.get("xref") or 0, bbox=bbox, visible=visible,
                                 width=int(info.get("width") or 0), height=int(info.get("height") or 0)))
     return result
+
+
+def shown_boxes(page) -> List[pymupdf.Rect]:
+    """The part the page shows of each raster image it draws, as :func:`placements` measures it, without
+    reading the images (``get_image_info()`` without xrefs or hashes decodes none): cheap on any page."""
+    infos = page.get_image_info()
+    return [visible for info, visible in zip(infos, _shown_parts(page, infos))
+            if not pymupdf.Rect(info["bbox"]).is_empty and not visible.is_empty]
 
 
 def _abut(a: pymupdf.Rect, b: pymupdf.Rect) -> bool:

@@ -129,6 +129,17 @@ be imported, the processor falls back to PyMuPDF (``fitz``): per-page text
 extraction, and — if OCR is enabled — rendering each page at 300 DPI and OCRing
 pages that have no text layer.
 
+The pipeline needs PyMuPDF 1.25.3 or later (the ``pymupdf`` module name, span
+``char_flags`` and ``alpha``). Three things it uses arrived in PyMuPDF 1.27.1; with an
+older PyMuPDF it falls back and says so once per process: without ``TEXT_CLIP`` a
+picture is measured without its clip paths (a warning: a picture a clip path hides or
+crops is taken whole); without invisible-only redaction hidden text that touches
+visible text can stay in a table cell (a warning); without ``TableFinder.textpage``
+the text of a page with tables is read once more (INFO, same result). PyMuPDF 1.26.7
+and later print a recommendation of their ``pymupdf_layout`` package to stdout; the
+pipeline switches that off, because stdout is where the CLI writes a document when no
+output file is given.
+
 .. code-block:: python
 
    loader = UnifiedDocumentLoader(ocr_provider="openai", api_key="sk-...")

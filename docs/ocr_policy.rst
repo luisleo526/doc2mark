@@ -345,10 +345,14 @@ asking again would cost a call (with the LLM providers two: the structured call
 and the free-form recovery behind it) on every run. Only a failed answer, and a
 result that still withholds values after the router firewall's redo, are asked
 again on the next run, never replayed; an entry of either kind already in a
-cache is a miss. A converted document is not written to ``cache_dir`` when its
-OCR failed somewhere (``failed`` requests, ``ocr_issues["failed"]``) or left a
-page showing content unread (``unread_pages``); answers with no text and
-refusals do not keep it out. A skipped cache write is logged at INFO with the
+cache is a miss. A provider's own refusal or safety block (OpenAI's refusal
+field, a Gemini SAFETY or RECITATION block) may not last: it is replayed for
+``refusal_ttl_seconds`` only (10 minutes by default; a hit does not extend it).
+A converted document is not written to ``cache_dir`` when its OCR failed
+somewhere (``failed`` requests, ``ocr_issues["failed"]``), left a page showing
+content unread (``unread_pages``), or holds a provider's own refusal or block
+(``ocr_issues["provider_refused"]``); answers with no text and "no readable
+text" statements do not keep it out. A skipped cache write is logged at INFO with the
 reason.
 
 Text-layer quality gate

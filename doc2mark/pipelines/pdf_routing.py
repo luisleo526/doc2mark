@@ -16,17 +16,19 @@ What the signals mean, the thresholds and the decisions live in
 :func:`text_source` hands the text and table extractors the page without the
 invisible text that must not become content.
 """
+import html
 import logging
 import math
 import os
 import re
 import unicodedata
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pymupdf
 
+from doc2mark.pipelines import pymupdf_compat
 from doc2mark.core.strategy import (
     GLYPH_INK_SHARE,
     GLYPH_SPREAD,
@@ -712,6 +714,10 @@ def _redacted_copy(page, drop: Sequence[Bbox], visible: Sequence[Bbox], keep: Se
     passes = [(clear, pymupdf.PDF_REDACT_TEXT_REMOVE)]
     if invisible_only is not None:
         passes.append((touching, invisible_only))
+    elif touching:
+        pymupdf_compat.missing("PDF_REDACT_TEXT_REMOVE_INVISIBLE",
+                               "hidden text that touches visible text stays in the page copy the table finder "
+                               "reads, so a table cell can keep it")
     if not any(rects for rects, _ in passes):
         return None
     try:
@@ -755,27 +761,77 @@ _CJK_RANGES = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0x
 _CJK_CHAR = re.compile("[" + "".join(f"{chr(low)}-{chr(high)}" for low, high in _CJK_RANGES) + "]")
 
 
+_TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
+_ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+
 def _tokens(text: str) -> List[str]:
-    """Words, case-folded, markup and punctuation dropped; CJK split per character (OCR engines
-    space CJK text unpredictably)."""
+    """Words, case-folded; markup (HTML tags, entities, Markdown backslash escapes) and punctuation
+    dropped; CJK split per character (OCR engines space CJK text unpredictably)."""
+    text = _ESCAPED.sub(r"\1", _TAG.sub(" ", html.unescape(text)))
     words = []
     for word in re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()):
         words.extend(_CJK_CHAR.findall(word) if _CJK_CHAR.search(word) else [word])
     return words
 
 
-def _match(words: List[str], ocr_words: List[str]) -> Optional[range]:
-    """Where the OCR words reproduce a line's ``words``: the first stretch of OCR words as long as the
-    line holding at least 80 % of its words, in order (markup, punctuation, case and spacing
-    ignored); None when there is none."""
+def _in_order(words: List[str], window: List[str]) -> List[int]:
+    """Positions in ``window`` of a longest run of ``words`` found there in order, other words
+    allowed between them (a longest common subsequence)."""
+    rows, columns = len(words), len(window)
+    lengths = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for i in range(rows - 1, -1, -1):
+        for j in range(columns - 1, -1, -1):
+            lengths[i][j] = (lengths[i + 1][j + 1] + 1 if words[i] == window[j]
+                             else max(lengths[i + 1][j], lengths[i][j + 1]))
+    found, i, j = [], 0, 0
+    while i < rows and j < columns:
+        if words[i] == window[j]:
+            found.append(j)
+            i, j = i + 1, j + 1
+        elif lengths[i + 1][j] >= lengths[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return found
+
+
+def _match(words: List[str], ocr_words: List[str],
+           where: Optional[Dict[str, List[int]]] = None) -> Optional[List[int]]:
+    """Which OCR words reproduce a line's ``words``: at least 80 % of them, in order, within a stretch
+    of OCR words at most twice as long as the line (words may come between them: a table cell
+    boundary, a word the text layer lacks; markup, punctuation, case and spacing are ignored); None
+    when there is none. ``where`` maps each OCR word to its positions (computed when omitted)."""
     if not words:
-        return range(0)
-    size, needed = len(words), 0.8 * len(words)
-    for start in range(max(1, len(ocr_words) - size + 1)):
-        window = ocr_words[start:start + size]
-        if sum(1 for a, b in zip(window, words) if a == b) >= needed:
-            return range(start, start + len(window))
+        return []
+    needed = (4 * len(words) + 4) // 5   # 80 %, rounded up
+    span = 2 * len(words)
+    if where is None:
+        where = {}
+        for position, word in enumerate(ocr_words):
+            where.setdefault(word, []).append(position)
+    # The first word found is among the first len(words) - needed + 1 words of the line.
+    starts = sorted({position for word in words[:len(words) - needed + 1] for position in where.get(word, ())})
+    wanted = set(words)
+    for start in starts:
+        window = ocr_words[start:start + span]
+        if sum(1 for word in window if word in wanted) < needed:
+            continue
+        found = _in_order(words, window)
+        if len(found) >= needed:
+            return [start + offset for offset in found]
     return None
+
+
+def _same_line(a: Sequence[float], b: Sequence[float]) -> bool:
+    """Whether two line boxes are one line (intersection over union at least 0.6)."""
+    width = min(a[2], b[2]) - max(a[0], b[0])
+    height = min(a[3], b[3]) - max(a[1], b[1])
+    if width <= 0 or height <= 0:
+        return False
+    overlap = width * height
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - overlap
+    return union > 0 and overlap / union >= 0.6
 
 
 _COVERING = ("fill-image", "fill-imgmask", "fill-shade", "fill-path")
@@ -789,13 +845,15 @@ def _shown(bbox: pymupdf.Rect, log: list, pixels: np.ndarray, to_pixels: pymupdf
     after = painted[-1] if painted else -1
     area = abs(bbox.width * bbox.height) or 1.0
     for kind, box in log[after + 1:]:
-        if kind in _COVERING and abs((pymupdf.Rect(box) & bbox).get_area()) >= 0.9 * area:
+        covered = pymupdf.Rect(box) & bbox
+        if kind in _COVERING and not covered.is_empty and abs(covered.width * covered.height) >= 0.9 * area:
             return False
     region = _region(pixels, bbox, to_pixels)
     return region is not None and region.size > 0 and _ink_share(region) >= MIN_LAYER_INK
 
 
-def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled: bool = False) -> List[str]:
+def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled: bool = False,
+                          chrome: Union[Sequence[Bbox], Callable[[], Sequence[Bbox]]] = ()) -> List[str]:
     """The page's painted, legible text lines that ``ocr_text`` does not reproduce and that the
     page visibly shows (text painted over by a picture, drawn in its background colour or
     garbled never reaches the OCR as such and is not kept).
@@ -805,6 +863,10 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled:
     layer garbled, nor when the OCR text holds words no layer line accounts for, as many as half
     the words of the lines to keep: the OCR then read those lines differently, so their text
     layer is wrong, not missed.
+
+    ``chrome``: the boxes (``get_text()`` space) of the page's running header, footer and page
+    number lines that the document leaves out (or a function returning them, asked only when a
+    line is missing): they are not kept either.
     """
     if not measure.signals.visible.chars:
         return []
@@ -820,16 +882,23 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled:
     legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
                              for spans in lines])
     ocr_words = _tokens(ocr_text)
+    where: Dict[str, List[int]] = {}
+    for position, word in enumerate(ocr_words):
+        where.setdefault(word, []).append(position)
     explained: Set[int] = set()
     candidates = []
     for spans, readable in zip(lines, legible):
         text = "".join(span["text"] for span in spans).strip()
         words = _tokens(text)
-        window = _match(words, ocr_words)
-        if window is not None:
-            explained.update(window)
+        found = _match(words, ocr_words, where)
+        if found is not None:
+            explained.update(found)
         elif readable:
             candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans)), len(words)))
+    if candidates:
+        regions = list(chrome() if callable(chrome) else chrome)
+        candidates = [candidate for candidate in candidates
+                      if not any(_same_line(tuple(candidate[1]), region) for region in regions)]
     if not candidates:
         return []
     if garbled and len(ocr_words) - len(explained) >= 0.5 * sum(count for _, _, count in candidates):

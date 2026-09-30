@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Any, Union, Optional, Tuple
 
 import pymupdf
 
+from doc2mark.pipelines import pymupdf_compat
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
 from doc2mark.utils.markdown import (escape_heading_closing, escape_inline_pieces, escape_line_start,
                                      escape_markdown_text)
@@ -58,6 +59,7 @@ _WINDOW_CACHE_MAXLEN = 4   # windows overlap; far pages are never reused -> tiny
 # Text lines at the top or bottom of the page that repeat from page to page
 # (running headers and footers, page numbers) are page furniture, not content.
 # Only strong evidence removes a line; see PDFLoader._detect_page_chrome.
+_WHOLE_MEDIA_TOLERANCE = 1.0   # points: a CropBox this close to the MediaBox shows all of it
 _CHROME_BAND = 0.12            # top/bottom fraction of the page height searched for chrome
 _CHROME_MIN_PAGES = 3          # chrome repeats on more than a couple of pages...
 _CHROME_MIN_SHARE = 0.5        # ...and on more than half of the document's pages
@@ -93,6 +95,9 @@ _PAGE_NUMBER_WORDS = _PAGE_WORDS | {"of", "von", "de", "sur", "di", "van", "共"
 BoilerplateJudge = Callable[[str, Dict[str, Any]], Optional[float]]
 
 logger = logging.getLogger(__name__)
+
+# The Markdown or JSON goes to stdout when no output file is given: no PyMuPDF advertisement there.
+pymupdf_compat.quiet_layout_recommendation()
 
 
 def _digest(data: Union[bytes, str, None]) -> Optional[str]:
@@ -1155,6 +1160,9 @@ class PDFLoader:
           back right after.
         * ``_crop_offsets``: where the visible area (the CropBox within the MediaBox) starts in
           the MediaBox, which brings those uncropped boxes into the frame of get_text().
+        * ``_whole_media_pages``: pages whose CropBox shows the whole MediaBox (within
+          ``_WHOLE_MEDIA_TOLERANCE``): find_tables() reads them in the same frame on any copy
+          of the page, cropped or not.
         * ``_rotated_cropped_pages``: pages whose boxes cannot be brought back (a CropBox
           inherited from /Pages, which stays while find_tables() runs, or page boxes that
           cannot be read). They get no table suppression: the table's text may repeat, but
@@ -1162,6 +1170,7 @@ class PDFLoader:
         """
         self._rotated_crop_boxes: Dict[int, str] = {}
         self._crop_offsets: Dict[int, Tuple[float, float]] = {}
+        self._whole_media_pages: set = set()
         self._rotated_cropped_pages: set = set()
         self._table_frames: Dict[int, Any] = {}
         for number in range(len(self.doc)):
@@ -1189,6 +1198,8 @@ class PDFLoader:
                 if visible[0] >= visible[2] or visible[1] >= visible[3]:
                     raise ValueError(f"CropBox {own} outside the MediaBox")
                 self._crop_offsets[number] = (visible[0] - media[0], media[3] - visible[3])
+                if all(abs(a - b) <= _WHOLE_MEDIA_TOLERANCE for a, b in zip(visible, media)):
+                    self._whole_media_pages.add(number)
             except Exception as e:
                 logger.debug(f"Could not read the page boxes of page {number + 1}, its tables are not suppressed: {e}")
                 self._rotated_cropped_pages.add(number)
@@ -2407,11 +2418,13 @@ class PDFLoader:
                     "position_y": 0.0,
                 }]
                 # A page overridden to render OCR keeps whatever real painted text the
-                # OCR did not reproduce (verbatim first).
+                # OCR did not reproduce (verbatim first), except the running headers, footers
+                # and page numbers the document leaves out on every page.
                 reason = self._page_routes.get(page_num, (None, None))[1]
                 if reason in _VERBATIM_TAIL_REASONS:
-                    missing = pdf_routing.missing_painted_lines(page, self._page_measure(page_num), render_text,
-                                                                garbled=reason == _REASON_ILLEGIBLE)
+                    missing = pdf_routing.missing_painted_lines(
+                        page, self._page_measure(page_num), render_text, garbled=reason == _REASON_ILLEGIBLE,
+                        chrome=lambda: [bbox for bbox, _, kept in self._page_chrome_regions(page_num) if not kept])
                     if missing:
                         items.append({
                             "type": "text:normal",
@@ -2608,13 +2621,17 @@ class PDFLoader:
         shows and its vector drawings grouped into figures (pdf_layout.cluster_boxes), without
         invisible white fills and page-sized backgrounds. They separate the column bands of the
         reading order even when pictures are not extracted; asked for only on pages with a column
-        gutter."""
+        gutter. The pictures' boxes come from the placements when they were measured, else from
+        pdf_images.shown_boxes, which does not read the images."""
         matrix = page.rotation_matrix
         figures = []
         try:
-            if page.number in self._placements or page.get_images():   # measuring placements reads the page
-                figures.extend(tuple(placement.visible * matrix) for placement in self._placements_of(page)
+            placed = self._placements.get(page.number)
+            if placed is not None:
+                figures.extend(tuple(placement.visible * matrix) for placement in placed
                                if not placement.visible.is_empty)
+            elif page.get_images():
+                figures.extend(tuple(box * matrix) for box in pdf_images.shown_boxes(page))
         except Exception as e:
             logger.debug(f"Picture placements of page {page.number + 1} unavailable: {e}")
         try:
@@ -2723,17 +2740,19 @@ class PDFLoader:
         page's tables were found uncropped (``_uncrop_for_tables``): their boxes are derotated
         as for the whole MediaBox, then moved by where the visible area starts. Where that is
         not possible (see ``_record_rotated_crop_boxes``), or when the tables were found on
-        another page object than the one uncropped (text read from a copy), none are returned:
-        the table's text may then appear twice, but no text is dropped. ``page_num`` is the
-        page's index in ``self.doc`` (default ``page.number``).
+        another page object than the one uncropped (text read from a copy) of a page that crops
+        part of its MediaBox away, none are returned: the table's text may then appear twice,
+        but no text is dropped. ``page_num`` is the page's index in ``self.doc`` (default
+        ``page.number``).
         """
         number = page.number if page_num is None else page_num
         frame = getattr(self, "_table_frames", {}).pop(number, None)
         if not table_bboxes or not page.rotation:
             return list(table_bboxes)
         uncropped = frame is not None and frame[0] is page.parent and frame[1] == page.xref
-        if number in getattr(self, "_rotated_cropped_pages", ()) or (
-                not uncropped and (frame is not None or number in getattr(self, "_rotated_crop_boxes", {}))):
+        whole = number in getattr(self, "_whole_media_pages", ())
+        if number in getattr(self, "_rotated_cropped_pages", ()) or (not uncropped and not whole and (
+                frame is not None or number in getattr(self, "_rotated_crop_boxes", {}))):
             logger.debug(f"Page {number + 1} is rotated and cropped: table text is not suppressed")
             return []
         matrix = frame[2] if uncropped else page.derotation_matrix
@@ -4223,9 +4242,13 @@ class PDFLoader:
         except Exception as e:
             logger.warning(f"Failed to find tables on page {page_num + 1}: {e}")
             finder, found = None, []
+        textpage = getattr(finder, "textpage", None)
+        if found and textpage is None:
+            pymupdf_compat.missing("TableFinder.textpage", "the text of each page with tables is read once more "
+                                                           "(same result)", level=logging.INFO)
 
         try:
-            tables, outside = pdf_tables.extract_page_tables(page, found, getattr(finder, "textpage", None))
+            tables, outside = pdf_tables.extract_page_tables(page, found, textpage)
             self._table_carry = pdf_tables.continue_table(
                 tables, outside, page_num, page.rect.height, getattr(self, "_table_carry", None),
                 lambda: pdf_tables.next_page_top_lines(page))

@@ -1290,10 +1290,13 @@ class UnifiedDocumentLoader:
     def _ocr_incomplete(result: ProcessedDocument) -> Optional[str]:
         """Why the document's OCR is not a final answer, or None when it is: images whose OCR
         failed (flagged ``failed`` by the provider, or left without an answer by a failed batch;
-        ``metadata.extra["ocr_images"]["failed"]`` and ``["ocr_issues"]["failed"]``), or pages
-        showing content whose render OCR returned nothing (``unread_pages``). Such a document is
-        not written to ``cache_dir``. An answer with no text, or a refusal, is an answer: a blank
-        page or a photo without words gets it again on every run."""
+        ``metadata.extra["ocr_images"]["failed"]`` and ``["ocr_issues"]["failed"]``), pages
+        showing content whose render OCR returned nothing (``unread_pages``), or images the
+        provider itself refused or blocked (``["ocr_issues"]["provider_refused"]``: that may not
+        last, so the OCR cache keeps it only briefly and ``cache_dir``, which never expires, not
+        at all). Such a document is not written to ``cache_dir``. An answer with no text, or a
+        "no readable text" statement, is an answer: a blank page or a photo without words gets it
+        again on every run."""
         extra = getattr(result.metadata, "extra", None) or {}
         images = extra.get("ocr_images") or {}
         issues = extra.get("ocr_issues") or {}
@@ -1302,6 +1305,8 @@ class UnifiedDocumentLoader:
             return f"OCR failed on {failed} image(s)"
         if images.get("unread_pages"):
             return f"unread page(s) {images['unread_pages']}: they show content but their OCR returned nothing"
+        if issues.get("provider_refused"):
+            return f"the OCR provider refused or blocked {issues['provider_refused']} image(s), which may not last"
         return None
 
     def _get_cached(

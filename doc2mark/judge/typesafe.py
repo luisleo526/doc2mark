@@ -97,14 +97,24 @@ def _rescale(probability: float, anchors: Sequence[Tuple[float, float]]) -> floa
     return 1.0
 
 
+class _NoWireLog(logging.Filter):
+    """Drops the SDK's DEBUG records (every request and response body: document text) while its
+    logger has no level of its own; see :func:`cap_sdk_logging`."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.INFO or logging.getLogger(SDK_LOGGER).level != logging.NOTSET
+
+
 def cap_sdk_logging() -> None:
-    """The SDK logs every request and response body -- document text -- at DEBUG. Cap its
-    logger at INFO (method, URL, status, timing) unless ``TYPESAFE_LOG_LEVEL`` asks for a
-    level or the ``typesafe_sdk`` logger was configured explicitly, so ``doc2mark -v`` does
-    not write page text to the log."""
+    """The SDK logs every request and response body -- document text -- at DEBUG, and each
+    request and retry (method, URL, status, timing) at INFO. Its DEBUG records are dropped
+    unless ``TYPESAFE_LOG_LEVEL`` (which the SDK applies at import) or the application set the
+    ``typesafe_sdk`` logger's level, so ``doc2mark -v`` does not write page text to the log.
+    Its level is left alone: the INFO records show only where the application's logging
+    shows INFO (``-v``), not in a default run."""
     sdk_logger = logging.getLogger(SDK_LOGGER)
-    if sdk_logger.level == logging.NOTSET and not os.environ.get(SDK_LOG_LEVEL_ENV, "").strip():
-        sdk_logger.setLevel(logging.INFO)
+    if not any(isinstance(existing, _NoWireLog) for existing in sdk_logger.filters):
+        sdk_logger.addFilter(_NoWireLog())
 
 
 def resolve_hooks(hooks: Union[None, str, Iterable[str]] = None) -> Tuple[str, ...]:

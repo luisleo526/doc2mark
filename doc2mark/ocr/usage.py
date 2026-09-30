@@ -18,8 +18,9 @@ can leave ``extra`` untouched.
 The same wrapper also keeps the per-load OCR *issues* (:meth:`UsageAggregatingOCR.
 pop_document_issues`): images whose answer was only a refusal (emitted empty),
 images that failed, images whose withheld values the router firewall could not
-recover, and an engine that could not run at all (``OCREngineError``) -- which the
-loader re-raises instead of returning a placeholder-only document.
+recover, answers kept although the optional non-content judge suspected them, and
+an engine that could not run at all (``OCREngineError``) -- which the loader
+re-raises instead of returning a placeholder-only document.
 """
 
 import threading
@@ -70,7 +71,8 @@ def _first_present(usage: Dict[str, Any], keys: Iterable[str]) -> int:
 
 def new_issue_sink() -> Dict[str, Any]:
     """A fresh per-document OCR issue record (see ``pop_document_issues``)."""
-    return {"refused": 0, "failed": 0, "withheld": 0, "errors": [], "locations": [], "engine_error": None}
+    return {"refused": 0, "provider_refused": 0, "failed": 0, "withheld": 0, "suspected": 0, "errors": [],
+            "locations": [], "engine_error": None}
 
 
 def merge_usage_into(sink: Dict[str, int], usage: Optional[Dict[str, Any]]) -> None:
@@ -173,13 +175,17 @@ class UsageAggregatingOCR(BaseOCR):
         """Return this load's OCR issues and clear them, or ``None`` when there were none.
 
         The dict counts images whose answer was only a refusal / "no readable text"
-        statement (``refused``, emitted as empty text), images that failed
-        (``failed``) and images that still withhold values after the router
-        firewall's verbatim redo (``withheld``), plus up to five distinct error
-        messages (``errors``) and where each issue happened (``locations``: one
-        ``{"issue": "refused" | "failed" | "withheld", "image": n}`` per image, ``n``
-        counting the images OCR'd during this load from 1, with the ``page`` a pipeline
-        reports through :meth:`label_last_batch`).
+        statement (``refused``, emitted as empty text; ``provider_refused`` of them the
+        provider's own refusal or safety block, which may not last: see
+        ``doc2mark.ocr.cache.REFUSAL_TTL_SECONDS``), images that failed (``failed``),
+        images that still withhold values after the router firewall's verbatim redo
+        (``withheld``) and answers kept as text although the optional non-content judge
+        rated them close to no content (``suspected``, ``metadata["non_content_suspected"]``),
+        plus up to five distinct error messages (``errors``) and where each issue happened
+        (``locations``: one ``{"issue": "refused" | "failed" | "withheld" | "suspected",
+        "image": n}`` per image, ``n`` counting the images OCR'd during this load from 1,
+        with the ``page``, ``slide`` or ``sheet`` a pipeline reports through
+        :meth:`label_last_batch`).
 
         Raises:
             OCREngineError: the OCR engine could not run at all during this load
@@ -194,7 +200,8 @@ class UsageAggregatingOCR(BaseOCR):
         if issues["engine_error"] is not None:
             raise issues["engine_error"]
         issues.pop("engine_error")
-        if not (issues["refused"] or issues["failed"] or issues["withheld"] or issues["errors"]):
+        if not (issues["refused"] or issues["failed"] or issues["withheld"] or issues["suspected"]
+                or issues["errors"]):
             return None
         if not issues["locations"]:
             issues.pop("locations")
@@ -240,7 +247,8 @@ class UsageAggregatingOCR(BaseOCR):
     def _record(self, results: Iterable[Any]) -> None:
         """Fold the usage of each *fresh* result into the active sink, and count the
         OCR issues every result's metadata reports (``ocr_refusal``, ``failed``,
-        ``router_fallback="unresolved"``) into the active issue record.
+        ``router_fallback="unresolved"``, ``non_content_suspected``) into the active
+        issue record.
 
         Results that :class:`CachedOCR` served from a cache hit or an intra-batch
         dedup fan-out carry the ``FROM_CACHE_METADATA_KEY`` flag — they represent
@@ -265,6 +273,8 @@ class UsageAggregatingOCR(BaseOCR):
                 if metadata.get("ocr_refusal"):
                     issues["refused"] += 1
                     found.append("refused")
+                    if metadata.get("non_content") == "provider_refusal":
+                        issues["provider_refused"] += 1
                 if metadata.get("failed"):
                     issues["failed"] += 1
                     found.append("failed")
@@ -274,6 +284,9 @@ class UsageAggregatingOCR(BaseOCR):
                 if metadata.get("router_fallback") == "unresolved":
                     issues["withheld"] += 1
                     found.append("withheld")
+                if metadata.get("non_content_suspected"):
+                    issues["suspected"] += 1
+                    found.append("suspected")
                 for issue in found:
                     if len(issues["locations"]) < _MAX_ISSUE_LOCATIONS:
                         issues["locations"].append({"issue": issue, "image": first + position + 1})

@@ -46,7 +46,9 @@ What each hook decides
    the same way (the judge's verdict is cached, so a re-read that returns the same words is
    left out too); in the free-form path (``--no-structured``) the answer is dropped and the
    result flagged ``ocr_refusal``. From 0.90 up to 0.95 the answer is kept and flagged
-   ``metadata["non_content_suspected"]``. A real answer the judge calls no content is lost,
+   ``metadata["non_content_suspected"]`` and counted in the document's
+   ``metadata.extra["ocr_issues"]["suspected"]``, with its page (or slide, or sheet) in
+   ``locations``. A real answer the judge calls no content is lost,
    so the threshold sits above the overlap measured on the labelled sets. See
    :mod:`doc2mark.ocr.refusal`.
 
@@ -134,9 +136,11 @@ as are the OCR answers of one batch; each HTTP attempt times out after ``timeout
 (2 by default), with one retry within a 4 s budget per question.
 
 The SDK logs every request and response body -- your document text -- at DEBUG level on the
-``typesafe_sdk`` logger. doc2mark caps that logger at INFO (method, URL, status and timing
-only), so ``doc2mark -v`` does not write page text to the log, unless you ask for its wire log
-with ``TYPESAFE_LOG_LEVEL=debug`` or configure the ``typesafe_sdk`` logger yourself.
+``typesafe_sdk`` logger, and the method, URL, status and timing of each request and retry at
+INFO. doc2mark drops the SDK's DEBUG records, so ``doc2mark -v`` shows the INFO lines but does
+not write page text to the log, and leaves the logger's level alone, so a default run (WARNING)
+prints none of them. To see the wire log, ask for it with ``TYPESAFE_LOG_LEVEL=debug`` or set the
+``typesafe_sdk`` logger's level yourself.
 
 Privacy
 -------
