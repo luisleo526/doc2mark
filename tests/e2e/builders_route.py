@@ -119,11 +119,18 @@ def _shift(char: str) -> str:
     return char
 
 
+def _glyph_offset(char: str) -> str:
+    """Letters 29 code points lower, as a subset font whose glyph IDs were taken for Unicode
+    ("Sample" -> "6DPSOH"): valid printable ASCII, but no words."""
+    return chr(ord(char) - 29) if char.isascii() and char.isalpha() else char
+
+
 GARBLERS: Dict[str, Optional[Callable[[str], str]]] = {
     "fffd": None,  # no ToUnicode at all: every glyph extracts as U+FFFD
     "pua": lambda ch: ch if ch.isspace() else chr(0xE000 + ord(ch) % 200),
     "mojibake": _mojibake,
     "shifted": _shift,
+    "glyph_offset": _glyph_offset,
 }
 
 

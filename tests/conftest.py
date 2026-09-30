@@ -1,9 +1,34 @@
 """Pytest configuration and fixtures."""
 
+import importlib.util
+import os
+
 import pytest
 from pathlib import Path
 import tempfile
 import shutil
+
+
+def _typesafe_missing():
+    """Why the TypeSafe API cannot be called from this environment, or None when it can."""
+    if importlib.util.find_spec("typesafe_sdk") is None:
+        return "the doc2mark[typesafe] extra (typesafe-sdk) is not installed"
+    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
+        return "TYPESAFE_API_KEY is not set"
+    return None
+
+
+def pytest_runtest_setup(item):
+    """``requires_typesafe`` tests call the TypeSafe API: skipped without the extra or the key (as in
+    GitHub CI), and failed instead when ``D2M_REQUIRE_TYPESAFE=1`` says they must run."""
+    if item.get_closest_marker("requires_typesafe") is None:
+        return
+    missing = _typesafe_missing()
+    if missing is None:
+        return
+    if os.environ.get("D2M_REQUIRE_TYPESAFE") == "1":
+        pytest.fail(f"requires_typesafe: {missing} (D2M_REQUIRE_TYPESAFE=1)", pytrace=False)
+    pytest.skip(f"requires_typesafe: {missing}")
 
 
 @pytest.fixture(scope="session")

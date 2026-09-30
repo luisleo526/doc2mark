@@ -5,7 +5,7 @@
 #
 # Builds d2m-e2e:<hash of tests/e2e/Dockerfile> if it is missing, copies this
 # checkout into a throwaway container (the checkout itself stays untouched),
-# installs it with `pip install -e ".[ocr,dev]"` (pip cache in the named volume
+# installs it with `pip install -e ".[ocr,dev]"` (see D2M_E2E_EXTRAS; pip cache in the named volume
 # d2m-e2e-pip-cache) and runs `pytest -m e2e <args>` with D2M_E2E_STRICT=1.
 # The exit code is pytest's, or 90 when the runner could not set the run up
 # (image build, copying the checkout, pip install, an unset D2M_E2E_PASS_ENV variable).
@@ -18,6 +18,12 @@
 #
 # A later -m in <args> replaces `-m e2e`, e.g. the unit suite in the same image:
 #   scripts/run_e2e_docker.sh -m "not e2e" -q
+#
+# D2M_E2E_EXTRAS: the extras installed with the checkout (default "ocr,dev"). The
+# requires_typesafe tests need the typesafe extra and TYPESAFE_API_KEY, e.g.:
+#   set -a; . ~/.config/typesafe/env; set +a
+#   D2M_E2E_EXTRAS="ocr,dev,typesafe" D2M_E2E_PASS_ENV="TYPESAFE_API_KEY D2M_REQUIRE_TYPESAFE" \
+#       D2M_REQUIRE_TYPESAFE=1 scripts/run_e2e_docker.sh
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,6 +59,7 @@ exec docker run --rm --init --name "$name" \
     -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
     -e PIP_ROOT_USER_ACTION=ignore \
     -e D2M_E2E_STRICT=1 \
+    -e D2M_E2E_EXTRAS="${D2M_E2E_EXTRAS:-ocr,dev}" \
     ${pass_env[@]+"${pass_env[@]}"} \
     "$image" \
     bash -euo pipefail -c '
@@ -61,6 +68,6 @@ exec docker run --rm --init --name "$name" \
         tar -C /src --exclude=.git --exclude=.venv --exclude=.omc --exclude=__pycache__ \
             --exclude=.pytest_cache --exclude="*.egg-info" -cf - . | tar -C /work -xf -
         cd /work
-        pip install -q -e ".[ocr,dev]"
+        pip install -q -e ".[$D2M_E2E_EXTRAS]"
         exec pytest -m e2e "$@"
     ' bash "$@"
