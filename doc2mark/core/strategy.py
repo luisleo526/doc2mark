@@ -254,6 +254,12 @@ def _is_private_use(code: int) -> bool:
     return 0xE000 <= code <= 0xF8FF or 0xF0000 <= code <= 0x10FFFD
 
 
+_PRIVATE = re.compile(f"[{chr(0xE000)}-{chr(0xF8FF)}{chr(0xF0000)}-{chr(0x10FFFD)}]")
+_LETTER = re.compile(r"[^\W\d_]")
+# ASCII control codes that are not whitespace: garbage wherever they appear.
+_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1b\x7f]")
+
+
 def _script_weight(code: int) -> float:
     if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF \
             or 0x20000 <= code <= 0x323AF:
@@ -272,6 +278,9 @@ def _scan_text(text: str, *, mojibake: bool = True, icons: bool = False) -> Tupl
     nor garbage. Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, and
     mojibake sequences when ``mojibake``.
     """
+    if text.isascii() and not _ASCII_CONTROL.search(text) and "(cid:" not in text:
+        counted = len("".join(text.split()))   # plain ASCII: all legible, weight 1 each
+        return 0, counted, float(counted)
     text = _CID.sub("\ufffd", text)
     mangled = _mojibake_positions(text)[0] if mojibake else set()
     garbage = counted = 0
@@ -321,10 +330,11 @@ def _layer_runs(spans: Iterable[Sequence]) -> List[Tuple[float, int, int, float]
     layer, judged in the context of the whole layer (see :func:`text_layer_stats`)."""
     spans = [(span[0] or "", float(span[1] or 0.0), span[2] if len(span) > 2 else "") for span in spans]
     mojibake = _mangled(set().union(*(_mojibake_positions(text)[1] for text, _, _ in spans)))
-    letters = sum(1 for text, _, _ in spans for char in text if char.isalpha() and not _is_private_use(ord(char)))
+    has_private = any(_PRIVATE.search(text) for text, _, _ in spans)
+    letters = sum(len(_LETTER.findall(text)) for text, _, _ in spans) if has_private else 0
     runs = []
     for text, size, font in spans:
-        private = sum(1 for char in text if _is_private_use(ord(char)))
+        private = len(_PRIVATE.findall(text)) if has_private else 0
         icons = bool(private) and (bool(_ICON_FONT.search(font or ""))
                                    or (private <= MAX_ICON_GLYPHS and letters >= MIN_PAGE_LETTERS))
         runs.append((size,) + _scan_text(text, mojibake=mojibake, icons=icons))
