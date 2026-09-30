@@ -399,6 +399,12 @@ def legible_lines(lines: Sequence[Sequence[Sequence]]) -> List[bool]:
     return verdicts
 
 
+def wants_judgment(layer: TextLayerStats) -> bool:
+    """Whether the optional legibility judge is asked about this text layer: one the
+    deterministic detector did not flag, of at least ``MIN_JUDGED_CHARS`` characters."""
+    return not layer.garbled and layer.chars >= MIN_JUDGED_CHARS
+
+
 def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, text: str) -> Optional[float]:
     """Ask the optional legibility judge about a text layer; return its verdict or None.
 
@@ -418,7 +424,7 @@ def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, te
     - ``None``, an exception or a value outside ``[0, 1]`` count as "cannot judge":
       the text is kept, exactly as without a judge.
     """
-    if judge is None or layer.garbled or layer.chars < MIN_JUDGED_CHARS:
+    if judge is None or not wants_judgment(layer):
         return None
     try:
         verdict = judge(text)

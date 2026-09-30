@@ -70,7 +70,9 @@ def test_judge_is_asked_once_per_ambiguous_line_with_its_context(tmp_path):
     data, markdown = _convert(_heading_on_two_of_four_pages(tmp_path / "doc.pdf"), judge)
 
     contexts = {text: context for text, context in judge.calls}
-    assert len(judge.calls) == 2 and set(contexts) == {"Summary of Findings", "ACME Corp"}
+    # The running header's first copy is not asked about: the rule removed its other copies
+    # already, and the judge may only take later copies the rule kept (never the last one).
+    assert len(judge.calls) == 1 and set(contexts) == {"Summary of Findings"}
     heading = contexts["Summary of Findings"]
     assert heading["zone"] == "header"
     assert heading["pages"] == [1, 3]
@@ -78,20 +80,18 @@ def test_judge_is_asked_once_per_ambiguous_line_with_its_context(tmp_path):
     assert heading["reason"] == "few_pages"
     assert heading["font_size"] > heading["body_font_size"]
     assert heading["repeated_on"] == [1, 3]
-    assert contexts["ACME Corp"]["reason"] == "first_occurrence"
-    assert contexts["ACME Corp"]["pages"] == [1]
-    assert contexts["ACME Corp"]["repeated_on"] == [1, 2, 3, 4]
     assert markdown.count("Summary of Findings") == 2  # None keeps the lines
     assert markdown.count("ACME Corp") == 1
 
 
-def test_judge_probability_at_or_above_half_removes_every_copy(tmp_path):
+def test_judge_probability_at_or_above_half_thins_a_line_to_its_first_copy(tmp_path):
     data, markdown = _convert(_heading_on_two_of_four_pages(tmp_path / "doc.pdf"), _RecordingJudge(0.5))
 
-    assert "Summary of Findings" not in markdown
-    assert "ACME Corp" not in markdown  # the kept first copy goes too
+    assert markdown.count("Summary of Findings") == 1  # the first copy always stays
+    assert markdown.count("ACME Corp") == 1  # the running header's first copy: never asked, kept
     retyped = [(item["page"], item["type"]) for item in data["content"] if item["content"] == "Summary of Findings"]
-    assert retyped == [(1, "text:header"), (3, "text:header")]  # retyped, not deleted
+    assert retyped[0][0] == 1 and retyped[0][1] != "text:header"
+    assert retyped[1:] == [(3, "text:header")]  # retyped, not deleted
 
 
 @pytest.mark.parametrize("answer", [0.49, 0.0, None, 1.5, -0.1, float("nan"), True, "yes", RuntimeError("down")])
@@ -107,7 +107,7 @@ def test_judge_may_answer_with_numpy_floats(tmp_path):
 
     data, markdown = _convert(_heading_on_two_of_four_pages(tmp_path / "doc.pdf"), _RecordingJudge(numpy.float32(0.9)))
 
-    assert "Summary of Findings" not in markdown
+    assert markdown.count("Summary of Findings") == 1
 
 
 def test_judge_is_not_asked_about_unique_lines_or_bare_page_numbers(tmp_path):
@@ -234,9 +234,8 @@ def test_numbered_labels_judged_chrome_keep_their_first_copy(tmp_path):
     assert not any(f"Lesson · {p}" in markdown for p in range(2, 7))
     headers = [(item["page"], item["content"]) for item in data["content"] if item["type"] == "text:header"]
     assert headers == [(p, f"Lesson · {p}") for p in range(2, 7)]
-    # The kept first copy is then asked about like the first copy of any running header.
-    assert [(text, context["reason"]) for text, context in judge.calls] == [
-        ("Lesson · 1", "numbered_label"), ("Lesson · 1", "first_occurrence")]
+    # The kept first copy is not asked about again: the judge never takes the last copy of a line.
+    assert [(text, context["reason"]) for text, context in judge.calls] == [("Lesson · 1", "numbered_label")]
 
 
 def test_numbered_labels_judged_chrome_but_not_at_the_page_edge_stay_plain_text(tmp_path):

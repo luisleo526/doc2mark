@@ -20,7 +20,8 @@ class PDFProcessor(BaseProcessor):
     """Processor for PDF documents using advanced pipeline."""
 
     def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None,
-                 legibility_judge: Optional[Callable[[str], Optional[float]]] = None):
+                 legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
+                 boilerplate_judge: Optional[Callable[[str, Dict[str, Any]], Optional[float]]] = None):
         """Initialize PDF processor.
         
         Args:
@@ -31,10 +32,13 @@ class PDFProcessor(BaseProcessor):
                 - 'styled_html': Full HTML with inline styles (legacy)
             legibility_judge: Optional ``judge(page_text) -> Optional[float]`` for the
                 text-layer quality gate (see doc2mark.core.strategy.judge_text_layer)
+            boilerplate_judge: Optional ``judge(line_text, context) -> Optional[float]`` for
+                repeated header/footer lines the rule keeps (see PDFLoader)
         """
         self.ocr = ocr
         self.table_style = table_style
         self.legibility_judge = legibility_judge
+        self.boilerplate_judge = boilerplate_judge
 
     def can_process(self, file_path: Union[str, Path]) -> bool:
         """Check if this processor can handle the file."""
@@ -85,6 +89,7 @@ class PDFProcessor(BaseProcessor):
                 ocr=self.ocr,  # Pass the OCR instance
                 table_style=kwargs.get('table_style', self.table_style),  # Pass table style
                 legibility_judge=self.legibility_judge,
+                boilerplate_judge=getattr(self, "boilerplate_judge", None),
             )
             
             # Convert to markdown using the advanced converter

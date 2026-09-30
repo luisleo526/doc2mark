@@ -65,6 +65,10 @@ class UnifiedDocumentLoader:
             table_style: Optional[str] = None,
             # Optional text-layer legibility judge (PDF quality gate)
             legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
+            # Optional judge for repeated header/footer lines the rule keeps (PDF)
+            boilerplate_judge: Optional[Callable[[str, Dict[str, Any]], Optional[float]]] = None,
+            # Optional judge object answering all hooks ("typesafe", "none" or an object)
+            judge: Any = None,
     ):
         """Initialize the document loader with enhanced OCR configuration.
 
@@ -120,8 +124,26 @@ class UnifiedDocumentLoader:
                 (``ocr_images=True`` with an OCR provider) and only for text layers the
                 deterministic garbage detector does not flag; see
                 doc2mark.core.strategy.judge_text_layer for the full contract.
+            boilerplate_judge: Optional ``judge(line_text, context) -> Optional[float]``
+                returning the probability that a repeated top/bottom line of a PDF is page
+                chrome; asked only about the lines the verbatim-first rule keeps (see
+                doc2mark.pipelines.pymupdf_advanced_pipeline.PDFLoader).
+
+            # All judge hooks at once:
+            judge: ``"typesafe"`` (the optional ``doc2mark[typesafe]`` add-on, key in
+                ``TYPESAFE_API_KEY``), ``"none"``, or an object with any of the attributes
+                ``legibility_judge``, ``boilerplate_judge`` and ``non_content_judge`` (the
+                last one screens OCR answers, see ``OCRConfig.non_content_judge``). None
+                (default) reads ``$DOC2MARK_JUDGE``. An explicit ``legibility_judge`` /
+                ``boilerplate_judge`` or ``OCRConfig.non_content_judge`` wins over the
+                object's. A judge that cannot answer leaves every decision to the
+                deterministic rules; see docs/judge.rst.
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
+
+        from doc2mark.judge import judge_hooks, resolve_judge
+        self.judge = resolve_judge(judge)
+        hooks = judge_hooks(self.judge)
 
         self.ocr_cache = None
         self.ocr = self._create_ocr_provider(
@@ -147,6 +169,7 @@ class UnifiedDocumentLoader:
             detail=detail,
         )
         self._apply_ocr_cache(ocr_cache)
+        self._attach_non_content_judge(hooks["non_content_judge"])
 
         # Cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -157,7 +180,8 @@ class UnifiedDocumentLoader:
         # Table output style (default: minimal_html for cleaner output)
         self.table_style = table_style if table_style else "minimal_html"
         logger.info(f"📊 Table style: {self.table_style}")
-        self.legibility_judge = legibility_judge
+        self.legibility_judge = legibility_judge if legibility_judge is not None else hooks["legibility_judge"]
+        self.boilerplate_judge = boilerplate_judge if boilerplate_judge is not None else hooks["boilerplate_judge"]
 
         # Registry of format processors
         self._processors: Dict[DocumentFormat, BaseProcessor] = {}
@@ -310,6 +334,15 @@ class UnifiedDocumentLoader:
             config=ocr_config
         )
 
+    def _attach_non_content_judge(self, judge: Optional[Callable[[str], Optional[float]]]) -> None:
+        """Give the OCR provider the judge object's ``non_content_judge``, unless OCR is off
+        or its config already names one (the caller's config object is not mutated)."""
+        target = self._unwrap_ocr(self.ocr)
+        config = getattr(target, "config", None)
+        if judge is None or not isinstance(config, OCRConfig) or config.non_content_judge is not None:
+            return
+        target.config = replace(config, non_content_judge=judge)
+
     @staticmethod
     def _log_ocr_configuration(ocr: BaseOCR, title: str):
         if hasattr(ocr, 'get_configuration_summary'):
@@ -403,7 +436,8 @@ class UnifiedDocumentLoader:
             # Initialize processors with OCR support
             office_processor = OfficeProcessor(ocr=ocr, table_style=self.table_style)
             pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style,
-                                         legibility_judge=getattr(self, "legibility_judge", None))
+                                         legibility_judge=getattr(self, "legibility_judge", None),
+                                         boilerplate_judge=getattr(self, "boilerplate_judge", None))
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
             legacy_processor = LegacyProcessor(ocr=ocr)
@@ -463,16 +497,19 @@ class UnifiedDocumentLoader:
         except ImportError:
             logger.debug("Email processor not available; skipping .eml support")
 
-    def _judge_identity(self) -> Optional[str]:
-        """A stable name for the configured legibility judge (for cache keys).
+    def _judge_identity(self, judge: Any = None) -> Optional[str]:
+        """A stable name for a judge hook (for cache keys), by default the legibility judge.
 
         A judge can name its own configuration with a ``cache_key`` attribute; otherwise
         its qualified name (plus the arguments of a ``functools.partial``) is used.
         """
-        judge = getattr(self, "legibility_judge", None)
+        if judge is None:
+            judge = getattr(self, "legibility_judge", None)
         if judge is None:
             return None
         try:
+            if getattr(judge, "available", True) is False:
+                return None  # a judge that cannot answer at all leaves the output to the rules: keyed as none
             explicit = getattr(judge, "cache_key", None)
             if explicit is not None:
                 return str(explicit)
@@ -484,6 +521,46 @@ class UnifiedDocumentLoader:
             return identity
         except Exception:
             return type(judge).__qualname__
+
+    def _begin_judge_document(self) -> Any:
+        """Start counting the judge's questions for one document (judges with ``begin_document``)."""
+        begin = getattr(getattr(self, "judge", None), "begin_document", None)
+        if not callable(begin):
+            return None
+        try:
+            return begin()
+        except Exception as e:
+            logger.debug(f"judge.begin_document failed: {e!r}")
+            return None
+
+    def _end_judge_document(self, start: Any, result: ProcessedDocument, file_path: Path) -> bool:
+        """Stamp what the judge did on the document (``metadata.extra["judge"]``) and warn, once
+        per document, when some of its questions got no answer (the rules decided them).
+        Returns False when the result must not be cached: the judge failed on some question,
+        or stopped answering during the document (its cache key named it as available)."""
+        end = getattr(getattr(self, "judge", None), "end_document", None)
+        if start is None or not callable(end):
+            return True
+        try:
+            stats = dict(end(start))
+        except Exception as e:
+            logger.debug(f"judge.end_document failed: {e!r}")
+            return False
+        complete = not stats.get("failed") and stats.get("unavailable") == start.get("unavailable")
+        if not (stats.get("asked") or stats.get("failed")):
+            return complete
+        if result.metadata.extra is None:
+            result.metadata.extra = {}
+        result.metadata.extra["judge"] = {
+            "name": getattr(self.judge, "name", type(self.judge).__name__),
+            "model": getattr(self.judge, "model", None),
+            **{key: stats.get(key) for key in ("asked", "cached", "fresh", "failed", "input_tokens", "cost_usd")},
+        }
+        if stats.get("failed"):
+            reason = stats.get("unavailable") or stats.get("last_error") or "no answer"
+            logger.warning(f"{file_path.name}: {stats['failed']} judge question(s) got no answer ({reason}); "
+                           f"the deterministic rules decided those cases")
+        return complete
 
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
@@ -571,6 +648,14 @@ class UnifiedDocumentLoader:
                 "legibility_judge": self._judge_identity(),
                 "routing_version": ROUTING_VERSION,
             }
+            # The other hooks change what a document emits too (keys only when set, so the
+            # cache keys of loaders without them stay as they were).
+            for name, hook in (("boilerplate_judge", getattr(self, "boilerplate_judge", None)),
+                               ("non_content_judge", getattr(getattr(self._unwrap_ocr(self.ocr), "config", None),
+                                                             "non_content_judge", None))):
+                identity = self._judge_identity(hook) if hook is not None else None
+                if identity is not None:
+                    cache_options[name] = identity
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
@@ -609,9 +694,11 @@ class UnifiedDocumentLoader:
             usage_ocr = getattr(self, "_usage_ocr", None)
             if usage_ocr is not None:
                 usage_ocr.begin_document_usage()
+            judge_start = self._begin_judge_document()
 
             # Process with mapped parameters
             result = processor.process(file_path, **processor_kwargs)
+            judge_complete = self._end_judge_document(judge_start, result, file_path)
 
             if usage_ocr is not None:
                 token_usage = usage_ocr.pop_document_usage()
@@ -647,6 +734,8 @@ class UnifiedDocumentLoader:
             # must read what this one could not (see _ocr_incomplete).
             if self.cache_dir:
                 incomplete = self._ocr_incomplete(result)
+                if not judge_complete:
+                    incomplete = "the judge could not answer every question"
                 if incomplete:
                     logger.info(f"Not caching {file_path.name}: {incomplete}; the next run converts it again")
                 else:
@@ -1414,6 +1503,8 @@ class UnifiedDocumentLoader:
         if not hasattr(self, "ocr_cache"):
             self.ocr_cache = None
         self._apply_ocr_cache(ocr_cache)
+        from doc2mark.judge import judge_hooks
+        self._attach_non_content_judge(judge_hooks(getattr(self, "judge", None))["non_content_judge"])
 
         # Reinitialize processors with new OCR
         self._initialize_processors()

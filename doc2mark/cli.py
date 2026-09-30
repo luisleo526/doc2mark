@@ -99,7 +99,8 @@ def process_single_file(file_path, loader_config, processing_config):
             ocr_provider=loader_config['ocr_provider'],
             api_key=loader_config['api_key'],
             ocr_config=loader_config.get('ocr_config'),
-            table_style=loader_config.get('table_style')
+            table_style=loader_config.get('table_style'),
+            judge=loader_config.get('judge'),
         )
         
         # Process with retry logic
@@ -153,6 +154,7 @@ Examples:
   doc2mark file.pdf --ocr tesseract --ocr-lang deu  # German Tesseract OCR
   doc2mark file.pdf --ocr none                    # Disable OCR
   doc2mark file.pdf --no-extract-images           # Skip image extraction
+  doc2mark file.pdf --ocr tesseract --ocr-images --judge typesafe  # Optional TypeSafe judge
   
   # Advanced processing
   doc2mark docs/ -r --pattern "*.pdf" -p 4        # Parallel processing with 4 workers
@@ -255,6 +257,17 @@ Supported formats:
         dest="ocr_images",
         action="store_false",
         help="Disable OCR on images"
+    )
+
+    judge_group = parser.add_argument_group('Judge options')
+    judge_group.add_argument(
+        "--judge",
+        choices=["none", "typesafe"],
+        default=None,
+        help="Optional judge for the decisions the rules cannot make alone: whether a PDF text layer "
+             "is legible, whether a repeated header/footer line is page chrome, whether an OCR answer "
+             "is only a refusal. 'typesafe' needs the doc2mark[typesafe] extra and TYPESAFE_API_KEY; "
+             "without them the rules decide, as with 'none'. (default: $DOC2MARK_JUDGE, else none)"
     )
 
     # Output options
@@ -426,7 +439,8 @@ Supported formats:
             ocr_provider=ocr_provider,
             api_key=args.api_key,
             ocr_config=ocr_config,
-            table_style=args.table_style
+            table_style=args.table_style,
+            judge=args.judge,
         )
 
         if input_path.is_file():
@@ -531,6 +545,7 @@ Supported formats:
                 'api_key': args.api_key,
                 'ocr_config': ocr_config,
                 'table_style': args.table_style,
+                'judge': args.judge,
             }
             
             processing_config = {
