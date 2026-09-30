@@ -279,6 +279,22 @@ def test_t4_real_merges_follow_the_drawn_cells(run_cli, e2e_dir, case):
             assert (text is None) == ((r, c) in covered), f"({r},{c}) coverage wrong: {table.rows}"
 
 
+@pytest.mark.parametrize("rotation", [90, 270])
+def test_landscape_page_table_is_read_like_any_other(run_cli, e2e_dir, rotation):
+    """A landscape page stored sideways with /Rotate (word processors, rotated scans) gets the same
+    cell reading as any other page, merged cells included. With PyMuPDF releases whose table finder
+    carries no text page (1.26 and older), such a table fell back to PyMuPDF's plain cell text."""
+    spec = MERGED_TABLES["docs_worked_example"]
+    result = convert(run_cli, B.landscape_table_pdf(e2e_dir / f"landscape{rotation}.pdf", spec["rows"],
+                                                    rotation=rotation, merges=spec["merges"], col_w=spec["col_w"]))
+
+    [table] = tables(result)
+    assert table.kind == "html", result.markdown
+    assert table.spans == spec["spans"], result.markdown
+    for (r, c), text in B.grid(spec["rows"]).items():
+        assert table.rows[r][c] == text, f"({r},{c}) should be {text!r}: {table.rows}"
+
+
 def _find(grid: Grid, text: str) -> Tuple[int, int]:
     [position] = [(r, c) for r, row in enumerate(grid.rows) for c, cell in enumerate(row) if cell == text]
     return position

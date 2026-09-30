@@ -81,6 +81,25 @@ def table_pdf(path: Path, rows: Sequence[Sequence[Optional[str]]], *, merges: It
     return Path(path)
 
 
+def landscape_table_pdf(path: Path, rows: Sequence[Sequence[Optional[str]]], *, rotation: int,
+                        merges: Iterable[Merge] = (), col_w: Optional[Sequence[float]] = None) -> Path:
+    """A landscape page stored the way word processors and scanners store one: a portrait page whose
+    content is drawn sideways, with ``/Rotate rotation`` so that it displays upright. The content is
+    one ruled table, as in :func:`table_pdf`."""
+    upright = pymupdf.open()
+    page = upright.new_page(width=A4[1], height=A4[0])
+    col_w = col_w or [80] * max(len(r) for r in rows)
+    ruled_table(page, 50, 50, col_w, [18] * len(rows), grid(rows), merges)
+    doc = pymupdf.open()
+    stored = doc.new_page(width=A4[0], height=A4[1])
+    stored.show_pdf_page(stored.rect, upright, 0, rotate=rotation)
+    stored.set_rotation(rotation)
+    doc.save(str(path))
+    doc.close()
+    upright.close()
+    return Path(path)
+
+
 # --- T3: text drawn over text ---------------------------------------------------------------------------
 
 def baked_form_pdf(path: Path) -> Path:
