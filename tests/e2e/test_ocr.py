@@ -796,12 +796,16 @@ CACHE_DIR_SCRIPT = (
 )
 
 
-def test_refused_recovery_keeps_the_document_out_of_cache_dir(e2e_dir, fake_llm, scan):
-    """M1 through the public API (``cache_dir`` has no CLI switch): a document whose page the provider refused on
-    the recovery call is not stored, so the next run asks again instead of serving the refusal for ever."""
+def test_refused_recovery_keeps_the_document_out_of_cache_dir(e2e_dir, fake_llm):
+    """M1 through the public API (``cache_dir`` has no CLI switch): a picture whose recovery call the provider
+    refused was stored with its document in ``cache_dir``, which never expires, so every later run served the
+    refusal. The document is not stored; the next run asks again. (A scanned page is kept out anyway, as a page
+    that shows content its OCR did not read: a picture is not.)"""
+    photo = e2e_dir / "label.png"
+    photo.write_bytes(pdfgen.text_png("LOT 4471"))
     fake_llm.script(structured=[fake.page("")], free_form=[fake.refusal(REFUSAL)])
 
-    proc = subprocess.run([sys.executable, "-c", CACHE_DIR_SCRIPT, str(scan), str(e2e_dir / "document-cache")],
+    proc = subprocess.run([sys.executable, "-c", CACHE_DIR_SCRIPT, str(photo), str(e2e_dir / "document-cache")],
                           cwd=e2e_dir, capture_output=True, text=True, encoding="utf-8", timeout=600,
                           env={**os.environ, **fake_llm.env})
 
