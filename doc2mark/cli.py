@@ -231,6 +231,8 @@ def _worker_main(connection, loader_config, processing_config):
     if hasattr(os, "setsid"):
         with suppress(OSError):
             os.setsid()  # a process group of its own: stopping the worker stops what it started (LibreOffice, ...)
+    with suppress(OSError):
+        connection.send('ready')  # the imports are done: a file's time limit starts now, not at process start
     while True:
         try:
             file_path = connection.recv()
@@ -258,12 +260,20 @@ class ConversionWorker:
         child_connection.close()
         self.file_path = None
         self.deadline = None
+        try:
+            started = self.connection.poll(120) and self.connection.recv() == 'ready'
+        except (EOFError, OSError):
+            started = False
+        if not started:
+            self.stop()
+            raise RuntimeError("a conversion worker process did not start")
 
     def start(self, file_path, timeout):
         """Send a file to convert; ``timeout`` seconds from now it counts as too slow (0 or None: never)."""
         self.file_path = file_path
         self.deadline = time.monotonic() + timeout if timeout else None
-        self.connection.send(file_path)
+        with suppress(OSError):  # a worker that died meanwhile is found out by the next wait()
+            self.connection.send(file_path)
 
     def stop(self):
         """Kill the worker, and what it started if it leads its own process group."""
