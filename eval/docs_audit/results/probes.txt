@@ -82,3 +82,6 @@ request keys: ['max_completion_tokens', 'model', 'response_format', 'stream']
 
 ## create_ocr_cache('redis') without a URL quietly returns a memory cache
 MemoryOCRCache
+
+## batch_process with extract_images=True reports a PDF with pictures as failed (base64 str written in 'wb' mode)
+failed | a bytes-like object is required, not 'str' | .md written: True
