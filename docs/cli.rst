@@ -25,10 +25,13 @@ Output
 - **One file with** ``-o PATH``: the extension of ``PATH`` is replaced by ``.md`` or ``.json``
   (``-o report`` and ``-o report.txt`` both write ``report.md``; the folder must exist);
   ``--format both`` writes both files. The command prints ``Output saved to: ...`` (not with ``-q``).
-- **A folder**: with ``-o DIR`` every converted document is written to ``DIR/<file stem>.md``
-  (or ``.json``), flat, whatever sub-folder it came from (two files with the same stem overwrite
-  each other), after all files were converted: a failure that stops the run writes nothing.
-  Without ``-o`` only a summary is printed.
+- **A folder**: with ``-o DIR`` every converted document is written to the same relative path
+  under ``DIR`` with ``.md`` (or ``.json``) in place of its extension (``docs/2024/report.pdf``
+  becomes ``DIR/2024/report.md``), as soon as it is converted: a failure that stops the run
+  keeps what was written before it. Files of one folder that would write the same name
+  (``report.txt`` and ``report.md``) are written as ``report.txt.md`` and ``report.md.md``, and
+  so is a file whose output would replace an input file (``-o`` naming the input folder); a
+  warning names them. Without ``-o`` only a summary is printed.
 
 The JSON is :meth:`ProcessedDocument.to_dict() <doc2mark.ProcessedDocument.to_dict>`: ``content``
 (the Markdown), ``metadata`` (with ``extra``), ``images``, ``tables``, ``sections`` and
@@ -78,7 +81,8 @@ Output
 ``--max-length N``
    Cut the content after ``N`` characters and add ``... (truncated)``.
 ``--preserve-structure``
-   Accepted but has no effect.
+   Deprecated: accepted with a warning and ignored, because a folder run always mirrors the
+   input tree under ``-o``.
 
 Folders
 ~~~~~~~
@@ -86,21 +90,28 @@ Folders
 ``-r, --recursive``
    Include sub-folders.
 ``--pattern GLOB``
-   Which entries to convert (default ``*``: every entry, sub-folders and unsupported files
-   included, so use a pattern such as ``"*.pdf"`` or ``--skip-errors``).
+   Which files to convert (default ``*``: every file; sub-folders are never converted
+   themselves, ``-r`` decides whether the files inside them match too). A file in a format
+   doc2mark does not read fails the run, so use a pattern such as ``"*.pdf"`` or
+   ``--skip-errors``.
 ``--exclude GLOB``
    Leave out file names matching ``GLOB`` (repeatable).
 ``--max-files N``, ``--sort {name,size,date}``
-   Keep the first ``N`` entries after sorting (ascending; default ``name``).
+   Keep the first ``N`` files after sorting (ascending; default ``name``), so ``--sort size
+   --max-files 10`` keeps the ten smallest files and ``--sort date`` the oldest.
 ``-p, --parallel N``
-   Convert ``N`` files at once in separate processes.
+   Convert ``N`` files at once. Every file of a folder run is converted in a worker process
+   (one at a time without ``-p``).
 ``--skip-errors``
    Report a file that fails and go on (the command then exits 0); without it the first failure
    stops the run.
 ``--retry N``
    Try a failing file ``N`` more times (default ``1``).
 ``--timeout SECONDS``
-   Accepted but not enforced.
+   The longest time one file of a folder run may take, its retries included (default ``300``;
+   ``0``: no limit). A file that takes longer is stopped (its worker process is killed, and with
+   it a LibreOffice it started) and counts as failed: ``timed out after 300 s``. A single-file
+   run is not limited.
 
 Messages
 ~~~~~~~~

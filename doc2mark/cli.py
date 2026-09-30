@@ -1,7 +1,7 @@
 """Command line interface for doc2mark."""
 
 from collections import Counter, deque
-from contextlib import suppress
+from contextlib import closing, suppress
 from datetime import datetime
 from pathlib import Path
 import argparse
@@ -756,28 +756,29 @@ Supported formats:
             # written as soon as it is done: a failure that ends the run keeps what was converted before it
             workers = args.parallel if args.parallel and args.parallel > 1 else 1
             if not args.quiet:
-                logger.info(f"Processing {len(files)} files ({workers} at a time, at most {args.timeout or 'any number of'} s each)")
+                limit = f"{args.timeout} s per file" if args.timeout else "no time limit"
+                logger.info(f"Processing {len(files)} files ({workers} at a time, {limit})")
 
             converted = []  # (path relative to the input folder, content length)
             failed_files = []
             show_progress = not args.quiet and args.progress != "none"
             if show_progress:
                 print_progress(0, len(files), args.progress, args.no_color)
-            for done, (status, file_path, result_or_error) in enumerate(
-                    convert_files(files, loader_config, processing_config, workers, args.timeout), 1):
-                if status == 'success':
-                    if output_path:
-                        write_outputs(result_or_error, output_path / output_names[file_path], args.format,
-                                      args.encoding)
-                    converted.append((file_path.relative_to(input_path),
-                                      len(result_or_error.content) if result_or_error.content else 0))
-                elif args.skip_errors:
-                    logger.error(f"Failed to process {file_path}: {result_or_error}")
-                    failed_files.append((file_path, result_or_error))
-                else:
-                    raise RuntimeError(f"Failed to process {file_path}: {result_or_error}")
-                if show_progress:
-                    print_progress(done, len(files), args.progress, args.no_color)
+            with closing(convert_files(files, loader_config, processing_config, workers, args.timeout)) as outcomes:
+                for done, (status, file_path, result_or_error) in enumerate(outcomes, 1):
+                    if status == 'success':
+                        if output_path:
+                            write_outputs(result_or_error, output_path / output_names[file_path], args.format,
+                                          args.encoding)
+                        converted.append((file_path.relative_to(input_path),
+                                          len(result_or_error.content) if result_or_error.content else 0))
+                    elif args.skip_errors:
+                        logger.error(f"Failed to process {file_path}: {result_or_error}")
+                        failed_files.append((file_path, result_or_error))
+                    else:
+                        raise RuntimeError(f"Failed to process {file_path}: {result_or_error}")
+                    if show_progress:
+                        print_progress(done, len(files), args.progress, args.no_color)
 
             if show_progress:
                 print()  # New line after progress

@@ -28,8 +28,12 @@ Every conversion returns a :class:`~doc2mark.ProcessedDocument`:
        "image", "content": <base64 PNG>, ...}`` (:doc:`images`). ``to_dict()`` turns bytes into
        base64.
    * - ``tables``, ``sections``
-     - Kept for compatibility; the built-in processors leave them ``None``. Tables are in
-       ``content`` and are ``table`` items of ``json_content``.
+     - Read from ``json_content``, so they are set for the formats that have it and ``None``
+       otherwise. ``tables``: one dict per ``table`` item, ``{"page", "format", "content"}``
+       (``content`` is the table as it is in the Markdown, ``format`` ``"html"`` or
+       ``"markdown"``). ``sections``: one dict per heading item (``text:title``,
+       ``text:section``), ``{"level", "title", "page"}``, with the level of its ``#`` heading in
+       the Markdown. The batch results' ``tables_found`` counts ``tables``.
 
 ``result.markdown`` is ``content``; ``result.text`` is ``content`` with ``#`` heading markers,
 ``**bold**``, ``*italics*``, ``[links](...)`` and ```code``` marks removed by simple patterns

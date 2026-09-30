@@ -99,7 +99,7 @@ doc2mark documents/ -r --pattern "*.pdf" -o converted/
 | Office | `.docx`, `.xlsx`, `.pptx` |
 | Legacy Office (via LibreOffice) | `.doc`, `.xls`, `.ppt`, `.pps`, `.rtf` |
 | Images | `.png`, `.jpg`, `.jpeg`, `.webp`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.heic`/`.heif` (with `doc2mark[heif]`), `.avif` (Pillow with AVIF support) |
-| Text and data | `.txt`, `.csv`, `.json`, `.jsonl` (`.tsv` is recognised but currently fails to convert) |
+| Text and data | `.txt`, `.csv`, `.tsv`, `.json`, `.jsonl` |
 | Markup | `.html`, `.htm`, `.xml`, `.md`, `.markdown` |
 | E-mail | `.eml` |
 

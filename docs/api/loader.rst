@@ -70,7 +70,9 @@ files with :meth:`~doc2mark.UnifiedDocumentLoader.load` or in batches. Guide: :d
    ``form_focused``, ``receipt_focused``, ``handwriting_focused``, ``code_focused``, or your own
    prompt text (``default_prompt``).
 ``table_style``
-   ``"minimal_html"`` (default), ``"markdown_grid"`` or ``"styled_html"`` (:doc:`/tables`).
+   ``"minimal_html"`` (default), ``"markdown_grid"`` or ``"styled_html"``, in any case, or a
+   :class:`~doc2mark.TableStyle`; any other name is a ``ValueError``. It applies to every
+   format, legacy Office files included (:doc:`/tables`).
 ``legibility_judge``, ``boilerplate_judge``, ``judge``
    The judge hooks, or a judge object / ``"typesafe"`` / ``"none"``; default
    ``$DOC2MARK_JUDGE`` (:doc:`/judge`).
@@ -80,5 +82,6 @@ files with :meth:`~doc2mark.UnifiedDocumentLoader.load` or in batches. Guide: :d
              set_ocr_provider, get_ocr_configuration, validate_ocr_setup
 
    ``load()`` notes: ``ocr_images=True`` implies ``extract_images=True`` when an OCR provider is
-   configured, and both flags also apply to image files; ``delimiter`` is currently ignored (the
-   CSV delimiter is detected). The batch result dictionaries are described in :doc:`/loading`.
+   configured, and both flags also apply to image files; ``delimiter`` is the CSV delimiter
+   (detected when omitted; a ``.tsv`` file is always tab separated). The batch result
+   dictionaries are described in :doc:`/loading`.

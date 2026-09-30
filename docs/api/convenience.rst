@@ -2,10 +2,11 @@ Convenience functions
 =====================
 
 Module-level shortcuts that create a :class:`~doc2mark.UnifiedDocumentLoader` for one call. The
-loader gets ``ocr_provider`` (default ``"openai"``), ``api_key`` and ``ocr_cache``; every other
-keyword argument goes to :meth:`~doc2mark.UnifiedDocumentLoader.load` (or to the batch method),
-so loader settings such as ``table_style``, ``model`` or ``judge`` need a loader of your own
-(:doc:`/loading`).
+loader gets ``ocr_provider`` (default ``"openai"``), ``api_key`` and ``ocr_cache``. Every other
+keyword argument goes where it belongs: the options of
+:meth:`~doc2mark.UnifiedDocumentLoader.load` (or of the batch method) to that call, all other
+loader settings (``table_style``, ``cache_dir``, ``model``, ``judge``, ...) to the loader; a name
+that is neither raises ``TypeError`` (:doc:`/loading`).
 
 .. list-table::
    :header-rows: 1

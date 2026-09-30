@@ -125,8 +125,8 @@ the loader is created), each conversion with its own throwaway profile; then the
 read as above. The original format and file name are kept in the metadata, and
 ``metadata.extra`` has ``converted_from`` and ``converted_to`` (``"doc"``, ``"docx"``). Without
 LibreOffice, :meth:`~doc2mark.UnifiedDocumentLoader.load` raises
-:class:`~doc2mark.ProcessingError` with installation guidance. The loader's ``table_style`` is not
-applied to legacy files (they always use ``minimal_html``).
+:class:`~doc2mark.ProcessingError` with installation guidance. The loader's ``table_style``
+applies to the converted file like it does to a Word, Excel or PowerPoint file.
 
 .. code-block:: python
 
@@ -141,11 +141,12 @@ Text and data
 - **.txt**: read with ``encoding`` (default ``utf-8``, not detected: a file in another encoding
   fails unless you pass it); a short line written entirely in capitals becomes a ``##`` heading,
   everything else is kept as written. Metadata: ``word_count``, ``line_count``.
-- **.csv**: the delimiter is detected (``csv.Sniffer``; the ``delimiter`` argument is currently
-  ignored), the first row is the header of a Markdown table. Cell text is not escaped. Metadata:
-  ``row_count`` (header included), ``column_count``, ``delimiter``.
-- **.tsv**: recognised, but conversion currently fails with a ``ProcessingError`` (a known bug);
-  rename the file to ``.csv`` and the tab delimiter is detected.
+- **.csv**: the delimiter is the ``delimiter`` argument (one character) when you pass it,
+  otherwise it is detected (``csv.Sniffer`` on the first 1,024 characters, a comma when nothing
+  is found). The first row is the header of a Markdown table. Cell text is not escaped.
+  Metadata: ``row_count`` (header included), ``column_count``, ``delimiter``.
+- **.tsv**: the same table and metadata, always tab separated (``delimiter`` is the CSV option
+  and does not apply).
 - **.json**: objects become ``**key**: value`` lines, lists ``-`` items, nested with indentation.
   Metadata: ``data_type`` (``dict``, ``list``, ...), ``item_count``.
 - **.jsonl**: ``# JSONL Data (N records)`` and one ``## Record i`` per valid line; invalid lines are
@@ -169,9 +170,14 @@ Markup
 - **XML** is parsed with defusedxml and written as a heading tree (element names as headings,
   attributes as lists, text kept). Metadata: ``root_tag``, ``element_count``.
 - **Markdown** is kept as written. YAML front matter is moved to ``metadata.frontmatter`` when
-  PyYAML is installed (it comes with the ``ocr`` and ``vertex_ai`` extras); note that a file
-  starting with a ``---`` rule is taken for front matter too. Metadata: ``header_count``,
-  ``link_count``, ``image_count``, ``line_count``.
+  PyYAML is installed (it comes with the ``ocr`` and ``vertex_ai`` extras). It is front matter
+  only when the file starts with a ``---`` line, a closing ``---`` line follows and the lines
+  between them are YAML that parses to a mapping; everything else that starts with a rule
+  (prose or a list between two rules, invalid YAML, no closing rule) stays in the text, which
+  is never changed. The text after the front matter is kept as written, except for the blank
+  lines right after the closing rule. Dates in front matter are ``datetime.date`` objects in
+  ``metadata.frontmatter`` and ISO strings in ``to_dict()`` and the CLI's JSON. Metadata:
+  ``header_count``, ``link_count``, ``image_count``, ``line_count``.
 
 E-mail
 ------

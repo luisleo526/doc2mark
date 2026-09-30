@@ -68,7 +68,8 @@ show_progress=False, encoding="utf-8", delimiter=None)``:
    files.
 ``encoding``, ``delimiter``
    ``encoding`` is used for text, CSV, JSON and markup files (default ``utf-8``, not detected).
-   ``delimiter`` is accepted but currently ignored: the CSV delimiter is always detected.
+   ``delimiter`` (one character) is the delimiter of CSV files; without it the delimiter is
+   detected. A ``.tsv`` file is always tab separated.
 
 Convenience functions
 ---------------------
@@ -84,11 +85,15 @@ For scripts, the module-level functions create a loader for one call:
 
 :func:`~doc2mark.load`, :func:`~doc2mark.document_to_markdown`,
 :func:`~doc2mark.batch_convert_to_markdown`, :func:`~doc2mark.batch_process_documents` and
-``batch_process_files`` accept ``ocr_provider`` (default ``"openai"``), ``api_key`` and
-``ocr_cache`` for the loader; any other keyword goes to ``load()`` or the batch method, not to
-the loader, so ``load("report.pdf", table_style="markdown_grid")`` raises ``TypeError``. For other
-loader settings (``table_style``, ``model``, ``cache_dir``, ``judge``) create a
-:class:`~doc2mark.UnifiedDocumentLoader`.
+``batch_process_files`` take ``ocr_provider`` (default ``"openai"``), ``api_key`` and
+``ocr_cache`` for the loader, and route every other keyword argument where it belongs: an option
+of ``load()`` (``encoding``, ``delimiter``, ``show_progress``) or of the batch method
+(``encoding``, ``delimiter``, ``max_workers``, ``progress_callback``) goes to that call, every
+other :class:`~doc2mark.UnifiedDocumentLoader` setting (``table_style``, ``model``,
+``cache_dir``, ``judge``, ...) to the loader. So ``load("report.pdf",
+table_style="markdown_grid")`` and ``load("report.pdf", cache_dir=".cache")`` work, and in a
+batch function ``max_workers`` is the number of files converted at once, not the OCR
+concurrency (set that on a loader of your own). A name that is neither raises ``TypeError``.
 
 Folders and file lists
 ----------------------
@@ -108,8 +113,9 @@ Folders and file lists
    print(len(results), "files,", len(failed), "failed")
 
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process` finds every file under ``input_dir``
-(``recursive=True`` by default) whose extension is a supported one in lower case (``.pdf``, not
-``.PDF``; ``.markdown`` too, but not ``.htm``), converts it and, with ``save_files=True`` (the
+(``recursive=True`` by default) that :meth:`~doc2mark.UnifiedDocumentLoader.load` accepts,
+whatever the case of its extension (``.PDF``, ``.htm`` and ``.markdown`` included; folders are
+never converted themselves), in path order, converts it and, with ``save_files=True`` (the
 default), writes ``<name>.md`` (or ``.json``), keeping the folder structure, and, when pictures
 were extracted, a ``<name>_images/`` folder (a known issue: a PDF whose pictures were extracted
 without OCR is then reported as failed although its ``.md`` was written). With
@@ -126,8 +132,8 @@ The returned dict maps each input path (a string, in input order) to a result:
 
    {"status": "failed", "error": "Processing failed: ...", "format": ".pdf"}
 
-``tables_found`` counts ``ProcessedDocument.tables``, which the built-in processors do not fill,
-so it is 0; count ``table`` items of ``json_content`` if you need it.
+``tables_found`` is the number of tables of the document (``ProcessedDocument.tables``, see
+:doc:`output`); it is 0 for files without content items (text, data and markup files).
 
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process_files` takes a list of paths instead. It
 writes only when ``output_dir`` is given, as ``output_dir/<file stem>.md`` (two inputs with the

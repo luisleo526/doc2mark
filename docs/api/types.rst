@@ -10,8 +10,9 @@ ProcessedDocument
    :members: to_dict, get_chunks, markdown, text
 
    Fields: ``content`` (str), ``metadata`` (:class:`~doc2mark.DocumentMetadata`), ``images``,
-   ``tables``, ``sections`` and ``json_content`` (lists of dicts or ``None``). The built-in
-   processors never fill ``tables`` or ``sections``.
+   ``tables``, ``sections`` and ``json_content`` (lists of dicts or ``None``). ``tables`` and
+   ``sections`` list the tables and headings of ``json_content`` (:doc:`/output`); they are
+   ``None`` for files without content items (text, data and markup files).
 
 DocumentMetadata
 ----------------
@@ -49,7 +50,7 @@ are ``None`` unless the format sets them:
      - Text, CSV, JSON, JSONL, HTML, XML and Markdown files: the ``encoding`` argument (not
        detected).
    * - ``delimiter``, ``row_count``, ``column_count``
-     - CSV (``row_count`` includes the header row).
+     - CSV and TSV (``row_count`` includes the header row).
    * - ``record_count``
      - JSONL.
    * - ``data_type``, ``item_count``
