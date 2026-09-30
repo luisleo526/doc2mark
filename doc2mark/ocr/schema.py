@@ -856,6 +856,14 @@ def _opens_table_body(text: str, pos: int, comment_ends: List[int]) -> bool:
     return False
 
 
+def _neutralize_before_table(text: str) -> str:
+    """Text before a sanitized table. A "<" it ends with is escaped too: the sanitizer
+    can return plain text (a ``<table-x>`` is unwrapped to its text), and "<" + "img
+    src=x onerror=..." would be a live tag."""
+    text = _neutralize_html(text, keep_breaks=True)
+    return text[:-1] + "&lt;" if text.endswith("<") else text
+
+
 def _sanitize_markdown(text: str) -> str:
     """Model-written Markdown (``page_markdown``, ``Table.markdown``, a free-form OCR
     answer): its Markdown structure is kept; each ``<table>...</table>`` block goes
@@ -875,13 +883,13 @@ def _sanitize_markdown(text: str) -> str:
         elif depth:
             depth -= 1
             if depth == 0:
-                out.append(_neutralize_html(text[last:start], keep_breaks=True))
+                out.append(_neutralize_before_table(text[last:start]))
                 out.append(normalize_table_html(sanitize_table_html(text[start:match.end()])))
                 last = match.end()
     if depth:
         # A table still open at the end (its markup goes straight on into rows): an
         # answer cut off at max_tokens.
-        out.append(_neutralize_html(text[last:start], keep_breaks=True))
+        out.append(_neutralize_before_table(text[last:start]))
         out.append(normalize_table_html(sanitize_table_html(text[start:])))
     else:  # no table left open, or a "<table>" merely mentioned in the prose
         out.append(_neutralize_html(text[last:], keep_breaks=True))

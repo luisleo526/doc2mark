@@ -245,9 +245,12 @@ indexes such an answer as page content:
    detected.", and the same statements in Chinese, Japanese, Korean, German, Spanish
    and French. The check is conservative. Text that addresses a reader (a request to
    resend or retake, "your photo", "please"), talks about a file, folder or system,
-   goes on past what it refuses ("I can't read the scans until Dr. Lee signs off.") or
+   goes on past what it refuses ("I can't read the scans until Dr. Lee signs off.",
+   or more sentences after it: "I can't help. It is too late to change the order.") or
    merely mentions an apology ("Sorry we missed you!", "This page intentionally left
-   blank.") is kept; what the check cannot decide is left to the judge below.
+   blank.") is kept; what the check cannot decide is left to the judge below. That
+   includes a model's refusal with a stock follow-up ("I'm sorry, but I can't assist
+   with that. If you have any other questions, feel free to ask!").
 3. A structured answer with no content goes to the free-form recovery, as an empty
    one always did. If the recovered answer is a refusal as well, the result is empty
    text with ``metadata["ocr_refusal"] = True``.
