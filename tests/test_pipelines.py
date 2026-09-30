@@ -206,8 +206,15 @@ class TestPipelines:
         # Ensure no literal placeholder remains
         assert '#VALUE!' not in result.content
 
-        # The picture anchored at A4 ("Sample Image:", a title row) carries its OCR text there
-        assert '[Image: ' in result.content
+        # The picture anchored at A4 ("Sample Image:", a title row) is marked on that line:
+        # "[Image: <text>]" when the model reads text in it, "[Image]" when it reads none.
+        line = next((line for line in result.content.splitlines() if line.startswith("Sample Image:")), "")
+        assert "[Image" in line, result.content[:1500]
+
+        # The internal OCR wrapper never leaks, and an empty OCR result is not an item
+        assert "image_ocr_result>" not in result.content
+        leaked = [item for item in result.json_content or [] if "image_ocr_result>" in (item.get("content") or "")]
+        assert not leaked, leaked
 
     def test_pptx_ocr_uses_self_ocr_not_visionagent(self, sample_documents_dir):
         """PPTX: OCR should run when self.ocr is configured, regardless of VisionAgent availability."""

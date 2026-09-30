@@ -286,6 +286,29 @@ def test_t14_xlsx_picture_ocr_text_lands_in_its_cell_once(run_cli, require_tool,
     assert result.markdown.count("5831") == 1, result.describe()
 
 
+@pytest.mark.parametrize("builder,name,needle", [
+    ("textless_pictures_workbook", "photos.xlsx", "pump"),
+    ("textless_pictures_document", "memo.docx", "Before the picture."),
+    ("textless_pictures_deck", "deck.pptx", "Slide with a background picture."),
+])
+def test_pictures_without_text_leave_no_empty_ocr_items(run_cli, require_tool, e2e_dir, builder, name, needle):
+    """OCR that finds no text in a picture must not produce an empty description item
+    (content "<image_ocr_result></image_ocr_result>"), and the wrapper never reaches the Markdown."""
+    require_tool("tesseract")
+    path = getattr(office, builder)(e2e_dir / name)
+
+    result = run_cli(path, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert routed_via(result) != "pdf", result.json["metadata"]  # the native Office paths are under test
+    assert needle in result.markdown, result.describe()[:3000]
+    items = result.json["json_content"] or []
+    empty = [item for item in items if item.get("type") == "text:image_description"
+             and not re.sub(r"</?image_ocr_result>", "", item.get("content") or "").strip()]
+    assert not empty, f"empty OCR description items: {empty}"
+    assert "image_ocr_result>" not in result.markdown, result.describe()[:3000]
+
+
 # Negative numbers under formats whose negative section conveys the sign only by colour, or
 # whose sections are picked by conditions: the displayed text must still carry the sign.
 NEGATIVE_FORMATS = [

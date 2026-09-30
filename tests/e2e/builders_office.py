@@ -494,6 +494,67 @@ def pptx_group_text_over_picture(path: Path, slides: int = 4) -> Path:
     return Path(path)
 
 
+TEXT_FREE_FILLER = ("Quarterly operations review: shipments grew in every region while "
+                    "returns fell, and the team closed the open audit items before the deadline.")
+
+
+def textless_pictures_workbook(path: Path) -> Path:
+    """A table with a text-free picture anchored in cell B2 and another anchored at E9,
+    outside the used range."""
+    blank = plain_picture((600, 400))
+    return workbook(path, [{
+        "title": "Photos",
+        "rows": [["Item", "Photo"], ["pump", None], ["valve", None]],
+        "images": {"B2": blank, "E9": blank},
+    }])
+
+
+def textless_pictures_document(path: Path) -> Path:
+    """Body paragraphs around a text-free inline picture (small, so the document stays on the
+    native path)."""
+    document = Document()
+    document.add_paragraph("Before the picture. " + TEXT_FREE_FILLER)
+    document.add_picture(io.BytesIO(plain_picture((600, 400))), width=Inches(2.0), height=Inches(1.3))
+    document.add_paragraph("After the picture. " + TEXT_FREE_FILLER)
+    document.save(str(path))
+    return Path(path)
+
+
+def textless_pictures_deck(path: Path) -> Path:
+    """Three text slides (enough text to stay on the native path) with text-free pictures:
+    a small picture shape, the slide's own background picture fill, and a picture inserted
+    into a picture placeholder."""
+    prs = _deck()
+    blank = plain_picture((600, 400))
+
+    slide = _blank_slide(prs)
+    slide.shapes.add_picture(io.BytesIO(blank), Emu(6000000), Emu(3500000), Emu(1800000), Emu(1200000))
+    _add_text_box(slide, "Slide with a picture shape. " + TEXT_FREE_FILLER * 2)
+
+    slide = _blank_slide(prs)
+    _set_background_picture(slide, blank)
+    _add_text_box(slide, "Slide with a background picture. " + TEXT_FREE_FILLER * 2)
+
+    layout = next(layout for layout in prs.slide_layouts if layout.name == "Picture with Caption")
+    slide = prs.slides.add_slide(layout)
+    placeholder = next(p for p in slide.placeholders if "PICTURE" in str(p.placeholder_format.type))
+    picture_idx = placeholder.placeholder_format.idx
+    placeholder.insert_picture(io.BytesIO(blank))
+    for other in list(slide.placeholders):
+        if other.placeholder_format.idx != picture_idx:
+            other._element.getparent().remove(other._element)
+    _add_text_box(slide, "Slide with a picture placeholder. " + TEXT_FREE_FILLER * 2)
+
+    prs.save(str(path))
+    return Path(path)
+
+
+def _add_text_box(slide, text: str) -> None:
+    box = slide.shapes.add_textbox(Emu(400000), Emu(300000), Emu(8300000), Emu(1500000))
+    box.text_frame.word_wrap = True
+    box.text_frame.text = text
+
+
 def xlsx_formats_rows() -> Tuple[List[list], Dict[str, str], Dict[Tuple[int, int], str]]:
     """Rows, number formats and the expected displayed text for the value-fidelity sheet.
 
