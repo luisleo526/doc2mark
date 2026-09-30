@@ -4,7 +4,7 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Any, List, Union, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
@@ -99,58 +99,30 @@ class TextProcessor(BaseProcessor):
             raise ProcessingError(f"TXT processing failed: {str(e)}")
 
     def _process_csv(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
-        """Process CSV file."""
-        try:
-            encoding = kwargs.get('encoding', 'utf-8')
-
-            with open(file_path, 'r', encoding=encoding, newline='') as f:
-                # Detect delimiter
-                sample = f.read(1024)
-                f.seek(0)
-                sniffer = csv.Sniffer()
-                try:
-                    delimiter = sniffer.sniff(sample).delimiter
-                except csv.Error:
-                    delimiter = ','
-
-                # Read CSV
-                reader = csv.reader(f, delimiter=delimiter)
-                rows = list(reader)
-
-            if not rows:
-                return "", {'row_count': 0, 'column_count': 0}
-
-            # Convert to markdown table
-            markdown_content = self._convert_csv_to_markdown(rows)
-
-            metadata = {
-                'row_count': len(rows),
-                'column_count': len(rows[0]) if rows else 0,
-                'delimiter': delimiter,
-                'encoding': encoding
-            }
-
-            return markdown_content, metadata
-
-        except Exception as e:
-            logger.error(f"Failed to process CSV: {e}")
-            raise ProcessingError(f"CSV processing failed: {str(e)}")
+        """Process CSV file: its cells are separated by ``delimiter`` (one character) when that is given,
+        else by the delimiter sniffed from the start of the file (a comma when nothing is found)."""
+        return self._process_delimited(file_path, 'CSV', kwargs.get('delimiter'), kwargs.get('encoding', 'utf-8'))
 
     def _process_tsv(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
-        """Process TSV file."""
-        # TSV is just CSV with tab delimiter
-        kwargs['delimiter'] = '\t'
-        content, metadata = self._process_csv_with_delimiter(file_path, '\t', **kwargs)
-        return content, metadata
+        """Process TSV file: always tab separated (``delimiter`` is the CSV option and does not apply)."""
+        return self._process_delimited(file_path, 'TSV', '\t', kwargs.get('encoding', 'utf-8'))
 
-    def _process_csv_with_delimiter(self, file_path: Path, delimiter: str, **kwargs) -> Tuple[str, dict]:
-        """Process CSV/TSV with specific delimiter."""
+    def _process_delimited(self, file_path: Path, kind: str, delimiter: Optional[str],
+                           encoding: str) -> Tuple[str, dict]:
+        """Process a CSV/TSV file; ``delimiter`` None means sniff it."""
+        if delimiter is not None and len(delimiter) != 1:
+            raise ProcessingError(f"{kind} delimiter must be a single character, got {delimiter!r}")
         try:
-            encoding = kwargs.get('encoding', 'utf-8')
-
             with open(file_path, 'r', encoding=encoding, newline='') as f:
-                reader = csv.reader(f, delimiter=delimiter)
-                rows = list(reader)
+                if delimiter is None:
+                    sample = f.read(1024)
+                    f.seek(0)
+                    try:
+                        delimiter = csv.Sniffer().sniff(sample).delimiter
+                    except csv.Error:
+                        delimiter = ','
+
+                rows = list(csv.reader(f, delimiter=delimiter))
 
             if not rows:
                 return "", {'row_count': 0, 'column_count': 0}
@@ -168,8 +140,8 @@ class TextProcessor(BaseProcessor):
             return markdown_content, metadata
 
         except Exception as e:
-            logger.error(f"Failed to process file with delimiter '{delimiter}': {e}")
-            raise ProcessingError(f"Processing failed: {str(e)}")
+            logger.error(f"Failed to process {kind}: {e}")
+            raise ProcessingError(f"{kind} processing failed: {str(e)}")
 
     def _process_json(self, file_path: Path, **kwargs) -> Tuple[str, dict]:
         """Process JSON file."""

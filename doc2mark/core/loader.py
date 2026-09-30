@@ -1,6 +1,7 @@
 """Main UnifiedDocumentLoader implementation."""
 
 import base64
+import datetime
 import hashlib
 import json
 import logging
@@ -20,6 +21,8 @@ from doc2mark.core.base import (
     UnsupportedFormatError
 )
 from doc2mark.core.strategy import ROUTING_VERSION
+from doc2mark.core.structure import tables_and_sections
+from doc2mark.core.table import TableStyle
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache, ocr_settings_identity
 from doc2mark.ocr.prompts import PromptTemplate
@@ -80,7 +83,7 @@ class UnifiedDocumentLoader:
             structured: Optional[bool] = None,
             detail: Optional[str] = None,
             # Table output configuration
-            table_style: Optional[str] = None,
+            table_style: Optional[Union[str, TableStyle]] = None,
             # Optional text-layer legibility judge (PDF quality gate)
             legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
             # Optional judge for repeated header/footer lines the rule keeps (PDF)
@@ -135,7 +138,9 @@ class UnifiedDocumentLoader:
                 the config / provider default untouched.
 
             # Table output configuration:
-            table_style: Output style for complex tables with merged cells:
+            table_style: Output style for complex tables with merged cells (a name in any case
+                or a ``TableStyle``; anything else is a ``ValueError``), used for every format,
+                legacy Office files included:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
                 - 'markdown_grid': Markdown with merge annotations
                 - 'styled_html': Full HTML with inline styles (legacy)
@@ -163,6 +168,9 @@ class UnifiedDocumentLoader:
                 deterministic rules; see docs/judge.rst.
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
+
+        # Checked first, so a misspelt style fails before anything is set up
+        table_style = self._normalize_table_style(table_style)
 
         from doc2mark.judge import judge_hooks, resolve_judge
         self.judge = resolve_judge(judge)
@@ -201,7 +209,7 @@ class UnifiedDocumentLoader:
             logger.info(f"📁 Cache directory: {self.cache_dir}")
 
         # Table output style (default: minimal_html for cleaner output)
-        self.table_style = table_style if table_style else "minimal_html"
+        self.table_style = table_style
         logger.info(f"📊 Table style: {self.table_style}")
         self.legibility_judge = legibility_judge if legibility_judge is not None else hooks["legibility_judge"]
         self.boilerplate_judge = boilerplate_judge if boilerplate_judge is not None else hooks["boilerplate_judge"]
@@ -211,6 +219,23 @@ class UnifiedDocumentLoader:
         self._initialize_processors()
 
         logger.info("✅ UnifiedDocumentLoader initialized successfully")
+
+    @staticmethod
+    def _normalize_table_style(table_style: Optional[Union[str, TableStyle]]) -> str:
+        """The name of a valid table style. None (or an empty string) is the default; a name is
+        matched in any case; anything else is a ValueError naming the valid styles, instead of
+        failing in the PDF reader and falling back to a basic converter in the Office one."""
+        if not table_style:
+            return TableStyle.default().value
+        if isinstance(table_style, TableStyle):
+            return table_style.value
+        if isinstance(table_style, str):
+            try:
+                return TableStyle(table_style.strip().lower()).value
+            except ValueError:
+                pass
+        valid = ", ".join(style.value for style in TableStyle)
+        raise ValueError(f"Unknown table_style {table_style!r}. Expected one of: {valid}")
 
     @staticmethod
     def _is_ocr_provider(provider: Union[str, OCRProvider], target: OCRProvider) -> bool:
@@ -473,7 +498,7 @@ class UnifiedDocumentLoader:
                                          boilerplate_judge=getattr(self, "boilerplate_judge", None))
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
-            legacy_processor = LegacyProcessor(ocr=ocr)
+            legacy_processor = LegacyProcessor(ocr=ocr, table_style=self.table_style)
             image_processor = ImageProcessor(ocr=ocr)
 
             # Register processors for each format
@@ -596,6 +621,19 @@ class UnifiedDocumentLoader:
         return complete
 
     @staticmethod
+    def _fill_structure(result: ProcessedDocument) -> None:
+        """Give a document its ``tables`` and ``sections`` (see ``doc2mark.core.structure``) when its
+        converter produced content items (``json_content``) and did not list them itself. Formats
+        without content items (text, data and markup files) keep both as None."""
+        if result.json_content is None or (result.tables is not None and result.sections is not None):
+            return
+        tables, sections = tables_and_sections(result.json_content)
+        if result.tables is None:
+            result.tables = tables
+        if result.sections is None:
+            result.sections = sections
+
+    @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
         """Normalize string output format names to OutputFormat enum values."""
         if isinstance(output_format, OutputFormat):
@@ -698,6 +736,7 @@ class UnifiedDocumentLoader:
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
+                self._fill_structure(cached)
                 return cached
         else:
             cache_options = {}
@@ -737,6 +776,7 @@ class UnifiedDocumentLoader:
 
             # Process with mapped parameters
             result = processor.process(file_path, **processor_kwargs)
+            self._fill_structure(result)
             judge_complete = self._end_judge_document(judge_start, result, file_path)
 
             if usage_ocr is not None:
@@ -985,29 +1025,27 @@ class UnifiedDocumentLoader:
         logger.info(f"📊 Recursive: {recursive}, Save files: {save_files}")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
-        # Find all supported files
-        pattern = "**/*" if recursive else "*"
+        # Find all supported files: one walk that asks the same question load() does (the extension,
+        # in any case), so report.PDF, page.htm and guide.markdown are found like their lower-case forms
         results = {}
         processed_count = 0
         error_count = 0
         start_time = time.time()
 
-        # Collect files by format for better processing
-        files_by_format = {}
+        files_by_format: Dict[DocumentFormat, List[Path]] = {}
         all_files = []
 
-        for doc_format in DocumentFormat:
-            format_pattern = f"{pattern}.{doc_format.value}"
-            files = list(input_dir.glob(format_pattern))
-            if files:
-                files_by_format[doc_format] = files
-                all_files.extend(files)
-
-        # Also check markdown extension variant
-        md_files = list(input_dir.glob(f"{pattern}.markdown"))
-        if md_files:
-            files_by_format[DocumentFormat.MARKDOWN] = files_by_format.get(DocumentFormat.MARKDOWN, []) + md_files
-            all_files.extend(md_files)
+        for file_path in sorted(input_dir.rglob("*") if recursive else input_dir.glob("*")):
+            if not file_path.is_file():
+                continue
+            try:
+                doc_format = self._detect_format(file_path)
+            except UnsupportedFormatError:
+                continue
+            if doc_format not in self._processors:
+                continue
+            files_by_format.setdefault(doc_format, []).append(file_path)
+            all_files.append(file_path)
 
         total_files = len(all_files)
 
@@ -1457,6 +1495,8 @@ class UnifiedDocumentLoader:
             return value.value
         if isinstance(value, Path):
             return str(value)
+        if isinstance(value, (datetime.date, datetime.time)):  # e.g. dates in Markdown front matter
+            return value.isoformat()
         if isinstance(value, dict):
             return {str(key): cls._json_cache_safe(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):

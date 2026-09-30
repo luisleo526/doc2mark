@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 import base64
 from dataclasses import asdict, dataclass, field
+import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -101,6 +102,8 @@ def _json_safe(value: Any) -> Any:
         return value.value
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
+    if isinstance(value, (datetime.date, datetime.time)):  # also datetime; YAML front matter reads dates as these
+        return value.isoformat()
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

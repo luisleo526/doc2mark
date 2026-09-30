@@ -4,9 +4,10 @@ A Python package that unifies document processing across multiple formats
 with advanced AI-powered OCR capabilities.
 """
 
+import inspect
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 __version__ = "0.6.1"
 __author__ = "Hao Liang Wen"
@@ -92,6 +93,27 @@ __all__ = [
 ]
 
 
+def _split_options(function: str, call: Callable, fixed: Iterable[str], options: Dict[str, Any]
+                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split the extra keyword arguments of a convenience function into ``(loader options, call options)``.
+
+    The options of ``call`` (``UnifiedDocumentLoader.load`` or a batch method: ``encoding``, ``delimiter``,
+    ``max_workers``, ...) go to that call, every other ``UnifiedDocumentLoader`` setting (``table_style``,
+    ``cache_dir``, ``model``, ``judge``, ...) to the loader. ``fixed`` names what the function passes itself.
+    A name that is neither is a ``TypeError``, as for any function that does not know a keyword argument.
+    """
+    call_names = set(inspect.signature(call).parameters) - {"self", *fixed}
+    loader_names = set(inspect.signature(UnifiedDocumentLoader.__init__).parameters) - {"self"}
+    unknown = [name for name in options if name not in call_names and name not in loader_names]
+    if unknown:
+        raise TypeError(
+            f"{function}() got an unexpected keyword argument {unknown[0]!r}. Besides its own parameters it takes "
+            f"any other UnifiedDocumentLoader setting (table_style, cache_dir, model, judge, ...) and the options "
+            f"of {call.__qualname__}() ({', '.join(sorted(call_names))})")
+    return ({name: value for name, value in options.items() if name not in call_names},
+            {name: value for name, value in options.items() if name in call_names})
+
+
 # Convenience functions
 def load(
         file_path: Union[str, Path],
@@ -118,7 +140,9 @@ def load(
         ocr_provider: OCR provider to use
         api_key: API key for OCR provider
         ocr_cache: Optional request-scoped OCR cache handler
-        **kwargs: Additional options
+        **kwargs: Additional options: any ``UnifiedDocumentLoader`` setting (``table_style``, ``cache_dir``,
+            ``model``, ``judge``, ...) goes to the loader; ``encoding``, ``delimiter`` and ``show_progress``
+            go to ``UnifiedDocumentLoader.load()``. Any other name is a ``TypeError``.
         
     Returns:
         ProcessedDocument
@@ -133,17 +157,20 @@ def load(
         # Extract images and perform OCR
         load("document.pdf", extract_images=True, ocr_images=True)
     """
+    loader_options, load_options = _split_options(
+        "load", UnifiedDocumentLoader.load, ("file_path", "output_format", "extract_images", "ocr_images"), kwargs)
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
-        ocr_cache=ocr_cache
+        ocr_cache=ocr_cache,
+        **loader_options
     )
     return loader.load(
         file_path,
         output_format=output_format,
         extract_images=extract_images,
         ocr_images=ocr_images,
-        **kwargs
+        **load_options
     )
 
 
@@ -174,15 +201,19 @@ def document_to_markdown(
         api_key: API key for OCR provider
         ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
-        **kwargs: Additional options
+        **kwargs: Additional options, routed as for ``load()``
         
     Returns:
         Markdown string
     """
+    loader_options, load_options = _split_options(
+        "document_to_markdown", UnifiedDocumentLoader.load,
+        ("file_path", "output_format", "extract_images", "ocr_images", "show_progress"), kwargs)
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
-        ocr_cache=ocr_cache
+        ocr_cache=ocr_cache,
+        **loader_options
     )
 
     # Process document
@@ -191,7 +222,7 @@ def document_to_markdown(
         output_format=OutputFormat.MARKDOWN,
         extract_images=extract_images,
         ocr_images=ocr_images,
-        **kwargs
+        **load_options
     )
 
     # Save if output path provided
@@ -235,15 +266,23 @@ def batch_convert_to_markdown(
         api_key: API key for OCR provider
         ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
-        **kwargs: Additional options
+        **kwargs: Additional options: ``UnifiedDocumentLoader`` settings (``table_style``, ``cache_dir``, ...)
+            go to the loader; ``encoding``, ``delimiter``, ``max_workers`` and ``progress_callback`` to
+            ``UnifiedDocumentLoader.batch_process()`` (``max_workers`` there means files converted at once).
+            Any other name is a ``TypeError``.
         
     Returns:
         Dictionary mapping input paths to results
     """
+    loader_options, batch_options = _split_options(
+        "batch_convert_to_markdown", UnifiedDocumentLoader.batch_process,
+        ("input_dir", "output_dir", "output_format", "extract_images", "ocr_images", "recursive", "show_progress",
+         "save_files"), kwargs)
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
-        ocr_cache=ocr_cache
+        ocr_cache=ocr_cache,
+        **loader_options
     )
 
     return loader.batch_process(
@@ -255,7 +294,7 @@ def batch_convert_to_markdown(
         recursive=recursive,
         show_progress=show_progress,
         save_files=True,
-        **kwargs
+        **batch_options
     )
 
 
@@ -292,15 +331,20 @@ def batch_process_documents(
         ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         save_files: Whether to save output files
-        **kwargs: Additional options
+        **kwargs: Additional options, routed as for ``batch_convert_to_markdown()``
         
     Returns:
         Dictionary mapping input paths to results with detailed metadata
     """
+    loader_options, batch_options = _split_options(
+        "batch_process_documents", UnifiedDocumentLoader.batch_process,
+        ("input_dir", "output_dir", "output_format", "extract_images", "ocr_images", "recursive", "show_progress",
+         "save_files"), kwargs)
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
-        ocr_cache=ocr_cache
+        ocr_cache=ocr_cache,
+        **loader_options
     )
 
     return loader.batch_process(
@@ -312,7 +356,7 @@ def batch_process_documents(
         recursive=recursive,
         show_progress=show_progress,
         save_files=save_files,
-        **kwargs
+        **batch_options
     )
 
 
@@ -347,7 +391,9 @@ def batch_process_files(
         ocr_cache: Optional request-scoped OCR cache handler
         show_progress: Whether to show progress messages
         save_files: Whether to save output files
-        **kwargs: Additional options
+        **kwargs: Additional options: ``UnifiedDocumentLoader`` settings (``table_style``, ``cache_dir``, ...)
+            go to the loader; ``encoding``, ``delimiter``, ``max_workers`` and ``progress_callback`` to
+            ``UnifiedDocumentLoader.batch_process_files()``. Any other name is a ``TypeError``.
         
     Returns:
         Dictionary mapping input paths to results
@@ -362,10 +408,15 @@ def batch_process_files(
         # Extract images and perform batch OCR
         batch_process_files(files, extract_images=True, ocr_images=True)
     """
+    loader_options, batch_options = _split_options(
+        "batch_process_files", UnifiedDocumentLoader.batch_process_files,
+        ("file_paths", "output_dir", "output_format", "extract_images", "ocr_images", "show_progress", "save_files"),
+        kwargs)
     loader = UnifiedDocumentLoader(
         ocr_provider=ocr_provider,
         api_key=api_key,
-        ocr_cache=ocr_cache
+        ocr_cache=ocr_cache,
+        **loader_options
     )
 
     return loader.batch_process_files(
@@ -376,5 +427,5 @@ def batch_process_files(
         ocr_images=ocr_images,
         show_progress=show_progress,
         save_files=save_files,
-        **kwargs
+        **batch_options
     )
