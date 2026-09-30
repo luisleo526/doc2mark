@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
-from doc2mark.ocr.base import TASK_PROMPTS, BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.base import TASK_PROMPTS, BaseOCR, OCREngineError, OCRConfig, OCRResult
 from doc2mark.ocr.schema import OCRPage
 
 
@@ -1221,17 +1221,33 @@ class CachedOCR(BaseOCR):
                 # Realign context to the deduped miss_images the provider receives.
                 call_kwargs["context_pdfs"] = miss_context
             judge_before = self._judge_state()
-            provider_results = self.wrapped.batch_process_images(miss_images, **call_kwargs)
-            # The keys name the judge as it was before the call: if it stopped answering during
-            # the batch (a rejected key), these results were not screened by it.
-            store = self._judge_state() == judge_before
-            if len(provider_results) != len(miss_images):
+            try:
+                provider_results = self.wrapped.batch_process_images(miss_images, **call_kwargs)
+            except Exception as exc:
+                # The call answered none of the images the cache did not hold. When the cache held
+                # others, their answers stand and the rest come back failed (never cached, so the next
+                # run asks again) instead of the whole batch raising; otherwise, and for an engine
+                # that cannot run at all, the error goes to the caller as before.
+                if isinstance(exc, OCREngineError) or all(result is None for result in results):
+                    raise
+                failure = f"{type(exc).__name__}: {exc}"
+                logger.warning(f"OCR request failed for {len(miss_images)} of {len(images)} image(s) "
+                               f"({failure}); the cached answers are kept")
+                for key in miss_keys:
+                    for position in miss_positions[key]:
+                        results[position] = OCRResult(text="", metadata={"failed": True, "error": failure})
+                provider_results = None
+            if provider_results is not None:
+                # The keys name the judge as it was before the call: if it stopped answering during
+                # the batch (a rejected key), these results were not screened by it.
+                store = self._judge_state() == judge_before
+                if len(provider_results) != len(miss_images):
+                    for key, provider_result in zip(miss_keys, provider_results):
+                        self._store_and_fanout(results, key, provider_result, miss_positions[key], store)
+                    raise RuntimeError("OCR provider returned a different number of results than requested")
+
                 for key, provider_result in zip(miss_keys, provider_results):
                     self._store_and_fanout(results, key, provider_result, miss_positions[key], store)
-                raise RuntimeError("OCR provider returned a different number of results than requested")
-
-            for key, provider_result in zip(miss_keys, provider_results):
-                self._store_and_fanout(results, key, provider_result, miss_positions[key], store)
 
         final_results: List[OCRResult] = []
         for result in results:

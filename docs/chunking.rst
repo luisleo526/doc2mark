@@ -43,8 +43,8 @@ How a document is split
    PDF body text marks footnotes as superscripts (``^1^``), so PDF footnotes end up in the last
    chunk.
 
-Items of type ``text:header`` and ``text:footer`` (the repeated copies of running headers and
-footers) are left out. An ``image`` item, which is there only with ``extract_images=True`` and
+Items of type ``text:header`` and ``text:footer`` (the repeated copies of a PDF's running headers
+and footers) are left out; a Word header or footer is written once and chunked like other text. An ``image`` item, which is there only with ``extract_images=True`` and
 no OCR, is written as a ``data:`` URI Markdown image: leave image extraction off (or drop those
 items) when you index text. ``include_page_markers`` is accepted but has no effect.
 

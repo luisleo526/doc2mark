@@ -39,8 +39,9 @@ optional :doc:`judge`.
 **The OpenAI provider does nothing, or fails.** It needs ``pip install "doc2mark[ocr]"`` and
 ``OPENAI_API_KEY`` (or ``api_key=``) set before the loader is created, and OCR only runs with
 ``ocr_images=True``. Without the extra or the key every OCR request fails: the document still
-converts, the pictures show a placeholder (``[image: OCR unavailable]`` in PDF output) and the
-error is listed in ``metadata.extra["ocr_issues"]["errors"]``.
+converts, the pictures show a placeholder (``[image: OCR unavailable]``), the error is listed in
+``metadata.extra["ocr_issues"]["errors"]`` and the pictures are counted in ``["failed"]``; such a
+document is not stored in ``cache_dir``.
 
 **A legacy Office file fails.** LibreOffice (``soffice``) was not found when the loader was
 created; see :doc:`installation`.
@@ -79,10 +80,9 @@ reads (:doc:`formats`; any case, ``.htm`` and ``.markdown`` included); anything 
 simple built-in converter is used and a warning is logged.
 
 **The document cache does not speed up a re-run.** A document is not cached when its OCR failed
-somewhere, a page showing content stayed unread, the provider refused an image, or the judge
-could not answer; an ``INFO`` log line gives the reason. (Conversely, an Office or image file
-whose OCR request raised, for example for a missing key, is cached with the error text: clear the
-cache folder after fixing it.) Changing the loader's options (output
+somewhere (including a request that raised, for example for a missing key), a page showing
+content stayed unread, the provider refused an image, or the judge could not answer; an ``INFO``
+log line gives the reason. Changing the loader's options (output
 format, table style, OCR provider or its settings, judges) also changes the cache key
 (:doc:`caching`).
 

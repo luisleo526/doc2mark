@@ -21,7 +21,8 @@ Inline ``*``, ``_`` and backticks are left alone: they can change emphasis, not 
 """
 
 import re
-from typing import List
+import unicodedata
+from typing import List, Optional
 
 _LINE_SEPARATORS = re.compile(r"\r\n?|[\x0b\x0c]")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1f]")
@@ -36,6 +37,7 @@ _BLOCK_START = re.compile(
 _RULE_LINE = re.compile(r"(?P<indent>[ \t]{0,3})[-=*_][-=*_ \t]*$")
 _ATX_CLOSING = re.compile(r"(?:^|(?<=[ \t]))#+[ \t]*$")
 _LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d{1,2}[.)])[ \t]+(?=\S)")
+_CJK_CHAR = re.compile("[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
 
 
 def normalize_control_chars(text: str) -> str:
@@ -109,6 +111,46 @@ def escape_heading_closing(line: str) -> str:
     if match:
         line = line[:match.start()] + "\\" + line[match.start():]
     return line
+
+
+def _is_cjk(char: str) -> bool:
+    return bool(char) and bool(_CJK_CHAR.match(char))
+
+
+def _is_punctuation(char: str) -> bool:
+    """CommonMark (0.31) punctuation: a Unicode punctuation (P*) or symbol (S*) character."""
+    return bool(char) and unicodedata.category(char)[0] in "PS"
+
+
+def _continues_word(char: str) -> bool:
+    """A letter or digit of a script that separates words with spaces, fullwidth Latin letters and
+    digits included: markup next to it would split a word for lexical retrieval (``A**I**``). CJK
+    characters need no spaces between words."""
+    return char.isalnum() and (not _is_cjk(char) or 0xFF10 <= ord(char) <= 0xFF5A)
+
+
+def emphasis_fits(before: str, core: str, after: str) -> bool:
+    """True when emphasis markers around ``core`` (``before`` / ``after``: the characters next to it,
+    "" at a line edge) keep Latin words whole (no ``A**I**``) and CommonMark can open and close
+    them: a marker next to punctuation inside needs a space, punctuation or the line edge outside,
+    so ``的**資料治理、**流程`` stays unmarked and ``的**資料治理、流程。**`` is marked."""
+    for outside, inside in ((before, core[:1]), (after, core[-1:])):
+        if _continues_word(outside):
+            return False
+        if outside and not outside.isspace() and not _is_punctuation(outside) and _is_punctuation(inside):
+            return False
+    return True
+
+
+def wrap_inline(text: str, opening: str, closing: Optional[str] = None) -> str:
+    """Wrap ``text`` in inline markers (``closing`` defaults to ``opening``), keeping the spaces around it
+    outside them."""
+    core = text.strip()
+    if not core:
+        return text
+    start = len(text) - len(text.lstrip())
+    closing = opening if closing is None else closing
+    return f"{text[:start]}{opening}{core}{closing}{text[start + len(core):]}"
 
 
 def escape_list_item(text: str) -> str:

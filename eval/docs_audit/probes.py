@@ -178,7 +178,8 @@ def _():
           repr(loader.load(work / "semi.csv").metadata.delimiter))
 
 
-@probe("PowerPoint: layout placeholder prompts leak into every slide; slide_count is unreliable")
+@probe("PowerPoint (fixed: layout placeholder prompts leaked into every slide, slide_count counted 'Slide '): "
+       "prompts on the slides and slide_count (issue 19, fixed)")
 def _():
     from doc2mark import UnifiedDocumentLoader
     doc = UnifiedDocumentLoader(ocr_provider=None).load(SAMPLES / "sample_presentation.pptx")
@@ -186,7 +187,8 @@ def _():
     print("page_count:", doc.metadata.page_count, "| slide_count:", doc.metadata.slide_count)
 
 
-@probe("PowerPoint: the text of a plain shape (rectangle) is emitted twice")
+@probe("PowerPoint (fixed: the text of a plain shape was emitted twice): occurrences of a rectangle's text "
+       "(issue 19, fixed)")
 def _():
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE
@@ -201,7 +203,7 @@ def _():
     print("'UNIQUE BOX TEXT' occurrences:", content.count("UNIQUE BOX TEXT"))
 
 
-@probe("Excel: sheet_names and total_cells are not set")
+@probe("Excel (fixed: sheet_names and total_cells were never set): sheet_names and total_cells (issue 21, fixed)")
 def _():
     from doc2mark import UnifiedDocumentLoader
     doc = UnifiedDocumentLoader(ocr_provider=None).load(SAMPLES / "sample_spreadsheet.xlsx")

@@ -61,8 +61,11 @@ Content items
 
 Each item of ``json_content`` is a dict with ``type`` and ``content``. PDF items also carry
 ``page`` (from 1) and ``position_y`` (the vertical position on the page); Word, PowerPoint and
-Excel items carry ``page`` (the page, slide or sheet number; Word header and footer items have
-none); PDF and Word titles and section headings carry ``level``.
+Excel items carry ``page`` (the page, slide or sheet number); PDF and Word titles and section
+headings carry ``level``. Word items of a header or footer carry ``region`` (``"header"`` /
+``"footer"``), and a Word paragraph or list item with bold, italic or linked runs carries
+``markdown``: its text as Markdown (``**bold**``, ``*italic*``, ``[text](url)``), which the
+Markdown output uses, while ``content`` keeps the text as written.
 
 .. list-table::
    :header-rows: 1
@@ -93,9 +96,10 @@ none); PDF and Word titles and section headings carry ``level``.
    * - ``image``
      - An extracted picture as base64 (``extract_images=True`` without OCR).
    * - ``text:header`` / ``text:footer``
-     - Running headers and footers the Markdown leaves out: the later copies of a repeated line,
-       and every copy of a bare page number or of a line repeating a title; also the header and
-       footer paragraphs of Word files. They are not in ``content`` and the chunker skips them.
+     - Running headers and footers of a PDF the Markdown leaves out: the later copies of a
+       repeated line, and every copy of a bare page number or of a line repeating a title. They
+       are not in ``content`` and the chunker skips them. (Word headers and footers are written
+       once per section, as items with ``region``.)
 
 .. code-block:: python
 
@@ -133,7 +137,8 @@ A key is present only when it has something to say.
    * - ``ocr_issues``
      - Any format, when OCR went wrong somewhere: ``refused`` (answers that were only a refusal
        or "no readable text", emitted as empty text), ``provider_refused`` (of those, the
-       provider's own refusal or safety block), ``failed``, ``withheld`` (sample values a
+       provider's own refusal or safety block), ``failed`` (images the provider flagged failed or
+       whose request raised, for example without an API key), ``withheld`` (sample values a
        screenshot left out), ``suspected`` (answers kept although the judge rated them close to
        no content), ``errors`` (up to five messages) and ``locations`` (one ``{"issue",
        "image", "page" | "slide" | "sheet"}`` per image). See :doc:`ocr`.

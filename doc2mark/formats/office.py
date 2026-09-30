@@ -1,6 +1,7 @@
 """Office format processors (DOCX, XLSX, PPTX)."""
 
 import logging
+import re
 import zipfile
 import base64
 from pathlib import Path
@@ -19,7 +20,7 @@ from doc2mark.ocr.base import BaseOCR
 try:
     from doc2mark.pipelines.office_advanced_pipeline import (
         DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader,
-        _W_T, _attr_int, _docx_rendered,
+        _W_T, _attr_int, _docx_rendered, _pptx_drawn_masters, _pptx_hidden,
     )
     ADVANCED_PIPELINE_AVAILABLE = True
     _PIPELINE_IMPORT_ERROR: Optional[ImportError] = None
@@ -88,18 +89,7 @@ def _pptx_background_picture(slide):
 
 def _pptx_inherited_shapes(slide) -> list:
     """Shape trees of the layout and master that are drawn on ``slide``."""
-    if slide._element.get('showMasterSp') in ('0', 'false'):
-        return []
-    layout = slide.slide_layout
-    trees = [layout.shapes]
-    if layout._element.get('showMasterSp') not in ('0', 'false'):
-        trees.append(layout.slide_master.shapes)
-    return trees
-
-
-def _pptx_hidden(shape) -> bool:
-    c_nv_pr = shape._element.find(f'./*/{{{_P_NS}}}cNvPr')
-    return c_nv_pr is not None and c_nv_pr.get('hidden') in ('1', 'true')
+    return [owner.shapes for owner in _pptx_drawn_masters(slide)]
 
 
 def _pptx_walk_shapes(shapes, transform=(1.0, 0.0, 1.0, 0.0)):
@@ -469,6 +459,9 @@ class OfficeProcessor(BaseProcessor):
         result.metadata.format = doc_format
         result.metadata.filename = file_path.name
         result.metadata.size_bytes = file_size
+        if ext == 'pptx':
+            from pptx import Presentation
+            result.metadata.slide_count = len(Presentation(str(file_path)).slides)
         if result.metadata.extra is None:
             result.metadata.extra = {}
         result.metadata.extra['routed_via'] = 'pdf'
@@ -518,14 +511,13 @@ class OfficeProcessor(BaseProcessor):
             
             # Add format-specific metadata
             if file_path.suffix.lower() == '.docx':
-                metadata['word_count'] = len(content.split())
+                # Words of the Markdown, not of its <!-- page N --> / <!-- header --> marker comments
+                metadata['word_count'] = len(re.sub(r'<!--.*?-->', ' ', content, flags=re.DOTALL).split())
             elif file_path.suffix.lower() == '.xlsx':
-                # XLSX specific metadata is already included in json_data
-                pass
+                metadata['sheet_names'] = json_data.get('sheet_names')
+                metadata['total_cells'] = json_data.get('total_cells')
             elif file_path.suffix.lower() == '.pptx':
-                # Count slides from content
-                slide_count = content.count('Slide ')
-                metadata['slide_count'] = max(slide_count, 1)
+                metadata['slide_count'] = json_data.get('pages')
             
             return content, metadata, images, json_content
 

@@ -61,24 +61,46 @@ escaped like PDF text (:doc:`pdf`), and ``json_content`` items carry ``page``.
 Heading N one level per rank; a paragraph set to outline level "body text" is no heading) and
 carry ``level``; lists keep their numbers and bullets (``1.``, ``-``, ``(1)``, ``壹、``, nested).
 Text in content controls, tracked insertions, fields, hyperlinks and nested tables (flattened into
-their cell) is kept; deleted text is not. Footnotes become ``[^N]`` / ``[^N]: ...``. Not
-extracted or not in the Markdown:
+their cell) is kept; deleted text is not. Footnotes become ``[^N]`` / ``[^N]: ...``. Also:
 
-- text boxes are not extracted at all;
-- header and footer paragraphs are only ``text:header`` / ``text:footer`` items in
-  ``json_content``, and tables in headers and footers are lost;
-- bold, italics and link targets are not kept;
-- a paragraph that starts with *Table*, *Figure*, *Chart* (and similar) or *Source:* / *Note:*
-  is written as an italic caption.
+- **Text boxes** and shapes with text (also grouped, in table cells and in headers) are read once
+  (Word saves each twice, as a drawing and as a fallback copy for old readers) and follow the text
+  of the paragraph they are anchored in; in a table cell they are further lines of the cell. A
+  numbered list in a text box is numbered on its own, as are those of headers and footers: they
+  never move the body's numbers.
+- **Headers and footers** that a section shows (a first-page or even-page one when the section
+  uses it) are written once each, with their tables and pictures: headers before the section's
+  first paragraph, footers after its last, each block between ``<!-- header -->`` and
+  ``<!-- /header -->`` (``<!-- footer -->`` / ``<!-- /footer -->``) lines. A header or footer that
+  a later section inherits, or that shows the same text and pictures as one already written, is
+  not repeated, and a line that only shows a page number (a ``PAGE`` or ``NUMPAGES`` field, whose
+  number is just the page Word last showed it on) is left out. A heading-styled line of a header is
+  a plain line there, not a heading of the document. Their ``json_content`` items carry
+  ``"region": "header"`` / ``"footer"``.
+- **Bold, italics and links** are written ``**bold**``, ``*italic*`` and ``[text](url)`` in
+  paragraphs and list items; headings, captions and table cells stay plain. The markup is added
+  only where it changes nothing a reader sees: markers only where they keep words whole and a
+  Markdown renderer can read them (a bold syllable inside a word stays unmarked), no emphasis on
+  a line that holds a literal ``*`` and no markup at all on a line that holds a backtick. A link
+  is written as a link only when it points to an ``http``, ``https`` or ``mailto`` address, is set
+  off from the text around it, is not preceded by ``!`` and has no bracket in its text; any other
+  link (a ``javascript:`` target, a bookmark in the document) keeps its text. The item's
+  ``content`` keeps the text as written; the Markdown of such a paragraph is in its ``markdown``
+  key.
+- A paragraph is a caption (``text:caption``, written in italics) when it has a caption style,
+  or starts with a caption word and a number followed by a separator or nothing (*Figure 2:
+  Revenue*, *Table 3. Totals*), or with *Source:* / *Note:*. *Tablets are ...*, *Table of
+  contents* or *Figure 1 shows ...* stay paragraphs.
 
 **PowerPoint (.pptx).** Each slide lists its title (``#``), subtitle (``##``) and shapes top to
 bottom, then its notes (``[Slide N Notes]``). A soft line break is a line break (``<br>`` in
 table cells); bullets stay as their characters, not Markdown lists. Tables are always written in
 the merged-cell style (``table_style``: HTML by default), even without merged cells; charts as
-their title and axis captions. Known issues: the
-slide layout's placeholder prompts (*Click to edit Master title style*, the date field, ``‹#›``)
-appear as captions on every slide, and the text of plain shapes such as rectangles is emitted
-twice.
+their title and axis captions. The layout's and master's placeholders are not slide text (their
+prompts, such as *Click to edit Master title style*, only show while editing), and neither are
+date and slide-number fields: a date, footer or slide-number placeholder gives the text typed
+into it on that slide. Text the layout or master draws on the slides (a tagline, a company line)
+is kept once, on the first slide that shows it. ``metadata.slide_count`` is the number of slides.
 
 **Excel (.xlsx).** Each sheet is ``# Sheet: <name>`` followed by its table. Cells show what
 Excel displays: ``10`` not ``10.0``, ``25%``, ``$1,234.50``, a date in the cell's format
@@ -86,15 +108,20 @@ Excel displays: ``10`` not ``10.0``, ``25%``, ``$1,234.50``, a date in the cell'
 a cached value as the formula (``=A2+B2``). Merged cells come from the sheet's merged ranges (a
 sheet without them is a plain Markdown table; a range whose top-left cell is empty is ignored);
 empty rows and columns are dropped; a single-cell row above the table becomes a paragraph only
-when it is merged across the table or separated by a blank row.
+when it is merged across the table or separated by a blank row. ``metadata.sheet_names`` lists
+every sheet in workbook order and ``metadata.total_cells`` counts the cells that show a value, in
+all sheets.
 
 **Pictures.** With ``extract_images=True`` and no OCR, each picture is embedded in the Markdown as
 a ``data:`` URI image, is an ``image`` item of ``json_content``, and is listed in
 ``result.images`` as ``{"data": <bytes>, "page": n}``. With OCR, all pictures of a document are
 sent in one batch and their text replaces them (``text:image_description``); a picture in a Word
 or Excel table cell becomes ``[Image]`` / ``[Image: <text>]`` in that cell; a picture whose OCR
-finds no text adds nothing; one whose OCR fails leaves the text ``OCR failed`` and is counted in
-``metadata.extra["ocr_issues"]``.
+finds no text adds nothing. A picture whose OCR failed (the request raised, for example without
+an API key, or the provider flagged the answer failed) shows ``[image: OCR unavailable]``, in a
+cell too, as in PDFs; it is counted in ``metadata.extra["ocr_issues"]["failed"]`` with its page,
+slide or sheet, the pictures of a request that raised are not sent again one by one, and the
+document is not stored in ``cache_dir`` (the next run asks again).
 
 **The Office image route.** A ``.docx`` or ``.pptx`` made mostly of pictures (slides that are
 full-slide images, a Word file of scanned pages) has no text to read natively. With OCR on,
