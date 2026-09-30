@@ -209,7 +209,7 @@ def test_t8_long_blank_run_in_a_cell_does_not_stall_the_conversion(run_cli, fake
 
 _LINK_INJECTIONS = (
     "![x](javascript:alert(1)) [click](javascript:alert(2)) ![](https://attacker.example/pixel.png) "
-    "[y](java&#115;cript:alert(3))"
+    "[y](java&#115;cript:alert(3)) [z](< javascript:alert(5)>)"
 )
 
 

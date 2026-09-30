@@ -281,6 +281,11 @@ def test_long_blank_run_in_a_cell_costs_linear_time():
     "[x](data:text/html;base64,PHNjcmlwdD4=)",
     "<table-x><caption>[x]</caption></table>(javascript:alert(1))",
     "`a` <table><tr><td>![p](https://attacker.example/p.png)</td></tr></table>",
+    # blanks a browser drops from a URL: after "<", and tabs or line breaks inside the scheme
+    "[x](< javascript:alert(1)>)",
+    "[x](<\tjava\tscript:alert(1)>)",
+    "[x](java\nscript:alert(1))",
+    "[r]: < javascript:alert(1)>\n\n[r]",
 ])
 def test_ocr_markdown_creates_no_image_or_script_link(text):
     assert _live_links(_sanitize_markdown(text)) == []
