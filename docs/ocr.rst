@@ -300,15 +300,18 @@ enabling or changing a judge screens cached answers again.
 
 The loader reports what happened per document in
 ``ProcessedDocument.metadata.extra["ocr_issues"]`` (present only when something did):
-``refused`` (answers emitted empty as refusals), ``failed`` (images that could not be
-read), ``withheld`` (images whose illustrative values stayed withheld; their Markdown
-says ``[N illustrative rows not transcribed]``, and likewise for fields, metrics and
-figures), up to five ``errors``, and ``locations``: one ``{"issue", "image", "page"}``
-entry per affected image (``image`` counts the images OCR'd in the document from 1;
-``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and Excel). Failed and
-withheld results are not cached, and neither is a document whose OCR failed (``cache_dir``);
-a refusal or "no readable text" answer is the provider's answer for that image and is cached
-(see :doc:`caching`). A per-image failure of the OpenAI, Vertex AI or Tesseract provider (a
+``refused`` (answers emitted empty as refusals; ``provider_refused`` of them are the
+provider's own refusal or safety block), ``failed`` (images that could not be read),
+``withheld`` (images whose illustrative values stayed withheld; their Markdown says
+``[N illustrative rows not transcribed]``, and likewise for fields, metrics and figures),
+``suspected`` (answers kept as text although the optional non-content judge rated them close
+to no content, see :doc:`judge`), up to five ``errors``, and ``locations``: one
+``{"issue", "image", "page"}`` entry per affected image (``image`` counts the images OCR'd in
+the document from 1; ``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and
+Excel). Failed and withheld results are not cached, and neither is a document whose OCR
+failed (``cache_dir``); a refusal or "no readable text" answer is the provider's answer for
+that image and is cached, a provider's own refusal or block only for ``refusal_ttl_seconds``
+(10 minutes) and never in ``cache_dir`` (see :doc:`caching`). A per-image failure of the OpenAI, Vertex AI or Tesseract provider (a
 timeout, a rate limit, a server error) comes back flagged ``metadata["failed"]``. An OCR engine
 that cannot run at all, such as Tesseract without the requested language data, raises
 ``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI

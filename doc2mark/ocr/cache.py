@@ -33,6 +33,14 @@ DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 # built from the image bytes + provider attrs, never result metadata).
 FROM_CACHE_METADATA_KEY = "doc2mark_from_cache"
 
+# Seconds a provider's own refusal or safety block (``metadata["non_content"] ==
+# "provider_refusal"``: OpenAI's ``message.refusal``, a Gemini SAFETY/RECITATION block) is
+# replayed from a cache. Such a decision can be transient, so it is kept briefly and never
+# extended by hits; a "no readable text" answer or an empty answer is the image's answer and
+# keeps the cache's normal TTL. Per cache: ``refusal_ttl_seconds`` of MemoryOCRCache,
+# RedisOCRCache and create_ocr_cache.
+REFUSAL_TTL_SECONDS = 600.0
+
 # Providers that consume an OCRConfig but are NOT LLM providers, so the
 # Tesseract-only fields (enhance_image/detect_layout/detect_tables) are live and
 # must stay in the cache key. Every other OCRConfig-backed provider is an LLM
@@ -205,6 +213,13 @@ def _uncacheable_reason(result: OCRResult) -> Optional[str]:
     return None
 
 
+def _short_lived(result: OCRResult) -> bool:
+    """Whether an answer is the provider's own refusal or safety block, cached only for
+    ``REFUSAL_TTL_SECONDS`` (see there)."""
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return metadata.get("non_content") == "provider_refusal"
+
+
 def _api_key_hash(provider: Any) -> Optional[str]:
     api_key = getattr(provider, "api_key", None)
     if not api_key:
@@ -257,6 +272,7 @@ class _SerializedCacheEntry:
     created_at: float
     expires_at: float
     refresh_count: int = 0
+    ttl_seconds: Optional[float] = None   # the entry's own TTL, given to set(): hits do not extend it
 
 
 def _serialize_ocr_cache_entry(
@@ -265,6 +281,7 @@ def _serialize_ocr_cache_entry(
     created_at: float,
     expires_at: float,
     refresh_count: int = 0,
+    ttl_seconds: Optional[float] = None,
 ) -> str:
     """Serialize an OCR cache value without request source data or secrets."""
     normalized = _normalize_result(result)
@@ -281,6 +298,8 @@ def _serialize_ocr_cache_entry(
         "expires_at": float(expires_at),
         "refresh_count": int(refresh_count),
     }
+    if ttl_seconds is not None:
+        payload["ttl_seconds"] = float(ttl_seconds)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
@@ -309,6 +328,7 @@ def _deserialize_ocr_cache_entry(payload: Any) -> _SerializedCacheEntry:
         created_at = float(payload["created_at"])
         expires_at = float(payload["expires_at"])
         refresh_count = int(payload.get("refresh_count", 0))
+        ttl_seconds = float(payload["ttl_seconds"]) if payload.get("ttl_seconds") is not None else None
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Malformed OCR cache metadata") from exc
 
@@ -326,6 +346,7 @@ def _deserialize_ocr_cache_entry(payload: Any) -> _SerializedCacheEntry:
         created_at=created_at,
         expires_at=expires_at,
         refresh_count=refresh_count,
+        ttl_seconds=ttl_seconds,
     )
 
 
@@ -337,9 +358,12 @@ def _validate_cache_bounds(
     ttl_seconds: float,
     max_age_seconds: Optional[float],
     max_refreshes: Optional[int],
+    refusal_ttl_seconds: float = REFUSAL_TTL_SECONDS,
 ) -> None:
     if ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be positive")
+    if refusal_ttl_seconds <= 0:
+        raise ValueError("refusal_ttl_seconds must be positive")
     if max_age_seconds is not None and max_age_seconds <= 0:
         raise ValueError("max_age_seconds must be positive or None")
     if max_refreshes is not None and max_refreshes < 0:
@@ -364,6 +388,8 @@ def _refreshed_expiry(
     ttl_seconds: float,
     max_age_seconds: Optional[float],
 ) -> float:
+    if getattr(entry, "ttl_seconds", None) is not None:
+        return entry.expires_at   # stored with its own TTL (a provider refusal): a hit does not extend it
     expires_at = now + ttl_seconds
     if max_age_seconds is not None:
         expires_at = min(expires_at, entry.created_at + max_age_seconds)
@@ -383,7 +409,8 @@ class OCRCache(ABC):
 
     @abstractmethod
     def set(self, key: str, result: OCRResult, ttl_seconds: Optional[float] = None) -> None:
-        """Store an OCR result."""
+        """Store an OCR result, for ``ttl_seconds`` when given (then a hit does not extend
+        it), else for the cache's TTL."""
 
     @abstractmethod
     def cleanup(self) -> int:
@@ -405,6 +432,7 @@ class _MemoryCacheEntry:
     expires_at: float
     hits: int = 0
     refresh_count: int = 0
+    ttl_seconds: Optional[float] = None   # the entry's own TTL, given to set(): hits do not extend it
 
 
 class MemoryOCRCache(OCRCache):
@@ -417,12 +445,14 @@ class MemoryOCRCache(OCRCache):
         max_entries: int = 1024,
         max_refreshes: Optional[int] = 10,
         time_func: Optional[Callable[[], float]] = None,
+        refusal_ttl_seconds: float = REFUSAL_TTL_SECONDS,
     ):
-        _validate_cache_bounds(ttl_seconds, max_age_seconds, max_refreshes)
+        _validate_cache_bounds(ttl_seconds, max_age_seconds, max_refreshes, refusal_ttl_seconds)
         if max_entries <= 0:
             raise ValueError("max_entries must be positive")
 
         self.ttl_seconds = ttl_seconds
+        self.refusal_ttl_seconds = refusal_ttl_seconds
         self.max_age_seconds = max_age_seconds
         self.max_entries = max_entries
         self.max_refreshes = max_refreshes
@@ -473,6 +503,7 @@ class MemoryOCRCache(OCRCache):
                 result=_copy_result(_normalize_result(result)),
                 created_at=now,
                 expires_at=expires_at,
+                ttl_seconds=ttl_seconds,
             )
             self._entries.move_to_end(key)
             self._stats["sets"] += 1
@@ -506,6 +537,7 @@ class MemoryOCRCache(OCRCache):
                     "entries": len(self._entries),
                     "max_entries": self.max_entries,
                     "ttl_seconds": self.ttl_seconds,
+                    "refusal_ttl_seconds": self.refusal_ttl_seconds,
                     "max_age_seconds": self.max_age_seconds,
                     "max_refreshes": self.max_refreshes,
                 }
@@ -547,6 +579,7 @@ class NoOpOCRCache(OCRCache):
                 "entries": 0,
                 "max_entries": 0,
                 "ttl_seconds": None,
+                "refusal_ttl_seconds": None,
                 "max_age_seconds": None,
                 "max_refreshes": None,
             }
@@ -569,10 +602,11 @@ class RedisOCRCache(OCRCache):
         max_refreshes: Optional[int] = 10,
         key_prefix: str = DEFAULT_REDIS_KEY_PREFIX,
         time_func: Optional[Callable[[], float]] = None,
+        refusal_ttl_seconds: float = REFUSAL_TTL_SECONDS,
     ):
         if not redis_url:
             raise ValueError("redis_url is required")
-        _validate_cache_bounds(ttl_seconds, max_age_seconds, max_refreshes)
+        _validate_cache_bounds(ttl_seconds, max_age_seconds, max_refreshes, refusal_ttl_seconds)
 
         try:
             import redis
@@ -581,6 +615,7 @@ class RedisOCRCache(OCRCache):
 
         self.redis_url = redis_url
         self.ttl_seconds = ttl_seconds
+        self.refusal_ttl_seconds = refusal_ttl_seconds
         self.max_age_seconds = max_age_seconds
         self.max_refreshes = max_refreshes
         self.key_prefix = key_prefix.rstrip(":")
@@ -644,6 +679,7 @@ class RedisOCRCache(OCRCache):
             created_at=now,
             expires_at=expires_at,
             refresh_count=0,
+            ttl_seconds=ttl_seconds,
         )
 
         try:
@@ -683,6 +719,7 @@ class RedisOCRCache(OCRCache):
                 "entries": None,
                 "max_entries": None,
                 "ttl_seconds": self.ttl_seconds,
+                "refusal_ttl_seconds": self.refusal_ttl_seconds,
                 "max_age_seconds": self.max_age_seconds,
                 "max_refreshes": self.max_refreshes,
                 "key_prefix": self.key_prefix,
@@ -761,12 +798,14 @@ class RedisOCRCache(OCRCache):
             created_at=entry.created_at,
             expires_at=_refreshed_expiry(entry, now, self.ttl_seconds, self.max_age_seconds),
             refresh_count=entry.refresh_count + 1,
+            ttl_seconds=entry.ttl_seconds,
         )
         value = _serialize_ocr_cache_entry(
             refreshed.result,
             created_at=refreshed.created_at,
             expires_at=refreshed.expires_at,
             refresh_count=refreshed.refresh_count,
+            ttl_seconds=refreshed.ttl_seconds,
         )
         return value, _redis_expires_in(refreshed.expires_at, now)
 
@@ -805,8 +844,10 @@ def create_ocr_cache(
     max_refreshes: Optional[int] = 10,
     max_entries: int = 1024,
     key_prefix: str = DEFAULT_REDIS_KEY_PREFIX,
+    refusal_ttl_seconds: float = REFUSAL_TTL_SECONDS,
 ) -> Optional[OCRCache]:
-    """Create an OCR cache backend from a small provider name."""
+    """Create an OCR cache backend from a small provider name (``refusal_ttl_seconds``: see
+    ``REFUSAL_TTL_SECONDS``)."""
     normalized = _normalize_cache_provider(provider)
     if normalized in {"none", "off", "false", "disabled", ""}:
         return None
@@ -818,6 +859,7 @@ def create_ocr_cache(
             max_age_seconds=max_age_seconds,
             max_entries=max_entries,
             max_refreshes=max_refreshes,
+            refusal_ttl_seconds=refusal_ttl_seconds,
         )
     if normalized == "redis":
         try:
@@ -827,6 +869,7 @@ def create_ocr_cache(
                 max_age_seconds=max_age_seconds,
                 max_refreshes=max_refreshes,
                 key_prefix=key_prefix,
+                refusal_ttl_seconds=refusal_ttl_seconds,
             )
         except Exception as exc:
             return _fallback_cache(
@@ -836,6 +879,7 @@ def create_ocr_cache(
                 max_age_seconds=max_age_seconds,
                 max_refreshes=max_refreshes,
                 max_entries=max_entries,
+                refusal_ttl_seconds=refusal_ttl_seconds,
             )
     raise ValueError(f"Unknown OCR cache provider: {provider}")
 
@@ -854,6 +898,7 @@ def _fallback_cache(
     max_age_seconds: Optional[float],
     max_refreshes: Optional[int],
     max_entries: int,
+    refusal_ttl_seconds: float = REFUSAL_TTL_SECONDS,
 ) -> Optional[OCRCache]:
     normalized = _normalize_cache_provider(fallback)
     if normalized in {"memory", "in-memory", "in_memory"}:
@@ -863,6 +908,7 @@ def _fallback_cache(
             max_age_seconds=max_age_seconds,
             max_entries=max_entries,
             max_refreshes=max_refreshes,
+            refusal_ttl_seconds=refusal_ttl_seconds,
         )
     if normalized in {"none", "off", "false", "disabled", ""}:
         logger.warning("Redis OCR cache unavailable; disabling OCR cache: %s", exc)
@@ -957,8 +1003,9 @@ class CachedOCR(BaseOCR):
     ) -> None:
         """Cache one fresh provider result and place it at every deduped position.
 
-        The value written to the cache is the clean, unmarked result, and only a
-        answer is written (see ``_uncacheable_reason``). Only the
+        The value written to the cache is the clean, unmarked result, and only an
+        answer is written (see ``_uncacheable_reason``); a provider refusal or block only
+        for the cache's ``refusal_ttl_seconds`` (see ``REFUSAL_TTL_SECONDS``). Only the
         first position is a fresh provider call this batch; the remaining
         positions are intra-batch dedup copies of the SAME single call, so they
         are flagged non-fresh (``FROM_CACHE_METADATA_KEY``) to keep a usage
@@ -968,7 +1015,11 @@ class CachedOCR(BaseOCR):
         reason = _uncacheable_reason(normalized)
         if reason is None and not store:
             reason = "the non-content judge stopped answering during the batch"
-        if reason is None:
+        if reason is None and _short_lived(normalized):
+            ttl = getattr(self.cache, "refusal_ttl_seconds", None) or REFUSAL_TTL_SECONDS
+            ttl = min(ttl, getattr(self.cache, "ttl_seconds", None) or ttl)   # never longer than an answer
+            self.cache.set(key, normalized, ttl_seconds=ttl)
+        elif reason is None:
             self.cache.set(key, normalized)
         else:
             logger.info("OCR result not cached (%s): the next run asks the provider again", reason)

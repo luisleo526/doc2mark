@@ -4,7 +4,12 @@ The E2E suite (tests/e2e/test_order.py) covers real PDFs through the CLI; these 
 on hand-made boxes: columns, rows, anchored items and the permutation guarantee.
 """
 
+import re
+
+from doc2mark import UnifiedDocumentLoader
+from doc2mark.pipelines import pdf_images
 from doc2mark.pipelines.pdf_layout import Region, cluster_boxes, reading_order
+from tests.e2e import builders_order
 
 
 def paragraph(x0, top, lines, width=240.0, size=10.0, pitch=12.0, group=None):
@@ -186,3 +191,26 @@ def test_cluster_boxes_groups_nearby_paths_and_drops_small_marks():
     figures = cluster_boxes(bars + frame + bullet)
     assert len(figures) == 1 and figures[0] == (50, 330, 545.5, 480.5)
     assert cluster_boxes([(0, 0, 1, 1)] * 5000) == []
+
+
+def test_figures_across_the_columns_are_measured_without_reading_the_pictures(tmp_path, monkeypatch):
+    """PR #23 follow-up: a page with a column gutter asks for the boxes of its pictures, and those were measured
+    as placements (``get_image_info(xrefs=True)``, which decodes every image of the page to hash it). On the real
+    Traditional-Chinese deck (20 of 30 slides have a candidate gutter) conversion got 15% slower with nothing
+    reordered. When pictures are not extracted, the figure boxes are measured without reading the images, and
+    the figure still cuts the columns."""
+    path, tags = builders_order.spanning_figure_pdf(tmp_path / "spanning.pdf", "picture")
+    calls = {"placements": 0, "shown_boxes": 0}
+    for name in calls:
+        measure = getattr(pdf_images, name, None)
+
+        def spy(page, *args, name=name, measure=measure, **kwargs):
+            calls[name] += 1
+            return measure(page, *args, **kwargs)
+
+        monkeypatch.setattr(pdf_images, name, spy, raising=False)
+    result = UnifiedDocumentLoader(ocr_provider=None).load(str(path))
+
+    read = re.findall(r"\[/?(?:[A-Z]+\d*)\]", result.content)
+    assert read == [marker for tag in tags for marker in (f"[{tag}]", f"[/{tag}]")]
+    assert calls == {"placements": 0, "shown_boxes": 1}

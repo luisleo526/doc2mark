@@ -255,6 +255,30 @@ def test_rotated_cropped_page_with_hidden_text_emits_its_table_once(run_cli, e2e
             assert _count(result.markdown, cell) == 1, f"{cell!r}\n{result.describe()}"
 
 
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+@pytest.mark.parametrize("cropbox", ["[0 0 595 842]", "[-2 -2 597 844]"], ids=["same-box", "around-the-mediabox"])
+def test_rotated_page_whose_cropbox_is_its_mediabox_with_hidden_text_emits_its_table_once(run_cli, e2e_dir,
+                                                                                          rotation, cropbox):
+    """The same with a CropBox that shows the whole MediaBox (the same box, as many producers write it, or one
+    reaching around it): the copy without the hidden text is made after the page was uncropped for table
+    detection, so the tables come from another page object than the uncropped one, and table text suppression
+    was switched off: every cell came out twice. With nothing cropped away both frames are the same, and the
+    table text is emitted once."""
+    cells = [["CM-H1", "CM-H2"], ["CM-V11", "CM-V12"], ["CM-V21", "CM-V22"]]
+    note = f"NOTE{rotation} beside the table."
+    pdf = B.rotated_cropped_table(e2e_dir / "hidden.pdf", rotation, cells, note, cropbox,
+                                  invisible="Hidden sentence nobody sees")
+
+    result = run_cli(pdf)
+
+    assert result.exit_code == 0, result.describe()
+    assert _count(result.markdown, note) == 1, result.describe()
+    assert _count(result.markdown, "Hidden sentence nobody sees") == 0, result.describe()
+    for row in cells:
+        for cell in row:
+            assert _count(result.markdown, cell) == 1, f"{cell!r}\n{result.describe()}"
+
+
 @pytest.mark.parametrize("rotation", [90, 270])
 def test_rotated_cropped_borderless_statement_is_one_table(run_cli, e2e_dir, rotation):
     """A borderless statement is found by PyMuPDF's text strategy, a second find_tables() call (PR #15).

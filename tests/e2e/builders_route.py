@@ -621,3 +621,43 @@ def garbled_title_grey_body_pdf(path: Path, title: str, body: Sequence[str]) -> 
     insert_lines(page, body, top=y + 12, fontsize=11, color=(0.72, 0.72, 0.72))
     garble(doc, "fffd")
     return _save(doc, path)
+
+
+def paper_scan_png(lines: Sequence[str], *, font_px: int = 26, top_share: float = 0.25) -> bytes:
+    """An A4 page scanned at about 100 dpi: ``lines`` in black from ``top_share`` of the way down, the paper
+    above and below them blank."""
+    size = (827, 1170)
+    image = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=font_px)
+    y = round(size[1] * top_share)
+    for line in lines:
+        right, bottom = draw.textbbox((font_px * 3, y), line, font=font)[2:]
+        if right > size[0] or bottom > size[1] - font_px * 4:
+            raise ValueError(f"text does not fit the scan at font_px={font_px}: {line!r}")
+        draw.text((font_px * 3, y), line, fill="black", font=font)
+        y = bottom + font_px
+    return _png(image)
+
+
+def report_with_scanned_page_pdf(path: Path, reports: Sequence[Sequence[str]], scan_lines: Sequence[str], *,
+                                 printed: Sequence[str] = (), running_header: str = "",
+                                 page_numbers: bool = False) -> Path:
+    """A text report whose second page is a full-page scan (``paper_scan_png`` of ``scan_lines``) with real text
+    printed over the blank paper above the scanned lines: ``printed`` lines. ``reports`` are the text pages
+    around it (the first before, the others after). Every page carries ``running_header`` at the top and
+    ``Page N of M`` at the bottom when asked, the scan too: printed over its blank margins."""
+    doc = pymupdf.open()
+    pages = [reports[0], None, *reports[1:]]
+    for number, lines in enumerate(pages, 1):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        if lines is None:
+            page.insert_image(page.rect, stream=paper_scan_png(scan_lines))
+            insert_lines(page, printed, top=110, fontsize=12)
+        else:
+            insert_lines(page, lines, top=120, fontsize=11)
+        if running_header:
+            insert_lines(page, [running_header], top=48, fontsize=9)
+        if page_numbers:
+            insert_lines(page, [f"Page {number} of {len(pages)}"], top=A4[1] - 40, fontsize=9)
+    return _save(doc, path)

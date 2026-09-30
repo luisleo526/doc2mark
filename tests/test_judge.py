@@ -610,13 +610,14 @@ def test_a_failed_question_counts_once_and_keeps_its_cause():
 @pytest.fixture
 def fake_sdk(monkeypatch):
     """A stand-in ``typesafe_sdk`` module that records how its client is built (the list it returns); the
-    real SDK logger's level is restored afterwards."""
+    real SDK logger's level and filters are restored afterwards."""
     created = []
     sdk_logger = logging.getLogger("typesafe_sdk")
-    previous = sdk_logger.level
+    previous, filters = sdk_logger.level, list(sdk_logger.filters)
     _fake_sdk(monkeypatch, created)
     yield created
     sdk_logger.setLevel(previous)
+    sdk_logger.filters[:] = filters
 
 
 def _fake_sdk(monkeypatch, created):
@@ -647,14 +648,61 @@ def test_a_question_that_cannot_be_answered_costs_at_most_about_four_seconds(fak
     assert options["timeout"] <= 2.0 and options["retry"].max_retries <= 1 and options["retry"].timeout <= 4.0
 
 
-@pytest.mark.parametrize("requested", [None, "debug"])
-def test_the_sdk_wire_log_is_capped_unless_requested(fake_sdk, monkeypatch, requested):
-    """m4: ``doc2mark -v`` set the root logger to DEBUG and the SDK logged request bodies (page text)."""
+@pytest.fixture
+def printed(monkeypatch):
+    """What the CLI's log handler prints: a handler on the root logger, whose level each test sets as
+    ``doc2mark`` (WARNING) or ``doc2mark -v`` (DEBUG) does. Yields ``(root logger, SDK records printed)``."""
+    records = []
+
+    class Printed(logging.Handler):
+        def emit(self, record):
+            if record.name == "typesafe_sdk":
+                records.append((record.levelno, record.getMessage()))
+
+    root, handler = logging.getLogger(), Printed()
+    previous = root.level
+    root.addHandler(handler)
+    monkeypatch.delenv("TYPESAFE_LOG_LEVEL", raising=False)
+    logging.getLogger("typesafe_sdk").setLevel(logging.NOTSET)
+    yield root, records
+    root.removeHandler(handler)
+    root.setLevel(previous)
+
+
+def _sdk_logs_one_request():
+    """What the SDK logs for one request: the wire (headers and body: page text) at DEBUG, the outcome at INFO."""
     sdk_logger = logging.getLogger("typesafe_sdk")
-    sdk_logger.setLevel(logging.NOTSET)
-    if requested:
-        monkeypatch.setenv("TYPESAFE_LOG_LEVEL", requested)
-    else:
-        monkeypatch.delenv("TYPESAFE_LOG_LEVEL", raising=False)
+    sdk_logger.debug("POST https://api.typesafe.ai/v1/system -> headers={} body=b'Invoice total EUR 2340'")
+    sdk_logger.info("POST https://api.typesafe.ai/v1/system <- 200 in 180ms (request r-1)")
+
+
+def test_a_default_run_prints_nothing_from_the_sdk(fake_sdk, printed):
+    """Follow-up of m4: capping the SDK logger at INFO set its level explicitly, so its INFO record of every
+    request and retry passed the WARNING-level CLI handler: a default ``--judge typesafe`` run printed one line
+    per question."""
+    root, records = printed
+    root.setLevel(logging.WARNING)
     TypeSafeJudge(cache_dir=False).legibility_judge("A legible page of text.")
-    assert sdk_logger.level == (logging.NOTSET if requested else logging.INFO)
+    _sdk_logs_one_request()
+    assert records == []
+
+
+def test_verbose_runs_print_the_request_outcome_but_never_a_body(fake_sdk, printed):
+    """m4: ``doc2mark -v`` sets the root logger to DEBUG; the SDK's wire log holds document text."""
+    root, records = printed
+    root.setLevel(logging.DEBUG)
+    TypeSafeJudge(cache_dir=False).legibility_judge("A legible page of text.")
+    _sdk_logs_one_request()
+    assert records == [(logging.INFO, "POST https://api.typesafe.ai/v1/system <- 200 in 180ms (request r-1)")]
+
+
+def test_the_wire_log_shows_when_the_sdk_logger_is_set_to_debug(fake_sdk, printed, monkeypatch):
+    """Whoever sets the SDK's own level (``TYPESAFE_LOG_LEVEL=debug``, which the SDK applies at import, or
+    ``logging.getLogger("typesafe_sdk").setLevel``) gets what they asked for."""
+    root, records = printed
+    root.setLevel(logging.WARNING)
+    monkeypatch.setenv("TYPESAFE_LOG_LEVEL", "debug")
+    logging.getLogger("typesafe_sdk").setLevel(logging.DEBUG)
+    TypeSafeJudge(cache_dir=False).legibility_judge("A legible page of text.")
+    _sdk_logs_one_request()
+    assert [level for level, _ in records] == [logging.DEBUG, logging.INFO]

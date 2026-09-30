@@ -1999,7 +1999,7 @@ def _review_pr22_items():
     import codecs
 
     def rot13(s): return codecs.encode(s, "rot13")
-    def rev_lines(s): return "\n".join(l[::-1] for l in s.split("\n"))
+    def rev_lines(s): return "\n".join(line[::-1] for line in s.split("\n"))
     def mojibake(s, enc_from, enc_to):
         return s.encode(enc_from).decode(enc_to, errors="ignore")
 

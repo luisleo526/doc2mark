@@ -18,6 +18,8 @@ import sys
 import pytest
 
 from tests.e2e import builders_route, pdfgen
+from tests.e2e import fake_openai as fake
+from tests.e2e.fake_openai import FakeOpenAI
 
 RENDER_OCR = "text:image_description"
 GARBAGE = re.compile("[\ufffd\ue000-\uf8ff]|\u00c3[\u0080-\u00bf]")
@@ -810,3 +812,75 @@ def test_legibility_judge_is_not_consulted_when_no_ocr_runs(require_tool, e2e_di
     output = json.loads(proc.stdout.strip().splitlines()[-1])
     assert output["judged"] == [], output
     assert "Lqyrlfh wrwdo HXU 2340" in words(output["content"]), output
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Wrap-up follow-ups of the verbatim tail: markup in the OCR answer, page chrome
+
+INVOICE_HEADER = "Invoice No: 2024-0012 Customer: ACME Ltd."
+INVOICE_SCAN = ["Item            Qty     Amount", "Pump seals      40      EUR 480.00",
+                "Impellers       12      EUR 1,860.00", "Total                   EUR 2,340.00"]
+INVOICE_TABLE = ("<table><tr><td>Invoice No</td><td>2024-0012</td></tr>"
+                 "<tr><td>Customer</td><td>ACME Ltd.</td></tr>"
+                 "<tr><td>Pump seals</td><td>40</td><td>EUR 480.00</td></tr>"
+                 "<tr><td>Impellers</td><td>12</td><td>EUR 1,860.00</td></tr>"
+                 "<tr><td>Total</td><td></td><td>EUR 2,340.00</td></tr></table>")
+RUNNING_HEADER = "ACME Pumps - quarterly maintenance report"
+
+
+@pytest.fixture
+def fake_llm():
+    with FakeOpenAI() as server:
+        yield server
+
+
+def test_printed_line_the_ocr_returned_as_a_table_is_not_added_again(run_cli, e2e_dir, fake_llm):
+    """The verbatim tail adds the printed lines of an OCR'd page that its OCR did not reproduce. It compared words
+    position by position, so one markup token between two words broke the match: when the OCR returned the page
+    as an HTML table (``<td>Invoice No</td><td>2024-0012</td>``), the printed header line was appended after the
+    table as if the OCR had missed it. Markup is not words, and the line's words are matched in order even when
+    other words come between them."""
+    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "invoice.pdf", REPORT, INVOICE_SCAN,
+                                                      printed=[INVOICE_HEADER])
+    fake_llm.script(structured=[fake.page("INVOICE", tables=[fake.table(INVOICE_TABLE)])])
+
+    result = run_cli(pdf, "--ocr", "openai", "--ocr-images", env=fake_llm.env, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert len(fake_llm.requests_of("structured")) == 1, result.describe()
+    text = words(result.markdown)
+    assert text.count("2024-0012") == 1 and text.count("ACME Ltd.") == 1, result.describe()
+    assert all(line in text for page in REPORT for line in page), result.describe()
+
+
+def test_printed_line_the_ocr_missed_is_still_added(run_cli, e2e_dir, fake_llm):
+    """The other side: a printed line whose words the OCR answer does not hold in order is kept (verbatim first)."""
+    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "invoice.pdf", REPORT, INVOICE_SCAN,
+                                                      printed=[INVOICE_HEADER])
+    table = INVOICE_TABLE.replace("<tr><td>Invoice No</td><td>2024-0012</td></tr><tr><td>Customer</td>"
+                                  "<td>ACME Ltd.</td></tr>", "")
+    fake_llm.script(structured=[fake.page("INVOICE", tables=[fake.table(table)])])
+
+    result = run_cli(pdf, "--ocr", "openai", "--ocr-images", env=fake_llm.env)
+
+    assert result.exit_code == 0, result.describe()
+    assert words(result.markdown).count(INVOICE_HEADER) == 1, result.describe()
+
+
+def test_running_header_and_page_number_of_an_ocrd_page_are_not_added_again(run_cli, e2e_dir, fake_llm):
+    """On text pages a running header is kept once (its first copy) and page numbers go. On a scanned page OCR'd
+    from its render, the verbatim tail appended the page's own copy of the running header and its page number
+    when the OCR left them out: they are page chrome there too."""
+    reports = [REPORT[0], REPORT[1], [line.replace("2026", "2027") for line in REPORT[1]]]
+    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "report.pdf", reports, INVOICE_SCAN,
+                                                      running_header=RUNNING_HEADER, page_numbers=True)
+    fake_llm.script(structured=[fake.page("\n".join(INVOICE_SCAN))])
+
+    result = run_cli(pdf, "--ocr", "openai", "--ocr-images", env=fake_llm.env, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    text = words(result.markdown)
+    assert "EUR 2,340.00" in text, result.describe()
+    assert text.count(RUNNING_HEADER) == 1, result.describe()
+    assert not re.search(r"Page \d of 4", text), result.describe()
+    assert all(line in text for page in reports for line in page), result.describe()
