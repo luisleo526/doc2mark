@@ -12,7 +12,7 @@ ProcessedDocument
    Fields: ``content`` (str), ``metadata`` (:class:`~doc2mark.DocumentMetadata`), ``images``,
    ``tables``, ``sections`` and ``json_content`` (lists of dicts or ``None``). ``tables`` and
    ``sections`` list the tables and headings of ``json_content`` (:doc:`/output`); they are
-   ``None`` for files without content items (text, data and markup files).
+   ``None`` for files without content items (text, data, markup and e-mail files).
 
 DocumentMetadata
 ----------------

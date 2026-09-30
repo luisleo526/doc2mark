@@ -184,7 +184,7 @@ def test_converting_a_folder_onto_itself_never_overwrites_a_source_file(run_cli,
 @pytest.mark.parametrize("workers", [[], ["-p", "2"]], ids=["sequential", "parallel"])
 def test_timeout_stops_a_file_that_takes_too_long_and_the_run_goes_on(run_cli, e2e_dir, workers):
     """Item 5: ``--timeout`` was only passed to ``future.result()`` after the file had finished, so nothing ever
-    timed out. Here the OCR provider never answers: ``scan.pdf`` is stopped after 3 s, ``a-notes.txt`` is done."""
+    timed out. Here the OCR provider never answers: ``scan.pdf`` is stopped after 5 s, ``a-notes.txt`` is done."""
     docs = e2e_dir / "docs"
     b.write(docs / "a-notes.txt", "Notes that convert at once")
     pdfgen.image_pdf(docs / "scan.pdf", "NEVER READ 4721")
@@ -192,14 +192,14 @@ def test_timeout_stops_a_file_that_takes_too_long_and_the_run_goes_on(run_cli, e
 
     with b.HangingOpenAI() as hanging:
         started = time.monotonic()
-        result = run_cli(docs, "--ocr", "openai", "--ocr-images", "--timeout", "3", "--retry", "0", "--skip-errors",
+        result = run_cli(docs, "--ocr", "openai", "--ocr-images", "--timeout", "5", "--retry", "0", "--skip-errors",
                          "-o", out, *workers, env=hanging.env, timeout=60, raw=True)
         elapsed = time.monotonic() - started
 
     assert result.exit_code == 0, result.describe()
-    assert "scan.pdf" in result.stderr and "timed out after 3 s" in result.stderr, result.describe()
+    assert "scan.pdf" in result.stderr and "timed out after 5 s" in result.stderr, result.describe()
     assert tree(out) == ["a-notes.md"], result.describe()
-    assert elapsed < 40, f"the file was stopped after {elapsed:.0f} s, not after its 3 s timeout"
+    assert elapsed < 40, f"the file was stopped after {elapsed:.0f} s, not after its 5 s timeout"
 
 
 def test_a_file_that_times_out_stops_the_run_unless_errors_are_skipped(run_cli, e2e_dir):
@@ -209,12 +209,12 @@ def test_a_file_that_times_out_stops_the_run_unless_errors_are_skipped(run_cli, 
     pdfgen.image_pdf(docs / "scan.pdf", "NEVER READ 4721")
 
     with b.HangingOpenAI() as hanging:
-        result = run_cli(docs, "--ocr", "openai", "--ocr-images", "--timeout", "3", "--retry", "0",
+        result = run_cli(docs, "--ocr", "openai", "--ocr-images", "--timeout", "5", "--retry", "0",
                          "-o", e2e_dir / "converted", env=hanging.env, timeout=60, raw=True)
 
     assert result.exit_code == 1, result.describe()
     assert "Failed to process" in result.stderr and "scan.pdf" in result.stderr, result.describe()
-    assert "timed out after 3 s" in result.stderr, result.describe()
+    assert "timed out after 5 s" in result.stderr, result.describe()
 
 
 @pytest.mark.parametrize("limit", ["30", "0"])

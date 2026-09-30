@@ -136,7 +136,7 @@ The returned dict maps each input path (a string, in input order) to a result:
    {"status": "failed", "error": "Processing failed: ...", "format": ".pdf"}
 
 ``tables_found`` is the number of tables of the document (``ProcessedDocument.tables``, see
-:doc:`output`); it is 0 for files without content items (text, data and markup files).
+:doc:`output`); it is 0 for files without content items (text, data, markup and e-mail files).
 
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process_files` takes a list of paths instead. It
 writes only when ``output_dir`` is given, as ``output_dir/<file stem>.md`` (two inputs with the

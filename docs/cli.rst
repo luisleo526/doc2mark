@@ -109,9 +109,9 @@ Folders
    Try a failing file ``N`` more times (default ``1``).
 ``--timeout SECONDS``
    The longest time one file of a folder run may take, its retries included (default ``300``;
-   ``0``: no limit). A file that takes longer is stopped (its worker process is killed, and with
-   it a LibreOffice it started) and counts as failed: ``timed out after 300 s``. A single-file
-   run is not limited.
+   ``0``: no limit). A file that takes longer is stopped (its worker process is killed, and on
+   Linux and macOS what it started too, such as LibreOffice) and counts as failed: ``timed out
+   after 300 s``. A single-file run is not limited.
 
 Messages
 ~~~~~~~~
