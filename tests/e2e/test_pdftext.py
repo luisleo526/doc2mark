@@ -51,6 +51,12 @@ def _assert_body_intact(markdown: str, pages: int, lines: int = 10) -> None:
     assert not missing_or_duplicated, f"body lines lost or duplicated: {missing_or_duplicated}\n{markdown}"
 
 
+def _tables(markdown: str) -> int:
+    """Tables in ``markdown``: pipe tables (one ``| --- |`` separator line each) and HTML tables."""
+    separators = [line for line in markdown.splitlines() if re.fullmatch(r"\|(?: ?:?-{3,}:? ?\|)+", line.strip())]
+    return len(separators) + markdown.count("<table")
+
+
 def _chrome_residue(markdown: str) -> list:
     """Lines of a BODY-only test document that are not body text, i.e. leftover page furniture."""
     return [line for line in _content_lines(markdown) if not line.startswith("BODY")]
@@ -227,6 +233,45 @@ def test_rotated_page_whose_cropbox_holds_an_indirect_number_keeps_the_note(run_
     for row in cells:
         for cell in row:
             assert _count(result.markdown, cell) == 1, f"{cell!r}\n{result.describe()}"
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_rotated_cropped_page_with_hidden_text_emits_its_table_once(run_cli, e2e_dir, rotation):
+    """Hidden text on a page makes the text path read the page without it (PR #18). The table of a
+    rotated page with its own CropBox is still found and suppressed in one frame: every cell once,
+    the note beside the table once, the hidden line nowhere."""
+    cells = [["HT-H1", "HT-H2"], ["HT-V11", "HT-V12"], ["HT-V21", "HT-V22"]]
+    note = f"NOTE{rotation} beside the table."
+    pdf = B.rotated_cropped_table(e2e_dir / "hidden.pdf", rotation, cells, note, "[30 42 570 792]",
+                                  invisible="Hidden sentence nobody sees")
+
+    result = run_cli(pdf)
+
+    assert result.exit_code == 0, result.describe()
+    assert _count(result.markdown, note) == 1, result.describe()
+    assert _count(result.markdown, "Hidden sentence nobody sees") == 0, result.describe()
+    for row in cells:
+        for cell in row:
+            assert _count(result.markdown, cell) == 1, f"{cell!r}\n{result.describe()}"
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+def test_rotated_cropped_borderless_statement_is_one_table(run_cli, e2e_dir, rotation):
+    """A borderless statement is found by PyMuPDF's text strategy, a second find_tables() call (PR #15).
+    On a landscape page stored sideways with its own CropBox both calls read the page in the same
+    frame: one table, every label and figure once, the title and the note under it once."""
+    note = f"RS-NOTE{rotation}: figures are audited."
+    pdf = B.rotated_cropped_statement(e2e_dir / "statement.pdf", rotation, "[20 30 575 812]", note)
+
+    result = run_cli(pdf)
+
+    assert result.exit_code == 0, result.describe()
+    assert _tables(result.markdown) == 1, result.describe()
+    for row in B.ROTATED_STATEMENT_ROWS:
+        for token in row:
+            assert _count(result.markdown, token) == 1, f"{token!r}\n{result.describe()}"
+    assert _count(result.markdown, "Statement of income (USD thousands)") == 1, result.describe()
+    assert _count(result.markdown, note) == 1, result.describe()
 
 
 @pytest.mark.parametrize("rotation", [90, 270])
@@ -639,6 +684,20 @@ def test_title_that_is_also_the_running_header_is_kept_once(run_cli, e2e_dir, ti
     assert result.exit_code == 0, result.describe()
     assert _count(result.markdown, "Quarterly Risk Review") == 1, result.describe()
     _assert_body_intact(result.markdown, pages)
+
+
+def test_hidden_title_does_not_take_the_running_header_with_it(run_cli, e2e_dir):
+    """An invisible title over nothing the page shows is hidden text: the text path leaves it out
+    (PR #18), and so must the running header/footer pass. The 9pt running header that repeats it then
+    repeats no title of the document, so its first copy stays (verbatim first)."""
+    pdf = B.paged_document(e2e_dir / "hidden-title.pdf", 6,
+                           B.title_then_running_header("Quarterly Risk Review", hidden=True))
+
+    result = run_cli(pdf)
+
+    assert result.exit_code == 0, result.describe()
+    assert _count(result.markdown, "Quarterly Risk Review") == 1, result.describe()
+    _assert_body_intact(result.markdown, 6)
 
 
 def test_statement_title_is_kept_when_the_contents_page_lists_it(run_cli, e2e_dir):

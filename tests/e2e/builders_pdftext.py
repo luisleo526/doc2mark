@@ -315,7 +315,8 @@ def _shift_content(doc, page, dx: float, dy: float) -> None:
 
 def rotated_cropped_table(path: Path, rotation: int, cells: Sequence[Sequence[str]], note: str, cropbox: str,
                           mediabox: str = "[0 0 595 842]", indirect_crop_x0: bool = False,
-                          parent_cropbox: Optional[str] = None, hidden: Optional[str] = None) -> Path:
+                          parent_cropbox: Optional[str] = None, hidden: Optional[str] = None,
+                          invisible: Optional[str] = None) -> Path:
     """A ruled table with a note right beside it on a ``/Rotate rotation`` page whose raw /MediaBox
     and /CropBox entries are ``mediabox`` and ``cropbox``, written unvalidated: a CropBox may reach
     outside the MediaBox or list its corners in any order, as in real files. The content is drawn
@@ -323,7 +324,9 @@ def rotated_cropped_table(path: Path, rotation: int, cells: Sequence[Sequence[st
     number is an indirect object (``[12 0 R 50 570 800]``), which PDF allows in any array.
     ``parent_cropbox`` is written as the /Pages node's raw /CropBox. ``hidden`` is a line printed
     near the bottom edge of the unrotated page, where a CropBox such as ``[30 42 570 792]`` hides
-    it; ``body_lines(1, 8)`` sit well inside it.
+    it; ``body_lines(1, 8)`` sit well inside it. ``invisible`` is a line of invisible text (render
+    mode 3) over nothing the page shows, away from the table: hidden text, left out of the text
+    (PR #18), which makes the text path read the page's tables from a copy without it.
 
     PyMuPDF's find_tables() reports the table box of such a page shifted by the crop, over the note.
     """
@@ -334,6 +337,8 @@ def rotated_cropped_table(path: Path, rotation: int, cells: Sequence[Sequence[st
     if hidden is not None:
         page.insert_text((200, 830), hidden, fontsize=8)
         page.insert_text((72, 450), "\n".join(line[:40] for line in body_lines(1, 8)), fontsize=10)
+    if invisible is not None:
+        page.insert_text((72, 640), invisible, fontsize=10, render_mode=3)
     page.set_rotation(rotation)
     x0, y0 = (float(value) for value in mediabox.strip("[]").split()[:2])
     if x0 or y0:
@@ -404,6 +409,35 @@ def footer_decorator(form: Callable[[int, int], str], *, font: str = "helv", y: 
     return decorate
 
 
+ROTATED_STATEMENT_ROWS = [("Revenue", "4,812", "4,377"), ("Cost of sales", "(2,905)", "(2,648)"),
+                          ("Gross profit", "1,907", "1,729"), ("Selling expenses", "(611)", "(583)"),
+                          ("Administrative expenses", "(402)", "(388)"), ("Operating profit", "894", "758")]
+
+
+def rotated_cropped_statement(path: Path, rotation: int, cropbox: str, note: str) -> Path:
+    """A borderless statement (a bold title, a label column and two right-aligned number columns set
+    with tab stops, no rules: a table only PyMuPDF's text strategy finds) with ``note`` under it, on
+    a landscape page stored sideways (``/Rotate rotation``, as word processors store one) whose own
+    raw /CropBox is ``cropbox``."""
+    upright = pymupdf.open()
+    page = upright.new_page(width=A4[1], height=A4[0])
+    page.insert_text((60, 70), "Statement of income (USD thousands)", fontsize=12, fontname="hebo")
+    y = 100
+    for label, *values in ROTATED_STATEMENT_ROWS:
+        page.insert_text((60, y), label, fontsize=10)
+        for right, value in zip((340, 440), values):
+            page.insert_text((right - pymupdf.get_text_length(value, fontsize=10), y), value, fontsize=10)
+        y += 16
+    page.insert_text((60, y + 20), note, fontsize=9)
+    doc = pymupdf.open()
+    stored = doc.new_page(width=A4[0], height=A4[1])
+    stored.show_pdf_page(stored.rect, upright, 0, rotate=rotation)
+    stored.set_rotation(rotation)
+    doc.xref_set_key(stored.xref, "CropBox", cropbox)
+    upright.close()
+    return _save(doc, path)
+
+
 def label_and_number_footer(page, p: int, n: int) -> None:
     """A footer row holding a per-page label ("Lesson · N", left) and the bare page number (right)."""
     _text(page, 72, 812, f"Lesson · {p}", 9)
@@ -442,13 +476,16 @@ def kpi_tiles_and_chart(page, p: int, n: int) -> None:
     _text(page, 290, 815, f"{p}", 9)
 
 
-def title_then_running_header(title: str, title_y: float = 80, header_from: int = 2) -> Decorate:
+def title_then_running_header(title: str, title_y: float = 80, header_from: int = 2,
+                               hidden: bool = False) -> Decorate:
     """Port of ``p03f_title_as_running_header.py`` (regular font): the document title on page 1
     (20pt, baseline at ``title_y``: 80 is in the top margin band, 130 just below it) that is also
-    the 9pt running header of every page from ``header_from`` on."""
+    the 9pt running header of every page from ``header_from`` on. With ``hidden`` the title is
+    invisible text (render mode 3) over nothing the page shows: hidden text, which the text path
+    leaves out (PR #18)."""
     def decorate(page, p, n):
         if p == 1:
-            _text(page, 72, title_y, title, 20)
+            _text(page, 72, title_y, title, 20, render_mode=3 if hidden else 0)
         elif p >= header_from:
             _text(page, 72, 40, title, 9)
     return decorate
