@@ -74,31 +74,30 @@ class TestDocxPageBreaks:
 
 
 class TestDocxHeaderFooter:
-    """DOCX headers/footers should be tagged and excluded from body."""
+    """DOCX headers/footers are written once per section, in marked blocks of the Markdown, and their
+    JSON items carry ``region``."""
 
-    def test_header_tagged(self):
+    def test_header_in_its_block(self):
         result = _load("test_rag_features.docx")
-        headers = [i for i in result.json_content if i["type"] == "text:header"]
-        assert len(headers) >= 1
-        assert any("ACME" in h["content"] or "Confidential" in h["content"] for h in headers)
+        headers = [i for i in result.json_content if i.get("region") == "header"]
+        assert [h["page"] for h in headers] == [1]
+        assert "ACME Corp" in headers[0]["content"] and "Confidential" in headers[0]["content"]
+        blocks = re.findall(r"<!-- header -->(.*?)<!-- /header -->", result.content, re.S)
+        assert len(blocks) == 1 and "Confidential" in blocks[0]
 
-    def test_footer_tagged(self):
+    def test_footer_in_its_block_after_the_body(self):
         result = _load("test_rag_features.docx")
-        footers = [i for i in result.json_content if i["type"] == "text:footer"]
-        assert len(footers) >= 1
+        footers = [i for i in result.json_content if i.get("region") == "footer"]
+        assert [(f["page"], f["content"]) for f in footers] == [(3, "Page Footer Text")]
+        blocks = re.findall(r"<!-- footer -->(.*?)<!-- /footer -->", result.content, re.S)
+        assert len(blocks) == 1 and "Page Footer Text" in blocks[0]
+        assert result.content.index("In conclusion") < result.content.index("<!-- footer -->")
 
-    def test_header_not_in_markdown_body(self):
+    def test_header_and_footer_text_written_once(self):
         result = _load("test_rag_features.docx")
-        # Headers are in json_content but NOT in the main markdown output
-        header_texts = [i["content"] for i in result.json_content if i["type"] == "text:header"]
-        for header_text in header_texts:
-            if header_text.strip():
-                # The exact header text should not appear as a standalone line in markdown
-                # (it may appear as part of footnote definitions, which is fine)
-                lines = result.content.split("\n")
-                normal_lines = [l for l in lines if not l.startswith("[^") and "<!-- " not in l]
-                for line in normal_lines:
-                    assert header_text not in line, f"Header '{header_text}' found in markdown body"
+        assert result.content.count("Confidential") == 1
+        assert result.content.count("Page Footer Text") == 1
+        assert not [i for i in result.json_content if i["type"] in ("text:header", "text:footer")]
 
 
 class TestDocxFootnotes:

@@ -184,3 +184,11 @@ def test_documents_with_failed_or_unread_ocr_are_not_cached():
     assert "failed" in UnifiedDocumentLoader._ocr_incomplete(_document({"ocr_images": {"failed": 1}}))
     assert "unread" in UnifiedDocumentLoader._ocr_incomplete(_document({"ocr_images": {"unread_pages": [2]}}))
     assert "failed" in UnifiedDocumentLoader._ocr_incomplete(_document({"ocr_issues": {"failed": 1, "refused": 0}}))
+
+
+def test_documents_whose_ocr_request_raised_are_not_cached():
+    """An OCR request that raised (no API key, an outage) is a failure even where no image was counted for it
+    (``ocr_issues["errors"]`` only): the document was stored in ``cache_dir`` with its failure text."""
+    reason = UnifiedDocumentLoader._ocr_incomplete(
+        _document({"ocr_issues": {"refused": 0, "failed": 0, "errors": ["RuntimeError: OpenAI OCR requires an API key"]}}))
+    assert reason is not None and "API key" in reason
