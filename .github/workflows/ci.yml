@@ -106,13 +106,22 @@ jobs:
   e2e:
     name: E2E (CLI in docker, Tesseract + LibreOffice)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The runner script sets D2M_E2E_STRICT=1 (a missing tool fails, never skips) and installs
+      # .[ocr,dev] in the container, which brings pytest-xdist. The tests are independent (fresh
+      # output dirs, per-conversion LibreOffice profiles), so they run on one worker per runner CPU.
+      # OMP_THREAD_LIMIT=1 is part of that: Tesseract runs several OpenMP threads for every call.
+      # Without it 4 workers took 19-22 min and one of three such runs hit a test's 300 s CLI timeout
+      # (8 workers: 4 timeouts); with it the suite takes ~11 min (serial: 33 min).
       - name: Run the CLI E2E suite (scripts/run_e2e_docker.sh, D2M_E2E_STRICT=1)
-        run: scripts/run_e2e_docker.sh -q -p no:cacheprovider
+        env:
+          OMP_THREAD_LIMIT: "1"
+          D2M_E2E_PASS_ENV: OMP_THREAD_LIMIT
+        run: scripts/run_e2e_docker.sh -q -p no:cacheprovider -n 4 --durations=15
 
   test-ocr:
     name: OCR tests (OpenAI)

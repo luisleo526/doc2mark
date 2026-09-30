@@ -411,6 +411,56 @@ This is on by default for multi-page PDFs and is applied before both markdown
 rendering and RAG chunking, so the repeated chrome never reaches your output or
 your vector store.
 
+## Optional: quality judge (TypeSafe/Jev)
+
+doc2mark's rules are deterministic, and when the evidence is weak they keep the
+text. Three of those open decisions can be handed to an optional judge,
+[TypeSafe's Jev](https://docs.typesafe.ai), which is asked only about the cases
+the rules leave open:
+
+- **Is this PDF page's text layer legible?** A layer can be valid Unicode and
+  still be nonsense (shifted letters, glyph IDs read as characters). A page the
+  judge rates illegible is OCR'd from its render (OCR must be on).
+- **Is this repeated header/footer line page chrome?** When the judge says yes, a
+  line the rules kept on several pages is thinned, normally to one copy. The judge
+  never removes a line's last copy.
+- **Is this OCR answer only a refusal or an error?** (LLM OCR providers only, not
+  Tesseract.) Such an answer is re-read or dropped instead of being indexed as
+  page text.
+
+Accuracy of each decision on the labelled sets in `tests/data/judge`, rules alone
+→ rules + judge. TEST is held out from the calibration data; EXTERNAL is 60 items
+written by a reviewer and never used for calibration. The sets are small, so read
+the numbers as a direction, not a guarantee.
+
+| Decision | TEST | EXTERNAL |
+|----------|:---:|:---:|
+| Text layer legible? | 67.4 % → 100 % (46 items) | 68.8 % → 100 % (16 items) |
+| Repeated line is page chrome? | 50.0 % → 95.2 % (42) | 66.7 % → 100 % (3 asked of 20) |
+| OCR answer is a refusal or error? | 76.7 % → 97.8 % (90) | 62.5 % → 83.3 % (24) |
+
+It is **off by default**. To turn it on:
+
+```bash
+pip install "doc2mark[typesafe]"          # also part of doc2mark[all]
+export TYPESAFE_API_KEY=...
+doc2mark report.pdf --ocr tesseract --ocr-images --judge typesafe
+```
+
+```python
+loader = UnifiedDocumentLoader(ocr_provider="tesseract", judge="typesafe")
+result = loader.load("report.pdf", ocr_images=True)
+# or set DOC2MARK_JUDGE=typesafe instead of judge="typesafe"
+```
+
+Without the extra or the key the output is the same as without a judge, and a
+question the service cannot answer is decided by the rules. **With the judge on,
+document text is sent to a third party** (TypeSafe, `api.typesafe.ai`): up to
+1,500 characters of each judged PDF page (with OCR on, nearly every text page), the
+judged header/footer lines and short OCR answers. Do not enable it for documents
+your agreement with TypeSafe does not cover. Costs, latency, privacy and the full evaluation are in
+[docs/judge.rst](docs/judge.rst).
+
 ## Supported formats
 
 | Category | Formats |
@@ -624,6 +674,19 @@ python -m sphinx -b html -W --keep-going docs docs/_build/html
 
 The repository includes `.github/workflows/docs.yml` for GitHub Pages. In the
 GitHub repository settings, set Pages source to **GitHub Actions**.
+
+## Tests
+
+```bash
+pip install -e ".[all,dev]"
+python -m pytest -m "not integration and not requires_api_key and not e2e"   # unit tests, as CI runs them
+scripts/run_e2e_docker.sh -q      # CLI end-to-end suite in Docker (Tesseract + LibreOffice)
+```
+
+The end-to-end suite in `tests/e2e` runs the real `doc2mark` command against real
+Tesseract and LibreOffice and checks only what it writes. CI runs it on every pull
+request to `main`. [docs/development.rst](docs/development.rst) explains how to run it
+(in Docker or locally) and how to write E2E tests.
 
 ## License
 
