@@ -1,7 +1,9 @@
 """Reproduce the code issues the docs audit found (listed in the PR under "Code issues found").
 
-Each probe prints what the code does; nothing is fixed here. Run it in the E2E image from the
-repository root (``eval/docs_audit/run_on_spark.sh`` runs it too)::
+Each probe prints what the code does; nothing is fixed here. A probe whose title says "fixed" shows an
+issue that has been fixed since: it prints the behaviour now (``results/probes.txt`` is the output at the
+audit commit). Run it in the E2E image from the repository root (``eval/docs_audit/run_on_spark.sh``
+runs it too)::
 
     python eval/docs_audit/probes.py
 """
@@ -40,29 +42,34 @@ def probe(title: str):
 work = Path(tempfile.mkdtemp(prefix="d2m-probes-"))
 
 
-@probe("CLI folder run: the default --pattern '*' also matches sub-folders, which fail the run")
+@probe("CLI folder run (fixed: the default --pattern '*' yielded sub-folders, which failed the run): "
+       "only files are converted, -r descends")
 def _():
     docs = work / "docs"
     (docs / "sub").mkdir(parents=True)
     shutil.copy(SAMPLES / "sample_text.txt", docs / "a.txt")
     shutil.copy(SAMPLES / "sample_text.txt", docs / "sub" / "b.txt")
     r = cli(str(docs), "-o", str(work / "out1"), "-q", cwd=work)
-    print("exit", r.returncode, "| stderr:", r.stderr.strip()[-200:])
-    r = cli(str(docs), "-r", "-o", str(work / "out2"), "-q", "--skip-errors", cwd=work)
-    print("with --skip-errors: exit", r.returncode, "| written:", sorted(p.name for p in (work / "out2").iterdir()))
+    print("exit", r.returncode, "| stderr:", r.stderr.strip()[-200:], "| written:",
+          sorted(p.name for p in (work / "out1").iterdir()))
+    r = cli(str(docs), "-r", "-o", str(work / "out2"), "-q", cwd=work)
+    print("with -r: exit", r.returncode, "| written:", sorted(p.relative_to(work / "out2").as_posix()
+                                                                   for p in (work / "out2").rglob("*") if p.is_file()))
 
 
-@probe("CLI folder output is flat by file stem: same-stem files overwrite each other")
+@probe("CLI folder output (fixed: it was flat by file stem, so same-stem files overwrote each other): the input "
+       "tree is mirrored")
 def _():
     docs = work / "stems"
     (docs / "2024").mkdir(parents=True)
     shutil.copy(SAMPLES / "sample_text.txt", docs / "report.txt")
     shutil.copy(SAMPLES / "sample_document.md", docs / "2024" / "report.md")
     r = cli(str(docs), "-r", "--pattern", "report.*", "-o", str(work / "out3"), "-q", cwd=work)
-    print("exit", r.returncode, "| inputs: 2 | written:", sorted(p.name for p in (work / "out3").iterdir()))
+    print("exit", r.returncode, "| inputs: 2 | written:", sorted(p.relative_to(work / "out3").as_posix()
+                                                                  for p in (work / "out3").rglob("*") if p.is_file()))
 
 
-@probe("CLI --sort size keeps the SMALLEST files, the --help epilog says 'Process 10 largest files'")
+@probe("CLI --sort size keeps the SMALLEST files (the --help epilog used to say 'Process 10 largest files')")
 def _():
     from doc2mark.cli import filter_files
     docs = work / "sizes"
@@ -71,18 +78,22 @@ def _():
         (docs / name).write_text("x" * size)
     print([p.name for p in filter_files(list(docs.iterdir()), max_files=1, sort_by="size")])
     r = cli("--help", cwd=work)
-    print([line.strip() for line in r.stdout.splitlines() if "largest" in line])
+    print([line.strip() for line in r.stdout.splitlines() if "--sort size" in line])
 
 
-@probe("CLI --preserve-structure and --timeout are parsed but never used")
+@probe("CLI --preserve-structure (fixed: parsed and never read) is deprecated, --timeout (fixed: never applied) "
+       "stops a slow file in folder runs")
 def _():
-    source = (ROOT / "doc2mark" / "cli.py").read_text()
-    print("args.preserve_structure used:", "args.preserve_structure" in source)
-    print("args.timeout used only as future.result(timeout=...) after as_completed:",
-          source.count("args.timeout"), "use(s)")
+    docs = work / "flags"
+    docs.mkdir()
+    shutil.copy(SAMPLES / "sample_text.txt", docs / "a.txt")
+    r = cli(str(docs), "--preserve-structure", "-o", str(work / "out4"), cwd=work)
+    print("exit", r.returncode, "| stderr:", r.stderr.strip()[-200:])
+    r = cli("--help", cwd=work)
+    print([line.strip() for line in r.stdout.splitlines() if "--timeout" in line or "Timeout per file" in line])
 
 
-@probe("batch_process skips upper-case extensions and .htm (load() accepts both)")
+@probe("batch_process (fixed: it skipped upper-case extensions and .htm) finds every file load() accepts")
 def _():
     from doc2mark import UnifiedDocumentLoader
     docs = work / "cases"
@@ -96,7 +107,7 @@ def _():
     print("load() works on both:", loader.load(docs / "upper.PDF").metadata.format, loader.load(docs / "page.htm").metadata.format)
 
 
-@probe("batch results: tables_found is always 0 (ProcessedDocument.tables is never filled)")
+@probe("batch results (fixed: tables_found was always 0) count the tables, read from the content items")
 def _():
     from doc2mark import UnifiedDocumentLoader
     loader = UnifiedDocumentLoader(ocr_provider=None)
@@ -105,16 +116,20 @@ def _():
     info = next(iter(results.values()))
     doc = loader.load(SAMPLES / "complex-tables" / "complex_table_test.pdf")
     print("tables_found:", info["metadata"]["tables_found"], "| table items:",
-          sum(i["type"] == "table" for i in doc.json_content), "| extra tables_count:", doc.metadata.extra.get("tables_count"))
+          sum(i["type"] == "table" for i in doc.json_content), "| extra tables_count:", doc.metadata.extra.get("tables_count"),
+          "| sections:", len(doc.sections))
 
 
-@probe("convenience functions pass **kwargs to load(), not to the loader: table_style= raises")
+@probe("convenience functions (fixed: **kwargs all went to load(), so table_style= raised) route loader settings "
+       "to the loader")
 def _():
     from doc2mark import load
+    print("table_style= works:", bool(load(str(SAMPLES / "sample_pdf.pdf"), ocr_provider=None,
+                                          table_style="markdown_grid").content))
     try:
-        load(str(SAMPLES / "sample_pdf.pdf"), table_style="markdown_grid")
+        load(str(SAMPLES / "sample_pdf.pdf"), ocr_provider=None, no_such_option=1)
     except TypeError as exc:
-        print("TypeError:", exc)
+        print("unknown name -> TypeError:", str(exc)[:80])
 
 
 @probe("ChunkingConfig.include_page_markers has no effect; every text:section is '##' in chunks")
@@ -146,20 +161,21 @@ def _():
 
 
 
-@probe(".tsv always fails; the CSV delimiter argument is ignored")
+@probe(".tsv (fixed: it always failed) converts; the CSV delimiter argument (fixed: it was ignored) is honoured")
 def _():
     from doc2mark import UnifiedDocumentLoader
     loader = UnifiedDocumentLoader(ocr_provider=None)
     (work / "t.tsv").write_text("a\tb\n1\t2\n")
     try:
-        loader.load(work / "t.tsv")
+        print("tsv:", loader.load(work / "t.tsv").content.splitlines()[:3])
     except Exception as exc:
         print("tsv:", type(exc).__name__, str(exc)[:120])
     (work / "t.csv").write_text("a\tb\n1\t2\n")
     print("same content as .csv:", loader.load(work / "t.csv").content.splitlines()[:3])
     (work / "semi.csv").write_text("a;b\n1;2\n")
     doc = loader.load(work / "semi.csv", delimiter=",")
-    print("delimiter=',' on a ';' file ->", repr(doc.metadata.delimiter))
+    print("delimiter=',' on a ';' file ->", repr(doc.metadata.delimiter), "| none given ->",
+          repr(loader.load(work / "semi.csv").metadata.delimiter))
 
 
 @probe("PowerPoint: layout placeholder prompts leak into every slide; slide_count is unreliable")
@@ -192,20 +208,22 @@ def _():
     print("sheet_names:", doc.metadata.sheet_names, "| total_cells:", doc.metadata.total_cells, "| page_count:", doc.metadata.page_count)
 
 
-@probe("an unknown table_style: PDF conversion fails, Office silently falls back to the basic converter")
+@probe("table_style (fixed: an unknown name failed PDF conversion and silently sent Office files to the basic "
+       "converter) is validated at the loader")
 def _():
     from doc2mark import UnifiedDocumentLoader
     loader = UnifiedDocumentLoader(ocr_provider=None, table_style="MARKDOWN_GRID")
     doc = loader.load(SAMPLES / "complex-tables" / "complex_table_test.docx")
-    print("docx: colspan in output:", "colspan" in doc.content, "| json_content:", doc.json_content is not None)
+    print("MARKDOWN_GRID -> style:", loader.table_style, "| colspan in docx output:", "colspan" in doc.content,
+          "| json_content:", doc.json_content is not None)
     try:
-        loader.load(SAMPLES / "complex-tables" / "complex_table_test.pdf")
-        print("pdf: converted")
-    except Exception as exc:
-        print("pdf:", type(exc).__name__, str(exc)[:100])
+        UnifiedDocumentLoader(ocr_provider=None, table_style="MARKDOWN-GRID")
+    except ValueError as exc:
+        print("unknown name -> ValueError:", str(exc)[:100])
 
 
-@probe("Markdown: a file that starts with a --- rule loses its first block to frontmatter")
+@probe("Markdown (fixed: a file that started with a --- rule lost its first block to frontmatter): only valid "
+       "front matter is taken out")
 def _():
     from doc2mark import UnifiedDocumentLoader
     (work / "rule.md").write_text("---\nIntro paragraph\n---\n# Title\n\nBody\n")

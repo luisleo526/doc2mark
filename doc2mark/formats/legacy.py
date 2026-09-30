@@ -20,13 +20,16 @@ logger = logging.getLogger(__name__)
 class LegacyProcessor(BaseProcessor):
     """Processor for legacy Office formats using LibreOffice conversion."""
 
-    def __init__(self, ocr: Optional[BaseOCR] = None):
+    def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None):
         """Initialize legacy processor.
         
         Args:
             ocr: OCR provider for image extraction
+            table_style: Output style for complex tables, used when the converted file is read
+                (see OfficeProcessor)
         """
         self.ocr = ocr
+        self.table_style = table_style
         self._office_processor = None
         self._libreoffice_path = self._find_libreoffice()
 
@@ -35,7 +38,7 @@ class LegacyProcessor(BaseProcessor):
         """Lazy load office processor for converted files."""
         if self._office_processor is None:
             from doc2mark.formats.office import OfficeProcessor
-            self._office_processor = OfficeProcessor(ocr=self.ocr)
+            self._office_processor = OfficeProcessor(ocr=self.ocr, table_style=self.table_style)
         return self._office_processor
 
     def can_process(self, file_path: Union[str, Path]) -> bool:

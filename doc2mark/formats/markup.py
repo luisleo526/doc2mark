@@ -4,7 +4,7 @@ import logging
 import re
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Union, Tuple
+from typing import Optional, Tuple, Union
 import defusedxml.ElementTree as ET
 
 from doc2mark.core.base import (
@@ -307,19 +307,7 @@ class MarkupProcessor(BaseProcessor):
                 content = f.read()
 
             # Extract metadata from frontmatter if present
-            frontmatter = {}
-            if content.startswith('---'):
-                parts = content.split('---', 2)
-                if len(parts) >= 3:
-                    # Parse YAML frontmatter
-                    try:
-                        import yaml
-                        frontmatter = yaml.safe_load(parts[1])
-                        content = parts[2].strip()
-                    except ImportError:
-                        logger.warning("PyYAML not installed, skipping frontmatter parsing")
-                    except Exception as e:
-                        logger.warning(f"Failed to parse frontmatter: {e}")
+            frontmatter, content = self._split_front_matter(content)
 
             # Count elements
             lines = content.split('\n')
@@ -350,6 +338,36 @@ class MarkupProcessor(BaseProcessor):
         except Exception as e:
             logger.error(f"Failed to process Markdown: {e}")
             raise ProcessingError(f"Markdown processing failed: {str(e)}")
+
+    @staticmethod
+    def _split_front_matter(content: str) -> Tuple[Optional[dict], str]:
+        """Split YAML front matter off the start of a Markdown text: ``(mapping, text after it)``.
+
+        Front matter is a first line ``---``, YAML that parses to a mapping and a closing ``---`` line.
+        Anything else that starts with a rule (prose or a list between two rules, a rule with text after
+        it, YAML that does not parse, no closing rule, PyYAML not installed) is not front matter: the
+        result is ``(None, content)`` and the text is kept as written. Only the blank lines right after
+        the closing rule are dropped from the text that follows it.
+        """
+        lines = content.split('\n')
+        if lines[0].rstrip() != '---':
+            return None, content
+        closing = next((i for i in range(1, len(lines)) if lines[i].rstrip() == '---'), None)
+        if closing is None:
+            return None, content
+        try:
+            import yaml
+        except ImportError:
+            logger.warning("PyYAML not installed, skipping frontmatter parsing")
+            return None, content
+        try:
+            frontmatter = yaml.safe_load('\n'.join(lines[1:closing]))
+        except Exception as e:  # YAMLError, but also ValueError for a date that does not exist (2024-02-30)
+            logger.warning(f"Not treating the leading --- block as front matter, it is not valid YAML: {e}")
+            return None, content
+        if not isinstance(frontmatter, dict):
+            return None, content
+        return frontmatter, '\n'.join(lines[closing + 1:]).lstrip('\r\n')
 
     def _xml_to_markdown(self, element, level=0) -> str:
         """Convert XML element to markdown."""

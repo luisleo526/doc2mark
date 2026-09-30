@@ -54,15 +54,26 @@ optional judge can thin those. :doc:`pdf` has the details.
 **The CLI prints only the start of the document.** Without ``-o`` the Markdown on stdout is cut
 after 1,000 characters; use ``-v`` or ``-o FILE``.
 
-**A folder run stops at a sub-folder or an unsupported file.** The CLI tries every entry the
-pattern matches; pass ``--pattern "*.pdf"`` (or similar) or ``--skip-errors``.
+**A folder run stops at an unsupported file.** The CLI converts every file the pattern matches
+(sub-folders are never converted themselves); a file of a format doc2mark does not read, such as
+``.svg`` or ``.DS_Store``, fails the run. Pass ``--pattern "*.pdf"`` (or similar) or
+``--skip-errors``.
 
-**Batch processing skips files.** ``batch_process`` looks for lower-case extensions
-(``report.PDF`` is not found) and not for ``.htm``; convert such files with ``load()`` or
-``batch_process_files()``.
+**A file in a folder run fails with ``timed out after 600 s (--timeout)``.** You passed
+``--timeout 600``, which limits the time one file may take (retries included); a slow conversion,
+a hung OCR service or a stuck LibreOffice is stopped and the file counts as failed. Raise the
+limit for big scans, or leave the option out (the default is no limit).
 
-**A TSV file fails.** TSV conversion currently fails with a ``ProcessingError`` (a known bug);
-rename the file to ``.csv``, whose delimiter detection finds the tabs.
+**An output file is named ``report.txt.md``.** Two inputs of one folder would have written the
+same output (``report.txt`` and ``report.md`` both give ``report.md``), or the output would have
+replaced an input file. Each of them is named after its whole file name instead, and a warning
+names them. Files in different folders never clash: the output folder mirrors the input tree.
+``-o`` cannot be the input folder (the outputs would be converted again by the next run); use a
+folder of its own, inside the input folder if you like.
+
+**Batch processing skips a file.** ``batch_process`` only takes files whose extension doc2mark
+reads (:doc:`formats`; any case, ``.htm`` and ``.markdown`` included); anything else, such as
+``.svg`` or a file without an extension, is skipped without a message.
 
 **HTML comes out flat.** Install ``markdownify`` (``pip install markdownify``); without it a
 simple built-in converter is used and a warning is logged.

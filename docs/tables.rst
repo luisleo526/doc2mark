@@ -78,9 +78,9 @@ prints
 
 The two empty corner cells stay, the group header is one ``<th colspan="3">``, and the
 *Canada* row has no first cell because that position is covered by *Americas*. In the document
-loader you only choose the style (use the exact lower-case name: an unknown name makes PDF
-conversion fail and makes Word/PowerPoint/Excel files fall back to a basic converter without
-merged cells; legacy ``.doc``/``.ppt``/``.xls`` files always use ``minimal_html``):
+loader you only choose the style (a name in any case, or a :class:`~doc2mark.TableStyle`; an
+unknown name raises ``ValueError`` when the loader is created; the style applies to every
+format, legacy ``.doc``/``.ppt``/``.xls`` files included):
 
 .. code-block:: python
 

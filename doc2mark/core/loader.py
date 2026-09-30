@@ -1,13 +1,15 @@
 """Main UnifiedDocumentLoader implementation."""
 
 import base64
+import datetime
 import hashlib
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
@@ -20,10 +22,13 @@ from doc2mark.core.base import (
     UnsupportedFormatError
 )
 from doc2mark.core.strategy import ROUTING_VERSION
+from doc2mark.core.structure import tables_and_sections
+from doc2mark.core.table import TableStyle
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache, ocr_settings_identity
 from doc2mark.ocr.prompts import PromptTemplate
 from doc2mark.ocr.usage import UsageAggregatingOCR
+from doc2mark.utils.output_paths import is_inside, plan_output_names
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +85,7 @@ class UnifiedDocumentLoader:
             structured: Optional[bool] = None,
             detail: Optional[str] = None,
             # Table output configuration
-            table_style: Optional[str] = None,
+            table_style: Optional[Union[str, TableStyle]] = None,
             # Optional text-layer legibility judge (PDF quality gate)
             legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
             # Optional judge for repeated header/footer lines the rule keeps (PDF)
@@ -135,7 +140,9 @@ class UnifiedDocumentLoader:
                 the config / provider default untouched.
 
             # Table output configuration:
-            table_style: Output style for complex tables with merged cells:
+            table_style: Output style for complex tables with merged cells (a name in any case
+                or a ``TableStyle``; anything else is a ``ValueError``), used for every format,
+                legacy Office files included:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
                 - 'markdown_grid': Markdown with merge annotations
                 - 'styled_html': Full HTML with inline styles (legacy)
@@ -163,6 +170,9 @@ class UnifiedDocumentLoader:
                 deterministic rules; see docs/judge.rst.
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
+
+        # Checked first, so a misspelt style fails before anything is set up
+        table_style = self._normalize_table_style(table_style)
 
         from doc2mark.judge import judge_hooks, resolve_judge
         self.judge = resolve_judge(judge)
@@ -201,7 +211,7 @@ class UnifiedDocumentLoader:
             logger.info(f"📁 Cache directory: {self.cache_dir}")
 
         # Table output style (default: minimal_html for cleaner output)
-        self.table_style = table_style if table_style else "minimal_html"
+        self.table_style = table_style
         logger.info(f"📊 Table style: {self.table_style}")
         self.legibility_judge = legibility_judge if legibility_judge is not None else hooks["legibility_judge"]
         self.boilerplate_judge = boilerplate_judge if boilerplate_judge is not None else hooks["boilerplate_judge"]
@@ -211,6 +221,23 @@ class UnifiedDocumentLoader:
         self._initialize_processors()
 
         logger.info("✅ UnifiedDocumentLoader initialized successfully")
+
+    @staticmethod
+    def _normalize_table_style(table_style: Optional[Union[str, TableStyle]]) -> str:
+        """The name of a valid table style. None (or an empty string) is the default; a name is
+        matched in any case; anything else is a ValueError naming the valid styles, instead of
+        failing in the PDF reader and falling back to a basic converter in the Office one."""
+        if not table_style:
+            return TableStyle.default().value
+        if isinstance(table_style, TableStyle):
+            return table_style.value
+        if isinstance(table_style, str):
+            try:
+                return TableStyle(table_style.strip().lower()).value
+            except ValueError:
+                pass
+        valid = ", ".join(style.value for style in TableStyle)
+        raise ValueError(f"Unknown table_style {table_style!r}. Expected one of: {valid}")
 
     @staticmethod
     def _is_ocr_provider(provider: Union[str, OCRProvider], target: OCRProvider) -> bool:
@@ -473,7 +500,7 @@ class UnifiedDocumentLoader:
                                          boilerplate_judge=getattr(self, "boilerplate_judge", None))
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
-            legacy_processor = LegacyProcessor(ocr=ocr)
+            legacy_processor = LegacyProcessor(ocr=ocr, table_style=self.table_style)
             image_processor = ImageProcessor(ocr=ocr)
 
             # Register processors for each format
@@ -594,6 +621,19 @@ class UnifiedDocumentLoader:
             logger.warning(f"{file_path.name}: {stats['failed']} judge question(s) got no answer ({reason}); "
                            f"the deterministic rules decided those cases")
         return complete
+
+    @staticmethod
+    def _fill_structure(result: ProcessedDocument) -> None:
+        """Give a document its ``tables`` and ``sections`` (see ``doc2mark.core.structure``) when its
+        converter produced content items (``json_content``) and did not list them itself. Formats
+        without content items (text, data and markup files) keep both as None."""
+        if result.json_content is None or (result.tables is not None and result.sections is not None):
+            return
+        tables, sections = tables_and_sections(result.json_content)
+        if result.tables is None:
+            result.tables = tables
+        if result.sections is None:
+            result.sections = sections
 
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
@@ -737,6 +777,7 @@ class UnifiedDocumentLoader:
 
             # Process with mapped parameters
             result = processor.process(file_path, **processor_kwargs)
+            self._fill_structure(result)
             judge_complete = self._end_judge_document(judge_start, result, file_path)
 
             if usage_ocr is not None:
@@ -940,7 +981,10 @@ class UnifiedDocumentLoader:
 
         Args:
             input_dir: Directory containing documents
-            output_dir: Optional output directory (default: same as input)
+            output_dir: Optional output directory (default: same as input). The input tree is mirrored
+                under it; files that would share an output name (``report.txt`` and ``report.md``) are
+                written as ``report.txt.md`` and ``report.md.md``. Next to the inputs (the default) an
+                output replaces the one an earlier run wrote.
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
@@ -985,29 +1029,32 @@ class UnifiedDocumentLoader:
         logger.info(f"📊 Recursive: {recursive}, Save files: {save_files}")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
-        # Find all supported files
-        pattern = "**/*" if recursive else "*"
+        # Find all supported files: one walk that asks the same question load() does (the extension,
+        # in any case), so report.PDF, page.htm and guide.markdown are found like their lower-case forms
         results = {}
         processed_count = 0
         error_count = 0
         start_time = time.time()
 
-        # Collect files by format for better processing
-        files_by_format = {}
+        files_by_format: Dict[DocumentFormat, List[Path]] = {}
         all_files = []
 
-        for doc_format in DocumentFormat:
-            format_pattern = f"{pattern}.{doc_format.value}"
-            files = list(input_dir.glob(format_pattern))
-            if files:
-                files_by_format[doc_format] = files
-                all_files.extend(files)
+        # Into an output folder of its own, what an earlier run wrote there (an output folder inside the input
+        # folder) is not input; next to the inputs (the default) an output replaces the one of an earlier run
+        in_place = is_inside(input_dir, output_dir) and is_inside(output_dir, input_dir)
+        nested_output = save_files and not in_place and is_inside(output_dir, input_dir)
 
-        # Also check markdown extension variant
-        md_files = list(input_dir.glob(f"{pattern}.markdown"))
-        if md_files:
-            files_by_format[DocumentFormat.MARKDOWN] = files_by_format.get(DocumentFormat.MARKDOWN, []) + md_files
-            all_files.extend(md_files)
+        for file_path in sorted(input_dir.rglob("*") if recursive else input_dir.glob("*")):
+            if not file_path.is_file() or (nested_output and is_inside(file_path, output_dir)):
+                continue
+            try:
+                doc_format = self._detect_format(file_path)
+            except UnsupportedFormatError:
+                continue
+            if doc_format not in self._processors:
+                continue
+            files_by_format.setdefault(doc_format, []).append(file_path)
+            all_files.append(file_path)
 
         total_files = len(all_files)
 
@@ -1020,6 +1067,14 @@ class UnifiedDocumentLoader:
             for fmt, files in files_by_format.items():
                 logger.info(f"   {fmt.value.upper()}: {len(files)} files")
 
+        # Into an output folder of its own, files that would share an output name (report.txt and report.md)
+        # keep their whole file name (report.txt.md)
+        output_names = None
+        suffixes = {OutputFormat.MARKDOWN: (".md",), OutputFormat.JSON: (".json",)}.get(output_format)
+        if save_files and suffixes and not in_place:
+            output_names = plan_output_names(
+                all_files, {path: path.relative_to(input_dir) for path in all_files}, output_dir, suffixes)
+
         # Build the ordered work list and pre-create output directories on the main
         # thread (so concurrent workers never race on mkdir).
         items = []
@@ -1028,7 +1083,8 @@ class UnifiedDocumentLoader:
                 continue
             rel_path = file_path.relative_to(input_dir)
             if save_files:
-                output_path = output_dir / rel_path.parent / file_path.stem
+                output_path = output_dir / (output_names[file_path] if output_names
+                                            else rel_path.parent / file_path.stem)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 output_path = None
@@ -1052,7 +1108,7 @@ class UnifiedDocumentLoader:
 
                 output_files = []
                 if save_files and output_path:
-                    output_files = self._save_result(result, output_path, output_format)
+                    output_files = self._save_result(result, output_path, output_format, source=file_path)
 
                 return {
                     'status': 'success',
@@ -1111,7 +1167,8 @@ class UnifiedDocumentLoader:
 
         Args:
             file_paths: List of file paths to process
-            output_dir: Optional output directory
+            output_dir: Optional output directory (flat; files that would share an output name, such as
+                ``q1.pdf`` of two folders, are written as ``q1.pdf.md`` and ``q1.pdf-2.md``)
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
@@ -1152,12 +1209,20 @@ class UnifiedDocumentLoader:
         logger.info(f"📄 Starting batch processing of {total_files} files")
         logger.info(f"🖼️  Image processing: extract_images={extract_images}, ocr_images={ocr_images}")
 
+        # Files that would share an output name (q1.pdf of two folders, report.txt and report.md) keep their whole
+        # file name (q1.pdf.md, q1.pdf-2.md) instead of overwriting each other
+        output_names = None
+        suffixes = {OutputFormat.MARKDOWN: (".md",), OutputFormat.JSON: (".json",)}.get(output_format)
+        if save_files and output_dir and suffixes:
+            output_names = plan_output_names(
+                file_paths, {path: PurePath(path.name) for path in file_paths}, Path(output_dir), suffixes)
+
         # Build the ordered work list and pre-create output directories on the main
         # thread (so concurrent workers never race on mkdir).
         items = []
         for file_path in file_paths:
             if save_files and output_dir:
-                output_path = Path(output_dir) / file_path.stem
+                output_path = Path(output_dir) / (output_names[file_path] if output_names else file_path.stem)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 output_path = None
@@ -1222,33 +1287,44 @@ class UnifiedDocumentLoader:
             self,
             result: ProcessedDocument,
             output_path: Path,
-            output_format: OutputFormat
+            output_format: OutputFormat,
+            source: Optional[Path] = None
     ) -> List[str]:
         """Save processing result to file(s).
         
         Args:
             result: Processing result
-            output_path: Base output path (without extension)
+            output_path: Base output path (without extension; a dot in the file name is part of it)
             output_format: Output format
+            source: The converted file. A result is never written over it (a Markdown file converted next to
+                itself would lose its front matter): that output is skipped.
             
         Returns:
             List of created file paths
         """
         output_files = []
 
+        def is_source(path: Path) -> bool:
+            if source is not None and path.exists() and os.path.samefile(path, source):
+                logger.warning(f"Not writing {path}: it is the file that was converted")
+                return True
+            return False
+
         if output_format == OutputFormat.MARKDOWN:
             # Save markdown
-            md_path = output_path.with_suffix('.md')
-            with open(md_path, 'w', encoding='utf-8') as f:
-                f.write(result.content)
-            output_files.append(str(md_path))
+            md_path = output_path.with_name(f"{output_path.name}.md")
+            if not is_source(md_path):
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(result.content)
+                output_files.append(str(md_path))
 
         elif output_format == OutputFormat.JSON:
             # Save JSON
-            json_path = output_path.with_suffix('.json')
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
-            output_files.append(str(json_path))
+            json_path = output_path.with_name(f"{output_path.name}.json")
+            if not is_source(json_path):
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
+                output_files.append(str(json_path))
 
         # Save images if extracted
         if result.images:
@@ -1457,6 +1533,10 @@ class UnifiedDocumentLoader:
             return value.value
         if isinstance(value, Path):
             return str(value)
+        if isinstance(value, (datetime.date, datetime.time)):  # e.g. dates in Markdown front matter
+            return value.isoformat()
+        if isinstance(value, (set, frozenset)):
+            return [cls._json_cache_safe(item) for item in sorted(value, key=str)]
         if isinstance(value, dict):
             return {str(key): cls._json_cache_safe(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
