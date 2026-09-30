@@ -2462,7 +2462,8 @@ class PDFLoader:
                 page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map)
             content_items.extend(image_items)
 
-        content_items = self._reading_order(page, content_items, list(zip(table_items, table_bboxes)), image_items)
+        content_items = self._reading_order(page, page_num, content_items, list(zip(table_items, table_bboxes)),
+                                            image_items)
 
         simple_content = []
         for item in content_items:
@@ -2497,8 +2498,8 @@ class PDFLoader:
 
         return simple_content
 
-    def _reading_order(self, page, items: List[SimpleContent], tables: List[Tuple[SimpleContent, tuple]],
-                       images: List[SimpleContent]) -> List[SimpleContent]:
+    def _reading_order(self, page, page_num: int, items: List[SimpleContent],
+                       tables: List[Tuple[SimpleContent, tuple]], images: List[SimpleContent]) -> List[SimpleContent]:
         """The page's items in reading order (see :mod:`doc2mark.pipelines.pdf_layout`).
 
         The starting point is the order by ``position_y`` (the top of the text block a piece
@@ -2506,14 +2507,19 @@ class PDFLoader:
         pictures and page chrome are measured unrotated and tables as displayed, so the page is
         ordered by where each item is displayed instead. Then pdf_layout reads columns column by
         column when the page clearly shows them. ``tables`` pairs each table item with its box
-        (as displayed); ``images`` are the picture items (their boxes are looked up)."""
+        as found; ``images`` are the picture items (their boxes are looked up)."""
+        rotated = bool(page.rotation % 360)
+        # A rotated page's tables were found uncropped: take their boxes as the text path mapped
+        # them (see _table_regions_in_text_space) when it could.
+        text_boxes = getattr(self, "_table_text_boxes", {}).pop(page_num, None)
+        if not rotated or not text_boxes or len(text_boxes) != len(tables):
+            text_boxes = None
         regions: Dict[int, pdf_layout.Region] = {}
-        for item, bbox in tables:
-            regions[id(item)] = pdf_layout.Region(tuple(bbox), kind="table")
+        for number, (item, bbox) in enumerate(tables):
+            box = tuple(pymupdf.Rect(text_boxes[number]) * page.rotation_matrix) if text_boxes else tuple(bbox)
+            regions[id(item)] = pdf_layout.Region(box, kind="table")
         for item, box in zip(images, self._image_item_boxes(page, images) if images else []):
             regions[id(item)] = pdf_layout.Region(box, kind="image")
-
-        rotated = bool(page.rotation % 360)
 
         def region(item) -> pdf_layout.Region:
             layout = getattr(item, "layout", None) or regions.get(id(item)) or pdf_layout.Region(None)
@@ -2521,7 +2527,7 @@ class PDFLoader:
                 # unknown place (a picture whose placement was not found): placed by its height
                 layout = replace(layout, box=(0.0, item.position_y, 0.0, item.position_y), anchored=True)
             if item.type == "text:footnote" and not layout.anchored:
-                layout = replace(layout, anchored=True)   # footnotes close the page, never a column
+                layout = replace(layout, anchored=True, edge=True)   # footnotes close the page
             return layout
 
         if rotated:
@@ -2542,7 +2548,7 @@ class PDFLoader:
         else:
             items = sorted(items, key=lambda item: item.position_y)
         try:
-            order = pdf_layout.reading_order([region(item) for item in items])
+            order = pdf_layout.reading_order([region(item) for item in items], page.rect.height)
         except Exception as e:   # never lose a page over its layout: keep the top-to-bottom order
             logger.warning(f"Reading order of page {page.number + 1} failed, keeping top-to-bottom order: {e}")
             return items
@@ -2550,7 +2556,8 @@ class PDFLoader:
 
     def _lines_region(self, page, lines: List[Dict[str, Any]], group=None, anchored: bool = False) -> pdf_layout.Region:
         """Where text lines stand on the page as displayed: their box (from the glyphs' baselines,
-        ``_visual_box``) and each line's width, font size, top and bottom."""
+        ``_visual_box``) and each line's width, font size, top and bottom. ``anchored`` lines are
+        page chrome: they open or close the page (``pdf_layout.Region.edge``)."""
         box, measured = None, []
         try:
             matrix = page.rotation_matrix
@@ -2565,16 +2572,16 @@ class PDFLoader:
             logger.debug(f"Line geometry unavailable: {e}")
             box, measured = None, []
         return pdf_layout.Region(tuple(box) if box is not None else None, "text", tuple(measured),
-                                 group=group, anchored=anchored)
+                                 group=group, anchored=anchored, edge=anchored)
 
     def _image_item_boxes(self, page, items: List[SimpleContent]) -> List[Optional[tuple]]:
         """The displayed box of each picture item: the placement of a picture on the page whose
-        top is the item's ``position_y``, taken in the order the placements are listed; None
-        when there is none (the item is then placed by its height alone)."""
+        top is the item's ``position_y``, taken in the order the page draws them; None when there
+        is none (the item is then placed by its height alone). ``get_image_info()`` without
+        hashes: the pictures are not decoded again."""
         placements = []
         try:
-            for info in page.get_images(full=True):
-                placements.extend(page.get_image_rects(info[0]))
+            placements = [pymupdf.Rect(info["bbox"]) for info in page.get_image_info()]
         except Exception as e:
             logger.debug(f"Picture placements of page {page.number + 1} unavailable: {e}")
         matrix = page.rotation_matrix
@@ -2604,6 +2611,9 @@ class PDFLoader:
         self._restore_cropbox(page, page_num)
         # find_tables() reports display (rotated) coordinates, get_text() unrotated ones.
         table_bboxes = self._table_regions_in_text_space(page, table_bboxes or [], page_num)
+        if not hasattr(self, "_table_text_boxes"):
+            self._table_text_boxes = {}
+        self._table_text_boxes[page.number if page_num is None else page_num] = table_bboxes  # see _reading_order
 
         # Get text dictionary with formatting info
         text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)

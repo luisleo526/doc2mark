@@ -42,14 +42,33 @@ def test_single_column_is_untouched():
     assert reading_order(regions) == list(range(len(regions)))
 
 
-def test_anchored_items_open_and_close_a_column_page():
-    header = Region((400, 20, 545, 30), "text", ((145, 8, 20, 30),), anchored=True)
-    footnote = Region((50, 770, 290, 790), "text", ((240, 7, 770, 790),), anchored=True)
+def test_running_header_opens_and_footnote_closes_a_column_page():
+    # a right-aligned header over the right column, a footnote under the left column while the
+    # right column runs lower
+    header = Region((400, 20, 545, 30), "text", ((145, 8, 20, 30),), anchored=True, edge=True)
+    footnote = Region((50, 700, 290, 720), "text", ((240, 7, 700, 720),), anchored=True, edge=True)
     left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
-    right = [paragraph(305, 100, 15), paragraph(305, 300, 25)]
+    right = [paragraph(305, 100, 15), paragraph(305, 300, 25), paragraph(305, 620, 10)]
     regions = by_top([header, footnote] + left + right)
-    order = [regions[k] for k in reading_order(regions)]
+    order = [regions[k] for k in reading_order(regions, 842)]
     assert order == [header] + left + right + [footnote]
+
+
+def test_picture_behind_a_label_stays_in_its_column():
+    left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
+    right = [paragraph(305, 100, 10), paragraph(305, 400, 20)]
+    picture = Region((305, 240, 545, 380), "image")
+    label = Region((320, 300, 400, 310), "text", ((80, 10, 300, 310),))
+    regions = by_top(left + right + [picture, label])
+    order = [regions[k] for k in reading_order(regions, 842)]
+    assert order == left + [right[0], picture, label, right[1]]
+
+
+def test_labels_centred_on_two_line_values_are_rows():
+    labels = [label(72, 106 + 40 * k) for k in range(6)]
+    values = [paragraph(240, 100 + 40 * k, 2, width=280) for k in range(6)]
+    regions = by_top(labels + values)
+    assert reading_order(regions) == list(range(len(regions)))
 
 
 def test_narrow_sidebar_is_read_after_the_main_text_it_stands_beside():

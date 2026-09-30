@@ -16,10 +16,10 @@ only on clear evidence of columns:
 
 A band that passes is read left side, then right side (each side can hold further columns); a
 narrow side beside a much wider one (a sidebar, a pull-quote, margin notes) is read after it as a
-whole. Anything else keeps the top-to-bottom order. Running headers and footers, footnotes and
-pictures with text over them (backgrounds) are never part of a column: they are placed by their
-height, so a header opens the page and a footnote or page number closes it. Pieces of one text
-block always stay together and in order.
+whole. Anything else keeps the top-to-bottom order. Running headers and footers and footnotes are
+never part of a column: a header opens the page, a footnote or page number closes it. A picture
+with text over it (a background) is not a column item either: it is placed by its height in the
+column it stands in. Pieces of one text block always stay together and in order.
 
 Everything here is deterministic geometry on item boxes; the result is always a permutation of the
 items, so reordering can neither drop nor duplicate text.
@@ -51,16 +51,18 @@ class Region:
     """What the reading order knows about one item of a page.
 
     ``box`` is the item's box as the page is displayed (``/Rotate`` applied), ``None`` when
-    unknown. ``kind`` is ``text``, ``table`` or ``image``. ``lines`` holds ``(width, font size, top,
-    bottom)`` of each line of a text item, as displayed. Items with the same ``group`` (the pieces of one text block) are read
-    together. ``anchored`` items (running headers and footers, footnotes, items without a box) are
-    never put in a column; they are placed by their height."""
+    unknown. ``kind`` is ``text``, ``table`` or ``image``. ``lines`` holds ``(width, font size,
+    top, bottom)`` of each line of a text item, as displayed. Items with the same ``group`` (the
+    pieces of one text block) are read together. ``anchored`` items are never put in a column:
+    ``edge`` ones (running headers and footers, footnotes) open or close the page, by the half of
+    the page they are in; the others are placed by their height in the column they stand in."""
 
     box: Optional[Box]
     kind: str = "text"
     lines: Tuple[Tuple[float, float, float, float], ...] = ()
     group: Optional[Hashable] = None
     anchored: bool = False
+    edge: bool = False
 
 
 @dataclass(eq=False)
@@ -83,9 +85,10 @@ class _Unit:
         return self.box[3] - self.box[1]
 
 
-def reading_order(regions: Sequence[Region]) -> List[int]:
+def reading_order(regions: Sequence[Region], page_height: Optional[float] = None) -> List[int]:
     """The reading order of ``regions``, given in top-to-bottom order: a permutation of their
-    indexes. It is ``0, 1, 2, …`` unless the page shows columns (see the module docstring)."""
+    indexes. It is ``0, 1, 2, …`` unless the page shows columns (see the module docstring).
+    ``page_height`` (as displayed) tells the top half of the page from the bottom half."""
     identity = list(range(len(regions)))
     units, anchored = _units(regions)
     # a picture with text drawn over it (a background, a watermark, a banner) is not a column item
@@ -101,22 +104,27 @@ def reading_order(regions: Sequence[Region]) -> List[int]:
     body = [index for unit in ordered for index in unit.members]
     if body == [index for unit in units for index in unit.members]:
         return identity
-    result = _place_anchored(ordered, anchored, regions)
+    if page_height is None:
+        page_height = max(unit.box[3] for unit in units) + min(unit.box[1] for unit in units)
+    result = _place_anchored(ordered, anchored, regions, page_height)
     return result if sorted(result) == identity else identity
 
 
 def _units(regions: Sequence[Region]) -> Tuple[List[_Unit], List[int]]:
     """Layout units (one per text block, table or picture) in top-to-bottom order, and the
-    anchored items."""
+    anchored items. An anchored piece of a text block (a footnote line) stays with the block's
+    other pieces."""
+    placed_groups = {(region.kind, region.group) for region in regions
+                     if region.group is not None and not region.anchored and _valid(region.box)}
     units: List[_Unit] = []
     by_group = {}
     anchored: List[int] = []
     for index, region in enumerate(regions):
         box = region.box
-        if region.anchored or box is None or box[2] < box[0] or box[3] < box[1]:
+        key = (region.kind, region.group) if region.group is not None else None
+        if not _valid(box) or (region.anchored and key not in placed_groups):
             anchored.append(index)
             continue
-        key = (region.kind, region.group) if region.group is not None else None
         unit = by_group.get(key) if key is not None else None
         if unit is None:
             unit = _Unit([index], tuple(box), region.kind, list(region.lines))
@@ -131,27 +139,46 @@ def _units(regions: Sequence[Region]) -> Tuple[List[_Unit], List[int]]:
     return units, anchored
 
 
-def _place_anchored(ordered: List[_Unit], anchored: List[int], regions: Sequence[Region]) -> List[int]:
-    """The units' items with each anchored item before the first unit (in reading order) that
-    starts at or below it, or at the end."""
+def _valid(box: Optional[Box]) -> bool:
+    return box is not None and box[2] >= box[0] and box[3] >= box[1]
+
+
+def _place_anchored(ordered: List[_Unit], anchored: List[int], regions: Sequence[Region],
+                    page_height: float) -> List[int]:
+    """The units' items (in reading order) with the anchored items put back: ``edge`` items at
+    the start (top half of the page) or the end (bottom half); the others before the first unit of
+    their column (units overlapping them horizontally) that starts at or below them, else after the
+    last unit of their column, else by height alone."""
     result = [index for unit in ordered for index in unit.members]
     if not anchored:
         return result
-    tops = [(unit.top, unit.members[0]) for unit in ordered]
-    slots = {}
+    start, end = [], []
+    before, after = {}, {}
     for index in anchored:
-        box = regions[index].box
-        top = box[1] if box is not None else None
-        slot = None
-        if top is not None:
-            slot = next((first for unit_top, first in tops if unit_top >= top), None)
-        slots.setdefault(slot, []).append(index)
-    placed = []
+        region = regions[index]
+        box = region.box
+        if box is None:
+            end.append(index)
+            continue
+        if region.edge:
+            (start if (box[1] + box[3]) / 2 < page_height / 2 else end).append(index)
+            continue
+        column = [unit for unit in ordered if min(unit.box[2], box[2]) > max(unit.box[0], box[0])]
+        below = next((unit for unit in column if unit.top >= box[1]), None)
+        if below is None and not column:
+            below = next((unit for unit in ordered if unit.top >= box[1]), None)
+        if below is not None:
+            before.setdefault(below.members[0], []).append(index)
+        elif column:
+            after.setdefault(column[-1].members[-1], []).append(index)
+        else:
+            end.append(index)
+    placed = list(start)
     for index in result:
-        placed.extend(slots.pop(index, []))
+        placed.extend(before.pop(index, []))
         placed.append(index)
-    placed.extend(slots.pop(None, []))
-    return placed
+        placed.extend(after.pop(index, []))
+    return placed + end
 
 
 def _order(units: List[_Unit], depth: int) -> List[_Unit]:
@@ -311,15 +338,24 @@ def _is_columns(slots: List[List[_Unit]]) -> bool:
 def _row_aligned(left: List[_Unit], right: List[_Unit]) -> bool:
     """Do the two sides start their items on the same rows (a form's labels and values, dates and
     their entries, a grid of text boxes, parallel texts)? Each side's first item is left out:
-    columns start at the same height too. A side of short items (not running text) is in rows
-    when half its items start where an item of the other side starts; two sides of running text
-    need at least two such rows on each side, since one paragraph can start level with another
-    by chance."""
+    columns start at the same height too. An item is on a row with an item of the other side when
+    both start at the same height, or when it is short (one or two lines) and its middle is level
+    with the other item (a label centred on a value); rows pair items one to one, so the labels of
+    a figure beside one paragraph are not rows. A side of short items (not running text) is
+    in rows when half its items are; two sides of running text need at least two rows on each
+    side, since one paragraph can start level with another by chance."""
     tolerance = max(_ALIGN_MIN, _ALIGN_EMS * _size(left + right))
 
     def aligned(side: List[_Unit], other: List[_Unit]) -> Tuple[int, int]:
         rest = sorted(side, key=lambda unit: unit.top)[1:]
-        hits = sum(1 for unit in rest if any(abs(unit.top - peer.top) <= tolerance for peer in other))
+        used, hits = set(), 0
+        for unit in rest:
+            peer = next((peer for peer in other if id(peer) not in used and (
+                abs(unit.top - peer.top) <= tolerance
+                or (len(unit.lines) <= 2 and peer.box[1] <= unit.middle <= peer.box[3]))), None)
+            if peer is not None:
+                used.add(id(peer))
+                hits += 1
         return hits, len(rest)
 
     left_hits, left_rest = aligned(left, right)
