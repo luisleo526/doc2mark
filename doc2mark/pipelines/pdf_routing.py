@@ -451,16 +451,30 @@ def text_source(page, measure: PageMeasure, keep_layer: bool):
                            trace_origins=measure.trace_origins), copy
 
 
+_CJK_CHAR = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+
+
 def _tokens(text: str) -> List[str]:
-    return re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold())
+    """Words, case-folded, markup and punctuation dropped; CJK split per character (OCR engines
+    space CJK text unpredictably)."""
+    words = []
+    for word in re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()):
+        words.extend(_CJK_CHAR.findall(word) if _CJK_CHAR.search(word) else [word])
+    return words
 
 
-def _reproduced(line: str, ocr_words: str) -> bool:
-    """Whether at least 80 % of the line's word characters appear, word by word, in the OCR
-    text (markup, punctuation, case and spacing ignored)."""
-    tokens = _tokens(line)
-    total = sum(len(token) for token in tokens)
-    return not total or sum(len(token) for token in tokens if token in ocr_words) >= 0.8 * total
+def _reproduced(line: str, ocr_words: List[str]) -> bool:
+    """Whether the OCR text contains the line: at least 80 % of its words, in order, in one stretch of
+    the OCR words of the same length (markup, punctuation, case and spacing ignored)."""
+    words = _tokens(line)
+    if not words:
+        return True
+    size, needed = len(words), 0.8 * len(words)
+    for start in range(max(1, len(ocr_words) - size + 1)):
+        window = ocr_words[start:start + size]
+        if sum(1 for a, b in zip(window, words) if a == b) >= needed:
+            return True
+    return False
 
 
 _COVERING = ("fill-image", "fill-imgmask", "fill-shade", "fill-path")
@@ -487,7 +501,7 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str
     never reaches the OCR and is not content)."""
     if not measure.signals.visible.chars or measure.signals.visible.garbled:
         return []
-    ocr_words = "".join(_tokens(ocr_text))
+    ocr_words = _tokens(ocr_text)
     candidates = []
     for block in page.get_text("dict", flags=TEXT_FLAGS).get("blocks", []):
         for line in block.get("lines", []) if block.get("type") == 0 else []:
