@@ -5,16 +5,17 @@
 
 * **Cell text.** The page's characters are read once, from the text page that
   ``find_tables()`` built (the characters and coordinates ``Table.extract()`` uses,
-  also on rotated pages), and each character goes to exactly one cell: the smallest
-  cell, over all tables on the page, that contains its centre. A nested table keeps
-  its own text and overlapping cells never share a character. Within a cell a text
-  run is dropped only when it redraws another run's text over it at the same size
-  and baseline (fake-bold overprint, a duplicated text layer), or when it is an
-  invisible OCR layer over visible text; *different* text drawn over text (a value
-  typed over ``____``, a tick over a checkbox, a watermark) is kept and read word by
-  word from left to right. Otherwise the text is assembled the
-  way ``Table.extract()`` does it: words split at spaces and gaps wider than 3 pt,
-  lines kept apart with ``\\n``.
+  also on rotated pages; PyMuPDF releases before 1.27 do not expose it, and the page's
+  own text is read in the same coordinates), and each character goes to exactly one
+  cell: the smallest cell, over all tables on the page, that contains its centre. A
+  nested table keeps its own text and overlapping cells never share a character.
+  Within a cell a text run is dropped only when it redraws another run's text over it
+  at the same size and baseline (fake-bold overprint, a duplicated text layer), or
+  when it is an invisible OCR layer over visible text; *different* text drawn over
+  text (a value typed over ``____``, a tick over a checkbox, a watermark) is kept and
+  read word by word from left to right. Otherwise the text is assembled the way
+  ``Table.extract()`` does it: words split at spaces and gaps wider than 3 pt, lines
+  kept apart with ``\\n``.
 * **Merged cells.** ``rowspan``/``colspan`` are measured from each drawn cell box
   against the grid's column and row boundaries, never guessed from blank cells.
 * **Plausibility.** A grid is kept as a table when it has text in at least two rows
@@ -114,14 +115,6 @@ def page_chars(page) -> List[Char]:
     rotated page, as displayed)."""
     textpage = page.get_textpage(flags=_TEXTPAGE_FLAGS)
     return read_chars(textpage, page.rotation_matrix if page.rotation else None)
-
-
-def table_chars(table) -> List[Char]:
-    """The characters of the page a found table is on, in the table's coordinates."""
-    textpage = getattr(table, "textpage", None)
-    if textpage is not None:
-        return read_chars(textpage)
-    return page_chars(table.page)
 
 
 # --- cell text --------------------------------------------------------------------------------------------
@@ -718,8 +711,10 @@ def extract_page_tables(page, found_tables: Sequence, textpage=None, text_tables
                         ) -> Tuple[List[PageTable], Optional[List[Char]]]:
     """Turn ``page.find_tables()`` results into validated :class:`PageTable` objects, and
     (``text_tables``) add the borderless tables :func:`find_text_tables` finds elsewhere on
-    the page. ``textpage`` is the text page ``find_tables()`` built (``TableFinder.textpage``),
-    reused so the page text is not extracted twice.
+    the page. ``textpage`` is the text page ``find_tables()`` built (``TableFinder.textpage``,
+    PyMuPDF 1.27 and later), reused so the page text is not extracted twice. Without it the
+    characters are read from ``page``, never from a found table's ``page``: on a rotated page
+    that is a temporary unrotated copy, gone once ``find_tables()`` returns.
 
     Returns the tables in page order and the page characters that are in none of them
     (body text, used by :func:`continue_table`), or None when the page has no table and its
@@ -736,7 +731,7 @@ def extract_page_tables(page, found_tables: Sequence, textpage=None, text_tables
         textpage = getattr(grids[0].table, "textpage", None)
     chars = None
     if grids:
-        chars = read_chars(textpage) if textpage is not None else table_chars(grids[0].table)
+        chars = read_chars(textpage) if textpage is not None else page_chars(page)
     page_area = abs(page.rect.width * page.rect.height)
     segment_cache: List[tuple] = []
 
