@@ -12,6 +12,8 @@ header is escaped like any other text, and a numbered line after bullets is an i
 import re
 from typing import List
 
+import markdown as python_markdown
+from bs4 import BeautifulSoup
 from markdown_it import MarkdownIt
 
 from tests.e2e import builders_order as b
@@ -128,9 +130,12 @@ def test_form_rows_keep_their_order(run_cli, e2e_dir):
     result = convert(run_cli, b.form_pdf(e2e_dir / "form.pdf"))
     markdown = result.markdown
 
-    texts = ["[INTRO]"] + [text for row in b.FORM_ROWS for text in row] + ["[CLOSE]"]
-    positions = [markdown.find(text) for text in texts]
-    assert -1 not in positions and positions == sorted(positions), result.describe()
+    # labels and values stand side by side like two columns, but the rows start at the same
+    # heights: the page keeps its top-to-bottom order, a row's label next to its value
+    rows = [sorted((markdown.find(label), markdown.find(value))) for label, value in b.FORM_ROWS]
+    assert all(-1 not in row for row in rows), result.describe()
+    spans = [(markdown.find("[INTRO]"), markdown.find("[INTRO]"))] + rows + [(markdown.find("[CLOSE]"),) * 2]
+    assert all(before[1] < after[0] for before, after in zip(spans, spans[1:])), result.describe()
 
 
 def test_single_column_page_keeps_its_order(run_cli, e2e_dir):
@@ -153,10 +158,10 @@ def test_kept_running_header_is_escaped(run_cli, e2e_dir):
 
 def test_numbered_line_after_bullets_is_an_item_of_its_own(run_cli, e2e_dir):
     result = convert(run_cli, b.bullets_then_number_pdf(e2e_dir / "bullets.pdf"))
-    tokens = _COMMONMARK.parse(result.markdown)
 
+    # CommonMark starts a new list at "5." ...
     items, lists = [], []
-    for index, token in enumerate(tokens):
+    for token in _COMMONMARK.parse(result.markdown):
         if token.type in ("bullet_list_open", "ordered_list_open"):
             lists.append((token.type, token.attrGet("start")))
         elif token.type in ("bullet_list_close", "ordered_list_close"):
@@ -165,3 +170,9 @@ def test_numbered_line_after_bullets_is_an_item_of_its_own(run_cli, e2e_dir):
             items.append((lists[-1], token.content))
     assert (("bullet_list_open", None), "Costs decreased") in items, (items, result.describe())
     assert (("ordered_list_open", 5), "Outlook for the next year") in items, (items, result.describe())
+    # ... and so do renderers that keep list types apart (Python-Markdown's sane_lists), where a
+    # numbered line right under a bullet would be a lazy continuation of the bullet's text
+    html = BeautifulSoup(python_markdown.markdown(result.markdown, extensions=["sane_lists"]), "html.parser")
+    texts = [" ".join(item.get_text(" ").split()) for item in html.find_all("li")]
+    assert "Costs decreased" in texts and "Outlook for the next year" in texts, (texts, result.describe())
+    assert [ol.get("start") for ol in html.find_all("ol")] == ["5"], (str(html), result.describe())
