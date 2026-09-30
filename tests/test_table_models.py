@@ -478,6 +478,7 @@ class TestMarkdownCell:
         ("x \\y \\。", "x \\y \\。"),  # before a letter or non-ASCII punctuation: kept
         ("<b> & &amp; x < 5", "&lt;b> & &amp;amp; x < 5"),
         ("bell\x07here", "bellhere"),
+        ("a \n" + chr(0x3000) * 2 + "b", "a<br>" + chr(0x3000) * 2 + "b"),  # full-width indentation kept
     ])
     def test_escaping(self, text, expected):
         assert markdown_cell(text) == expected

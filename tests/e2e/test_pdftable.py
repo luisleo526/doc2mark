@@ -509,6 +509,15 @@ def test_r2_backslashes_in_cells_read_back_exactly(run_cli, e2e_dir, style):
     assert table.rows[1 if merged else 0:] == B.BACKSLASH_ROWS, result.markdown
 
 
+def test_r2_office_cell_keeps_full_width_indentation(run_cli, e2e_dir):
+    """Only ASCII spaces around a cell's line breaks are trimmed: a line indented with full-width
+    spaces keeps them after its <br>, as main rendered it."""
+    result = convert(run_cli, B.indented_cell_docx(e2e_dir / "indent.docx"))
+
+    [table] = tables(result)
+    assert table.row_starting("目標")[1] == B.INDENTED_LINES, result.markdown
+
+
 @pytest.mark.parametrize("row_h", [18, 12], ids=["normal_rows", "tight_rows"])
 def test_r2_underscores_stay_in_their_word_and_row(run_cli, e2e_dir, row_h):
     """The text page find_tables() builds in PyMuPDF 1.28 measures glyphs by their ink, and an underscore's

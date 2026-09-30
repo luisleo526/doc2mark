@@ -411,6 +411,29 @@ def backslash_table_pdf(path: Path, *, merged: bool) -> Path:
     return Path(path)
 
 
+IDEOGRAPHIC_SPACE = chr(0x3000)
+INDENTED_LINES = "目標：\n" + IDEOGRAPHIC_SPACE * 2 + "本系統旨在提升行銷效率。"
+
+
+def indented_cell_docx(path: Path) -> Path:
+    """A Word table cell holding a heading line, a line break (``<w:br/>``) and a line indented
+    with two full-width spaces, as the sample ``fail-1.docx`` indents its paragraphs
+    (``INDENTED_LINES``)."""
+    import docx
+
+    document = docx.Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Item"
+    table.cell(0, 1).text = "Spec"
+    table.cell(1, 0).text = "目標"
+    first, second = INDENTED_LINES.split("\n")
+    paragraph = table.cell(1, 1).paragraphs[0]
+    paragraph.add_run(first).add_break()
+    paragraph.add_run(second)
+    document.save(str(path))
+    return Path(path)
+
+
 def control_chars_xlsx(path: Path) -> Path:
     """Workbook whose cells hold CR/LF, a lone CR and a tab (the only control characters a worksheet
     accepts)."""
