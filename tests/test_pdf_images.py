@@ -193,3 +193,17 @@ def test_empty_or_failed_results_are_not_cached(first):
     assert cached.batch_process_images([b"image"])[0].text == "INVOICE 8812"
     assert cached.batch_process_images([b"image"])[0].text == "INVOICE 8812"
     assert provider.calls == 2
+
+
+def test_an_empty_entry_already_in_the_cache_is_not_replayed():
+    """An empty answer cached by an older doc2mark (or another writer) is a miss, not an answer."""
+    from doc2mark.ocr.cache import build_ocr_cache_key
+
+    provider = _ScriptedOCR([OCRResult(text="INVOICE 8812")])
+    cache = MemoryOCRCache()
+    cached = CachedOCR(provider, cache)
+    key = build_ocr_cache_key(provider, b"image", kwargs={})
+    cache.set(key, OCRResult(text=""))
+    assert cached.batch_process_images([b"image"])[0].text == "INVOICE 8812"
+    assert provider.calls == 1
+    assert cache.get(key).text == "INVOICE 8812"   # the same entry, now holding the answer

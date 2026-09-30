@@ -45,8 +45,10 @@ TILE_OVERLAP = 0.05
 # A picture is judged on a grey copy of at most CLASSIFY_SIDE pixels a side.
 # - "plain": fewer than MIN_DETAIL_PIXELS edge pixels (a neighbour at least
 #   DETAIL_CONTRAST grey levels away), once rows and columns that are mostly edge
-#   (rules, frame lines) are left out: a flat colour, a gradient, a blank area, a frame.
-#   Nothing to read: never OCR'd.
+#   (LINE_SHARE of them: rules, frame lines) are left out: a flat colour, a gradient,
+#   a blank area, a frame. Nothing to read: never OCR'd. The contrast is low on purpose:
+#   a faint scan (grey print on white, 40 levels apart) still has edges after the copy
+#   is shrunk, and a false "plain" would lose its words.
 # - "text": ink (at least INK_CONTRAST levels off the picture's most common grey) broken
 #   into strokes the way glyphs are: at least TEXT_TRANSITIONS ink/background changes
 #   along the average inked pixel row (a solid icon has 2, a ring 4, a word of text
@@ -55,11 +57,11 @@ TILE_OVERLAP = 0.05
 # A *small* picture (under SMALL_PICTURE_SHARE of the page in both directions, or under
 # SMALL_PICTURE_POINTS on both sides) is OCR'd only when it reads as text; a larger one
 # unless it is plain. When unsure (pixels that cannot be read), a picture is OCR'd.
-CLASSIFY_SIDE = 512
-DETAIL_CONTRAST = 40
+CLASSIFY_SIDE = 1024
+DETAIL_CONTRAST = 16
 MIN_DETAIL_PIXELS = 24
-LINE_SHARE = 0.5
-INK_CONTRAST = 48
+LINE_SHARE = 0.8
+INK_CONTRAST = 32
 TEXT_TRANSITIONS = 6
 SMALL_PICTURE_SHARE = 0.10
 SMALL_PICTURE_POINTS = 48.0
@@ -229,7 +231,7 @@ def is_small(rect: pymupdf.Rect, page) -> bool:
 
 def _grey_samples(pix: pymupdf.Pixmap) -> np.ndarray:
     """A pixmap as a grey array (rows x columns), alpha flattened onto white, at most CLASSIFY_SIDE a side."""
-    while max(pix.width, pix.height) > 2 * CLASSIFY_SIDE:
+    while max(pix.width, pix.height) > CLASSIFY_SIDE:
         pix.shrink(1)
     alpha = pix.alpha
     samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width * pix.n]

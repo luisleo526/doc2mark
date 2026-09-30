@@ -2081,7 +2081,7 @@ class PDFLoader:
                     content = pdf_images.classify(page, picture, lambda xref: pdf_images.image_grey(self.doc, xref))
                     self._xref_content[picture.xref] = content
             else:
-                content = pdf_images.classify(page, picture, None, self._copies)
+                content = pdf_images.classify(page, picture, None, getattr(self, "_copies", None))
             if pdf_images.ocr_worthy(page, picture, content):
                 kept.append(picture)
             else:
@@ -2126,14 +2126,16 @@ class PDFLoader:
                 job["identity"] = ("xref", picture.xref, page_num if ctx else None)
                 job["load"] = lambda xref=picture.xref: self._extract_image_bytes(xref)
             else:
+                copies = getattr(self, "_copies", None)
                 try:
-                    pix = pdf_images.render_region(page, picture.region, picture.dpi, self._copies)
+                    pix = pdf_images.render_region(page, picture.region, picture.dpi, copies)
                     job["image"] = pix.tobytes("png")
                 except Exception as e:
                     logger.warning(f"Failed to render a picture on page {page_num + 1}: {e}")
                     continue
                 finally:
-                    self._copies.discard()
+                    if copies is not None:
+                        copies.discard()
                 job["identity"] = ("image", _digest(job["image"]), _digest(ctx))
             yield job
 

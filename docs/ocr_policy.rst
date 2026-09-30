@@ -225,8 +225,20 @@ would duplicate tokens or add garbage.
 
 If the render's OCR comes back empty (a blank page, a refusal, a failure), the
 page falls back to its own text layer, with a warning, instead of disappearing.
+A page that shows content (ink on its render) also carries the marker
+``[page N: OCR returned no content]``, so a page the OCR could not read never
+vanishes silently; a blank page needs no marker. Such pages are listed in
+``metadata.extra["ocr_images"]["unread_pages"]``.
 
 These whole-page renders also request ``page_markdown`` synthesis (Layer 4).
+
+Renders are streamed: pages are rendered and sent to the provider in batches of
+at most 32 images (or twice the provider's ``max_concurrency`` when that is
+higher) and 128 MiB of image data, and each batch's images are released once it
+is answered. Memory stays flat whatever the page count (a 160-page scan whose
+renders are about 2.9 MB each peaked at 1.2 GB when every render was held for
+one call; streamed, about 0.5 GB, the same as for 40 pages). The output keeps
+page order. Identical renders (blank pages, repeated slides) are one request.
 
 The ``"text"`` route
 ~~~~~~~~~~~~~~~~~~~~
@@ -239,9 +251,72 @@ The deterministic rule-based layer is authoritative:
 - **Text** is extracted block-by-block and classified (title / section /
   list / caption / footnote / header / footer) from font-size, weight, and
   layout heuristics -- preserved verbatim for the BM42 RAG flow.
-- **Embedded figures** are OCR'd individually. Tiny decorative images (logos,
-  icons, bullets -- smaller than 10% of the page in *both* width and height) are
-  skipped before paying for extraction or an OCR call.
+- **Pictures** are OCR'd individually, each once, when they carry content (see
+  *Pictures on the text route*).
+
+Pictures on the text route
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``doc2mark.pipelines.pdf_images`` decides what the text route sends to OCR. Every
+rule looks at what the page shows, never at the file's structure alone:
+
+- **Placements.** An image counts once per place the page draws it
+  (``get_image_info``): an image listed twice in the page's resources (directly
+  and through a Form XObject) is drawn once and counts once.
+- **Shown.** A placement the page does not show is no picture: less than 10 % of
+  it on the visible page (CropBox), or less than 12 pt of it on either side
+  (placed off the page, or bleeding onto it by a sliver). Neither is an image of
+  fewer than 12 pixels a side.
+- **Tiles.** Placements that abut edge to edge (at most 1 pt apart, overlapping by
+  at most 5 % of the smaller one, alongside each other for at least half the
+  shorter side) are tiles of one picture, like a scan cut into strips or a grid.
+  Their region is rendered at the resolution the tiles carry (150 to 300 DPI),
+  without the text painted over it (the text layer already emits that text), and
+  OCR'd as one picture, so words are not cut at tile edges. An inline image
+  (``BI``/``ID``/``EI``, it has no xref) is rendered the same way.
+- **Content.** A picture is judged on a grey copy of at most 1024 pixels a side:
+
+  * *plain* -- fewer than 24 edge pixels (neighbours at least 16 grey levels
+    apart) once rows and columns that are at least 80 % edge (rules, frame lines)
+    are left out: a flat colour, a gradient, a blank area or a frame. Never
+    OCR'd: a themed slide background or a letterhead tint has nothing to read,
+    and a language model would only describe it. The contrast is low on purpose,
+    so a faint scan still counts as having detail.
+  * *text* -- ink (32 grey levels off the picture's most common grey) broken into
+    strokes the way glyphs are: at least 6 ink/background changes along the
+    average inked pixel row. Printed words and numbers, charts with printed
+    values, and photos read this way. Always OCR'd.
+  * *shapes* -- anything else: an icon, a logo mark without letters.
+
+  A *small* picture (under 10 % of the page in both directions, compared in the
+  page's unrotated frame, or under 48 pt on both sides) is OCR'd only when it
+  reads as text; a larger one unless it is plain. A picture whose pixels cannot
+  be decoded is OCR'd (when unsure, keep). A 130 x 75 pt chart with printed
+  numbers on a 1440 x 810 pt slide is therefore OCR'd, a 40 pt icon is not.
+- **One request per content.** An image shown on many pages or at several places
+  is sent to OCR once (the same pixels under another xref too), and its text is
+  emitted once per place the page shows it, at that place. With neighbour-page
+  context for embedded images (``context_pages=2``) the answer depends on the
+  page, so the request is made once per page.
+
+A picture whose OCR is missing (a failed batch) leaves the placeholder
+``[image: OCR unavailable]`` at each place it shows; one whose OCR returned no
+text leaves nothing. What was sent is reported in
+``metadata.extra["ocr_images"]``: ``ocr_requests`` (images sent to the
+provider), ``page_renders``, ``batches`` and ``largest_batch``, ``empty`` and
+``failed`` (requests answered with no text, or not answered), ``skipped``
+(placements not OCR'd because the page does not show them, ``not_shown``, or
+they carry nothing to read, ``no_content``) and ``unread_pages``.
+
+Routing counts a page's pictures the same way: for *uncaptured content* (see
+*Per-page routes*), the image XObjects the page shows are what the text route
+reads one by one; tiles and inline images are not, so a page without a text layer
+that shows a tiled or inline-image scan is OCR'd from its render.
+
+Neither an OCR result with no text or flagged ``failed`` is ever cached
+(``ocr_cache``), nor a converted document with unanswered images or unread pages
+(``cache_dir``): an empty answer looks the same as an outage or a refusal, so the
+next run asks the provider again.
 
 Text-layer quality gate
 ~~~~~~~~~~~~~~~~~~~~~~~
