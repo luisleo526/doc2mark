@@ -53,7 +53,8 @@ Word, PowerPoint, Excel
 
 Word, PowerPoint and Excel files are read from their XML. The Markdown starts each page, slide or
 sheet with a marker comment (``<!-- page 2 -->``, ``<!-- slide 3 -->``, ``<!-- sheet 1 -->``);
-Word has no stored pages, so its page numbers count explicit page and section breaks. Text is
+a Word file stores no pages, so its page numbers count the page breaks recorded in it (explicit
+breaks, section breaks and the page breaks Word saved at its last layout). Text is
 escaped like PDF text (:doc:`pdf`), and ``json_content`` items carry ``page``.
 
 **Word (.docx).** Headings follow the paragraph's outline level (Title ``#``, Subtitle ``##``,

@@ -31,6 +31,8 @@ so loader settings such as ``table_style``, ``model`` or ``judge`` need a loader
 
 The batch functions return the per-file result dictionaries described in :doc:`/loading`
 (``{"status": "success" | "failed", ...}``).
+``ocr_images=True`` does not need ``extract_images=True``: with an OCR provider it turns
+extraction on itself.
 
 .. code-block:: python
 

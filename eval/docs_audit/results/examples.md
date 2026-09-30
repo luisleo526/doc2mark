@@ -1,9 +1,9 @@
 # Docs examples run
 
 - doc2mark: 0.6.1 (/work/doc2mark/__init__.py)
-- git: unknown
+- git: 70f39da
 - host: spark-1693
-- date: 2026-09-30 14:36 UTC
+- date: 2026-09-30 15:00 UTC
 - python: 3.12.14
 - results: {"pass": 76, "skip": 12}
 
@@ -12,16 +12,16 @@
 | block | lang | mode | status | detail / first output line |
 |---|---|---|---|---|
 | `README.md:10` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
-| `README.md:50` | bash | skip | skip | not run: the runner installs doc2mark with these extras (pip install -e ".[ocr,dev,docs,tokenizers,redis,typesafe]") |
-| `README.md:63` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
-| `README.md:77` | python | python | pass | INVOICE 2041 |
-| `README.md:88` | bash | bash | pass | Output saved to: report.md |
-| `README.md:117` | html | check | pass | <!-- page 1 --> |
-| `README.md:138` | python | python | pass | <!-- page 1 --> |
-| `README.md:189` | python | python (fake OpenAI) | pass | ACME STORE |
-| `README.md:249` | bash | bash | pass | calls TypeSafe when TYPESAFE_API_KEY is set in the run |
-| `README.md:255` | python | python | pass | prints the judge record when TYPESAFE_API_KEY is set, None otherwise |
-| `README.md:287` | bash | skip | skip | not run here: the full unit and E2E suites were run separately on the same commit (see the PR) |
+| `README.md:51` | bash | skip | skip | not run: the runner installs doc2mark with these extras (pip install -e ".[ocr,dev,docs,tokenizers,redis,typesafe]") |
+| `README.md:64` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
+| `README.md:78` | python | python | pass | INVOICE 2041 |
+| `README.md:89` | bash | bash | pass | Output saved to: report.md |
+| `README.md:118` | html | check | pass | <!-- page 1 --> |
+| `README.md:139` | python | python | pass | <!-- page 1 --> |
+| `README.md:190` | python | python (fake OpenAI) | pass | ACME STORE |
+| `README.md:250` | bash | bash | pass | calls TypeSafe when TYPESAFE_API_KEY is set in the run |
+| `README.md:256` | python | python | pass | prints the judge record when TYPESAFE_API_KEY is set, None otherwise |
+| `README.md:288` | bash | skip | skip | not run here: the full unit and E2E suites were run separately on the same commit (see the PR) |
 | `docs/api/convenience.rst:37` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
 | `docs/api/loader.rst:9` | python | check | pass | UnifiedDocumentLoader( |
 | `docs/api/ocr.rst:102` | python | python | pass | ['gemini', 'openai', 'tesseract', 'vertex_ai'] |
@@ -65,7 +65,7 @@
 | `docs/loading.rst:14` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
 | `docs/loading.rst:49` | python | python | pass | 11 6 |
 | `docs/loading.rst:80` | python | python | pass | Markdown saved to: out/report.md |
-| `docs/loading.rst:98` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis.1/4 documents/ |
+| `docs/loading.rst:98` | python | python | pass | 1/4 documents/notes.mdConsider using the pymupdf_layout package for a greatly improved page layout a |
 | `docs/loading.rst:121` | python | check | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
 | `docs/loading.rst:145` | python | python | pass | Consider using the pymupdf_layout package for a greatly improved page layout analysis. |
 | `docs/ocr.rst:48` | python | python | pass | gpt-5.4-mini gemini-3.1-flash-lite-preview |

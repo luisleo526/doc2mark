@@ -12,7 +12,7 @@ re-run after any change to the docs or the code.
 | `merged_cells.py` | Re-measures the merged-cell comparison of the README (doc2mark, and markitdown / Docling when installed). |
 | `run_judge_eval.sh` | Re-runs `eval/judge_eval.py` (the judge numbers of the README and docs/judge.rst) on a spark with a fresh verdict cache. |
 
-Results of the audit are in `results/`: `examples.md` and `probes.log` (the run on the PR's head
+Results of the audit are in `results/`: `examples.md` and `probes.txt` (the run on the PR's head
 commit), `merged_cells.*` and `judge_eval.*` (the re-measured numbers), `claims.md` (every claim of
 the old README and docs with its status and evidence) and `facts-*.md` (the code fact sheets the
 rewrite was based on; the throwaway probe scripts they cite are not committed, `probes.py`

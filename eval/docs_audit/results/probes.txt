@@ -1,0 +1,84 @@
+
+## CLI folder run: the default --pattern '*' also matches sub-folders, which fail the run
+exit 1 | stderr: Error: Cannot detect format for extension:
+with --skip-errors: exit 0 | written: ['a.md', 'b.md']
+
+## CLI folder output is flat by file stem: same-stem files overwrite each other
+exit 0 | inputs: 2 | written: ['report.md']
+
+## CLI --sort size keeps the SMALLEST files, the --help epilog says 'Process 10 largest files'
+['small.txt']
+['doc2mark docs/ --max-files 10 --sort size       # Process 10 largest files']
+
+## CLI --preserve-structure and --timeout are parsed but never used
+args.preserve_structure used: False
+args.timeout used only as future.result(timeout=...) after as_completed: 1 use(s)
+
+## batch_process skips upper-case extensions and .htm (load() accepts both)
+batch_process found: ['plain.txt']
+Consider using the pymupdf_layout package for a greatly improved page layout analysis.
+load() works on both: DocumentFormat.PDF DocumentFormat.HTML
+
+## batch results: tables_found is always 0 (ProcessedDocument.tables is never filled)
+tables_found: 0 | table items: 1 | extra tables_count: 1
+
+## convenience functions pass **kwargs to load(), not to the loader: table_style= raises
+TypeError: UnifiedDocumentLoader.load() got an unexpected keyword argument 'table_style'
+
+## ChunkingConfig.include_page_markers has no effect; every text:section is '##' in chunks
+same output: True | ['# T', '# T\n\n## Deep\n\nbody']
+
+## batch_process_files is importable from doc2mark but missing from doc2mark.__all__
+hasattr: True | in __all__: False
+
+## docstrings rendered in the API reference that contradict the code
+load(): 'requires extract_images=True' in docstring: True
+UnifiedDocumentLoader.load note 'only work with Office and PDF formats': True
+CLI epilog 'GPT-4V': True
+
+## .tsv always fails; the CSV delimiter argument is ignored
+tsv: ProcessingError Processing failed: TextProcessor._process_csv_with_delimiter() got multiple values for argument 'delimiter'
+same content as .csv: ['| a | b |', '|---|---|', '| 1 | 2 |']
+delimiter=',' on a ';' file -> ';'
+
+## PowerPoint: layout placeholder prompts leak into every slide; slide_count is unreliable
+'Click to edit Master title style' occurrences: 5
+page_count: 5 | slide_count: 1
+
+## PowerPoint: the text of a plain shape (rectangle) is emitted twice
+'UNIQUE BOX TEXT' occurrences: 2
+
+## Excel: sheet_names and total_cells are not set
+sheet_names: None | total_cells: None | page_count: 1
+
+## an unknown table_style: PDF conversion fails, Office silently falls back to the basic converter
+docx: colspan in output: False | json_content: False
+pdf: ProcessingError Processing failed: PDF processing failed: 'MARKDOWN_GRID' is not a valid TableStyle
+
+## Markdown: a file that starts with a --- rule loses its first block to frontmatter
+content: '# Title\n\nBody' | frontmatter: 'Intro paragraph'
+
+## ProcessedDocument.text removes '# ' anywhere
+'I write Ccode.\n'
+
+## chunker: footnotes starting with the same 20 characters collide; a title-less document keeps its first section as a parent
+hierarchies: [['A'], ['A', 'B']]
+footnotes kept: 1 of 2
+
+## OCR facade and loader: settings that do not reach the Vertex AI provider
+OCR('vertex_ai', project=...): TypeError: OCRConfig.__init__() got an unexpected keyword argument 'project'
+OCR('vertex_ai', model='gemini-2.0-flash').model -> gemini-3.1-flash-lite-preview
+loader 'gemini': model gemini-3.1-flash-lite-preview | location global
+
+## OCR cache key ignores OCRConfig.task
+same key for task=auto and task=receipt: True
+
+## non_content_judge values outside [0, 1] are not rejected
+judge returning 1.5 -> judge
+judge returning None -> None
+
+## loader top_p / frequency_penalty / presence_penalty never reach the OpenAI request
+request keys: ['max_completion_tokens', 'model', 'response_format', 'stream']
+
+## create_ocr_cache('redis') without a URL quietly returns a memory cache
+MemoryOCRCache

@@ -14,7 +14,8 @@ Every conversion returns a :class:`~doc2mark.ProcessedDocument`:
    * - ``metadata``
      - A :class:`~doc2mark.DocumentMetadata`: ``filename``, ``format`` (a
        :class:`~doc2mark.DocumentFormat`), ``size_bytes``, and the fields the format provides
-       (``page_count``, ``word_count``, ``sheet_names``, ``slide_count``, ``row_count``, ...).
+       (``page_count``, ``word_count``, ``line_count``, ``row_count``, ...; see
+       :class:`~doc2mark.DocumentMetadata` for which format sets which).
        ``metadata.extra`` is a dict of conversion reports, described below.
    * - ``json_content``
      - The same content as a list of typed items in reading order (PDF, Office and image files;
@@ -54,9 +55,10 @@ Output formats
 Content items
 -------------
 
-Each item of ``json_content`` is a dict with ``type`` and ``content``. PDF and Office items
-also carry ``page`` (the page, slide or sheet number, from 1) and ``position_y`` (the vertical
-position on the page), and PDF titles and section headings carry ``level``.
+Each item of ``json_content`` is a dict with ``type`` and ``content``. PDF items also carry
+``page`` (from 1) and ``position_y`` (the vertical position on the page); Word, PowerPoint and
+Excel items carry ``page`` (the page, slide or sheet number; Word header and footer items have
+none); PDF and Word titles and section headings carry ``level``.
 
 .. list-table::
    :header-rows: 1
@@ -77,7 +79,8 @@ position on the page), and PDF titles and section headings carry ``level``.
    * - ``text:footnote``
      - A footnote, ``[^N]: ...`` when its number is raised.
    * - ``text:image_description``
-     - The OCR text of a picture or of a whole-page render.
+     - The OCR text of a picture or of a whole-page render (in PDF and image-file items wrapped
+       in ``<image_ocr_result>`` tags; the Markdown has the plain text).
    * - ``table``
      - A table as HTML (merged cells) or a Markdown pipe table (see :doc:`tables`).
    * - ``image``
@@ -116,9 +119,9 @@ A key is present only when it has something to say.
    * - ``ocr_images``
      - PDF with OCR on: what was sent to the provider. ``ocr_requests``, ``page_renders``,
        ``batches``, ``largest_batch``, ``empty`` (answered with no text), ``failed`` (no
-       answer), ``skipped`` (``{"not_shown": n, "no_content": n}``: pictures the page does not
-       show, or that carry nothing to read) and, when some exist, ``unread_pages`` (pages that
-       show content but whose OCR returned nothing).
+       answer), ``skipped`` (counts by reason: ``not_shown`` for pictures the page does not
+       show, ``no_content`` for pictures with nothing to read; ``{}`` when none) and, when some
+       exist, ``unread_pages`` (pages that show content but whose OCR returned nothing).
    * - ``ocr_issues``
      - Any format, when OCR went wrong somewhere: ``refused`` (answers that were only a refusal
        or "no readable text", emitted as empty text), ``provider_refused`` (of those, the
