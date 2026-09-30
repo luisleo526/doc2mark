@@ -477,7 +477,7 @@ listed in ``metadata.extra["hidden_text"]`` and a warning names them.
 What this cannot catch: invisible text laid over a region of a picture that
 shows something (a photo, scanned text) or over outlined glyphs (or other ink
 broken into strokes, such as a dense hatching) looks exactly like an OCR layer
-and is kept as the page's text. With PyMuPDF older than 1.27,
+and is kept as the page's text. With PyMuPDF older than 1.27.1,
 which cannot remove only the invisible glyphs where they touch painted text,
 hidden text touching painted text inside a table can reach that table's cells
 (paragraphs are not affected).

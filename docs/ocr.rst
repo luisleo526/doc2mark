@@ -101,13 +101,14 @@ The OCR facade
 ``max_concurrency``, ``model``, ...); anything else raises ``TypeError``. A string ``task`` is
 checked against :class:`~doc2mark.Task` and ``detail`` must be ``"raw"`` or ``"full"``, otherwise
 ``ValueError``. The facade adds no cache and no document-level reports; use the loader for
-those. Settings that are not ``OCRConfig`` fields (``project``, ``location``, ``timeout``) are set
-on the provider classes directly, for example :class:`~doc2mark.ocr.vertex_ai.VertexAIOCR`
+those. Settings that are not ``OCRConfig`` fields (``project``, ``location``; ``timeout`` is one,
+but deprecated and without effect) are set on the provider classes directly, for example :class:`~doc2mark.ocr.vertex_ai.VertexAIOCR`
 ``(project=..., location=..., model=...)``, whose model the facade does not change.
 
 ``read(images, *, task=None, tasks=None, language=None, structured=None, detail=None)`` and
 ``read_one(image, **same)`` override the configuration per call; ``tasks`` gives one task per
-image and must have the same length as ``images``.
+image and must have the same length as ``images``. Tesseract ignores the per-call values and
+uses its configured ``language``.
 
 Structured results
 ~~~~~~~~~~~~~~~~~~
@@ -125,9 +126,11 @@ with a hard boundary between two halves:
   ``figures``, ``sections``, ``typed_entities``, ``relations``, ``self_confidence``,
   ``legibility`` and more (:doc:`api/schema`).
 
-``result.text`` is ``page.to_markdown()``: ``raw.text`` (escaped), then each table (``html``
-when present), a table of the page's metrics and its figures. ``fields``, ``headings``,
-``dates`` and the interpretation are not rendered: read them from ``result.document``. For
+``result.text`` is ``page.to_markdown()``: the interpretation's ``page_title`` as a ``#``
+heading (when ``raw.text`` does not start with it), ``raw.text`` (escaped), each table
+(``html`` when present), a table of the page's metrics, the interpretation's figures and, when
+its sections carry summaries, a section outline. ``fields``, ``headings``, ``dates``, the
+summary and the entities are not rendered: read them from ``result.document``. For
 whole-page renders of PDF pages the model also writes a cleaner ``page_markdown``, used instead
 of ``raw.text`` when it covers at least 85 % of its words (:doc:`ocr_policy`).
 
@@ -189,8 +192,8 @@ Refusals and "no readable text" answers
 ---------------------------------------
 
 A vision model sometimes answers with "I'm sorry, but I can't assist with that
-request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark never
-indexes such an answer as page content:
+request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark does not
+index such an answer as page content:
 
 1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
    when a structured answer ignores the schema), and Gemini answers stopped for

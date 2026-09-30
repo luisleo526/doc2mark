@@ -32,9 +32,9 @@ What each hook decides
    page or an earlier one, as on a deck's cover, that copy is the one left): the brand line
    printed beside every slide title of a deck goes from once per slide to once. The judge can never remove the last copy of a
    line, and it is not asked about a running header's first copy (the rule already removed the
-   others: a letterhead stays once). Titles, per-page labels (``Lesson 3``), unit notes and
-   disclaimers are content, the question tells the model (a judge that answers yes anyway
-   thins them). See :doc:`pdf` for the rule.
+   others: a letterhead stays once). The question tells the model that titles, per-page labels
+   (``Lesson 3``), unit notes and disclaimers are content; a judge that answers yes anyway thins
+   them. See :doc:`pdf` for the rule.
 
 ``non_content_judge(ocr_text) -> Optional[float]``
    *Is this OCR answer only a refusal, an error or a "no readable text" statement?* The

@@ -13,7 +13,7 @@ Convert and chunk
 
    from doc2mark import ChunkingConfig, UnifiedDocumentLoader
 
-   loader = UnifiedDocumentLoader(ocr_provider=None)       # no OCR: nothing leaves the machine
+   loader = UnifiedDocumentLoader(ocr_provider=None, judge="none")   # nothing leaves the machine
    config = ChunkingConfig(max_chunk_size=1200, overlap=150)
 
    records = []
@@ -40,9 +40,9 @@ Convert and chunk
        print(hit["id"], hit["pages"], hit["section"])
 
 :meth:`ProcessedDocument.get_chunks() <doc2mark.ProcessedDocument.get_chunks>` splits the
-document at its title and section headings, packs the items of a section into chunks of at most
-``max_chunk_size`` characters (tables are never split) and prepends the end of the previous
-chunk as overlap. Each :class:`~doc2mark.Chunk` carries its section path and page span, which
+document at its title and section headings, packs the items of a section into chunks of about
+``max_chunk_size`` characters (items are not cut, so a long paragraph or a table can be larger)
+and prepends the end of the previous chunk as overlap. Each :class:`~doc2mark.Chunk` carries its section path and page span, which
 is what you store next to the vector. :doc:`chunking` describes the options, token-based sizes
 and the edge cases.
 

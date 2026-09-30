@@ -78,7 +78,8 @@ Results and enums
 .. autoclass:: doc2mark.ocr.OCRResult
 
    ``text`` (Markdown, ``""`` for a refusal or a failure), ``confidence``, ``language``,
-   ``metadata`` (``model``, ``token_usage``, ``failed``, ``ocr_refusal``, ...) and ``document``
+   ``metadata`` (LLM providers: ``model``, ``token_usage``, flags such as ``failed`` and
+   ``ocr_refusal``; Tesseract: engine details and ``failed``) and ``document``
    (an :class:`~doc2mark.ocr.schema.OCRPage`, or ``None`` for free-form answers and failed Tesseract
    images).
 

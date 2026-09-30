@@ -148,7 +148,7 @@ and turns every grid it finds into a ``TableData`` (``doc2mark.pipelines.pdf_tab
 
 **Cell text.** The page's characters are read once per page, from the text page
 ``find_tables()`` built (the same characters and coordinates PyMuPDF's own
-``Table.extract()`` uses, also on rotated pages; PyMuPDF releases before 1.27 do not
+``Table.extract()`` uses, also on rotated pages; PyMuPDF releases before 1.27.1 do not
 expose it, and the page's own text is read in the same coordinates). Every character
 goes to exactly one cell: the smallest cell, over all tables on the page, that
 contains the centre of the glyph. So a table nested inside another table's cell

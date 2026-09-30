@@ -110,8 +110,10 @@ Folders and file lists
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process` finds every file under ``input_dir``
 (``recursive=True`` by default) whose extension is a supported one in lower case (``.pdf``, not
 ``.PDF``; ``.markdown`` too, but not ``.htm``), converts it and, with ``save_files=True`` (the
-default), writes ``<name>.md`` (or ``.json``) and a ``<name>_images/`` folder when pictures were
-extracted, keeping the folder structure. Without ``output_dir`` the files are written next to
+default), writes ``<name>.md`` (or ``.json``), keeping the folder structure, and, when pictures
+were extracted, a ``<name>_images/`` folder (a known issue: a PDF whose pictures were extracted
+without OCR is then reported as failed although its ``.md`` was written). With
+``output_format="text"`` no file is written. Without ``output_dir`` the files are written next to
 the inputs. One file failing does not stop the batch.
 
 The returned dict maps each input path (a string, in input order) to a result:

@@ -67,7 +67,9 @@ none); PDF and Word titles and section headings carry ``level``.
    * - ``type``
      - Content
    * - ``text:title``
-     - The document title (``#`` in the Markdown); ``level`` 1.
+     - A level-1 heading (``#`` in the Markdown): the PDF title (at most one), each Word Title /
+       Heading 1, each slide title, each ``Sheet: <name>`` of a workbook. PDF and Word items
+       carry ``level``; slide and sheet titles do not.
    * - ``text:section``
      - A heading; ``level`` 2 to 6 matches the ``#`` count in the Markdown.
    * - ``text:normal``
@@ -77,17 +79,19 @@ none); PDF and Word titles and section headings carry ``level``.
    * - ``text:caption``
      - A figure or table caption.
    * - ``text:footnote``
-     - A footnote, ``[^N]: ...`` when its number is raised.
+     - A footnote, as printed (``1 Source: ...``); the Markdown writes it ``[^1]: ...`` when its
+       number is raised.
    * - ``text:image_description``
-     - The OCR text of a picture or of a whole-page render (in PDF and image-file items wrapped
-       in ``<image_ocr_result>`` tags; the Markdown has the plain text).
+     - The OCR text of a picture or of a whole-page render, wrapped in ``<image_ocr_result>``
+       tags (the Markdown has the plain text).
    * - ``table``
      - A table as HTML (merged cells) or a Markdown pipe table (see :doc:`tables`).
    * - ``image``
      - An extracted picture as base64 (``extract_images=True`` without OCR).
    * - ``text:header`` / ``text:footer``
-     - The later copies of a running header or footer, and header/footer paragraphs of Word
-       files. They are not in ``content`` and the chunker skips them.
+     - Running headers and footers the Markdown leaves out: the later copies of a repeated line,
+       and every copy of a bare page number or of a line repeating a title; also the header and
+       footer paragraphs of Word files. They are not in ``content`` and the chunker skips them.
 
 .. code-block:: python
 
@@ -172,8 +176,9 @@ Errors
 for an unknown ``output_format``. Any failure during conversion is raised as
 :class:`~doc2mark.ProcessingError` (``Processing failed: ...``) with the original exception as
 its ``__cause__``: for example an OCR engine that cannot run (Tesseract without the requested
-language data, cause ``OCREngineError``), a failed LibreOffice conversion (cause
-:class:`~doc2mark.ConversionError`) or a legacy file without LibreOffice. So catch
+language data, cause ``OCREngineError``), a failed LibreOffice conversion (a chain of
+``ProcessingError`` that ends in :class:`~doc2mark.ConversionError`) or a legacy file without
+LibreOffice. So catch
 ``ProcessingError`` (``UnsupportedFormatError`` is a subclass); ``OCRError`` and
 ``ConversionError`` do not reach you directly. A picture or page the OCR provider could not read
 does not fail the document: it is reported in ``ocr_issues``.

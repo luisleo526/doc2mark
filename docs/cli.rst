@@ -27,7 +27,8 @@ Output
   ``--format both`` writes both files. The command prints ``Output saved to: ...`` (not with ``-q``).
 - **A folder**: with ``-o DIR`` every converted document is written to ``DIR/<file stem>.md``
   (or ``.json``), flat, whatever sub-folder it came from (two files with the same stem overwrite
-  each other); without ``-o`` only a summary is printed.
+  each other), after all files were converted: a failure that stops the run writes nothing.
+  Without ``-o`` only a summary is printed.
 
 The JSON is :meth:`ProcessedDocument.to_dict() <doc2mark.ProcessedDocument.to_dict>`: ``content``
 (the Markdown), ``metadata`` (with ``extra``), ``images``, ``tables``, ``sections`` and

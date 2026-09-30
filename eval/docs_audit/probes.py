@@ -284,4 +284,14 @@ def _():
     print(type(create_ocr_cache("redis")).__name__)
 
 
+@probe("batch_process with extract_images=True reports a PDF with pictures as failed (base64 str written in 'wb' mode)")
+def _():
+    from doc2mark import UnifiedDocumentLoader
+    loader = UnifiedDocumentLoader(ocr_provider=None)
+    results = loader.batch_process_files([SAMPLES / "sample_pdf.pdf"], output_dir=work / "imgout", extract_images=True,
+                                         show_progress=False)
+    info = next(iter(results.values()))
+    print(info["status"], "|", info.get("error"), "| .md written:", (work / "imgout" / "sample_pdf.md").exists())
+
+
 shutil.rmtree(work, ignore_errors=True)

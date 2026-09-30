@@ -16,7 +16,8 @@ Convert a file
 :func:`~doc2mark.load` builds a :class:`~doc2mark.UnifiedDocumentLoader`, converts one file and
 returns a :class:`~doc2mark.ProcessedDocument`. The format comes from the file extension (see
 :doc:`formats`). Nothing is sent anywhere: text, tables and structure are read from the file
-itself, and OCR runs only when you ask for it.
+itself, OCR runs only when you ask for it, and so does the optional judge (unless the
+``DOC2MARK_JUDGE`` environment variable turns it on, see :doc:`judge`).
 
 To convert many files, create the loader once and reuse it:
 

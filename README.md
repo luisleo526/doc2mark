@@ -26,7 +26,7 @@ Documentation: <https://luisleo526.github.io/doc2mark/>
 
 - **Complex tables survive.** Merged cells (`rowspan`/`colspan`) from Word, PowerPoint, Excel and
   ruled PDF tables are kept as a small HTML table inside the Markdown; other tables are ordinary
-  Markdown tables. A line break inside a cell is `<br>`. ([Tables](#tables))
+  Markdown tables (PowerPoint tables are always HTML). A line break inside a cell is `<br>`. ([Tables](#tables))
 - **Verbatim first.** Text is kept unless there is strong evidence to change it. Bare page numbers
   are dropped; a running header or footer keeps its first copy instead of vanishing; hyphenated
   words keep their hyphen unless the document spells them without one elsewhere.

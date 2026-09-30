@@ -69,7 +69,9 @@ simple built-in converter is used and a warning is logged.
 
 **The document cache does not speed up a re-run.** A document is not cached when its OCR failed
 somewhere, a page showing content stayed unread, the provider refused an image, or the judge
-could not answer; an ``INFO`` log line gives the reason. Changing the loader's options (output
+could not answer; an ``INFO`` log line gives the reason. (Conversely, an Office or image file
+whose OCR request raised, for example for a missing key, is cached with the error text: clear the
+cache folder after fixing it.) Changing the loader's options (output
 format, table style, OCR provider, judges) also changes the cache key (:doc:`caching`).
 
 **Token chunking stalls or fails offline.** tiktoken downloads its encoding data on first use;

@@ -109,4 +109,6 @@ A document is **not** stored when its OCR is not a final answer: an image whose 
 PDF picture that could not be extracted, a PDF page that shows content but whose OCR returned
 nothing (``ocr_images["unread_pages"]``), an image the provider itself refused or blocked
 (``ocr_issues["provider_refused"]``), or, with the optional judge, a question the judge could not
-answer. An ``INFO`` log line names the reason; the next load converts it again.
+answer. An ``INFO`` log line names the reason; the next load converts it again. One gap: a Word,
+PowerPoint, Excel or image file whose OCR request raised an error (for example no API key) is
+stored with the error text (``OCR failed``), so clear the folder after fixing the cause.

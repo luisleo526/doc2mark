@@ -15,8 +15,9 @@ Headings
   the document is as large. It appears at most once (a page that was OCR'd can still carry its
   own page title).
 - Section headings are ``##`` and deeper, ranked by font size across the document and by decimal
-  outline depth (``1.2`` below ``1``), without skipped levels. Bold body-size lines, Word 2013+
-  headings and ``第一條``-style CJK headings count. A heading is one line without bold or italic
+  outline depth (``1.2`` below ``1``), without skipped levels. Bold body-size lines, slightly
+  larger lines in capitals or in colour (the non-bold headings of Word 2013 and later) and
+  ``第一條``-style CJK headings count. A heading is one line without bold or italic
   markup. The ``json_content`` items ``text:title`` / ``text:section`` carry the same ``level``.
 - Uppercase labels, chart labels, drop caps, running headers and text set across the page's
   reading direction (a vertical arXiv stamp) are not headings.

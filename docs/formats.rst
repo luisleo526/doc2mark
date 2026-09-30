@@ -73,8 +73,9 @@ extracted or not in the Markdown:
 
 **PowerPoint (.pptx).** Each slide lists its title (``#``), subtitle (``##``) and shapes top to
 bottom, then its notes (``[Slide N Notes]``). A soft line break is a line break (``<br>`` in
-table cells); bullets stay as their characters, not Markdown lists. Tables are always written as
-HTML (``table_style`` applies), charts as their title and axis captions. Known issues: the
+table cells); bullets stay as their characters, not Markdown lists. Tables are always written in
+the merged-cell style (``table_style``: HTML by default), even without merged cells; charts as
+their title and axis captions. Known issues: the
 slide layout's placeholder prompts (*Click to edit Master title style*, the date field, ``‹#›``)
 appear as captions on every slide, and the text of plain shapes such as rectangles is emitted
 twice.
@@ -98,7 +99,8 @@ finds no text adds nothing; one whose OCR fails leaves the text ``OCR failed`` a
 **The Office image route.** A ``.docx`` or ``.pptx`` made mostly of pictures (slides that are
 full-slide images, a Word file of scanned pages) has no text to read natively. With OCR on,
 doc2mark measures picture coverage and text length from the XML (the same thresholds as for
-PDFs: coverage at least 0.55 and fewer than 200 characters of text per slide or page); a file that
+PDFs: coverage at least 0.55 and fewer than 200 characters of text, per slide on average for
+PowerPoint, for the whole document against one page for Word); a file that
 looks image-dominant is converted to PDF with LibreOffice, and when that PDF's own route is
 ``image`` it is read by the PDF pipeline (whole-page OCR), with ``metadata.extra["routed_via"] ==
 "pdf"``. Otherwise the file is read natively and, when the route was tried,

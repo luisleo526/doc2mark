@@ -68,8 +68,9 @@ relation subjects/objects are substrings of ``raw.text``, and that withheld
 
 When you read a page, treat ``raw`` as ground truth and ``interpretation`` as
 an *additive overlay* that is safe to ignore. Always check
-``page.interpretation is not None`` before reading interpretive fields — with
-``detail="raw"`` or a Tesseract backend it will be ``None``.
+``page.interpretation is not None`` before reading interpretive fields: it is ``None``
+for Tesseract and for Vertex AI with ``detail="raw"``, and usually for OpenAI with
+``detail="raw"`` (the model is asked to leave it out).
 
 
 ``OCRPage`` — the top-level result

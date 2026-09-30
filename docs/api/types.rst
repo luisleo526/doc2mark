@@ -81,8 +81,9 @@ Exceptions
 :class:`~doc2mark.ProcessingError` is the base class of the library's own exceptions.
 :meth:`~doc2mark.UnifiedDocumentLoader.load` raises :class:`~doc2mark.UnsupportedFormatError`
 for an unknown extension and wraps every failure during conversion in a ``ProcessingError``
-whose ``__cause__`` is the original error (for example ``OCREngineError``, a subclass of
-:class:`~doc2mark.OCRError`, or :class:`~doc2mark.ConversionError`). A missing file raises
+whose ``__cause__`` chain leads to the original error (for example ``OCREngineError``, a
+subclass of :class:`~doc2mark.OCRError`, or :class:`~doc2mark.ConversionError`). A missing file
+raises
 ``FileNotFoundError`` and an unknown ``output_format`` raises ``ValueError``.
 
 .. code-block:: python

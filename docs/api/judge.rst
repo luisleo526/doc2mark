@@ -7,8 +7,8 @@ argument with :func:`~doc2mark.judge.resolve_judge` and takes the hooks from it 
 :func:`~doc2mark.judge.judge_hooks`.
 
 A hook is a plain callable that returns the probability of "yes" (0 to 1) or ``None`` when it
-cannot judge; ``None``, an exception or a value outside 0 to 1 leaves the rule's decision in
-place:
+cannot judge. ``None`` or an exception leaves the rule's decision in place, and so does a value
+outside 0 to 1 for the first two hooks (``non_content_judge`` values are not range-checked):
 
 - ``legibility_judge(page_text) -> float | None``: probability that a PDF page's text layer is
   legible (``UnifiedDocumentLoader(legibility_judge=...)``);
