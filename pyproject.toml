@@ -45,6 +45,7 @@ classifiers = [
 
 dependencies = [
     "pymupdf>=1.23.0",
+    "numpy>=1.21.0",
     "python-docx>=0.8.11",
     "openpyxl>=3.0.10",
     "python-pptx>=0.6.21",

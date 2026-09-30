@@ -6,11 +6,12 @@ What the signals mean, the thresholds and the decisions live in
 - raster image coverage: the union of the image rectangles clipped to the visible
   page (CropBox), inline (BI/ID/EI) images included;
 - the painted text, and the invisible (render mode 3, fully transparent) text, which
-  is either the text of what the page shows (the render has ink under it: a scanner's
-  OCR layer, a transparent copy of text baked into artwork) or hidden text;
+  is either the text of what the page shows (a scanner's OCR layer, a transparent copy
+  of text baked into artwork or drawn as outlines), a copy of painted text, or hidden
+  text;
 - on pages without a usable text layer, what the text route cannot capture: pictures
   it does not OCR one by one (inline images, picture tiles) and other ink (vector
-  outlines).
+  outlines), line art (rules, frames, table grids) left out.
 
 :func:`text_source` hands the text and table extractors the page without the
 invisible text that must not become content.
@@ -20,17 +21,24 @@ import math
 import os
 import re
 import unicodedata
-from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
 import pymupdf
 
 from doc2mark.core.strategy import (
+    GLYPH_INK_SHARE,
+    GLYPH_SPREAD,
     IMAGE_PAGE_COVERAGE,
+    INK_CONTRAST,
+    LAYER_BLANK_CONTRAST,
+    LAYER_BLANK_SHARE,
+    LAYER_DPI,
     MIN_LAYER_INK,
     NO_TEXT_LIMIT,
     PageSignals,
+    legible_lines,
     text_layer_stats,
 )
 
@@ -42,11 +50,10 @@ TEXT_FLAGS = pymupdf.TEXT_PRESERVE_LIGATURES
 _FILLED = 16    # FZ_STEXT_FILLED in span["char_flags"] (PyMuPDF >= 1.25.2)
 _STROKED = 32   # FZ_STEXT_STROKED
 _INK_DPI = 72
-_INK_CONTRAST = 48       # grey levels a pixel must differ from its background to count as ink
 _MAX_EXACT_UNION = 256   # beyond this many rectangles the union is measured on a raster
 
 Bbox = Tuple[float, float, float, float]
-Row = Tuple[str, float, Bbox]   # (span text, font size, bbox)
+Row = Tuple[str, float, Bbox, str]   # (span text, font size, bbox, font name)
 
 _char_flags_mark_painting: Optional[bool] = None
 
@@ -103,9 +110,34 @@ def span_is_invisible(span: dict, trace_origins: Optional[Set[Tuple[float, float
     return False
 
 
-def _centre_in(bbox: Sequence[float], rects: Sequence[pymupdf.Rect]) -> bool:
-    centre = pymupdf.Point((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
-    return any(centre in rect for rect in rects)
+def _array(bboxes: Iterable[Sequence[float]]) -> np.ndarray:
+    """Rectangles as an (n, 4) array of x0, y0, x1, y1."""
+    return np.array([tuple(bbox)[:4] for bbox in bboxes], dtype=float).reshape(-1, 4)
+
+
+def _centres_in(bboxes: np.ndarray, rects: np.ndarray) -> np.ndarray:
+    """Whether the centre of each of ``bboxes`` lies in one of ``rects``."""
+    if not len(bboxes) or not len(rects):
+        return np.zeros(len(bboxes), dtype=bool)
+    x = (bboxes[:, 0:1] + bboxes[:, 2:3]) / 2
+    y = (bboxes[:, 1:2] + bboxes[:, 3:4]) / 2
+    return ((rects[:, 0] <= x) & (x <= rects[:, 2]) & (rects[:, 1] <= y) & (y <= rects[:, 3])).any(axis=1)
+
+
+def _overlaps(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(len(a), len(b)) areas of the intersections of the rectangles ``a`` and ``b``."""
+    width = np.minimum(a[:, None, 2], b[None, :, 2]) - np.maximum(a[:, None, 0], b[None, :, 0])
+    height = np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1])
+    return np.clip(width, 0, None) * np.clip(height, 0, None)
+
+
+def _any_overlap(a: np.ndarray, b: np.ndarray, chunk: int = 256) -> np.ndarray:
+    """Whether each rectangle of ``a`` overlaps one of ``b`` (in chunks, for pages with many spans)."""
+    result = np.zeros(len(a), dtype=bool)
+    if len(b):
+        for start in range(0, len(a), chunk):
+            result[start:start + chunk] = (_overlaps(a[start:start + chunk], b) > 0).any(axis=1)
+    return result
 
 
 def _union_bbox(bboxes: Iterable[Sequence[float]]) -> Bbox:
@@ -123,6 +155,7 @@ def drop_invisible_text(text_dict: dict, keep_rects: Sequence[pymupdf.Rect] = ()
     Lines and text blocks left empty are removed; the bounding boxes of the ones that
     lost spans are recomputed from what remains.
     """
+    keep = _array(keep_rects)
     blocks = []
     for block in text_dict.get("blocks", []):
         if block.get("type") != 0:
@@ -130,8 +163,13 @@ def drop_invisible_text(text_dict: dict, keep_rects: Sequence[pymupdf.Rect] = ()
             continue
         lines, changed = [], False
         for line in block.get("lines", []):
-            spans = [span for span in line.get("spans", [])
-                     if not span_is_invisible(span, trace_origins) or _centre_in(span["bbox"], keep_rects)]
+            spans = line.get("spans", [])
+            invisible = [span_is_invisible(span, trace_origins) for span in spans]
+            if not any(invisible):
+                lines.append(line)
+                continue
+            kept = _centres_in(_array(span["bbox"] for span in spans), keep)
+            spans = [span for span, hidden, keep_it in zip(spans, invisible, kept) if not hidden or keep_it]
             if len(spans) == len(line.get("spans", [])):
                 lines.append(line)
                 continue
@@ -148,13 +186,21 @@ def drop_invisible_text(text_dict: dict, keep_rects: Sequence[pymupdf.Rect] = ()
 class VisibleTextPage:
     """A PyMuPDF page whose ``get_text("dict" | "rawdict")`` leaves out invisible text,
     except invisible text centred in ``keep_rects``. Everything else is delegated to
-    the real page."""
+    the real page.
+
+    PyMuPDF's table finder reads the page's text itself: when a table it finds meets
+    ``drop_rects``, the tables are found again on ``redact()`` (a copy of the page
+    without that text), and the page reads from the copy from then on.
+    """
 
     def __init__(self, page, keep_rects: Sequence[pymupdf.Rect] = (),
-                 trace_origins: Optional[Set[Tuple[float, float]]] = None):
+                 trace_origins: Optional[Set[Tuple[float, float]]] = None,
+                 drop_rects: Sequence[pymupdf.Rect] = (), redact: Optional[Callable[[], object]] = None):
         self._page = page
         self._keep_rects = [pymupdf.Rect(rect) for rect in keep_rects]
         self._trace_origins = trace_origins
+        self._drop_rects = [pymupdf.Rect(rect) for rect in drop_rects]
+        self._redact = redact
 
     def __getattr__(self, name):
         return getattr(self._page, name)
@@ -164,6 +210,46 @@ class VisibleTextPage:
         if option in ("dict", "rawdict") and isinstance(result, dict):
             return drop_invisible_text(result, self._keep_rects, self._trace_origins)
         return result
+
+    def find_tables(self, *args, **kwargs):
+        tables = self._page.find_tables(*args, **kwargs)
+        if self._redact is not None and any(pymupdf.Rect(table.bbox).intersects(rect)
+                                            for table in getattr(tables, "tables", ()) for rect in self._drop_rects):
+            copy, self._redact = self._redact(), None
+            if copy is not None:
+                self._page = copy
+                tables = copy.find_tables(*args, **kwargs)
+        return tables
+
+
+class PageCopies:
+    """Editable copies of a document's pages, all on one second handle of the same file.
+
+    The handle is opened once per document (a new document would lose the catalog's
+    optional-content state, so layers that are off would show). :meth:`copy` appends a
+    full copy of a page; :meth:`discard` deletes the copies again.
+    """
+
+    def __init__(self, doc):
+        self._source = doc
+        self._doc = None
+
+    def copy(self, number: int):
+        if self._doc is None:
+            name = self._source.name
+            self._doc = (pymupdf.open(name) if name and os.path.exists(name)
+                         else pymupdf.open("pdf", self._source.tobytes()))
+        self._doc.fullcopy_page(number)
+        return self._doc[-1]
+
+    def discard(self) -> None:
+        if self._doc is not None and len(self._doc) > len(self._source):
+            self._doc.delete_pages(len(self._source), len(self._doc) - 1)
+
+    def close(self) -> None:
+        if self._doc is not None:
+            self._doc.close()
+            self._doc = None
 
 
 def page_area(page) -> pymupdf.Rect:
@@ -175,21 +261,17 @@ def union_area(rects: Iterable[pymupdf.Rect], bounds: Optional[pymupdf.Rect] = N
     """Area covered by the union of axis-aligned rectangles (overlaps counted once).
 
     Exact for up to ``_MAX_EXACT_UNION`` rectangles; above that (tiled scans) measured on
-    a raster of ``bounds`` with at most 1000 pixels a side.
+    a raster of ``bounds`` with at most 1000 cells a side.
     """
     rects = [rect for rect in rects if not rect.is_empty]
     if len(rects) > _MAX_EXACT_UNION and bounds is not None and not bounds.is_empty:
         scale = min(1.0, 1000 / max(bounds.width, bounds.height))
-        grid = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, math.ceil(bounds.width * scale),
-                                                            math.ceil(bounds.height * scale)), False)
-        grid.clear_with(255)
-        to_grid = pymupdf.Matrix(1, 0, 0, 1, -bounds.x0, -bounds.y0) * pymupdf.Matrix(scale, scale)
+        grid = np.zeros((math.ceil(bounds.height * scale), math.ceil(bounds.width * scale)), dtype=bool)
         for rect in rects:
-            box = (rect * to_grid).irect & grid.irect
-            if not box.is_empty:
-                grid.set_rect(box, (0,))
-        samples = grid.samples
-        return (len(samples) - len(samples.translate(None, b"\x00"))) / (scale * scale)
+            x0, y0 = max(0, int((rect.x0 - bounds.x0) * scale)), max(0, int((rect.y0 - bounds.y0) * scale))
+            x1, y1 = math.ceil((rect.x1 - bounds.x0) * scale), math.ceil((rect.y1 - bounds.y0) * scale)
+            grid[y0:y1, x0:x1] = True
+        return float(grid.sum()) / (scale * scale)
     xs = sorted({rect.x0 for rect in rects} | {rect.x1 for rect in rects})
     area = 0.0
     for left, right in zip(xs, xs[1:]):
@@ -240,62 +322,219 @@ def uncaptured_raster(page, rects: List[pymupdf.Rect], ocr_rects: Iterable[pymup
     return min(union_area(left_out, area) / page_size, 1.0)
 
 
-def _grey_render(page) -> Tuple[pymupdf.Pixmap, pymupdf.Matrix]:
-    zoom = _INK_DPI / 72
+# --- Pixels ---------------------------------------------------------------------
+
+
+def _grey(page, dpi: float) -> Tuple[np.ndarray, pymupdf.Matrix]:
+    """The page rendered in grey at ``dpi`` (rows x columns), and the matrix from page to pixels."""
+    zoom = dpi / 72
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False)
-    return pix, page.rotation_matrix * pymupdf.Matrix(zoom, zoom)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    return pixels, page.rotation_matrix * pymupdf.Matrix(zoom, zoom)
 
 
-def _background(samples: bytes) -> int:
-    """The most common grey level (the background)."""
-    return Counter(samples[::7] or samples).most_common(1)[0][0]
+def _region(pixels: np.ndarray, bbox: Sequence[float], to_pixels: pymupdf.Matrix) -> Optional[np.ndarray]:
+    """The pixels of ``bbox`` (page coordinates), or None when it is off the render."""
+    box = (pymupdf.Rect(bbox) * to_pixels).irect & pymupdf.IRect(0, 0, pixels.shape[1], pixels.shape[0])
+    return None if box.is_empty else pixels[box.y0:box.y1, box.x0:box.x1]
 
 
-def _ink_share(samples: bytes, background: int) -> float:
-    """Share of pixels differing from ``background`` by more than ``_INK_CONTRAST`` levels (any colour)."""
-    if not samples:
-        return 0.0
-    near = bytes(range(max(0, background - _INK_CONTRAST), min(255, background + _INK_CONTRAST) + 1))
-    return len(samples.translate(None, near)) / len(samples)
+def _deviation(region: np.ndarray) -> np.ndarray:
+    """How far each pixel is from the region's background (its most common grey)."""
+    return np.abs(region.astype(np.int16) - int(np.bincount(region.ravel(), minlength=256).argmax()))
 
 
-def _paint(pix: pymupdf.Pixmap, rects: Iterable[Sequence[float]], to_pixels: pymupdf.Matrix, level: int) -> None:
-    for rect in rects:
-        box = (pymupdf.Rect(rect) * to_pixels).irect & pix.irect
-        if not box.is_empty:
-            pix.set_rect(box, (level,))
+def _blank(region: np.ndarray) -> bool:
+    """Nothing shows: (almost) every pixel within LAYER_BLANK_CONTRAST levels of the background."""
+    return float((_deviation(region) > LAYER_BLANK_CONTRAST).mean()) < LAYER_BLANK_SHARE
+
+
+def _glyph_like(region: np.ndarray) -> bool:
+    """Ink spread over the rows and the columns of the region, as glyphs are (not a rule or a box edge)."""
+    ink = _deviation(region) > INK_CONTRAST
+    return (float(ink.mean()) >= GLYPH_INK_SHARE and float(ink.any(axis=1).mean()) >= GLYPH_SPREAD
+            and float(ink.any(axis=0).mean()) >= GLYPH_SPREAD)
+
+
+def _ink_share(region: np.ndarray) -> float:
+    return float((_deviation(region) > INK_CONTRAST).mean())
+
+
+def _edges(rect: pymupdf.Rect, pad: float) -> List[pymupdf.Rect]:
+    return [pymupdf.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y0 + pad),
+            pymupdf.Rect(rect.x0 - pad, rect.y1 - pad, rect.x1 + pad, rect.y1 + pad),
+            pymupdf.Rect(rect.x0 - pad, rect.y0 - pad, rect.x0 + pad, rect.y1 + pad),
+            pymupdf.Rect(rect.x1 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad)]
+
+
+def _line_art(page) -> List[pymupdf.Rect]:
+    """Where the page draws rules, frames and grids: horizontal and vertical strokes, rectangle
+    and quad outlines, and fills thinner than 2 pt. Not content by themselves."""
+    rects = []
+    for path in page.get_drawings():
+        kind = path.get("type") or ""
+        bbox = pymupdf.Rect(path.get("rect") or (0, 0, 0, 0))
+        if "f" in kind:
+            if min(bbox.width, bbox.height) <= 2:
+                rects.append(bbox + (-1, -1, 1, 1))
+            continue
+        pad = (path.get("width") or 1) / 2 + 1
+        for item in path.get("items", []):
+            if item[0] == "l" and (abs(item[1].x - item[2].x) <= 1 or abs(item[1].y - item[2].y) <= 1):
+                rects.append(pymupdf.Rect(item[1], item[2]).normalize() + (-pad, -pad, pad, pad))
+            elif item[0] == "re":
+                rects.extend(_edges(pymupdf.Rect(item[1]), pad))
+            elif item[0] == "qu":
+                rects.extend(_edges(item[1].rect, pad))
+    return rects
+
+
+def _pixel_boxes(bboxes: np.ndarray, to_pixels: pymupdf.Matrix, shape: Tuple[int, ...]) -> np.ndarray:
+    """Integer pixel boxes (x0, y0, x1, y1) of ``bboxes`` on a render of ``shape``, clipped to it
+    (empty where they are off it)."""
+    xs, ys = bboxes[:, [0, 2, 0, 2]], bboxes[:, [1, 1, 3, 3]]
+    px = to_pixels.a * xs + to_pixels.c * ys + to_pixels.e
+    py = to_pixels.b * xs + to_pixels.d * ys + to_pixels.f
+    boxes = np.stack([np.floor(px.min(axis=1)), np.floor(py.min(axis=1)),
+                      np.ceil(px.max(axis=1)), np.ceil(py.max(axis=1))], axis=1)
+    return np.clip(boxes, 0, [shape[1], shape[0], shape[1], shape[0]]).astype(int)
 
 
 def uncaptured_ink(page, blank: Iterable[Sequence[float]]) -> float:
     """Share of the page showing ink (any colour) outside ``blank`` (areas the text route already
-    captures), measured on a grey render."""
-    pix, to_pixels = _grey_render(page)
-    background = _background(pix.samples)
-    _paint(pix, blank, to_pixels, background)
-    return _ink_share(pix.samples, background)
+    captures) and outside line art, measured on a grey render."""
+    pixels, to_pixels = _grey(page, _INK_DPI)
+    pixels = pixels.copy()
+    background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
+    for bbox in list(blank) + _line_art(page):
+        box = (pymupdf.Rect(bbox) * to_pixels).irect & pymupdf.IRect(0, 0, pixels.shape[1], pixels.shape[0])
+        if not box.is_empty:
+            pixels[box.y0:box.y1, box.x0:box.x1] = background
+    return float((np.abs(pixels.astype(np.int16) - background) > INK_CONTRAST).mean())
 
 
-def _box_samples(samples: bytes, stride: int, box: pymupdf.IRect) -> bytes:
-    return b"".join(samples[y * stride + box.x0:y * stride + box.x1] for y in range(box.y0, box.y1))
+# --- Invisible text ---------------------------------------------------------------
 
 
-def split_invisible(page, invisible: Sequence[Row], visible: Sequence[Row]) -> Tuple[List[Row], List[Row]]:
-    """Split invisible spans into (text layer, hidden text): a span is the text of what the page
-    shows when the render, painted text left out, has ink under it (``MIN_LAYER_INK``)."""
-    if not invisible:
-        return [], []
-    pix, to_pixels = _grey_render(page)
-    _paint(pix, [bbox for _, _, bbox in visible], to_pixels, _background(pix.samples))
-    samples, stride = pix.samples, pix.stride
-    layer, hidden = [], []
-    for row in invisible:
-        box = (pymupdf.Rect(row[2]) * to_pixels).irect & pix.irect
-        part = _box_samples(samples, stride, box) if not box.is_empty else b""
-        if part and _ink_share(part, _background(part)) >= MIN_LAYER_INK:
-            layer.append(row)
-        else:
-            hidden.append(row)
-    return layer, hidden
+def _norm(text: str) -> str:
+    return "".join(text.split()).casefold()
+
+
+def _same_text(row: Row, under: Sequence[Row]) -> bool:
+    """Whether the painted spans ``under`` read, over the extent of the invisible span ``row``, the
+    same text (each painted span's characters taken in proportion to the width it shares)."""
+    text = _norm(row[0])
+    if not text:
+        return False
+    x0, x1 = row[2][0], row[2][2]
+    margin = 1 + len(text) // 4
+    parts = []
+    for painted, _, box, _ in sorted(under, key=lambda other: other[2][0]):
+        width = box[2] - box[0]
+        if width <= 0 or not painted:
+            continue
+        first = max(0, math.floor((x0 - box[0]) / width * len(painted)) - margin)
+        last = min(len(painted), math.ceil((x1 - box[0]) / width * len(painted)) + margin)
+        parts.append(painted[first:last])
+    painted = _norm("".join(parts))
+    return bool(painted) and (text in painted or (painted in text and len(painted) >= 0.5 * len(text)))
+
+
+def _duplicates(invisible: Sequence[Row], visible: Sequence[Row], rows: np.ndarray, shown: np.ndarray,
+                chunk: int = 256) -> np.ndarray:
+    """Whether each invisible span repeats the painted text it lies on (an invisible duplicate): painted
+    spans on the same line (sharing half the taller one's height, so not a big stamp or a rotated
+    watermark) that read the same text where it lies."""
+    result = np.zeros(len(invisible), dtype=bool)
+    if not len(shown):
+        return result
+    shown_height = shown[:, 3] - shown[:, 1]
+    for start in range(0, len(invisible), chunk):
+        part = rows[start:start + chunk]
+        width = np.minimum(part[:, None, 2], shown[None, :, 2]) - np.maximum(part[:, None, 0], shown[None, :, 0])
+        height = np.minimum(part[:, None, 3], shown[None, :, 3]) - np.maximum(part[:, None, 1], shown[None, :, 1])
+        taller = np.maximum((part[:, 3] - part[:, 1])[:, None], shown_height[None, :])
+        for index, same_line in enumerate((width > 0) & (height >= 0.5 * taller), start):
+            if same_line.any():
+                result[index] = _same_text(invisible[index], [visible[k] for k in np.flatnonzero(same_line)])
+    return result
+
+
+def _without_text(page, copies: "PageCopies"):
+    """A copy of ``page`` with all its text removed (pictures and drawings kept)."""
+    copy = copies.copy(page.number)
+    copy.add_redact_annot(page_area(page), fill=False)
+    copy.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                          text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    return copy
+
+
+_PAINTING = ("fill-path", "stroke-path", "fill-image", "fill-imgmask", "fill-shade")
+
+
+def _erase(region: np.ndarray, box: pymupdf.IRect, rects: Iterable[pymupdf.Rect], to_pixels: pymupdf.Matrix,
+           background: int) -> np.ndarray:
+    """``region`` (the pixels of ``box``) with ``rects`` painted over in ``background``."""
+    region = region.copy()
+    for rect in rects:
+        part = (rect * to_pixels).irect & box
+        if not part.is_empty:
+            region[part.y0 - box.y0:part.y1 - box.y0, part.x0 - box.x0:part.x1 - box.x0] = background
+    return region
+
+
+def classify_invisible(page, invisible: Sequence[Row], visible: Sequence[Row], pictures: Sequence[pymupdf.Rect],
+                       copies: "PageCopies") -> Tuple[List[Row], List[Row], List[Row]]:
+    """Split invisible spans into (layer, hidden, duplicates).
+
+    A duplicate repeats the painted text it lies on. A span with nothing but text
+    painted under it lies over nothing the page shows (hidden). The rest is judged on
+    the page rendered without its text (a copy is rendered only where painted text
+    overlaps them; invisible text never renders): over a picture a span is the
+    picture's text (layer) unless the region under it is blank; elsewhere it is layer
+    only over glyph-like ink (text drawn as outlines), rules and frames crossing it
+    left out.
+    """
+    rows = _array(row[2] for row in invisible) + [-0.5, -0.5, 0.5, 0.5]
+    shown = _array(row[2] for row in visible)
+    duplicate = _duplicates(invisible, visible, rows, shown)
+    painted = _array(box for kind, box in page.get_bboxlog() if kind in _PAINTING) + [-1, -1, 1, 1]
+    candidate = ~duplicate & _any_overlap(rows, painted)
+    duplicates = [row for row, flag in zip(invisible, duplicate) if flag]
+    hidden = [row for row, flag, check in zip(invisible, duplicate, candidate) if not flag and not check]
+    if not candidate.any():
+        return [], hidden, duplicates
+    overlapped = bool(_any_overlap(rows[candidate], shown).any())
+    try:
+        pixels, to_pixels = _grey(_without_text(page, copies) if overlapped else page, LAYER_DPI)
+    finally:
+        if overlapped:
+            copies.discard()
+    boxes = _pixel_boxes(rows, to_pixels, pixels.shape)
+    over_picture = _centres_in(rows, _array(pictures))
+    art = background = None
+    layer = []
+    for index in np.flatnonzero(candidate):
+        row = invisible[index]
+        x0, y0, x1, y1 = boxes[index]
+        if x1 <= x0 or y1 <= y0:
+            hidden.append(row)   # off the visible page
+            continue
+        region = pixels[y0:y1, x0:x1]
+        if over_picture[index]:
+            (hidden if _blank(region) else layer).append(row)
+            continue
+        if art is None:
+            art = _line_art(page)
+        rect = pymupdf.Rect(row[2])
+        inside = rect + (-1, -1, 1, 1)
+        crossing = [piece for piece in art if piece.intersects(rect) and not inside.contains(piece)]
+        if crossing:
+            if background is None:
+                background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
+            region = _erase(region, pymupdf.IRect(x0, y0, x1, y1), crossing, to_pixels, background)
+        (layer if _glyph_like(region) else hidden).append(row)
+    return layer, hidden, duplicates
 
 
 @dataclass(frozen=True)
@@ -303,15 +542,16 @@ class PageMeasure:
     """Routing signals of one page, plus what the text path needs to honour them."""
 
     signals: PageSignals
-    layer_rects: Tuple[Bbox, ...] = ()     # invisible spans over ink: the text of what the page shows
-    hidden_rects: Tuple[Bbox, ...] = ()    # invisible spans over nothing visible: hidden text
-    visible_rects: Tuple[Bbox, ...] = ()   # painted spans (kept only on pages with invisible text)
+    layer_rects: Tuple[Bbox, ...] = ()      # invisible spans over what the page shows: its text
+    hidden_rects: Tuple[Bbox, ...] = ()     # invisible spans over nothing the page shows: hidden text
+    duplicate_rects: Tuple[Bbox, ...] = ()  # invisible copies of the painted text they lie on
+    visible_rects: Tuple[Bbox, ...] = ()    # painted spans (kept only on pages with invisible text)
     trace_origins: Optional[frozenset] = None  # invisible-glyph origins, only without char_flags support
-    text: Optional[str] = None             # the page's text layer, for the optional legibility judge
+    text: Optional[str] = None              # the page's text layer, for the optional legibility judge
 
     @property
     def has_invisible_text(self) -> bool:
-        return bool(self.layer_rects or self.hidden_rects)
+        return bool(self.layer_rects or self.hidden_rects or self.duplicate_rects)
 
 
 def _span_rows(text_dict: dict, trace_origins) -> Tuple[List[Row], List[Row], List[List[Row]]]:
@@ -325,7 +565,8 @@ def _span_rows(text_dict: dict, trace_origins) -> Tuple[List[Row], List[Row], Li
                 text = span.get("text", "")
                 if not text:
                     continue
-                row = (text, float(span.get("size", 0.0)), tuple(span.get("bbox", (0, 0, 0, 0))))
+                row = (text, float(span.get("size", 0.0)), tuple(span.get("bbox", (0, 0, 0, 0))),
+                       span.get("font", ""))
                 (invisible if span_is_invisible(span, trace_origins) else visible).append(row)
                 rows.append(row)
             lines.append(rows)
@@ -333,40 +574,48 @@ def _span_rows(text_dict: dict, trace_origins) -> Tuple[List[Row], List[Row], Li
 
 
 def measure_page(page, *, ocr_rects: Callable[[object], List[pymupdf.Rect]] = lambda page: [],
-                 keep_text: bool = False) -> PageMeasure:
+                 keep_text: bool = False, copies: Optional[PageCopies] = None) -> PageMeasure:
     """Measure the routing signals of ``page``.
 
     ``ocr_rects(page)`` returns the rectangles of the pictures the text route OCRs one by
-    one. ``keep_text`` keeps the page's text layer (for the legibility judge).
+    one. ``keep_text`` keeps the page's text layer (for the legibility judge). ``copies``
+    provides editable page copies (a private one is used and closed when omitted).
     """
     trace_origins = None if char_flags_mark_painting() else frozenset(invisible_trace_origins(page))
     text_dict = page.get_text("dict", flags=TEXT_FLAGS)
     visible, invisible, lines = _span_rows(text_dict, trace_origins)
     invisible = [row for row in invisible if row[0].strip()]
-    try:
-        layer, hidden = split_invisible(page, invisible, visible)
-    except Exception as exc:
-        logger.debug(f"Invisible-text check failed on page {page.number + 1}: {exc}")
-        layer, hidden = [], list(invisible)
     rects = image_rects(page)
     coverage = image_coverage(page, rects)
-    visible_stats = text_layer_stats((text, size) for text, size, _ in visible)
-    raster, ink = 0.0, None
-    if visible_stats.weight < NO_TEXT_LIMIT:
+    layer, hidden, duplicates = [], [], []
+    if invisible:
+        own = copies is None
+        copies = copies or PageCopies(page.parent)
         try:
-            raster = uncaptured_raster(page, rects, ocr_rects(page))
-            if coverage < IMAGE_PAGE_COVERAGE:
-                ink = uncaptured_ink(page, [bbox for _, _, bbox in visible] + [tuple(rect) for rect in rects])
-        except Exception as exc:
-            logger.debug(f"Uncaptured-content measure failed on page {page.number + 1}: {exc}")
+            layer, hidden, duplicates = classify_invisible(page, invisible, visible, rects, copies)
+        except Exception as exc:  # cannot tell what shows: keep the text (fail open)
+            logger.warning(f"Page {page.number + 1}: could not check what its invisible text lies on ({exc}); "
+                           f"keeping it as the page's text")
+            layer, hidden, duplicates = list(invisible), [], []
+        finally:
+            if own:
+                copies.close()
     signals = PageSignals(
         image_coverage=coverage,
-        visible=visible_stats,
-        invisible=text_layer_stats((text, size) for text, size, _ in layer),
-        hidden_chars=sum(len("".join(text.split())) for text, _, _ in hidden),
-        uncaptured_raster=raster,
-        uncaptured_ink=ink,
+        visible=text_layer_stats((text, size, font) for text, size, _, font in visible),
+        invisible=text_layer_stats((text, size, font) for text, size, _, font in layer),
+        hidden_chars=sum(len("".join(text.split())) for text, _, _, _ in hidden),
     )
+    # What the text route cannot capture matters only without a usable text layer (a
+    # searchable scan has one: its OCR layer).
+    if signals.visible.weight < NO_TEXT_LIMIT and not signals.searchable_scan:
+        try:
+            raster = uncaptured_raster(page, rects, ocr_rects(page))
+            ink = (uncaptured_ink(page, [bbox for _, _, bbox, _ in visible] + [tuple(rect) for rect in rects])
+                   if coverage < IMAGE_PAGE_COVERAGE else None)
+            signals = replace(signals, uncaptured_raster=raster, uncaptured_ink=ink)
+        except Exception as exc:
+            logger.debug(f"Uncaptured-content measure failed on page {page.number + 1}: {exc}")
     text = None
     if keep_text:
         source = {id(row) for row in (layer if signals.searchable_scan else visible)}
@@ -374,30 +623,24 @@ def measure_page(page, *, ocr_rects: Callable[[object], List[pymupdf.Rect]] = la
                                                for line in lines) if joined)
     return PageMeasure(
         signals=signals,
-        layer_rects=tuple(bbox for _, _, bbox in layer),
-        hidden_rects=tuple(bbox for _, _, bbox in hidden),
-        visible_rects=tuple(bbox for _, _, bbox in visible) if invisible else (),
+        layer_rects=tuple(row[2] for row in layer),
+        hidden_rects=tuple(row[2] for row in hidden),
+        duplicate_rects=tuple(row[2] for row in duplicates),
+        visible_rects=tuple(row[2] for row in visible) if invisible else (),
         trace_origins=trace_origins if invisible else None,
         text=text,
     )
 
 
-def _reopen(page):
-    """A second handle on the page's document (same file, so its layer (OCG) state is kept)."""
-    name = page.parent.name
-    if name and os.path.exists(name):
-        return pymupdf.open(name)
-    return pymupdf.open("pdf", page.parent.tobytes())
-
-
-def _redacted_copy(page, drop: Sequence[Bbox], visible: Sequence[Bbox], keep: Sequence[Bbox]):
-    """A second handle on the page's document whose copy of the page has the invisible text
-    under ``drop`` removed, or None.
+def _redacted_copy(page, drop: Sequence[Bbox], visible: Sequence[Bbox], keep: Sequence[Bbox],
+                   copies: PageCopies):
+    """A copy of ``page`` (from ``copies``) with the invisible text under ``drop`` removed, or None.
 
     Rectangles clear of visible text and of text to keep lose every glyph under them
     (this also removes render mode 7 text). Rectangles touching visible text lose only
     their invisible glyphs, which needs PyMuPDF's invisible-text redaction (1.27+);
-    without it they are left to the span filter of :class:`VisibleTextPage`.
+    without it they are left to the span filter of :class:`VisibleTextPage`, and table
+    cells may keep them.
     """
     invisible_only = getattr(pymupdf, "PDF_REDACT_TEXT_REMOVE_INVISIBLE", None)
     keep = [pymupdf.Rect(bbox) for bbox in keep]
@@ -413,45 +656,45 @@ def _redacted_copy(page, drop: Sequence[Bbox], visible: Sequence[Bbox], keep: Se
         passes.append((touching, invisible_only))
     if not any(rects for rects, _ in passes):
         return None
-    copy = None
     try:
-        copy = _reopen(page)
-        target = copy[page.number]
+        copy = copies.copy(page.number)
         for rects, mode in passes:
             if rects:
                 for rect in rects:
-                    target.add_redact_annot(rect, fill=False)
-                target.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                                        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=mode)
+                    copy.add_redact_annot(rect, fill=False)
+                copy.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                                      graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=mode)
         return copy
     except Exception as exc:
         logger.debug(f"Could not strip invisible text from page {page.number + 1}: {exc}")
-        if copy is not None:
-            copy.close()
+        copies.discard()
         return None
 
 
-def text_source(page, measure: PageMeasure, keep_layer: bool):
-    """``(page, document)``: the page as the text and table extractors must read it, and a
-    document to close afterwards (None when the page itself is returned).
+def text_source(page, measure: PageMeasure, copies: PageCopies, ocrd_rects: Sequence[pymupdf.Rect] = ()):
+    """The page as the text and table extractors must read it.
 
-    Hidden text never reaches them; the text layer of what the page shows only when
-    ``keep_layer`` (its pictures are not OCR'd in this run). Table cells are read by
-    PyMuPDF's table finder, so the invisible text is removed from a second copy of the
-    page; the returned page also filters ``get_text("dict" | "rawdict")`` in case a span
-    could not be removed.
+    Hidden text and invisible copies of painted text never reach them, nor layer spans
+    centred in ``ocrd_rects`` (pictures whose OCR returned text in this run: that text
+    replaces them). Other layer spans are the page's text and stay. When a table meets
+    text to drop, the table finder reads a copy of the page from ``copies`` without it
+    (see :class:`VisibleTextPage`); discard the copies once the page is extracted.
     """
-    drop = list(measure.hidden_rects) + ([] if keep_layer else list(measure.layer_rects))
+    replaced = _centres_in(_array(measure.layer_rects), _array(ocrd_rects))
+    keep = [bbox for bbox, flag in zip(measure.layer_rects, replaced) if not flag]
+    drop = (list(measure.hidden_rects) + list(measure.duplicate_rects)
+            + [bbox for bbox, flag in zip(measure.layer_rects, replaced) if flag])
     if not drop:
-        return page, None
-    keep = list(measure.layer_rects) if keep_layer else []
-    copy = _redacted_copy(page, drop, measure.visible_rects, keep)
-    source = copy[page.number] if copy is not None else page
-    return VisibleTextPage(source, keep_rects=[pymupdf.Rect(bbox) for bbox in keep],
-                           trace_origins=measure.trace_origins), copy
+        return page
+    return VisibleTextPage(page, keep_rects=[pymupdf.Rect(bbox) for bbox in keep],
+                           trace_origins=measure.trace_origins, drop_rects=[pymupdf.Rect(bbox) for bbox in drop],
+                           redact=lambda: _redacted_copy(page, drop, measure.visible_rects, keep, copies))
 
 
-_CJK_CHAR = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+# --- Verbatim tail ----------------------------------------------------------------
+
+_CJK_RANGES = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF))
+_CJK_CHAR = re.compile("[" + "".join(f"{chr(low)}-{chr(high)}" for low, high in _CJK_RANGES) + "]")
 
 
 def _tokens(text: str) -> List[str]:
@@ -480,7 +723,7 @@ def _reproduced(line: str, ocr_words: List[str]) -> bool:
 _COVERING = ("fill-image", "fill-imgmask", "fill-shade", "fill-path")
 
 
-def _shown(bbox: pymupdf.Rect, log: list, pix: pymupdf.Pixmap, to_pixels: pymupdf.Matrix) -> bool:
+def _shown(bbox: pymupdf.Rect, log: list, pixels: np.ndarray, to_pixels: pymupdf.Matrix) -> bool:
     """Whether painted text in ``bbox`` shows on the page: not painted over by a later picture
     or shape, and drawn with enough contrast to its background."""
     painted = [index for index, (kind, box) in enumerate(log)
@@ -490,31 +733,37 @@ def _shown(bbox: pymupdf.Rect, log: list, pix: pymupdf.Pixmap, to_pixels: pymupd
     for kind, box in log[after + 1:]:
         if kind in _COVERING and abs((pymupdf.Rect(box) & bbox).get_area()) >= 0.9 * area:
             return False
-    box = (bbox * to_pixels).irect & pix.irect
-    part = _box_samples(pix.samples, pix.stride, box) if not box.is_empty else b""
-    return bool(part) and _ink_share(part, _background(part)) >= MIN_LAYER_INK
+    region = _region(pixels, bbox, to_pixels)
+    return region is not None and region.size > 0 and _ink_share(region) >= MIN_LAYER_INK
 
 
 def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str]:
     """The page's painted, legible text lines that ``ocr_text`` does not reproduce and that the
-    page visibly shows (text painted over by a picture, or drawn in its background colour,
-    never reaches the OCR and is not content)."""
-    if not measure.signals.visible.chars or measure.signals.visible.garbled:
+    page visibly shows (text painted over by a picture, drawn in its background colour or
+    garbled never reaches the OCR as such and is not kept)."""
+    if not measure.signals.visible.chars:
         return []
-    ocr_words = _tokens(ocr_text)
-    candidates = []
+    lines = []
     for block in page.get_text("dict", flags=TEXT_FLAGS).get("blocks", []):
         for line in block.get("lines", []) if block.get("type") == 0 else []:
-            spans = [span for span in line.get("spans", []) if not span_is_invisible(span, measure.trace_origins)]
-            text = "".join(span.get("text", "") for span in spans).strip()
-            if text and not _reproduced(text, ocr_words):
-                candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans))))
+            spans = [span for span in line.get("spans", [])
+                     if span.get("text") and not span_is_invisible(span, measure.trace_origins)]
+            if spans:
+                lines.append(spans)
+    legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
+                             for spans in lines])
+    ocr_words = _tokens(ocr_text)
+    candidates = []
+    for spans, readable in zip(lines, legible):
+        text = "".join(span["text"] for span in spans).strip()
+        if text and readable and not _reproduced(text, ocr_words):
+            candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans))))
     if not candidates:
         return []
     try:
         log = page.get_bboxlog()
-        pix, to_pixels = _grey_render(page)
-        return [text for text, bbox in candidates if _shown(bbox, log, pix, to_pixels)]
+        pixels, to_pixels = _grey(page, _INK_DPI)
+        return [text for text, bbox in candidates if _shown(bbox, log, pixels, to_pixels)]
     except Exception as exc:  # cannot tell what shows: keep the text (verbatim first)
         logger.debug(f"Visibility check failed on page {page.number + 1}: {exc}")
         return [text for text, _ in candidates]

@@ -83,7 +83,9 @@ user-facing:
      - ``0.3``
      - ``decide_doc_strategy(..., text_illegibility)``: share of garbled text
        pages at or above which an image-dominant document routes ``"image"``.
-       The PDF route passes none (it gates every page on its own).
+       Kept for API compatibility: no doc2mark route passes it any more (the PDF
+       route gates every page on its own, the Office route measures no text
+       quality).
    * - ``GARBAGE_TEXT_RATIO`` / ``MIN_GARBAGE_GLYPHS``
      - ``0.1`` / ``3``
      - A page's text layer is garbled when at least 3 undecodable glyphs make up
@@ -132,10 +134,13 @@ For a PDF, ``PDFLoader`` measures every page once
   (render mode 3, fully transparent) is kept apart (see *Invisible text*).
 - **text-layer quality** -- whether the text layer is garbled (see *Text-layer
   quality gate*).
-- **uncaptured content** -- on a page with (almost) no usable text: the share of
-  the page covered by pictures the text route does not OCR one by one (inline
-  images, picture tiles too small to count as figures), and the share showing
-  other ink, any colour (vector-outlined text), on a 72 DPI render.
+- **uncaptured content** -- on a page with (almost) no usable text that is not a
+  searchable scan: the share of the page covered by pictures the text route does
+  not OCR one by one (inline images, picture tiles too small to count as
+  figures), and the share showing other ink, any colour (vector-outlined text),
+  on a 72 DPI render. Line art is not content by itself and does not count:
+  horizontal and vertical strokes, rectangle outlines and fills thinner than
+  2 pt (rules, frames, table grids).
 
 ``_document_image_strategy`` feeds the page means to ``decide_doc_strategy``,
 caches the result and logs it, e.g.::
@@ -171,7 +176,9 @@ matching rule wins):
      - ``image``
      - Less than 50 legible characters, but pictures the text route cannot OCR
        cover at least 5 % of the page (scans stored as inline images or tiles),
-       or other ink covers at least 0.1 % of it (text drawn as vector outlines).
+       or other ink covers at least 0.1 % of it (text drawn as vector outlines;
+       rules, frames and table grids do not count, so a blank page with a
+       header rule and a page number keeps its text path).
    * - ``image_dominant_page``
      - ``image``
      - In a ``"text"`` document: pictures cover at least 0.825 of the page
@@ -184,9 +191,11 @@ matching rule wins):
        text appendix in a slide deck keeps its verbatim text layer.
 
 A page overridden to render OCR as a searchable scan, a page without a usable
-text layer or a scanned page may still carry a little real, legible text (a
-caption, a heading, a stamp). Whatever of it the OCR did not reproduce is kept
-verbatim after the OCR text, so an override never loses real text.
+text layer, a page with a garbled text layer or a scanned page may still carry
+real, legible text (a caption, a heading, a stamp, the clean body under a garbled
+title). Whatever legible line of it the OCR did not reproduce, and the page
+visibly shows, is kept verbatim after the OCR text, so an override never loses
+real text; garbled lines are not kept (the OCR read them from the render).
 
 The margins are hysteresis: a page near a threshold follows its document, so a
 deck or a report keeps one consistent treatment, and only clear outliers switch.
@@ -239,9 +248,15 @@ The deterministic detector (``text_layer_stats``) counts as garbage glyphs:
 
 - U+FFFD replacement characters and ``(cid:N)`` placeholders;
 - control codes (raw character IDs);
-- runs of private-use characters (a lone private-use glyph is an icon or a
-  bullet and counts as neither text nor garbage);
-- mojibake pairs (UTF-8 read as Latin-1 or cp1252, such as ``Ã©``).
+- runs of private-use characters, except icons, which count as neither text nor
+  garbage: a lone private-use glyph (a bullet), the private-use glyphs of icon
+  and symbol fonts (Font Awesome, Wingdings, Symbol and the like), and a short
+  row of up to 5 of them on a page that otherwise reads as text (a star rating);
+- mojibake sequences (UTF-8 read as Latin-1 or cp1252), in a layer that has a
+  typical one -- a Latin-1 letter read back as two characters (``Ã©``) or
+  typographic punctuation (``â€™``) -- or at least two distinct ones: mojibake
+  mangles every accented letter of a layer, while a lone match is ordinary
+  punctuation after an accented letter (``fermé…”`` reads as one).
 
 Each character is weighted by its prominence, ``(font size / the page's body
 size)`` squared, capped at 4 squared: an unreadable 38 pt title weighs as much as
@@ -283,9 +298,11 @@ The contract (``doc2mark.core.strategy.judge_text_layer``):
 - The judge returns the probability that the text is legible content a person
   could read (prose, tables, code, identifiers, any script), or ``None`` when it
   cannot judge.
-- It is consulted at most once per page, only for layers of at least 20
-  characters that the deterministic detector did not already flag, and, with
-  OCR on, only for pages that would keep their text layer.
+- It is consulted only with OCR on (an OCR provider and ``ocr_images=True``):
+  its verdict can only send a page to OCR, so without OCR it is never called.
+  It is asked at most once per page, only for layers of at least 20 characters
+  that the deterministic detector did not already flag, and only for pages that
+  would keep their text layer.
 - Below ``LEGIBILITY_JUDGE_THRESHOLD`` (0.7) the page is treated as garbled.
   ``None``, an exception or a value outside 0..1 mean "cannot judge": the text
   is kept, exactly as without a judge.
@@ -297,20 +314,42 @@ Invisible text
 ~~~~~~~~~~~~~~
 
 Text drawn in render mode 3 (or fully transparent) is not shown on the page.
-Each invisible span is checked against a 72 DPI render with the painted text left
-out:
+Each invisible span is classified by what the page shows under it, with or
+without OCR:
 
-- **Over something the page shows** (at least ``MIN_LAYER_INK``, 3 %, of the
-  span's area differs from its background) it is the text of what is shown: a
-  scanner's OCR layer, or the transparent copy a slide export keeps of text it
-  baked into the artwork. It is emitted when those pictures are not OCR'd (no
-  OCR provider), and dropped when they are, so there is one source, not two. A
-  page that is mostly such a layer over a page-covering scan is a *searchable
-  scan* and is OCR'd from its render.
-- **Over nothing visible** it is hidden text -- a known prompt-injection vector in
-  RAG -- and is never emitted, on any page, in paragraphs or in table cells (the
-  page is read from a copy with that text removed). The pages are listed in
-  ``metadata.extra["hidden_text"]`` and a warning names them.
+- **A copy of the painted text it lies on** (the invisible duplicate some
+  exporters and OCR tools add) is dropped; the painted text stays.
+- **Over a picture** it is the picture's text -- a scanner's OCR layer, or the
+  transparent copy a slide export keeps of text it baked into the artwork --
+  unless the picture is blank under it: fewer than 1 % of the span's pixels differ
+  from the region's background by more than 12 grey levels, on a 100 DPI render
+  of the page with its text removed. A watermark or stamp painted over a scan
+  therefore does not hide the scan, and faint or low-contrast scans still count.
+- **Over other ink** it is the text of glyph-like ink (text drawn as vector
+  outlines); rules, box edges and table grids crossing the span do not count.
+- **Over nothing but painted text, or over nothing**, it is hidden text -- a
+  known prompt-injection vector in RAG.
+
+In doubt the text is kept: when the page cannot be checked (a render or a copy
+fails), all of its invisible text is kept and a warning is logged, because losing
+a scan's only text is worse than emitting a hidden line.
+
+Text of what the page shows is emitted, except over a picture whose OCR in this
+run returned text: that OCR replaces it, so each picture gives one source, not
+two, while the invisible text over other pictures and over outlines on the same
+page stays. A page that is mostly such a layer over a page-covering scan is a
+*searchable scan* and is OCR'd from its render.
+
+Hidden text is left out of paragraphs and of table cells (when a table meets it,
+the table finder reads a copy of the page with that text removed); the pages are
+listed in ``metadata.extra["hidden_text"]`` and a warning names them.
+
+What this cannot catch: invisible text laid over a region of a picture that
+shows something (a photo, scanned text) or over outlined glyphs looks exactly
+like an OCR layer and is kept as the page's text. With PyMuPDF older than 1.27,
+which cannot remove only the invisible glyphs where they touch painted text,
+hidden text touching painted text inside a table can reach that table's cells
+(paragraphs are not affected).
 
 What the output records
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -324,7 +363,8 @@ includes them):
 - ``text_layer_quality``: one entry per garbled page, with ``garbage_ratio``,
   ``garbage_glyphs``, ``judge_legibility`` and ``action`` (``"ocr"`` or
   ``"kept"``).
-- ``hidden_text``: pages whose invisible text was left out, with its length.
+- ``hidden_text``: pages whose hidden text was left out, with its length
+  (invisible duplicates of painted text are dropped without being counted).
 
 A document that yields no text at all never does so silently: a warning says so
 and, without OCR, points at the pages that need it (scans, vector outlines);

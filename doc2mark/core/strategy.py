@@ -86,18 +86,37 @@ PAGE_OVERRIDE_MARGIN = 0.5
 # content the text route cannot capture, only OCR of the page render can read it:
 # pictures the text route does not OCR one by one (inline images, picture tiles too
 # small to count as figures) over at least MIN_UNCAPTURED_RASTER of the page, or ink
-# (vector outlines, any colour) over at least MIN_UNCAPTURED_INK of it. Three short
-# lines of 12 pt outlined text already cover about 0.2 %; a false alarm (a page frame)
-# costs one OCR call, a miss loses the page's words, so the floor is low.
+# (vector outlines, any colour) over at least MIN_UNCAPTURED_INK of it. Line art is not
+# content by itself and is left out: horizontal and vertical strokes, rectangle
+# outlines and fills thinner than 2 pt (rules, frames, table grids). Three short lines
+# of 12 pt outlined text already cover about 0.2 %; a false alarm (a logo) costs one
+# OCR call, a miss loses the page's words, so the floor is low.
 NO_TEXT_LIMIT = IMAGE_PAGE_TEXT_LIMIT / 4
 MIN_UNCAPTURED_RASTER = 0.05
 MIN_UNCAPTURED_INK = 0.001
 
 # Invisible (render mode 3, fully transparent) text is the text of what the page shows
-# (a scanner's OCR layer, the transparent copy of text baked into artwork) when the
-# render shows ink under it: at least this share of the span's area differs from its
-# background, painted text left out. Invisible text over nothing visible is hidden
-# text and never content.
+# (a scanner's OCR layer, the transparent copy of text baked into artwork or drawn as
+# outlines) when the page, rendered without its text, shows something under it.
+# Invisible text over nothing visible is hidden text, and an invisible span repeating
+# the painted text it lies on is a duplicate; neither is emitted. In doubt the text is
+# kept: losing a scan's only text is worse than emitting a hidden line.
+# - Over a picture it is the picture's text unless the region is blank: fewer than
+#   LAYER_BLANK_SHARE of its pixels differ from the region's background (its most common
+#   grey) by more than LAYER_BLANK_CONTRAST levels, at LAYER_DPI, so faint and
+#   low-contrast scans count.
+# - Elsewhere only glyph-like ink counts (outlined text), not a rule or a box edge: rules
+#   and frames crossing the span left out, at least GLYPH_INK_SHARE of the region is ink
+#   (INK_CONTRAST levels off its background), spread over at least GLYPH_SPREAD of its
+#   rows and of its columns.
+# A painted line of the verbatim tail (below) counts as shown when at least
+# MIN_LAYER_INK of its box is ink on the page render.
+LAYER_DPI = 100
+LAYER_BLANK_CONTRAST = 12
+LAYER_BLANK_SHARE = 0.01
+INK_CONTRAST = 48
+GLYPH_INK_SHARE = 0.05
+GLYPH_SPREAD = 0.3
 MIN_LAYER_INK = 0.03
 
 # Bumped whenever routing changes what a page emits for the same input, so caches of
@@ -112,12 +131,12 @@ REASON_NO_TEXT_LAYER = "no_text_layer"
 REASON_IMAGE_PAGE = "image_dominant_page"
 REASON_TEXT_PAGE = "dense_text_page"
 
-# A page overridden to render OCR for one of these reasons may still carry a little
-# legible painted text (a caption, a heading, a stamp). Whatever of it the OCR did not
-# reproduce is kept verbatim after the OCR, so the override never loses real text.
-# (A garbled layer has nothing verbatim to keep; pages following an image document
-# route are the document's slides or scans.)
-VERBATIM_TAIL_REASONS = (REASON_SEARCHABLE_SCAN, REASON_NO_TEXT_LAYER, REASON_IMAGE_PAGE)
+# A page overridden to render OCR for one of these reasons may still carry legible
+# painted text (a caption, a heading, a stamp, the clean body under a garbled title).
+# Whatever legible line the OCR did not reproduce is kept verbatim after the OCR, so the
+# override never loses real text. (Pages following an image document route are the
+# document's slides or scans.)
+VERBATIM_TAIL_REASONS = (REASON_SEARCHABLE_SCAN, REASON_NO_TEXT_LAYER, REASON_IMAGE_PAGE, REASON_ILLEGIBLE)
 
 
 def decide_doc_strategy(
@@ -137,9 +156,10 @@ def decide_doc_strategy(
       the share of its text pages whose layer is garbled), i.e. the render must be
       trusted instead.
 
-    Otherwise ``"text"``. The PDF route passes no ``text_illegibility``: it checks
-    every page's text layer and OCRs garbled pages one by one
-    (:func:`decide_page_route`), so garbled pages never take clean pages with them.
+    Otherwise ``"text"``. ``text_illegibility`` is kept for API compatibility; no
+    doc2mark route passes it any more: the PDF route checks every page's text layer
+    and OCRs garbled pages one by one (:func:`decide_page_route`), so garbled pages
+    never take clean pages with them, and the Office route measures no text quality.
     """
     if mean_image_coverage >= IMAGE_PAGE_COVERAGE and (
         mean_text_chars_per_page < IMAGE_PAGE_TEXT_LIMIT
@@ -174,9 +194,11 @@ def _byte_of(char: str) -> Optional[int]:
     return encoded[0] if len(encoded) == 1 else None
 
 
-def _mojibake_positions(text: str) -> set:
-    """Indexes of the characters that are UTF-8 sequences read as Latin-1/cp1252."""
+def _mojibake_positions(text: str) -> Tuple[set, set]:
+    """(indexes of the characters that are UTF-8 sequences read as Latin-1/cp1252, those
+    sequences)."""
     positions: set = set()
+    sequences: set = set()
     for match in _MOJIBAKE_CANDIDATE.finditer(text):
         start = match.start()
         if start in positions:
@@ -196,7 +218,33 @@ def _mojibake_positions(text: str) -> set:
         except UnicodeDecodeError:
             continue
         positions.update(range(start, start + length))
-    return positions
+        sequences.add(text[start:start + length])
+    return positions, sequences
+
+
+# Mojibake is a property of a whole text layer: every non-ASCII character comes out
+# mangled. A match made only by an accented letter before punctuation
+# ("ferm\u00e9\u2026\u201d" reads as one) is ordinary typography, so matches count as
+# garbage only when the layer has a typical one -- the reading of a Latin-1 letter (lead
+# byte C2 or C3, "\u00c3\u00a9") or of typographic punctuation ("\u00e2\u20ac\u2122") --
+# or MIN_MOJIBAKE_SEQUENCES distinct ones.
+MIN_MOJIBAKE_SEQUENCES = 2
+_TYPICAL_MOJIBAKE = (chr(0xC2), chr(0xC3), chr(0xE2) + chr(0x20AC))
+
+
+def _mangled(sequences: set) -> bool:
+    """Whether the mojibake matches of a layer make it a mangled layer (see MIN_MOJIBAKE_SEQUENCES)."""
+    return len(sequences) >= MIN_MOJIBAKE_SEQUENCES or any(seq.startswith(_TYPICAL_MOJIBAKE) for seq in sequences)
+
+
+# Icon and symbol fonts put their glyphs in the private-use area: stars, bullets,
+# arrows. Their glyphs are icons, not garbage; so are the private-use glyphs of any
+# font when a span holds only a short row of them (MAX_ICON_GLYPHS) on a page that
+# otherwise reads as text (MIN_PAGE_LETTERS letters).
+_ICON_FONT = re.compile(r"awesome|icon|glyph|symbol|wingding|webding|dingbat|material|emoji|zapf|fontello|"
+                        r"entypo|octicon", re.IGNORECASE)
+MAX_ICON_GLYPHS = 5
+MIN_PAGE_LETTERS = 10
 
 
 def _is_private_use(code: int) -> bool:
@@ -213,15 +261,16 @@ def _script_weight(code: int) -> float:
     return 1.0
 
 
-def _scan_text(text: str) -> Tuple[int, int, float]:
+def _scan_text(text: str, *, mojibake: bool = True, icons: bool = False) -> Tuple[int, int, float]:
     """(garbage glyphs, counted characters, legible weight) of one run of text.
 
-    Counted characters are the non-whitespace ones, except a lone private-use glyph
-    (an icon or bullet from a symbol font), which is neither text nor garbage.
-    Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, mojibake sequences.
+    Counted characters are the non-whitespace ones, except private-use glyphs that are
+    icons or bullets (a lone one; all of them when ``icons``), which are neither text
+    nor garbage. Garbage: U+FFFD, ``(cid:N)``, control codes, private-use runs, and
+    mojibake sequences when ``mojibake``.
     """
     text = _CID.sub("\ufffd", text)
-    mojibake = _mojibake_positions(text)
+    mangled = _mojibake_positions(text)[0] if mojibake else set()
     garbage = counted = 0
     weight = 0.0
     for index, char in enumerate(text):
@@ -230,10 +279,10 @@ def _scan_text(text: str) -> Tuple[int, int, float]:
         code = ord(char)
         if _is_private_use(code):
             neighbours = (text[index - 1] if index else "", text[index + 1] if index + 1 < len(text) else "")
-            if not any(n and _is_private_use(ord(n)) for n in neighbours):
+            if icons or not any(n and _is_private_use(ord(n)) for n in neighbours):
                 continue
             garbage += 1
-        elif char == "\ufffd" or code < 0x20 or 0x7F <= code <= 0x9F or index in mojibake:
+        elif char == "\ufffd" or code < 0x20 or 0x7F <= code <= 0x9F or index in mangled:
             garbage += 1
         else:
             weight += _script_weight(code)
@@ -246,7 +295,7 @@ def text_weight(text: str) -> float:
     non-garbage characters, a CJK ideograph counting ``IDEOGRAPH_WEIGHT`` and a
     kana or hangul syllable ``SYLLABLE_WEIGHT``. This is the unit of
     ``IMAGE_PAGE_TEXT_LIMIT``."""
-    return _scan_text(text)[2]
+    return text_layer_stats([(text, 0.0)]).weight
 
 
 @dataclass(frozen=True)
@@ -264,17 +313,31 @@ class TextLayerStats:
         return self.garbage_glyphs >= MIN_GARBAGE_GLYPHS and self.garbage_ratio >= GARBAGE_TEXT_RATIO
 
 
-def text_layer_stats(spans: Iterable[Tuple[str, float]]) -> TextLayerStats:
-    """Measure a text layer given as ``(text, font size)`` runs in reading order.
+def _layer_runs(spans: Iterable[Sequence]) -> List[Tuple[float, int, int, float]]:
+    """(font size, garbage glyphs, counted characters, legible weight) of each run of a text
+    layer, judged in the context of the whole layer (see :func:`text_layer_stats`)."""
+    spans = [(span[0] or "", float(span[1] or 0.0), span[2] if len(span) > 2 else "") for span in spans]
+    mojibake = _mangled(set().union(*(_mojibake_positions(text)[1] for text, _, _ in spans)))
+    letters = sum(1 for text, _, _ in spans for char in text if char.isalpha() and not _is_private_use(ord(char)))
+    runs = []
+    for text, size, font in spans:
+        private = sum(1 for char in text if _is_private_use(ord(char)))
+        icons = bool(private) and (bool(_ICON_FONT.search(font or ""))
+                                   or (private <= MAX_ICON_GLYPHS and letters >= MIN_PAGE_LETTERS))
+        runs.append((size,) + _scan_text(text, mojibake=mojibake, icons=icons))
+    return runs
+
+
+def text_layer_stats(spans: Iterable[Sequence]) -> TextLayerStats:
+    """Measure a text layer given as ``(text, font size)`` or ``(text, font size, font name)``
+    runs in reading order.
 
     The body size is the character-weighted median font size; a character's
-    prominence is ``min(size / body size, MAX_PROMINENCE) ** 2``.
+    prominence is ``min(size / body size, MAX_PROMINENCE) ** 2``. Mojibake counts only
+    in a mangled layer (see ``MIN_MOJIBAKE_SEQUENCES``); private-use glyphs of icon
+    fonts, and short private-use rows on a page that otherwise reads as text, are icons.
     """
-    runs = []
-    for text, size in spans:
-        garbage, counted, weight = _scan_text(text or "")
-        if counted:
-            runs.append((float(size or 0.0), garbage, counted, weight))
+    runs = [run for run in _layer_runs(spans) if run[2]]
     if not runs:
         return TextLayerStats()
     by_size = sorted(runs)
@@ -297,6 +360,19 @@ def text_layer_stats(spans: Iterable[Tuple[str, float]]) -> TextLayerStats:
     )
 
 
+def legible_lines(lines: Sequence[Sequence[Sequence]]) -> List[bool]:
+    """Whether each line of a page's text layer (its runs, as for :func:`text_layer_stats`)
+    reads as text: fewer than ``GARBAGE_TEXT_RATIO`` of its characters are garbage, judged
+    in the context of the whole page (mojibake, icon glyphs)."""
+    runs = iter(_layer_runs([span for line in lines for span in line]))
+    verdicts = []
+    for line in lines:
+        line_runs = [next(runs) for _ in line]
+        garbage, counted = sum(run[1] for run in line_runs), sum(run[2] for run in line_runs)
+        verdicts.append(garbage < GARBAGE_TEXT_RATIO * counted if garbage else True)
+    return verdicts
+
+
 def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, text: str) -> Optional[float]:
     """Ask the optional legibility judge about a text layer; return its verdict or None.
 
@@ -308,11 +384,11 @@ def judge_text_layer(judge: Optional[LegibilityJudge], layer: TextLayerStats, te
       person could read (prose, tables, code, identifiers, any script), as opposed to
       text garbled by a broken text layer (substituted or shifted letters, mojibake,
       placeholder glyphs); or ``None`` when it cannot judge.
-    - It is consulted only where the deterministic detector cannot decide: for layers
+    - It is consulted only when an OCR provider is active (its verdict can only send a
+      page to OCR), and only where the deterministic detector cannot decide: for layers
       of at least ``MIN_JUDGED_CHARS`` characters that are not already garbled, once
-      per page. Below ``LEGIBILITY_JUDGE_THRESHOLD`` the page is treated as garbled:
-      OCR'd from its render when an OCR provider is active, otherwise kept and
-      reported.
+      per page. Below ``LEGIBILITY_JUDGE_THRESHOLD`` the page is treated as garbled and
+      OCR'd from its render.
     - ``None``, an exception or a value outside ``[0, 1]`` count as "cannot judge":
       the text is kept, exactly as without a judge.
     """
@@ -344,14 +420,15 @@ class PageSignals:
 
     ``image_coverage`` is the share of the page covered by raster images (the union of
     their visible rectangles). ``visible`` describes the painted text; ``invisible`` the
-    invisible text lying over what the page shows (see ``MIN_LAYER_INK``: a scanner's OCR
-    layer, a transparent copy of text baked into artwork). ``hidden_chars`` counts the
-    invisible characters over nothing visible. ``uncaptured_raster`` is the share of the
-    page covered by pictures the text route cannot OCR one by one (inline images,
-    picture tiles), ``uncaptured_ink`` the share showing other ink neither the text layer
-    nor the pictures account for (None when not measured: pages with a usable text layer
-    or image-dominant pages). ``judge_legibility`` is the optional judge's verdict on
-    :attr:`text_layer`.
+    invisible text lying over what the page shows (see ``LAYER_DPI``: a scanner's OCR
+    layer, a transparent copy of text baked into artwork or drawn as outlines).
+    ``hidden_chars`` counts the invisible characters over nothing visible.
+    ``uncaptured_raster`` is the share of the page covered by pictures the text route
+    cannot OCR one by one (inline images, picture tiles), ``uncaptured_ink`` the share
+    showing other ink (line art left out) neither the text layer nor the pictures account
+    for. Both are measured only on pages without a usable text layer that are not
+    searchable scans (``uncaptured_ink`` is None when not measured, and on image-dominant
+    pages). ``judge_legibility`` is the optional judge's verdict on :attr:`text_layer`.
     """
 
     image_coverage: float = 0.0

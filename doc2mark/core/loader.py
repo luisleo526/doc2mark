@@ -116,7 +116,8 @@ class UnifiedDocumentLoader:
             # Text-layer quality gate (PDF):
             legibility_judge: Optional ``judge(page_text) -> Optional[float]``
                 returning the probability that a page's extracted text is legible, or
-                None when it cannot judge. Consulted only for text layers the
+                None when it cannot judge. Consulted only when OCR is active
+                (``ocr_images=True`` with an OCR provider) and only for text layers the
                 deterministic garbage detector does not flag; see
                 doc2mark.core.strategy.judge_text_layer for the full contract.
         """
