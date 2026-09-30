@@ -130,8 +130,9 @@ class TableData(BaseModel):
     Invariants enforced by validators:
     - cells is always rectangular (ragged rows padded)
     - All spans clamped to table bounds
-    - A span never covers a non-empty cell: such spans are shrunk (widest first,
-      then tallest) so every value stays visible
+    - A span never covers a cell holding other text (empty cells and cells repeating the
+      span's own text are absorbed): such spans are shrunk (widest first, then tallest) so
+      every value stays visible
     - Continuation cells marked for spanned regions
     - is_complex auto-detected from spans
     - No None values — empty Cell() for missing data
@@ -204,15 +205,16 @@ class TableData(BaseModel):
                     )
             padded.append(new_row)
 
-        # Pass 2: Mark continuation cells. A span may only cover empty cells that no
-        # earlier span claimed (an empty cell's own span, e.g. one repeated on every
-        # position of a merged range, is absorbed); a span that would cover text is
-        # shrunk (keep the widest run of free cells in its first row, then as many rows
-        # as stay free across that width), so no value is ever hidden.
+        # Pass 2: Mark continuation cells. A span may cover cells no earlier span claimed that
+        # are empty or repeat its own text (a merged range reported on, or filled into, every
+        # position it covers); a span that would cover other text is shrunk (keep the widest
+        # run of free cells in its first row, then as many rows as stay free across that
+        # width), so no value is ever hidden.
         claimed = set()
 
-        def is_free(r, c):
-            return (r, c) not in claimed and not padded[r][c].text.strip()
+        def is_free(r, c, text):
+            covered = padded[r][c].text.strip()
+            return (r, c) not in claimed and (not covered or covered == text)
 
         shrunk = 0
         for r in range(row_count):
@@ -220,11 +222,12 @@ class TableData(BaseModel):
                 cell = padded[r][c]
                 if cell.is_continuation or (cell.rowspan == 1 and cell.colspan == 1):
                     continue
+                text = cell.text.strip()
                 width = 1
-                while width < cell.colspan and is_free(r, c + width):
+                while width < cell.colspan and is_free(r, c + width, text):
                     width += 1
                 height = 1
-                while height < cell.rowspan and all(is_free(r + height, c + k) for k in range(width)):
+                while height < cell.rowspan and all(is_free(r + height, c + k, text) for k in range(width)):
                     height += 1
                 if (height, width) != (cell.rowspan, cell.colspan):
                     shrunk += 1
@@ -254,8 +257,12 @@ class TableData(BaseModel):
             log("TableData: shrank %d merged-cell span(s) that would have covered non-empty cells; "
                 "the covered values are kept as separate cells", shrunk)
 
-        # Auto-detect complexity
-        if not self.is_complex and any(c.rowspan > 1 or c.colspan > 1 for row in padded for c in row):
+        # Complexity follows the spans that are left: a table whose spans were all shrunk away
+        # renders as a simple table
+        has_span = any(c.rowspan > 1 or c.colspan > 1 for row in padded for c in row)
+        if shrunk:
+            self.is_complex = has_span
+        elif has_span:
             self.is_complex = True
 
         self.cells = padded

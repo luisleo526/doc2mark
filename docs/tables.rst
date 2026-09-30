@@ -66,6 +66,11 @@ Text drawn over other text is handled by what it is:
   right, so a typed value stays in one piece next to its label
   (``Name: John Smith ____``, ``姓名：＿＿＿ 王小明``); a single glyph dropped onto
   text stays in place (``[X] Yes [ ] No``).
+* Invisible text (an OCR layer: fully transparent, or neither filled nor stroked)
+  drawn over visible text in a cell is dropped; the visible glyphs are the text and
+  the hidden layer only repeats them, often with recognition errors
+  (``Acc0unt``, ``1,25O,OOO``). Invisible text with nothing visible under it, as on
+  a scanned page, is the cell's text.
 
 **Merged cells.** PyMuPDF reports the grid as rows of cell boxes (``None`` where a
 merged box covers a position). Column ``j`` starts at the ``j``-th distinct cell
@@ -91,34 +96,48 @@ A ruled single-row table (a signature line) is kept; a logo made of filled shape
 (one row of text), a frame of overlapping panels or a page-sized background is
 not, and its text stays with the normal text output.
 
-**Tables without vertical rules.** On pages where at least three text lines break
-into three or more pieces at wide gaps (at least 8 pt and one font size), the text
-is also searched with PyMuPDF's text strategy (``find_tables(strategy="text")``).
-Such a candidate is kept only when, after caption and note lines above and below
-it are set aside:
+**Tables without vertical rules.** A page is also searched with PyMuPDF's text
+strategy (``find_tables(strategy="text")``) when at least three of its text lines
+break into three or more pieces at wide gaps (at least 8 pt and one font size) and
+some column of those pieces (sharing a left or right edge) is at least 60% numbers;
+a multi-column directory or article has the gaps but no such column and costs
+nothing extra. A candidate is kept only when, after caption and note lines above
+and below it are set aside:
 
 * it has at least three rows and three columns (two columns when booktabs rules
   run above and below it),
 * at least one column besides the first is mostly numbers,
 * no row's text runs across a column boundary with ordinary word spacing (a
   boundary that splits a label in most rows, such as ``Line item | 1``, is merged
-  instead) and no word straddles a boundary,
+  instead), and no word straddles a column boundary or the table's left or right
+  edge (text running on past the last column, such as a long comment or a sidebar
+  set on the same lines, would be cut off),
 * at least half of its cells have text, at most a quarter of its rows have a
-  single cell, and 70% of its cells are short (at most 40 characters).
+  single cell, and 70% of its cells are short (at most 40 characters),
+* it is not a table of contents (dot leaders, or entries whose only number is a
+  last-column page number that never goes down),
+* every text block that touches it lies inside it. The text output skips each text
+  block that touches a table, so a caption, lead-in sentence or note set at the
+  rows' own leading -- which puts it in the same block as the rows -- would
+  otherwise be lost; such a table stays text instead.
 
 A wrapped line of a cell (closer to its row than rows are to each other, no
 numbers) stays in that cell. Prose, two-column articles, key/value blocks, tables
-of contents and slide text boxes fail these checks and stay text. Measured on 1,379
-pages of reference PDFs (reports, decks, forms, scans with a text layer), the
-search found 18 tables, all real, and no false ones.
+of contents, slide text boxes and sidebars fail these checks and stay text.
+Measured on 1,379 pages of reference PDFs (reports, decks, forms, scans with a text
+layer), the search found 18 tables, all real, and no false ones; a reviewer's set
+of adversarial pages (tables inside paragraphs, a free-text last column, a sidebar,
+tables of contents) keeps every word.
 
 **Header rows.** A header row that PyMuPDF finds just above the ruled cells (drawn
 without borders, for example bold names over a rule) becomes the table's header
-when it names at least two columns. When a page's first table continues the
-previous page's last table -- consecutive pages, nothing but the running
-header/footer bands between them, the same column edges -- its first row is kept
-as its header only if it repeats the previous header or is styled as one (bold
-over plain rows). Otherwise the first row stays a data row: the previous header
+when it names at least two columns, and only if no text block around it reaches
+outside the table and the header. When a page's first table continues the previous
+page's last table -- consecutive pages, the same column edges, nothing after the
+previous table but the page's bottom 8%, and nothing above this one but lines in
+the top 8% that repeat a line from the previous page's top 8% (a running header;
+a heading over a new table is not one) -- its first row is kept as its header only
+if it repeats the previous header or is styled as one (bold over plain rows). Otherwise the first row stays a data row: the previous header
 is repeated when it is known to be a header (bold, or drawn above the cells), and
 an empty header row is used when it is not, because a plain first row may just as
 well be the first pair of a key/value form.
@@ -155,12 +174,14 @@ From ``TableData`` to clean HTML
 * pad ragged rows to a rectangle,
 * clamp every span to the table bounds (a ``rowspan`` can never run past the last
   row),
-* never let a span cover a non-empty cell: such a span is shrunk to the widest run
-  of empty cells in its first row, then to as many rows as stay empty across that
-  width, so no value is ever hidden (a warning is logged the first time this
-  happens),
+* never let a span cover a cell with other text: a span absorbs empty cells and
+  cells that repeat its own text (a merged range reported on, or filled into, every
+  position it covers), and is otherwise shrunk to the widest run of such cells in
+  its first row, then to as many rows as stay free across that width, so no value
+  is ever hidden (a warning is logged the first time this happens),
 * mark the positions covered by a span as *continuation* cells, and
-* auto-set ``is_complex = True`` when any span is present.
+* set ``is_complex = True`` when any span is present -- and back to ``False`` when
+  the spans that made a table complex were all shrunk away.
 
 A ``TableRenderer`` then renders it. The renderer chooses its output from the
 ``table_style`` you configured (see below). For a complex table the default

@@ -9,9 +9,10 @@
   cell, over all tables on the page, that contains its centre. A nested table keeps
   its own text and overlapping cells never share a character. Within a cell a text
   run is dropped only when it redraws another run's text over it at the same size
-  and baseline (fake-bold overprint, a duplicated text layer); *different* text drawn
-  over text (a value typed over ``____``, a tick over a checkbox, a watermark) is
-  kept and read word by word from left to right. Otherwise the text is assembled the
+  and baseline (fake-bold overprint, a duplicated text layer), or when it is an
+  invisible OCR layer over visible text; *different* text drawn over text (a value
+  typed over ``____``, a tick over a checkbox, a watermark) is kept and read word by
+  word from left to right. Otherwise the text is assembled the
   way ``Table.extract()`` does it: words split at spaces and gaps wider than 3 pt,
   lines kept apart with ``\\n``.
 * **Merged cells.** ``rowspan``/``colspan`` are measured from each drawn cell box
@@ -19,7 +20,8 @@
 * **Plausibility.** A grid is kept as a table when it has text in at least two rows
   and two columns, or when its cell borders are drawn as lines (strokes or hairline
   fills). A grid without drawn borders that has overlapping cells or covers most of
-  the page is page decoration, not a table.
+  the page is page decoration, not a table. A table never claims a region whose text
+  it does not emit (:func:`claims_only_its_text`).
 * **Headers.** A header row that PyMuPDF finds just above the ruled cells (drawn
   without borders) becomes the table's header row; see :func:`continue_table`
   for tables that run on across a page break.
@@ -29,7 +31,7 @@ import bisect
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pymupdf
 
@@ -57,9 +59,9 @@ _LIGATURES = {"ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl", "ﬁ": "fi", "ﬂ": "fl",
 class Char:
     """One character with the geometry ``Table.extract()`` uses (small glyph heights)."""
 
-    __slots__ = ("text", "x0", "top", "x1", "bottom", "cx", "cy", "size", "run", "upright", "bold")
+    __slots__ = ("text", "x0", "top", "x1", "bottom", "cx", "cy", "size", "run", "upright", "bold", "visible")
 
-    def __init__(self, text, x0, top, x1, bottom, size, run, upright, bold):
+    def __init__(self, text, x0, top, x1, bottom, size, run, upright, bold, visible=True):
         self.text = text
         self.x0, self.top, self.x1, self.bottom = x0, top, x1, bottom
         self.cx = (x0 + x1) / 2
@@ -68,6 +70,7 @@ class Char:
         self.run = run  # MuPDF line number: characters drawn as one text run share it
         self.upright = upright
         self.bold = bold
+        self.visible = visible  # False for invisible text (an OCR layer: render mode 3, alpha 0)
 
 
 def read_chars(textpage, matrix=None) -> List[Char]:
@@ -96,11 +99,13 @@ def read_chars(textpage, matrix=None) -> List[Char]:
             for span in line.get("spans", ()):
                 size = span.get("size", 0.0)
                 bold = bool(span.get("flags", 0) & 16 or span.get("char_flags", 0) & 8)
+                # invisible text: fully transparent, or neither filled nor stroked (render mode 3)
+                visible = span.get("alpha", 255) != 0 and ("char_flags" not in span or bool(span["char_flags"] & 48))
                 for char in span.get("chars", ()):
                     x0, y0, x1, y1 = char["bbox"]
                     if matrix is not None:
                         x0, y0, x1, y1 = pymupdf.Rect(x0, y0, x1, y1) * matrix
-                    chars.append(Char(char["c"], x0, y0, x1, y1, size, run, upright, bold))
+                    chars.append(Char(char["c"], x0, y0, x1, y1, size, run, upright, bold, visible))
     return chars
 
 
@@ -155,6 +160,29 @@ def _redraws(b: _Run, a: _Run) -> bool:
     tolerance = 0.6 * size
     return (a.x0 - tolerance <= b.x0 and b.x1 <= a.x1 + tolerance
             and 2 * len(b.ink) >= len(a.ink) and _is_subsequence(b.ink, a.ink))
+
+
+def _without_hidden_copies(chars: Sequence[Char]) -> Sequence[Char]:
+    """Drop invisible text (an OCR layer) drawn over visible text: the visible glyphs are the text,
+    the hidden layer repeats them, often with recognition errors. Invisible text with nothing
+    visible under it (a scanned cell) is kept."""
+    hidden = [char for char in chars if not char.visible and not char.text.isspace()]
+    if not hidden:
+        return chars
+    shown = sorted((char for char in chars if char.visible and not char.text.isspace()), key=lambda char: char.cy)
+    if not shown:
+        return chars
+    mids = [char.cy for char in shown]
+    covered: Dict[int, List[int]] = {}
+    for char in hidden:
+        lo = bisect.bisect_left(mids, char.cy - 0.5 * char.size)
+        hi = bisect.bisect_right(mids, char.cy + 0.5 * char.size)
+        over = any(min(char.x1, other.x1) > max(char.x0, other.x0) for other in shown[lo:hi])
+        counts = covered.setdefault(char.run, [0, 0])
+        counts[0] += 1
+        counts[1] += over
+    dropped = {run for run, (total, over) in covered.items() if 2 * over >= total}
+    return [char for char in chars if char.visible or char.run not in dropped]
 
 
 def _without_redrawn_runs(chars: Sequence[Char]) -> Sequence[Char]:
@@ -309,17 +337,11 @@ def cell_text(chars: Sequence[Char]) -> str:
     """The text of one cell (or any region) from its characters in stream order."""
     if not chars:
         return ""
-    chars = _without_redrawn_runs(chars)
+    chars = _without_redrawn_runs(_without_hidden_copies(chars))
     upright = [char for char in chars if char.upright]
     rotated = [char for char in chars if not char.upright]
     parts = [_upright_text(upright) if upright else "", _rotated_text(rotated) if rotated else ""]
     return "\n".join(part for part in parts if part).strip()
-
-
-def region_text(chars: Sequence[Char], bbox: Rect) -> str:
-    """The text of the characters whose centre lies in ``bbox``."""
-    x0, y0, x1, y1 = bbox
-    return cell_text([char for char in chars if x0 <= char.cx < x1 and y0 <= char.cy < y1])
 
 
 # --- grids ------------------------------------------------------------------------------------------------
@@ -631,10 +653,7 @@ class PageTable:
 
     @property
     def bbox(self) -> Rect:
-        if not self.header_bbox:
-            return self.grid_bbox
-        a, b = self.grid_bbox, self.header_bbox
-        return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+        return _union(self.grid_bbox, self.header_bbox) if self.header_bbox else self.grid_bbox
 
     def rows(self) -> Tuple[List[List[str]], Dict[Tuple[int, int], Tuple[int, int]]]:
         rows = [[text or "" for text in row] for row in self.cells]
@@ -686,6 +705,15 @@ def _overlaps(a: Rect, b: Rect) -> bool:
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+def _touches(a: Rect, b: Rect) -> bool:
+    """Overlap as the text output tests it: boxes that merely touch count."""
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _union(a: Rect, b: Rect) -> Rect:
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
 def extract_page_tables(page, found_tables: Sequence, textpage=None, text_tables: bool = True
                         ) -> Tuple[List[PageTable], Optional[List[Char]]]:
     """Turn ``page.find_tables()`` results into validated :class:`PageTable` objects, and
@@ -726,10 +754,19 @@ def extract_page_tables(page, found_tables: Sequence, textpage=None, text_tables
         if len(kept) != len(grids):
             logger.debug(f"Page {page.number + 1}: {len(grids) - len(kept)} table candidate(s) are not tabular")
             outside = assign_chars(chars, kept)
+        blocks = None
         for grid in kept:
             table = PageTable.from_grid(grid)
-            table.header, table.header_bbox = _external_header(grid.table, grid.n_cols)
-            table.header_known = table.header is not None
+            header, header_bbox = _external_header(grid.table, grid.n_cols)
+            if header_bbox is not None:
+                # the header's box joins the table's only if no text block there reaches outside both
+                if blocks is None:
+                    blocks = text_blocks(page)
+                near = [block for block in blocks if _touches(block[0], header_bbox)]
+                if not claims_only_its_text(_union(grid.bbox, header_bbox), near):
+                    header, header_bbox = None, None
+            table.header, table.header_bbox = header, header_bbox
+            table.header_known = header is not None
             tables.append(table)
         header_boxes = [t.header_bbox for t in tables if t.header_bbox]
         if header_boxes:
@@ -751,19 +788,35 @@ _NUMERIC = re.compile(r"[(\[]?[-+−–]?\s?[$€£¥]?\s?\d[\d\s,.'’]*%?[)\]]
 _GAP = 8.0  # a gap at least this wide (and at least one font size) separates two columns
 
 
-def _looks_columnar(words: Sequence[tuple]) -> bool:
-    """Cheap gate before the text-strategy search: at least three text lines on the page
-    that break into three or more pieces at wide gaps. ``words`` are ``(x0, y0, x1, y1, ...)``."""
+def _looks_tabular(words: Sequence[tuple]) -> bool:
+    """Cheap gate before the text-strategy search. ``words`` are ``(x0, y0, x1, y1, text, ...)``.
+
+    At least three text lines must break into three or more pieces at wide gaps, and some
+    column of pieces (pieces after the first on their line that share a left or a right
+    edge within 3 pt) must have at least three pieces, 60% of them numbers. A directory or
+    a multi-column layout has the gaps but no such column.
+    """
     lines = _clusters(list(words), lambda word: round((word[1] + word[3]) / 2, 1), Y_TOLERANCE)
     columnar = 0
+    columns: Dict[Tuple[str, int], List[int]] = {}
     for line in lines:
         line = sorted(line, key=lambda word: word[0])
-        gaps = sum(1 for a, b in zip(line, line[1:]) if b[0] - a[2] >= max(_GAP, 0.8 * (a[3] - a[1])))
-        if gaps >= 2:
-            columnar += 1
-            if columnar >= 3:
-                return True
-    return False
+        pieces = [[line[0]]]
+        for a, b in zip(line, line[1:]):
+            if b[0] - a[2] >= max(_GAP, 0.8 * (a[3] - a[1])):
+                pieces.append([b])
+            else:
+                pieces[-1].append(b)
+        if len(pieces) < 3:
+            continue
+        columnar += 1
+        for piece in pieces[1:]:
+            number = bool(_NUMERIC.fullmatch(" ".join(word[4] for word in piece)))
+            for key in (("left", round(piece[0][0] / 3)), ("right", round(piece[-1][2] / 3))):
+                counts = columns.setdefault(key, [0, 0])
+                counts[0] += 1
+                counts[1] += number
+    return columnar >= 3 and any(numbers >= 3 and numbers >= 0.6 * total for total, numbers in columns.values())
 
 
 def _ink_extent(chars: Sequence[Char]) -> Optional[Tuple[float, float, float]]:
@@ -871,11 +924,14 @@ def _text_table(grid: TableGrid, chars: Sequence[Char], words: Sequence[tuple], 
     col_edges = [grid.col_edges[group[0]] for group in groups] + [grid.col_edges[groups[-1][-1] + 1]]
     top, bottom = grid.row_edges[rows[0]], grid.row_edges[last_row + 1]
     x0, x1 = col_edges[0], col_edges[-1]
-    # no word may straddle a column boundary
+    # no word may straddle a column boundary, nor the table's left or right edge (text running on
+    # past the last column would be cut off)
     for w in words:
         if top <= (w[1] + w[3]) / 2 < bottom and w[2] > x0 and w[0] < x1:
-            if any(w[0] < edge - 1 and w[2] > edge + 1 for edge in col_edges[1:-1]):
+            if any(w[0] < edge - 1 and w[2] > edge + 1 for edge in col_edges):
                 return None
+    if _is_table_of_contents(table):
+        return None
     bold = []
     for record in records:
         ink = [char for r in record for c in range(grid.n_cols) if (r, c) in cells
@@ -884,11 +940,66 @@ def _text_table(grid: TableGrid, chars: Sequence[Char], words: Sequence[tuple], 
     return PageTable(table, {}, (x0, top, x1, bottom), col_edges, bold)
 
 
+_LEADER = re.compile(r"\.{4,}|(?:\. ){3,}|…{2,}|·{3,}")
+_PAGE_NUMBER = re.compile(r"\d{1,3}")
+
+
+def _is_table_of_contents(table: List[List[str]]) -> bool:
+    """Dot leaders, or entries whose only number is a last-column page number that never goes down
+    (``Chapter 2 | Market overview | p. 5 | 5``): a table of contents, which reads better as text."""
+    if any(_LEADER.search(text) for row in table for text in row):
+        return True
+    last = [row[-1].strip() for row in table if row[-1].strip()]
+    others = [text.strip() for row in table for text in row[1:-1] if text.strip()]
+    if len(last) < 3 or not all(_PAGE_NUMBER.fullmatch(text) for text in last):
+        return False
+    pages = [int(text) for text in last]
+    if any(b < a for a, b in zip(pages, pages[1:])):
+        return False
+    return not any(_NUMERIC.fullmatch(text) for text in others)
+
+
 def _ruled_rows(bbox: Rect, horizontal) -> bool:
     """Is the region bounded by horizontal rules spanning most of its width (booktabs)?"""
     x0, y0, x1, y1 = bbox
     spans = [(y, s0, s1) for y, s0, s1 in horizontal if min(s1, x1) - max(s0, x0) >= 0.8 * (x1 - x0)]
     return (any(y0 - 12 <= y <= y0 + 6 for y, _, _ in spans) and any(y1 - 6 <= y <= y1 + 12 for y, _, _ in spans))
+
+
+def text_blocks(page) -> List[Tuple[Rect, List[Tuple[Rect, float]]]]:
+    """The text blocks the text output reads (``get_text("dict")`` with its flags), each as its box
+    and the boxes and sizes of its non-blank spans, in the coordinates ``find_tables()`` uses."""
+    matrix = page.rotation_matrix if page.rotation else None
+
+    def box(bbox) -> Rect:
+        return tuple(pymupdf.Rect(bbox) * matrix) if matrix is not None else tuple(bbox)
+
+    blocks = []
+    for block in page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)["blocks"]:
+        if block.get("type") != 0:
+            continue
+        spans = [(box(span["bbox"]), span["size"]) for line in block["lines"] for span in line["spans"]
+                 if span["text"].strip()]
+        blocks.append((box(block["bbox"]), spans))
+    return blocks
+
+
+def claims_only_its_text(bbox: Rect, blocks: Sequence[Tuple[Rect, List[Tuple[Rect, float]]]]) -> bool:
+    """Does every text block that touches ``bbox`` lie inside it?
+
+    The text output skips every block that touches a table's box, so a box that touches a block
+    with text outside it (a caption or note set at the rows' own leading, a sidebar, the rest of a
+    comment) would silently drop that text.
+    """
+    x0, y0, x1, y1 = bbox
+    for block_bbox, spans in blocks:
+        if not _touches(block_bbox, bbox):
+            continue
+        for (sx0, sy0, sx1, sy1), size in spans:
+            slack = 0.35 * size  # the text output measures full glyph heights, the table small ones
+            if sx0 < x0 - 1 or sx1 > x1 + 1 or sy0 < y0 - slack or sy1 > y1 + slack:
+                return False
+    return True
 
 
 def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Rect],
@@ -901,9 +1012,12 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
     at least one column besides the first is mostly numbers, no row's text runs across a
     column boundary with ordinary word spacing (a boundary that splits a label in most rows
     is merged instead), no word straddles a boundary, at least half the cells have text, at
-    most a quarter of the rows have a single cell, and 70% of the cells are short (at most
-    40 characters). Prose, two-column layouts, key/value blocks and slide text boxes fail
-    these checks, so their text stays with the text path.
+    most a quarter of the rows have a single cell, 70% of the cells are short (at most 40
+    characters), it is not a table of contents, no word runs over its left or right edge, and
+    every text block touching it lies inside it (:func:`claims_only_its_text`). Prose, two-column
+    layouts, key/value blocks, slide text boxes and tables of contents fail these checks, and so
+    does a table whose caption, notes or neighbouring text share a text block with its rows; their
+    text stays with the text path.
 
     ``chars`` are the page characters outside ``exclude`` (the tables already found), or None
     when they have not been read yet; the second value returned is that list, read if needed.
@@ -917,7 +1031,7 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
             words = [tuple(pymupdf.Rect(w[:4]) * matrix) + tuple(w[4:]) for w in words]
     words = [w for w in words if not any(b[0] <= (w[0] + w[2]) / 2 < b[2] and b[1] <= (w[1] + w[3]) / 2 < b[3]
                                          for b in exclude)]
-    if not _looks_columnar(words):
+    if not _looks_tabular(words):
         return [], chars
     if chars is None:
         chars = read_chars(textpage) if textpage is not None else page_chars(page)
@@ -929,6 +1043,7 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
         logger.debug(f"Text-strategy table search failed: {e}")
         return [], chars
     tables: List[PageTable] = []
+    blocks = None
     for candidate in candidates:
         try:
             grid = TableGrid(candidate)
@@ -938,6 +1053,10 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
             continue
         table = _text_table(grid, chars, words, _ruled_rows(grid.bbox, segments()[0]))
         if table is not None:
+            if blocks is None:
+                blocks = text_blocks(page)
+            if not claims_only_its_text(table.grid_bbox, blocks):
+                continue
             tables.append(table)
             x0, y0, x1, y1 = table.grid_bbox
             chars = [char for char in chars if not (x0 <= char.cx < x1 and y0 <= char.cy < y1)]
@@ -948,16 +1067,31 @@ def find_text_tables(page, chars: Optional[Sequence[Char]], exclude: Sequence[Re
 
 @dataclass
 class TableCarry:
-    """The last table of a page, when nothing but the page footer follows it."""
+    """The last table of a page, when nothing but the page's bottom 8% follows it."""
 
     page_num: int
     col_edges: List[float]
     header: HeaderRow
     header_is_known: bool  # the header row is known to be a header (styled, or drawn above the cells)
+    header_lines: Set[str] = field(default_factory=set)  # text lines in that page's top band
 
 
 def _has_text(chars: Sequence[Char], top: float, bottom: float) -> bool:
     return any(top < char.cy < bottom and not char.text.isspace() for char in chars)
+
+
+def _lines(chars: Sequence[Char], top: float, bottom: float) -> Set[str]:
+    """The text lines with their middle between ``top`` and ``bottom``, digits masked (so running
+    headers and footers with page numbers compare equal from page to page)."""
+    runs: Dict[int, List[Char]] = {}
+    for char in chars:
+        runs.setdefault(char.run, []).append(char)
+    lines = set()
+    for run in runs.values():
+        ink = [char for char in run if not char.text.isspace()]
+        if ink and top < sorted(char.cy for char in ink)[len(ink) // 2] < bottom:
+            lines.add(re.sub(r"\d+", "#", " ".join("".join(char.text for char in run).split())))
+    return lines
 
 
 def _header_is_known(table: PageTable) -> bool:
@@ -972,14 +1106,16 @@ def continue_table(tables: List[PageTable], outside: Sequence[Char], page_num: i
     """Keep the first data row of a table continued from the previous page out of the header.
 
     The first table on this page continues the previous page's last table when the pages
-    are consecutive, nothing but the running header/footer bands separates the two, and
-    the columns line up (same left and right edges, and each column edge of this table is
-    one of the previous table's). If its first row repeats the previous header, or is
-    styled as a header (bold over a non-bold row), it keeps that header. Otherwise its
-    first row is data: it gets the previous page's header row when that row is known to be
-    a header (bold over non-bold, or drawn above the ruled cells) and the columns are the
-    same, and an empty header row otherwise -- a plain first row may just as well be the
-    first key/value pair of a form, and repeating it would duplicate data.
+    are consecutive, the columns line up (same left and right edges, and each column edge of
+    this table is one of the previous table's), nothing but the bottom 8% of the previous page
+    follows the previous table, and the only text above this table is in the top 8% of this
+    page and repeats a line from the previous page's top 8% (a running header; page numbers
+    masked). A heading over a new table is not a running header. If its first row repeats
+    the previous header, or is styled as a header (bold over a non-bold row), it keeps that
+    header. Otherwise its first row is data: it gets the previous page's header row when that
+    row is known to be a header (bold over non-bold, or drawn above the ruled cells) and the
+    columns are the same, and an empty header row otherwise -- a plain first row may just as
+    well be the first key/value pair of a form, and repeating it would duplicate data.
 
     Returns the carry for the next page.
     """
@@ -991,7 +1127,9 @@ def continue_table(tables: List[PageTable], outside: Sequence[Char], page_num: i
             abs(a - b) <= EDGE_TOLERANCE for a, b in zip(edges, previous))
         lined_up = (abs(edges[0] - previous[0]) <= EDGE_TOLERANCE and abs(edges[-1] - previous[-1]) <= EDGE_TOLERANCE
                     and all(any(abs(a - b) <= EDGE_TOLERANCE for b in previous) for a in edges))
-        if first.header is None and lined_up and not _has_text(outside, band, first.bbox[1] - 1):
+        only_running_header = (not _has_text(outside, band, first.bbox[1] - 1)
+                               and _lines(outside, -1.0, first.bbox[1] - 1) <= carry.header_lines)
+        if first.header is None and lined_up and only_running_header:
             repeated = [text for text, _ in carry.header if text]
             own = [text for text in first.first_row_texts() if text]
             if own != repeated and not _header_is_known(first):
@@ -1005,4 +1143,5 @@ def continue_table(tables: List[PageTable], outside: Sequence[Char], page_num: i
     last = max(tables, key=lambda t: t.bbox[3])
     if _has_text(outside, last.bbox[3] + 1, page_height - band):
         return None
-    return TableCarry(page_num, list(last.col_edges), last.header_row(), _header_is_known(last))
+    return TableCarry(page_num, list(last.col_edges), last.header_row(), _header_is_known(last),
+                      _lines(outside, -1.0, band))
