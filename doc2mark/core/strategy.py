@@ -186,6 +186,11 @@ def _mojibake_positions(text: str) -> set:
         raw = [_byte_of(char) for char in text[start:start + length]]
         if len(raw) < length or any(b is None or not 0x80 <= b <= 0xBF for b in raw[1:]):
             continue
+        # A no-break space after an accented capital or a sign is ordinary typography
+        # ("S\u00c9CURIT\u00c9\u00a0:", "210\u00a0\u00d7\u00a0297"); it is mojibake only
+        # after the Latin-1 readings of the two most common lead bytes.
+        if 0xA0 in raw[1:] and lead not in (0xC2, 0xC3):
+            continue
         try:
             bytes([lead] + raw[1:]).decode("utf-8")
         except UnicodeDecodeError:

@@ -374,9 +374,9 @@ def page_number_title_pdf(path: Path, number: str, title: str, body: Sequence[st
 
 
 def table_with_hidden_text_pdf(path: Path, intro: Sequence[str], rows: Sequence[Sequence[str]],
-                               hidden_in_cell: str, hidden_below: str) -> Path:
-    """A text page with a ruled table; one INVISIBLE word sits inside the last column of the second
-    row, and an invisible line sits below the table."""
+                               hidden_in_cell: str, hidden_below: str, *, render_mode: int = 3) -> Path:
+    """A text page with a ruled table; one INVISIBLE word (``render_mode`` 3, or 7: clip only) sits
+    inside the last column of the second row, and an invisible line sits below the table."""
     doc = pymupdf.open()
     page = text_page(doc, intro)
     x0, y0, col_w, row_h = MARGIN, 300, 150, 30
@@ -388,8 +388,8 @@ def table_with_hidden_text_pdf(path: Path, intro: Sequence[str], rows: Sequence[
         for c, value in enumerate(row):
             page.insert_text((x0 + c * col_w + 5, y0 + r * row_h + 20), value, fontsize=10)
     page.insert_text((x0 + (len(rows[0]) - 1) * col_w + 70, y0 + row_h + 20), hidden_in_cell, fontsize=5,
-                     render_mode=3)
-    insert_lines(page, [hidden_below], top=y0 + len(rows) * row_h + 60, fontsize=10, render_mode=3)
+                     render_mode=render_mode)
+    insert_lines(page, [hidden_below], top=y0 + len(rows) * row_h + 60, fontsize=10, render_mode=render_mode)
     return _save(doc, path)
 
 
@@ -444,4 +444,26 @@ def report_with_outlined_notice_pdf(path: Path, report: Sequence[str], notice: S
     doc = pymupdf.open()
     text_page(doc, report)
     vector_page(doc, notice, fontsize=12, color=(0.45, 0.45, 0.45))
+    return _save(doc, path)
+
+
+def off_layer_and_hidden_text_pdf(path: Path, visible: Sequence[str], off_layer: str, hidden: str) -> Path:
+    """A text page with one line in an optional-content layer that is OFF by default (not shown) and one
+    INVISIBLE line."""
+    doc = pymupdf.open()
+    page = text_page(doc, visible)
+    layer = doc.add_ocg("Draft notes", on=False)
+    page.insert_text((MARGIN, 500), off_layer, fontsize=11, oc=layer)
+    insert_lines(page, [hidden], top=600, fontsize=11, render_mode=3)
+    return _save(doc, path)
+
+
+def report_with_covered_text_scan_pdf(path: Path, report: Sequence[str], scan_text: str, covered: str) -> Path:
+    """A text page, then a scanned page (one full-page picture, no text layer) under which a line of real
+    text was painted first, so the picture hides it."""
+    doc = pymupdf.open()
+    text_page(doc, report)
+    page = doc.new_page(width=A4[0], height=A4[1])
+    insert_lines(page, [covered], top=A4[1] / 2, fontsize=11)
+    page.insert_image(page.rect, stream=pdfgen.text_png(scan_text))
     return _save(doc, path)

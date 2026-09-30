@@ -463,13 +463,26 @@ class UnifiedDocumentLoader:
             logger.debug("Email processor not available; skipping .eml support")
 
     def _judge_identity(self) -> Optional[str]:
-        """A stable name for the configured legibility judge (for cache keys)."""
+        """A stable name for the configured legibility judge (for cache keys).
+
+        A judge can name its own configuration with a ``cache_key`` attribute; otherwise
+        its qualified name (plus the arguments of a ``functools.partial``) is used.
+        """
         judge = getattr(self, "legibility_judge", None)
         if judge is None:
             return None
-        target = getattr(judge, "__func__", judge)
-        name = getattr(target, "__qualname__", None) or type(judge).__qualname__
-        return f"{getattr(target, '__module__', type(judge).__module__)}.{name}"
+        try:
+            explicit = getattr(judge, "cache_key", None)
+            if explicit is not None:
+                return str(explicit)
+            target = getattr(judge, "func", None) or getattr(judge, "__func__", None) or judge
+            name = getattr(target, "__qualname__", None) or type(target).__qualname__
+            identity = f"{getattr(target, '__module__', type(target).__module__)}.{name}"
+            if getattr(judge, "func", None) is not None:  # functools.partial
+                identity += repr((getattr(judge, "args", ()), getattr(judge, "keywords", {})))
+            return identity
+        except Exception:
+            return type(judge).__qualname__
 
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:

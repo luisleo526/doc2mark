@@ -17,6 +17,9 @@ invisible text that must not become content.
 """
 import logging
 import math
+import os
+import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
@@ -379,74 +382,128 @@ def measure_page(page, *, ocr_rects: Callable[[object], List[pymupdf.Rect]] = la
     )
 
 
-def _redacted_copy(page, drop: Sequence[Bbox], guard: Sequence[Bbox]):
-    """A one-page copy of ``page`` with the invisible text under ``drop`` removed, or None.
+def _reopen(page):
+    """A second handle on the page's document (same file, so its layer (OCG) state is kept)."""
+    name = page.parent.name
+    if name and os.path.exists(name):
+        return pymupdf.open(name)
+    return pymupdf.open("pdf", page.parent.tobytes())
 
-    With PyMuPDF's invisible-text redaction (1.27+) only invisible glyphs go; otherwise all
-    glyphs under a rectangle go, so rectangles touching ``guard`` (visible text, text to
-    keep) are left alone and only the span filter of :class:`VisibleTextPage` applies there.
+
+def _redacted_copy(page, drop: Sequence[Bbox], visible: Sequence[Bbox], keep: Sequence[Bbox]):
+    """A second handle on the page's document whose copy of the page has the invisible text
+    under ``drop`` removed, or None.
+
+    Rectangles clear of visible text and of text to keep lose every glyph under them
+    (this also removes render mode 7 text). Rectangles touching visible text lose only
+    their invisible glyphs, which needs PyMuPDF's invisible-text redaction (1.27+);
+    without it they are left to the span filter of :class:`VisibleTextPage`.
     """
     invisible_only = getattr(pymupdf, "PDF_REDACT_TEXT_REMOVE_INVISIBLE", None)
-    copy = pymupdf.open()
+    keep = [pymupdf.Rect(bbox) for bbox in keep]
+    visible = [pymupdf.Rect(bbox) for bbox in visible]
+    clear, touching = [], []
+    for bbox in drop:
+        rect = pymupdf.Rect(bbox)
+        if any(rect.intersects(other) for other in keep):
+            continue
+        (touching if any(rect.intersects(other) for other in visible) else clear).append(rect)
+    passes = [(clear, pymupdf.PDF_REDACT_TEXT_REMOVE)]
+    if invisible_only is not None:
+        passes.append((touching, invisible_only))
+    if not any(rects for rects, _ in passes):
+        return None
+    copy = None
     try:
-        copy.insert_pdf(page.parent, from_page=page.number, to_page=page.number)
-        target = copy[0]
-        guard = [pymupdf.Rect(bbox) for bbox in guard]
-        added = 0
-        for bbox in drop:
-            rect = pymupdf.Rect(bbox)
-            if any(rect.intersects(other) for other in guard):
-                continue
-            target.add_redact_annot(rect, fill=False)
-            added += 1
-        if added:
-            target.apply_redactions(
-                images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-                text=invisible_only if invisible_only is not None else pymupdf.PDF_REDACT_TEXT_REMOVE,
-            )
-            return copy
+        copy = _reopen(page)
+        target = copy[page.number]
+        for rects, mode in passes:
+            if rects:
+                for rect in rects:
+                    target.add_redact_annot(rect, fill=False)
+                target.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                                        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=mode)
+        return copy
     except Exception as exc:
         logger.debug(f"Could not strip invisible text from page {page.number + 1}: {exc}")
-    copy.close()
-    return None
+        if copy is not None:
+            copy.close()
+        return None
 
 
 def text_source(page, measure: PageMeasure, keep_layer: bool):
-    """``(page, copy)``: the page as the text and table extractors must read it, and the one-page
-    document to close afterwards (None when no copy was made).
+    """``(page, document)``: the page as the text and table extractors must read it, and a
+    document to close afterwards (None when the page itself is returned).
 
     Hidden text never reaches them; the text layer of what the page shows only when
     ``keep_layer`` (its pictures are not OCR'd in this run). Table cells are read by
-    PyMuPDF's table finder, so the invisible text is removed from a one-page copy; the
-    returned page also filters ``get_text("dict" | "rawdict")`` in case a span could not
-    be removed.
+    PyMuPDF's table finder, so the invisible text is removed from a second copy of the
+    page; the returned page also filters ``get_text("dict" | "rawdict")`` in case a span
+    could not be removed.
     """
     drop = list(measure.hidden_rects) + ([] if keep_layer else list(measure.layer_rects))
     if not drop:
         return page, None
     keep = list(measure.layer_rects) if keep_layer else []
-    invisible_only = getattr(pymupdf, "PDF_REDACT_TEXT_REMOVE_INVISIBLE", None) is not None
-    copy = _redacted_copy(page, drop, keep + ([] if invisible_only else list(measure.visible_rects)))
-    source = copy[0] if copy is not None else page
+    copy = _redacted_copy(page, drop, measure.visible_rects, keep)
+    source = copy[page.number] if copy is not None else page
     return VisibleTextPage(source, keep_rects=[pymupdf.Rect(bbox) for bbox in keep],
                            trace_origins=measure.trace_origins), copy
 
 
+def _tokens(text: str) -> List[str]:
+    return re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold())
+
+
+def _reproduced(line: str, ocr_words: str) -> bool:
+    """Whether at least 80 % of the line's word characters appear, word by word, in the OCR
+    text (markup, punctuation, case and spacing ignored)."""
+    tokens = _tokens(line)
+    total = sum(len(token) for token in tokens)
+    return not total or sum(len(token) for token in tokens if token in ocr_words) >= 0.8 * total
+
+
+_COVERING = ("fill-image", "fill-imgmask", "fill-shade", "fill-path")
+
+
+def _shown(bbox: pymupdf.Rect, log: list, pix: pymupdf.Pixmap, to_pixels: pymupdf.Matrix) -> bool:
+    """Whether painted text in ``bbox`` shows on the page: not painted over by a later picture
+    or shape, and drawn with enough contrast to its background."""
+    painted = [index for index, (kind, box) in enumerate(log)
+               if kind.endswith("-text") and pymupdf.Rect(box).intersects(bbox)]
+    after = painted[-1] if painted else -1
+    area = abs(bbox.width * bbox.height) or 1.0
+    for kind, box in log[after + 1:]:
+        if kind in _COVERING and abs((pymupdf.Rect(box) & bbox).get_area()) >= 0.9 * area:
+            return False
+    box = (bbox * to_pixels).irect & pix.irect
+    part = _box_samples(pix.samples, pix.stride, box) if not box.is_empty else b""
+    return bool(part) and _ink_share(part, _background(part)) >= MIN_LAYER_INK
+
+
 def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str]:
-    """The page's painted, legible text lines that ``ocr_text`` does not reproduce (compared
-    without whitespace and case)."""
+    """The page's painted, legible text lines that ``ocr_text`` does not reproduce and that the
+    page visibly shows (text painted over by a picture, or drawn in its background colour,
+    never reaches the OCR and is not content)."""
     if not measure.signals.visible.chars or measure.signals.visible.garbled:
         return []
-    seen = "".join(ocr_text.split()).casefold()
-    missing = []
+    ocr_words = "".join(_tokens(ocr_text))
+    candidates = []
     for block in page.get_text("dict", flags=TEXT_FLAGS).get("blocks", []):
         for line in block.get("lines", []) if block.get("type") == 0 else []:
-            text = "".join(span.get("text", "") for span in line.get("spans", [])
-                           if not span_is_invisible(span, measure.trace_origins)).strip()
-            if text and "".join(text.split()).casefold() not in seen:
-                missing.append(text)
-    return missing
+            spans = [span for span in line.get("spans", []) if not span_is_invisible(span, measure.trace_origins)]
+            text = "".join(span.get("text", "") for span in spans).strip()
+            if text and not _reproduced(text, ocr_words):
+                candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans))))
+    if not candidates:
+        return []
+    try:
+        log = page.get_bboxlog()
+        pix, to_pixels = _grey_render(page)
+        return [text for text, bbox in candidates if _shown(bbox, log, pix, to_pixels)]
+    except Exception as exc:  # cannot tell what shows: keep the text (verbatim first)
+        logger.debug(f"Visibility check failed on page {page.number + 1}: {exc}")
+        return [text for text, _ in candidates]
 
 
 def describe_pages(page_numbers: Sequence[int], limit: int = 10) -> str:

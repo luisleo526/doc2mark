@@ -29,6 +29,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     judge_text_layer as _judge_text_layer,
     pages_without_text as _pages_without_text,
     VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
+    MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
 )
 from doc2mark.pipelines import pdf_routing  # noqa: E402
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
@@ -686,7 +687,8 @@ class PDFLoader:
             logger.warning(f"{name}: no text could be extracted from its {n} page(s){hint}")
         elif ocr_active:
             silent = [i for i, page in enumerate(signals) if i + 1 not in emitted
-                      and (page.image_coverage > 0 or page.uncaptured_content or page.invisible.chars)]
+                      and (page.image_coverage >= _MIN_UNCAPTURED_RASTER or page.uncaptured_content
+                           or page.invisible.chars)]
             if silent:
                 logger.warning(f"{name} {pdf_routing.describe_pages(silent)}: no text was extracted although the "
                                f"page shows content (the OCR returned nothing)")
