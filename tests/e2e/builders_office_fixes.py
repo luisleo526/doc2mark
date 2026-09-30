@@ -501,3 +501,160 @@ def xlsx_for_metadata(path: Path) -> Path:
         {"title": "Notes", "rows": [["Reviewed by finance"]]},
         {"title": "Empty", "rows": []},
     ])
+
+
+# --------------------------------------------------------------------------- Review round 1
+
+
+def docx_markup_edge_cases(path: Path) -> Path:
+    """Paragraphs whose runs put Markdown markup next to characters that change it: a backslash right
+    before or inside bold text and at the end of a link's text, ``!`` right before a link, a literal ``*``
+    on a line with bold text, a bold run next to a bold link that is not written (a relative target),
+    bold / bold-italic / italic runs that touch, a link whose text holds ``]:`` at the start of a line,
+    a backtick in a link's text, and a bold fullwidth letter inside a fullwidth word. Returns ``path``;
+    the paragraphs' plain texts are ``MARKUP_EDGE_TEXTS``."""
+    document = Document()
+    p = document.add_paragraph("Install to C:" + chr(92))
+    p.add_run("Program Files").bold = True
+    p.add_run(" now.")
+    p = document.add_paragraph()
+    p.add_run("share" + chr(92)).bold = True
+    p.add_run(" next")
+    p = document.add_paragraph("Open ")
+    _hyperlink(p, "C:" + chr(92) + "docs" + chr(92), url="https://example.com/docs")
+    p.add_run(" today.")
+    p = document.add_paragraph("Yahoo!")
+    _hyperlink(p, "Mail", url="https://mail.yahoo.com/")
+    p.add_run(" today.")
+    p = document.add_paragraph("Replace CHANGE_ME_* with the value. ")
+    p.add_run("Keep this secret.").bold = True
+    p = document.add_paragraph()
+    p.add_run("詳見").bold = True
+    _hyperlink(p, "附件一", url="附件一.xlsx", bold=True)
+    p.add_run("。")
+    p = document.add_paragraph()
+    p.add_run("Remark.").bold = True
+    run = p.add_run("(1)")
+    run.bold = run.italic = True
+    p.add_run("(2)").italic = True
+    p = document.add_paragraph()
+    _hyperlink(p, "a]: b", url="https://example.com/x")
+    p.add_run(" tail")
+    p = document.add_paragraph("Run ")
+    _hyperlink(p, "a`b", url="https://example.com/y")
+    p.add_run(" and c`d.")
+    p = document.add_paragraph("ＰＤ")
+    p.add_run("Ｆ").bold = True
+    p.add_run("檔案")
+    document.save(str(path))
+    return Path(path)
+
+
+MARKUP_EDGE_TEXTS = [
+    "Install to C:" + chr(92) + "Program Files now.",
+    "share" + chr(92) + " next",
+    "Open C:" + chr(92) + "docs" + chr(92) + " today.",
+    "Yahoo!Mail today.",
+    "Replace CHANGE_ME_* with the value. Keep this secret.",
+    "詳見附件一。",
+    "Remark.(1)(2)",
+    "a]: b tail",
+    "Run a`b and c`d.",
+    "ＰＤＦ檔案",
+]
+
+
+def _styled_text_box_run(style_id: str, text: str) -> str:
+    """XML of a run holding a text box whose one paragraph ``text`` has the paragraph style ``style_id``."""
+    ids = _Ids()
+    ids.next = 300
+    paragraph = (f'<w:p><w:pPr><w:pStyle w:val="{style_id}"/></w:pPr>'
+                 f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>')
+    shape = (
+        '<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2286000" cy="457200"/>'
+        '</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>'
+        f'<wps:txbx><w:txbxContent>{paragraph}</w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp>'
+    )
+    return (f'<w:r {NAMESPACES}><mc:AlternateContent><mc:Choice Requires="wps">'
+            f'{_anchor(ids, shape, "http://schemas.microsoft.com/office/word/2010/wordprocessingShape")}'
+            f'</mc:Choice><mc:Fallback><w:pict>{_vml_shape(ids, [text])}</w:pict></mc:Fallback>'
+            '</mc:AlternateContent></w:r>')
+
+
+def docx_header_edge_cases(path: Path) -> Path:
+    """A header with a symbol-only paragraph (``★★★★☆``), a Title-styled paragraph, a bullet and a
+    numbered item; a body that starts with a second-level bullet, then two numbered items with a text box
+    holding a third numbered item (same list style) between them."""
+    document = Document()
+    header = document.sections[0].header
+    header.paragraphs[0].text = "★★★★☆"
+    header.add_paragraph("ACME Quarterly Report 7000", style="Title")
+    header.add_paragraph("Header bullet 7001", style="List Bullet")
+    header.add_paragraph("Header numbered 7002", style="List Number")
+    document.add_paragraph("Body bullet level two 7101", style="List Bullet 2")
+    document.add_paragraph("A plain body paragraph between the lists 7150.")
+    document.add_paragraph("Body step one 7201", style="List Number")
+    anchor = document.add_paragraph("Anchor of the boxed step 7250.")
+    style_id = document.styles["List Number"].style_id
+    _append_run(anchor, _styled_text_box_run(style_id, "Boxed step 7301"))
+    document.add_paragraph("Body step two 7202", style="List Number")
+    document.save(str(path))
+    return Path(path)
+
+
+def docx_repeated_header_parts(path: Path, sections: int = 3) -> Path:
+    """``sections`` sections (each on a new page), each with its OWN header part (not linked to the
+    previous one) holding the same text ``ACME CONFIDENTIAL 8801``, and the same footer text
+    ``Distribution list 8802`` in its own footer part; body ``Section N body 8900``."""
+    document = Document()
+    for number in range(1, sections + 1):
+        section = document.sections[0] if number == 1 else document.add_section(WD_SECTION.NEW_PAGE)
+        if number > 1:
+            section.header.is_linked_to_previous = False
+            section.footer.is_linked_to_previous = False
+        section.header.paragraphs[0].text = "ACME CONFIDENTIAL 8801"
+        section.footer.paragraphs[0].text = "Distribution list 8802"
+        document.add_paragraph(f"Section {number} body 8900.")
+    document.save(str(path))
+    return Path(path)
+
+
+def pptx_master_field_deck(path: Path) -> Path:
+    """Two blank slides; the slide master draws a text box ``Page `` + slide-number FIELD (``‹#›``)."""
+    prs = Presentation()
+    tree = prs.slide_master.shapes._spTree
+    shape_id = max(int(e.get("id")) for e in tree.iter(f"{{{P_NS}}}cNvPr")) + 1
+    paragraph = ('<a:p><a:r><a:rPr lang="en-US"/><a:t>Page </a:t></a:r>'
+                 '<a:fld id="{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}" type="slidenum"><a:rPr lang="en-US"/>'
+                 f'<a:t>{chr(0x2039)}#{chr(0x203A)}</a:t></a:fld></a:p>')
+    tree.append(etree.fromstring(
+        f'<p:sp xmlns:p="{P_NS}" xmlns:a="{A_NS}"><p:nvSpPr>'
+        f'<p:cNvPr id="{shape_id}" name="Page box {shape_id}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+        '<p:spPr><a:xfrm><a:off x="457200" y="6400800"/><a:ext cx="2286000" cy="369332"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+        f'<p:txBody><a:bodyPr wrap="none"/><a:lstStyle/>{paragraph}</p:txBody></p:sp>'))
+    for number in (1, 2):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Emu(457200), Emu(457200), Emu(7315200), Emu(914400))
+        box.text_frame.text = f"Slide body 96{number}0"
+    prs.save(str(path))
+    return Path(path)
+
+
+def docx_one_picture(path: Path, label: str) -> Path:
+    """A text document with one small picture showing ``label``."""
+    document = Document()
+    document.add_paragraph("Inspection report. " + FILLER)
+    document.add_paragraph().add_run().add_picture(io.BytesIO(label_picture(label)), width=Inches(1.5))
+    document.save(str(path))
+    return Path(path)
+
+
+def docx_two_pictures(path: Path, first: str, second: str) -> Path:
+    """Like :func:`docx_one_picture` with two pictures (``first`` then ``second``)."""
+    document = Document()
+    document.add_paragraph("Inspection report. " + FILLER)
+    for label in (first, second):
+        document.add_paragraph().add_run().add_picture(io.BytesIO(label_picture(label)), width=Inches(1.5))
+    document.save(str(path))
+    return Path(path)

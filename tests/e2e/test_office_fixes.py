@@ -408,3 +408,170 @@ def test_14_failed_ocr_is_not_cached_and_the_run_with_a_key_reads_the_pictures(e
     assert (output["issues"] or {}).get("failed", 0) >= 1, output
     assert requests >= 1, output
     assert "LOT 4471 PART" in output["second"] and UNAVAILABLE not in output["second"], output
+
+
+# --------------------------------------------------------------------------- Review round 1 (#30)
+
+
+def rendered_paragraphs(markdown: str) -> List[str]:
+    """The text of every paragraph a reader sees (Python-Markdown), whitespace-normalized."""
+    return [builders_ocr.normalize(p.get_text()) for p in builders_ocr.render(markdown).find_all("p")]
+
+
+def test_r1_inline_markup_never_changes_what_a_reader_sees(run_cli, e2e_dir):
+    """Review of #30 (findings 1-3, nits 1-3): markup put right after a backslash, after "!", on a line with a
+    literal "*", between touching runs, around a link text holding "]:" or a backtick, or inside a fullwidth
+    word changed what a reader sees (a consumed backslash, an image instead of a link, a moved "*", "****",
+    a URL shown as text) or split a word. Every paragraph now reads as its text in the document."""
+    path = build.docx_markup_edge_cases(e2e_dir / "markup.docx")
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    md = result.markdown
+    assert builders_ocr.render(md).find_all("img") == [] and builders_ocr.active_html(md) == [], result.describe()
+    shown = rendered_paragraphs(md)
+    backtick = next(text for text in build.MARKUP_EDGE_TEXTS if "`" in text)
+    for text in build.MARKUP_EDGE_TEXTS:
+        if text != backtick:  # backticks are code-span syntax for any text, formatted or not
+            assert text in shown, f"{text!r} not shown\n{shown}\n{result.describe()}"
+    assert "example.com/y" not in builders_ocr.visible_text(md), result.describe()
+    assert "****" not in md and "ＰＤＦ檔案" in md, result.describe()
+
+
+def test_r1_header_paragraphs_keep_symbols_stay_out_of_the_outline_and_lists(run_cli, e2e_dir):
+    """Review of #30 (findings 4-7): a symbol-only header paragraph (``★★★★☆``) was dropped as a page number,
+    a Title-styled header paragraph became the document's ``#`` heading, a numbered header item and a numbered
+    item in a text box moved the body's numbers (2., 3., 4.), and a nested body bullet right after the header
+    block became a code block."""
+    path = build.docx_header_edge_cases(e2e_dir / "header_edges.docx")
+
+    result = run_cli(path, "--ocr", "none", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    md = result.markdown
+    [header] = region(md, "header")
+    assert "★★★★☆" in header and "ACME Quarterly Report 7000" in header, result.describe()
+    assert not [line for line in lines_of(md) if line.startswith("#")], result.describe()
+    lines = lines_of(md)
+    for line in ("1. Header numbered 7002", "1. Body step one 7201", "1. Boxed step 7301", "2. Body step two 7202"):
+        assert line in lines, f"{line!r}\n{result.describe()}"
+    page = builders_ocr.render(md)
+    assert page.find_all("pre") == [] and "Body bullet level two 7101" in [
+        builders_ocr.normalize(li.get_text()) for li in page.find_all("li")], result.describe()
+    types = {item["content"]: item["type"] for item in result.json["json_content"]}
+    assert types["ACME Quarterly Report 7000"] == "text:normal", types
+
+
+def test_r1_identical_headers_of_several_sections_are_written_once(run_cli, e2e_dir):
+    """Review of #30 (nit 8): each section with its own header part holding the same text (unlinked
+    headers, merged documents) repeated that text once per section; like a PDF running header, it is kept
+    once."""
+    path = build.docx_repeated_header_parts(e2e_dir / "repeated.docx")
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    md = result.markdown
+    assert md.count("ACME CONFIDENTIAL 8801") == 1 and md.count("Distribution list 8802") == 1, result.describe()
+    assert md.count("body 8900.") == 3, result.describe()
+
+
+def test_r1_fields_in_text_the_master_draws_are_not_slide_text(run_cli, e2e_dir):
+    """Review of #30 (finding 8): a master text box ``Page `` + slide-number field added ``Page ‹#›``."""
+    path = build.pptx_master_field_deck(e2e_dir / "master_field.pptx")
+
+    result = run_cli(path, "--ocr", "none")
+
+    assert result.exit_code == 0, result.describe()
+    md = result.markdown
+    assert SLIDE_NUMBER_PROMPT not in md, result.describe()
+    assert "Page" in lines_of(sections(md, "slide")[1]) and md.count("Page") == 1, result.describe()
+
+
+def test_r1_word_count_does_not_count_marker_comments(run_cli, e2e_dir):
+    """Review of #30 (nit 5): ``word_count`` of a Word file counted the words of the page and header marker
+    comments."""
+    path = build.docx_headers_and_footers(e2e_dir / "headers.docx")
+
+    result = run_cli(path, "--ocr", "none", fmt="json")
+
+    assert result.exit_code == 0, result.describe()
+    words = re.sub(r"<!--.*?-->", " ", result.json["content"]).split()
+    assert result.json["metadata"]["word_count"] == len(words), result.json["metadata"]
+
+
+def run_api(e2e_dir, script, *args):
+    """Run ``script`` with this interpreter (the public ``doc2mark`` Python API) and return its last stdout
+    line as JSON."""
+    proc = subprocess.run([sys.executable, "-c", script, *map(str, args)], cwd=e2e_dir, capture_output=True,
+                          text=True, encoding="utf-8", timeout=600)
+    assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+CACHED_HITS_SCRIPT = (
+    "import json, sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "from doc2mark.ocr.base import BaseOCR, OCRResult\n"
+    "from doc2mark.ocr.cache import MemoryOCRCache\n"
+    "class Switchable(BaseOCR):\n"
+    "    '''Answers every picture with CACHED ANSWER 5501 until it goes down; then every call raises.'''\n"
+    "    def __init__(self):\n"
+    "        super().__init__(api_key=None)\n"
+    "        self.down = False\n"
+    "    def batch_process_images(self, images, **kwargs):\n"
+    "        if self.down:\n"
+    "            raise RuntimeError('provider down')\n"
+    "        return [OCRResult(text='CACHED ANSWER 5501') for _ in images]\n"
+    "    def validate_api_key(self):\n"
+    "        return True\n"
+    "ocr = Switchable()\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=ocr, ocr_cache=MemoryOCRCache())\n"
+    "loader.load(sys.argv[1], ocr_images=True)\n"
+    "ocr.down = True\n"
+    "second = loader.load(sys.argv[2], ocr_images=True)\n"
+    "print(json.dumps({'content': second.content, 'issues': (second.metadata.extra or {}).get('ocr_issues')}))\n"
+)
+
+
+def test_r1_a_raised_batch_keeps_the_answers_the_ocr_cache_holds(e2e_dir):
+    """Review of #30 (finding 9): with an OCR cache (``ocr_cache=``, no CLI switch) holding the answer for one
+    picture, a batch call that raised for the other lost both: the cache wrapper raised for the whole batch.
+    The cached answer is used; only the picture the provider could not read is marked and counted."""
+    first = build.docx_one_picture(e2e_dir / "one.docx", "PART 5501")
+    second = build.docx_two_pictures(e2e_dir / "two.docx", "PART 5501", "PART 5502")
+
+    output = run_api(e2e_dir, CACHED_HITS_SCRIPT, first, second)
+
+    assert output["content"].count("CACHED ANSWER 5501") == 1, output
+    assert output["content"].count(UNAVAILABLE) == 1, output
+    assert (output["issues"] or {}).get("failed") == 1, output
+
+
+PDF_DOWN_SCRIPT = (
+    "import json, sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "from doc2mark.ocr.base import BaseOCR\n"
+    "class Down(BaseOCR):\n"
+    "    def __init__(self):\n"
+    "        super().__init__(api_key=None)\n"
+    "    def batch_process_images(self, images, **kwargs):\n"
+    "        raise RuntimeError('provider down')\n"
+    "    def validate_api_key(self):\n"
+    "        return True\n"
+    "result = UnifiedDocumentLoader(ocr_provider=Down()).load(sys.argv[1], ocr_images=True)\n"
+    "print(json.dumps((result.metadata.extra or {}).get('ocr_issues')))\n"
+)
+
+
+def test_r1_pdf_pages_of_a_raised_batch_are_failures_on_their_page(e2e_dir):
+    """Review of #30 (finding 10): the failures of a PDF batch call that raised had no page in
+    ``ocr_issues["locations"]``."""
+    pdf = builders_ocr.scan_pdf(e2e_dir / "scan.pdf", ["SCANNED PAGE ONE", "SCANNED PAGE TWO"])
+
+    issues = run_api(e2e_dir, PDF_DOWN_SCRIPT, pdf)
+
+    assert issues["failed"] == 2, issues
+    assert issues["locations"] == [{"issue": "failed", "image": 1, "page": 1},
+                                   {"issue": "failed", "image": 2, "page": 2}], issues
