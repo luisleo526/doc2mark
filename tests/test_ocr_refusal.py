@@ -161,6 +161,13 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "Sorry, I couldn't process the photos from the wedding yet.",
     "Unfortunately, I cannot provide a description of the driver.",
     "Unfortunately, I can't comply with the request to extend the lease.",
+    "Unfortunately, I cannot assist with processing your claim as it was filed after the deadline.",
+    "Sorry, I can't help with reading the contract until Monday.",
+    "I'm sorry, I can't help with identifying the bird, I'm no expert.",
+    "Unfortunately, I can't assist with transcribing the interviews until next week.",
+    "I'm sorry, I can't provide a transcription of the hearing until the judge approves it.",
+    "I'm sorry, I can't help with reading the text in your photo.",
+    "Sorry, I can't read the scans. It seems Dr. Lee has them.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -173,6 +180,16 @@ def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     "I'm unable to read the text in this image.",
     "I am unable to transcribe this image because the resolution is too low.",
     "I'm sorry, but I can't do that.",
+    "I'm sorry, I can't help with identifying people in images.",
+    "Sorry, I can't provide a transcription of copyrighted material.",
+    # with a model's stock follow-up
+    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
+    "I'm sorry, but I can't assist with that.\nIf you have any other questions, feel free to ask!",
+    "I'm sorry, I can't help with that. Is there anything else I can do for you?",
+    "I'm sorry, but I can't read the text in this image. It appears to be too blurry.",
+    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
+    "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
+    "I can't read the text in this image. It looks to be too dark.",
     "Illegible",
     "[Blank]",
     "No readable text",

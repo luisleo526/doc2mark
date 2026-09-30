@@ -257,6 +257,24 @@ def test_t10_free_form_table_without_the_usual_row_markup_is_kept(run_cli, fake_
     assert build.html_tables(result.markdown) == [[["Revenue", "1,200"]]], result.describe()
 
 
+@pytest.mark.parametrize("answer", [
+    pytest.param("Report\n<table>" + "<!-- row -->" * 30, id="comments-after-a-table-tag"),
+    pytest.param("<table><!--a-->" * 40_000 + " end", id="table-tags-each-with-a-comment"),
+    pytest.param("<table><!--" * 40_000, id="comments-that-never-end"),
+    pytest.param("<table" * 200_000, id="table-tags-that-never-close"),
+])
+def test_t10_repeated_comments_and_table_tags_do_not_stall_the_conversion(run_cli, fake_llm, scan, answer):
+    """Markup a model can repeat until max_tokens. None of it opens a table, and finding
+    that out must take neither exponential nor quadratic time."""
+    fake_llm.script(free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured", timeout=30)
+
+    assert result.exit_code == 0, result.describe()
+    assert build.html_tables(result.markdown) == [], result.describe()
+    assert result.markdown.count("&lt;table") == answer.count("<table"), "every mention stays as text"
+
+
 def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
     """A free-form answer cut off inside a table (max_tokens) still yields a sanitized table,
     not the table's markup as escaped text."""
@@ -346,6 +364,17 @@ def test_t19_caption_and_unit_text_next_to_the_table_are_kept(run_cli, fake_llm,
     assert "Table 3: Revenue by region" in visible, result.describe()
     assert "Unit: NT$ thousand" in visible, result.describe()
     assert build.html_tables(result.markdown) == [[["North", "1"]], [["South", "2"]]], result.describe()
+
+
+@pytest.mark.parametrize("html", [
+    "<table>Totals<tr><td>North</td>(provisional)<td>1</td></tr><tr><td>South</td><td>2</td></tr>Unit: NT$</table>",
+    "<table>Totals<td>North</td>(provisional)<td>1</td><tr><td>South</td><td>2</td></tr>Unit: NT$</table>",
+])
+def test_t19_text_between_rows_and_cells_keeps_its_reading_order(run_cli, fake_llm, scan, html):
+    result = _table_run(run_cli, fake_llm, scan, html)
+    visible = build.visible_text(result.markdown)
+    assert re.search(r"Totals.*\(provisional\).*Unit: NT\$", visible), result.describe()
+    assert build.html_tables(result.markdown) == [[["North", "1"], ["South", "2"]]], result.describe()
 
 
 def test_t19_markdown_table_in_the_html_field_is_kept(run_cli, fake_llm, scan):
@@ -463,6 +492,22 @@ def test_multilingual_no_text_answers_are_not_indexed(run_cli, fake_llm, scan, a
     assert ocr_issues(result).get("refused") == 1, result.json
 
 
+@pytest.mark.parametrize("answer", [
+    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
+    "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
+    "If you could provide a clearer image, I'd be happy to help!",
+    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
+])
+def test_refusal_with_a_stock_follow_up_is_not_indexed(run_cli, fake_llm, scan, answer):
+    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert build.squash(answer.split(".")[0]) not in build.squash(result.markdown), result.describe()
+    assert ocr_issues(result).get("refused") == 1, result.json
+
+
 def test_free_form_refusal_is_reported(run_cli, fake_llm, scan):
     fake_llm.script(free_form=[fake.refusal(REFUSAL)])
 
@@ -505,6 +550,9 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "I can't read the scans until Dr. Lee signs off.",
     "Sorry, I can't read the scans until Dr. Lee signs off.",
     "很抱歉，我無法處理這批照片，下週一再處理。",
+    "Sorry, I can't help with reading the contract until Monday.",
+    "I'm sorry, I can't provide a transcription of the hearing until the judge approves it.",
+    "Sorry, I can't read the scans. It seems Dr. Lee has them.",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])
