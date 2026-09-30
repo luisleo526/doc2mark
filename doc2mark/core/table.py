@@ -20,12 +20,12 @@ _SPAN_OVERLAP_LOGGED = False
 # --- Cell text escaping ------------------------------------------------------------
 # Every renderer passes cell text through these, following the escaping policy shared
 # with the Markdown body-text path: escape only what would change the table's
-# Markdown/HTML structure, keep everything else verbatim.
+# Markdown/HTML structure or make characters disappear, keep everything else verbatim.
 _LINE_BREAK = re.compile(r"\r\n|[\r\n\x0b\x0c\x85  ]")
 _CONTROL_CHAR = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")  # C0 controls except \t and \n
 _ENTITY_START = re.compile(r"&(?=#[0-9]+;|#[xX][0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]*;)")
 _TAG_START = re.compile(r"<(?=[A-Za-z/!?])")
-_PIPE = re.compile(r"(\\*)\|")
+_CONSUMED_BACKSLASH = re.compile(r"\\(?=[!-/:-@\[-`{-~]|$)")  # before ASCII punctuation or at the end
 
 
 def _plain_cell_text(text: str) -> str:
@@ -35,13 +35,24 @@ def _plain_cell_text(text: str) -> str:
 
 
 def markdown_cell(text: str) -> str:
-    """Cell text for a pipe table: one line (line breaks become spaces), ``|`` escaped as
-    ``\\|`` (backslashes right before it doubled so they survive), and ``<`` / ``&`` escaped
-    only where they would start an HTML tag or an entity. ``x < 5 & y`` stays as is."""
-    text = " ".join(line.strip() for line in _plain_cell_text(text).split("\n") if line.strip())
-    text = _ENTITY_START.sub("&amp;", text)
-    text = _TAG_START.sub("&lt;", text)
-    return _PIPE.sub(lambda m: m.group(1) * 2 + "\\|", text)
+    """Cell text for a pipe table: line breaks as ``<br>`` (GFM; blank lines at the ends
+    dropped), ``|`` escaped as ``\\|``, a backslash doubled where a Markdown renderer would
+    consume it (before ASCII punctuation, before a line break, at the end of the cell), and
+    ``<`` / ``&`` escaped only where they would start an HTML tag or an entity.
+    ``x < 5 & y`` stays as is."""
+    lines = [line.strip() for line in _plain_cell_text(text).split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "<br>".join(_markdown_cell_line(line) for line in lines)
+
+
+def _markdown_cell_line(line: str) -> str:
+    line = _CONSUMED_BACKSLASH.sub(r"\\\\", line)  # first: it looks at the characters as written
+    line = _ENTITY_START.sub("&amp;", line)
+    line = _TAG_START.sub("&lt;", line)
+    return line.replace("|", "\\|")
 
 
 def html_cell(text: str, quote: bool = False) -> str:

@@ -199,19 +199,23 @@ the first physical row and ``<td>`` elsewhere, attaches ``rowspan`` / ``colspan`
 only when greater than 1 and **skips continuation cells entirely**. Simple
 (span-free) tables render as ordinary pipe-delimited Markdown instead.
 
-Cell text is escaped only as far as the table structure needs, the same way in
-every style:
+Cell text is escaped only as far as the table structure needs, or to keep
+characters from disappearing, the same way in every style:
 
 * Line breaks of every kind (``\r\n``, ``\r``, vertical tab -- a soft line break in
-  PowerPoint --, form feed, U+2028/U+2029) become ``<br>`` in HTML cells and a
-  space in Markdown cells; other C0 control characters (except tab) are removed.
-* HTML cells escape ``&``, ``<`` and ``>`` (``styled_html`` also ``"``).
-* Markdown cells (pipe tables and ``markdown_grid``) escape ``|`` as ``\|`` (a
-  backslash right before it is doubled so it survives), ``<`` only where it would
-  start a tag (``<img …>`` becomes ``&lt;img …>``; ``x < 5`` stays as is) and ``&``
-  only where it would start an entity (``&lt;`` in the text becomes
-  ``&amp;lt;``). Everything else, including ``*``, ``_`` and backticks, is kept
-  verbatim.
+  PowerPoint --, form feed, U+2028/U+2029) become ``<br>`` in HTML and in Markdown
+  cells (a GFM pipe table has no other way to break a line; blank lines at the start
+  and end of a cell are dropped); other C0 control characters (except tab) are
+  removed.
+* HTML cells escape ``&``, ``<`` and ``>`` (``styled_html`` also ``"``); backslashes
+  are kept as they are.
+* Markdown cells (pipe tables and ``markdown_grid``) escape ``|`` as ``\|``, ``<``
+  only where it would start a tag (``<img …>`` becomes ``&lt;img …>``; ``x < 5``
+  stays as is) and ``&`` only where it would start an entity (``&lt;`` in the text
+  becomes ``&amp;lt;``). A backslash that a Markdown renderer would consume is
+  doubled, as in body text: before ASCII punctuation (``C:\*.txt`` becomes
+  ``C:\\*.txt``, ``\|`` becomes ``\\\|``), before a line break and at the end of
+  the cell. Everything else, including ``*``, ``_`` and backticks, is kept verbatim.
 
 Choosing the output style
 -------------------------
