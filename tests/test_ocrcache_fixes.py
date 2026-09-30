@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr import cache as cache_module
 from doc2mark.ocr.base import TASK_PROMPTS, OCRConfig, OCRResult, Task
-from doc2mark.ocr.cache import CachedOCR, RedisOCRCache, build_ocr_cache_key, ocr_settings_identity
+from doc2mark.ocr.cache import CachedOCR, RedisOCRCache, build_ocr_cache_key
 from doc2mark.ocr.openai import OpenAIOCR
 from doc2mark.ocr.refusal import screen_non_content
 from doc2mark.ocr.schema import OCRPage, RawExtraction
@@ -107,6 +107,8 @@ def test_a_task_given_as_text_or_as_task_is_one_key():
 
 
 def test_the_settings_identity_leaves_out_what_changes_no_answer():
+    from doc2mark.ocr.cache import ocr_settings_identity
+
     a = OpenAIOCR(api_key="key-a", timeout=5, max_retries=1, max_workers=2, config=OCRConfig(max_concurrency=4))
     b = OpenAIOCR(api_key="key-b", timeout=60, max_retries=5, max_workers=8, config=OCRConfig(max_concurrency=16))
 
