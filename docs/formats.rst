@@ -176,19 +176,29 @@ Reading order of PDF pages:
   turned tables) is read as it is displayed, so a table follows its title and the
   running header and page number stay at the edges.
 - Columns are read one after the other, top to bottom within each column: two or
-  three columns, of equal or unequal widths. Text, a figure or a caption across the
-  columns (a title, an abstract, a full-width figure) keeps its place between the
-  columns above and below it. Running headers open the page; footnotes and page
-  numbers close it.
+  three columns, of equal or unequal widths. Text, a picture, a drawing or a caption
+  across the columns (a title, an abstract, a full-width figure) keeps its place
+  between the columns above and below it; pictures and drawings do this also when
+  images are not extracted (the default). Running headers open the page; footnotes
+  and page numbers close it.
 - A sidebar or pull-quote beside the main text (much narrower, with fewer lines) is
   read after the text it stands beside, as a whole.
 - Columns need clear evidence: a vertical strip of white space between items that
-  stand side by side, running text (lines ten or more font sizes wide) beside text
-  on the other side, and nothing crossing the strip next to them. Items on the two
-  sides that start at the same heights (a form's labels and values, a grid of text
-  boxes, parallel texts) are rows, not columns. Without that evidence, and on pages
-  that mix different column layouts, the page keeps its top-to-bottom order.
-  Reordering never drops or repeats text: the pieces of a paragraph stay together.
+  stand side by side, running text (three lines ten or more font sizes wide, one
+  under the other) beside text on the other side, and nothing reaching across the
+  strip next to them. An item reaches across the strip when it passes both of its
+  edges or is centred in it: a line of ragged text that runs a few points into the
+  strip stays in its column. Text items of the two sides that are on the same rows
+  are rows, not columns: a form's labels and values, terms set level with or centred
+  on their definitions, a grid of text boxes. Two columns of running text count as
+  rows only when three quarters of their paragraphs (and at least two) start level on
+  both sides, as in parallel texts; paragraphs that start level by chance on a shared
+  line grid do not turn column reading off. Without that evidence, and on pages that
+  mix different column layouts, the page keeps its top-to-bottom order. Reordering
+  never drops or repeats text: the pieces of a paragraph stay together.
+- Text set across the page's reading direction (a vertical arXiv stamp in the margin,
+  a turned axis label) is plain text: it is never a heading or the title, and it does
+  not count as the page's largest font size.
 
 Legacy Office formats (DOC, PPT, PPS, XLS, RTF)
 -----------------------------------------------
