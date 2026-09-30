@@ -175,3 +175,20 @@ def noisy_scan_pdf(path: Path, pages: int, *, seed: int = 7) -> Path:
             xref = page.insert_image(page.rect, stream=picture)
         page.insert_text((MARGIN, A4[1] - 20), f"sheet {number}", fontsize=8)
     return _save(doc, path)
+
+
+def transparent_picture_pdf(path: Path, body: Sequence[str], lines: Sequence[str]) -> Path:
+    """An A4 text page with a transparent PNG picture of ``lines`` (black letters on a fully transparent
+    background, as charts and logos are often exported): in the PDF the letters' shape is only in the
+    image's soft mask, and its colour channels are black everywhere."""
+    image = Image.new("RGBA", (1200, 300), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=90)
+    y = 40
+    for line in lines:
+        draw.text((40, y), line, fill=(0, 0, 0, 255), font=font)
+        y += 120
+    doc = pymupdf.open()
+    page = text_page(doc, body)
+    page.insert_image(pymupdf.Rect(MARGIN, 400, MARGIN + 400, 500), stream=_png(image))
+    return _save(doc, path)

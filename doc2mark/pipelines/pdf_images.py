@@ -247,20 +247,51 @@ def _grey_samples(pix: pymupdf.Pixmap) -> np.ndarray:
     return grey.astype(np.int16)
 
 
+def _masked_pixmap(doc, xref: int) -> Optional[pymupdf.Pixmap]:
+    """The image XObject ``xref`` decoded (grey or RGB), with its soft mask as alpha; None when it has a
+    soft mask that cannot be applied (a transparent logo's colour channels alone may be flat)."""
+    pix = pymupdf.Pixmap(doc, xref)
+    if pix.colorspace is not None and pix.colorspace.n not in (1, 3):   # CMYK, DeviceN, ...
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    smask = doc.xref_get_key(xref, "SMask")
+    if smask[0] == "xref" and not pix.alpha:
+        mask = pymupdf.Pixmap(doc, int(smask[1].split()[0]))
+        if (mask.width, mask.height) != (pix.width, pix.height) or mask.n != 1:
+            return None
+        pix = pymupdf.Pixmap(pix, mask)
+    return pix
+
+
 def image_grey(doc, xref: int) -> Optional[np.ndarray]:
-    """The image XObject ``xref`` as a grey array, its soft mask applied (None when it cannot be decoded)."""
+    """The image XObject ``xref`` as a grey array, its soft mask applied; None when it cannot be decoded
+    or its soft mask cannot be applied."""
     try:
-        pix = pymupdf.Pixmap(doc, xref)
-        if pix.colorspace is not None and pix.colorspace.n not in (1, 3):   # CMYK, DeviceN, ...
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-        smask = doc.xref_get_key(xref, "SMask")
-        if smask[0] == "xref" and not pix.alpha:
-            mask = pymupdf.Pixmap(doc, int(smask[1].split()[0]))
-            if (mask.width, mask.height) == (pix.width, pix.height) and mask.n == 1:
-                pix = pymupdf.Pixmap(pix, mask)
-        return _grey_samples(pix)
+        pix = _masked_pixmap(doc, xref)
+        return None if pix is None else _grey_samples(pix)
     except Exception as exc:
         logger.debug(f"Could not decode image {xref} for its content check: {exc}")
+        return None
+
+
+def flattened_png(doc, xref: int) -> Optional[bytes]:
+    """For an image XObject with a soft mask (transparency), a PNG of it composited onto white, as a white
+    page shows it: the image's own colour channels may be flat (black letters whose shape is only in the
+    mask). None for an image without a soft mask, or when it cannot be composited."""
+    if doc.xref_get_key(xref, "SMask")[0] != "xref":
+        return None
+    try:
+        pix = _masked_pixmap(doc, xref)
+        if pix is None or not pix.alpha:
+            return None
+        samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width * pix.n]
+        samples = samples.reshape(pix.height, pix.width, pix.n).astype(np.float32)
+        share = samples[:, :, -1:] / 255.0
+        colour = samples[:, :, :-1] * share + 255.0 * (1.0 - share)
+        space = pymupdf.csRGB if colour.shape[2] == 3 else pymupdf.csGRAY
+        flat = pymupdf.Pixmap(space, pix.width, pix.height, np.round(colour).astype(np.uint8).tobytes(), 0)
+        return flat.tobytes("png")
+    except Exception as exc:
+        logger.debug(f"Could not composite image {xref} onto white: {exc}")
         return None
 
 

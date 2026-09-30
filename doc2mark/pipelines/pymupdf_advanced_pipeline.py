@@ -2124,7 +2124,7 @@ class PDFLoader:
                 # One request per image, however often it shows (per page when its neighbour
                 # pages go along as context: the answer then depends on the page).
                 job["identity"] = ("xref", picture.xref, page_num if ctx else None)
-                job["load"] = lambda xref=picture.xref: self._extract_image_bytes(xref)
+                job["load"] = lambda xref=picture.xref: self._picture_bytes(xref)
             else:
                 copies = getattr(self, "_copies", None)
                 try:
@@ -2138,6 +2138,14 @@ class PDFLoader:
                         copies.discard()
                 job["identity"] = ("image", _digest(job["image"]), _digest(ctx))
             yield job
+
+    def _picture_bytes(self, xref: int) -> Optional[Tuple[bytes, str, str]]:
+        """What OCR reads of an image XObject: a transparent image composited onto white (as the page
+        shows it), any other image as extracted (see _extract_image_bytes)."""
+        flattened = pdf_images.flattened_png(self.doc, xref)
+        if flattened is not None:
+            return flattened, "png", "image/png"
+        return self._extract_image_bytes(xref)
 
     def _ocr_batch_limit(self) -> int:
         """Images per OCR call: _OCR_BATCH_IMAGES, or twice the provider's concurrency when higher."""

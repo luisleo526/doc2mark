@@ -173,6 +173,19 @@ def test_plain_backgrounds_and_icons_are_not_sent_to_ocr(run_cli, require_tool, 
         assert all(line in text for line in lines), result.describe()
 
 
+def test_transparent_picture_is_read_as_the_page_shows_it(run_cli, require_tool, e2e_dir):
+    """A transparent PNG (black letters on a transparent background, how charts and logos are often exported)
+    reached OCR as its colour channels alone, a solid black rectangle, so its words were lost. OCR reads it
+    composited onto white, as the page shows it."""
+    require_tool("tesseract")
+    pdf = builders_images.transparent_picture_pdf(e2e_dir / "transparent.pdf", BODY, ["NET 4410 EUR"])
+
+    result = run_ocr(run_cli, pdf)
+
+    assert "4410" in result.markdown, result.describe()
+    assert all(line in words(result.markdown) for line in BODY), result.describe()
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Off-page pictures
 
