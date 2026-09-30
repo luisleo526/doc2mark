@@ -173,24 +173,25 @@ class TestPDFHeaderFooterDedup:
     """PDF with repeated header/footer on every page should dedup them."""
 
     def test_header_detected_on_all_pages(self):
+        """The running header's first copy stays as content; its repeats are text:header."""
         result = _load("test_rag_features.pdf")
         headers = [i for i in result.json_content if i["type"] == "text:header"]
         header_pages = {h.get("page") for h in headers}
-        assert len(header_pages) == 5, f"Expected headers on 5 pages, got {header_pages}"
+        assert header_pages == {2, 3, 4, 5}, f"Expected headers on pages 2-5, got {header_pages}"
 
     def test_footer_detected_on_all_pages(self):
         result = _load("test_rag_features.pdf")
         footers = [i for i in result.json_content if i["type"] == "text:footer"]
         footer_pages = {f.get("page") for f in footers}
-        assert len(footer_pages) == 5, f"Expected footers on 5 pages, got {footer_pages}"
+        assert footer_pages == {2, 3, 4, 5}, f"Expected footers on pages 2-5, got {footer_pages}"
 
     def test_header_excluded_from_markdown(self):
         result = _load("test_rag_features.pdf")
-        assert "ACME Corp" not in result.content, "Header should be excluded from markdown"
+        assert result.content.count("ACME Corp") == 1, "Only the header's first copy stays in markdown"
 
     def test_footer_excluded_from_markdown(self):
         result = _load("test_rag_features.pdf")
-        assert "Confidential" not in result.content, "Footer should be excluded from markdown"
+        assert result.content.count("Confidential") == 1, "Only the footer's first copy stays in markdown"
 
     def test_body_content_preserved(self):
         result = _load("test_rag_features.pdf")
@@ -339,7 +340,7 @@ class TestChunkingE2E:
         result = _load("test_rag_features.pdf")
         chunks = result.get_chunks(ChunkingConfig(max_chunk_size=10000, overlap=0))
         all_text = " ".join(c.content for c in chunks)
-        assert "ACME Corp" not in all_text, "Header should not appear in chunks"
+        assert all_text.count("ACME Corp") == 1, "Only the header's first copy should appear in chunks"
 
     def test_docx_chunks_have_sections(self):
         result = _load("test_rag_features.docx")
