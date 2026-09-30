@@ -16,6 +16,7 @@ import re
 import pytest
 
 from tests.e2e import builders_ocr as build
+from tests.e2e import builders_office as office
 from tests.e2e import fake_openai as fake
 from tests.e2e import pdfgen
 from tests.e2e.fake_openai import FakeOpenAI
@@ -613,6 +614,8 @@ def test_multilingual_no_text_answers_are_not_indexed(run_cli, fake_llm, scan, a
     "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
     "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
     "If you could provide a clearer image, I'd be happy to help!",
+    "I'm sorry, but I can't share that.",
+    "The image is too blurry to read.",
 ])
 def test_whole_answer_refusal_with_a_reason_or_a_courtesy_tail_is_not_indexed(run_cli, fake_llm, scan, answer):
     fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text(answer)])
@@ -702,6 +705,59 @@ def test_no_text_answer_does_not_wipe_the_figure_of_its_page(run_cli, fake_llm, 
     assert fake_llm.requests_of("free_form") == [], "a page with content must not be re-OCR'd"
 
 
+def test_blank_scanned_page_gets_no_marker(run_cli, fake_llm, e2e_dir):
+    """A genuinely blank scanned page that OCR reads as empty is not flagged in the Markdown."""
+    blank = build.scan_pdf(e2e_dir / "blank.pdf", pages="")
+    fake_llm.script(structured=[fake.page("")], free_form=[fake.text("")])
+
+    result = run_llm(run_cli, blank, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert "OCR returned no content" not in result.markdown, result.describe()
+
+
+@pytest.mark.parametrize("kind", ["pptx", "xlsx"])
+def test_office_ocr_issue_locations_name_the_slide_or_sheet(run_cli, fake_llm, e2e_dir, kind):
+    if kind == "pptx":
+        path = office.pptx_picture_deck(e2e_dir / "deck.pptx", ["FIRST 1111", "SECOND 2222"])
+        expected = [{"issue": "refused", "image": 1, "slide": 1}, {"issue": "refused", "image": 2, "slide": 2}]
+    else:
+        path = office.workbook(e2e_dir / "book.xlsx", [
+            {"title": "Summary", "rows": [["Total", 1]]},
+            {"title": "Q3 Parts", "rows": [["Item", "Picture"], ["Logo", None]],
+             "images": {"B2": office.plain_picture((160, 80))}},
+        ])
+        expected = [{"issue": "refused", "image": 1, "sheet": "Q3 Parts"}]
+    fake_llm.script(structured=[fake.page(REFUSAL)], free_form=[fake.text(REFUSAL)])
+
+    result = run_llm(run_cli, path, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert ocr_issues(result).get("locations") == expected, result.json
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx"])
+def test_office_cell_picture_ocr_text_is_escaped_once(run_cli, fake_llm, e2e_dir, kind):
+    """A picture in a table cell gets its OCR text in the cell ([Image: <text>]). The table
+    renderer escapes that text, so it must get the text as read, not already escaped: it
+    reads as the picture shows it, and a link in it stays dead."""
+    if kind == "docx":
+        path = build.docx_picture_in_cell(e2e_dir / "cell.docx")
+    else:
+        path = office.workbook(e2e_dir / "cell.xlsx", [{
+            "title": "Parts", "rows": [["Item", "Picture"], ["Logo", None]],
+            "images": {"B2": office.plain_picture((160, 80))}}])
+    fake_llm.script(structured=[fake.page("List<String> & [x](javascript:alert(1)) ![p](https://attacker.example/p.png)")])
+
+    result = run_llm(run_cli, path, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    visible = build.visible_text(result.markdown)
+    assert "List<String> &" in visible and "&lt;" not in visible, result.describe()
+    assert _links_and_images(result.markdown) == [], result.describe()
+    assert build.active_html(result.markdown) == [], result.describe()
+
+
 def test_refused_page_leaves_a_marker_and_its_location(run_cli, fake_llm, scan):
     fake_llm.script(structured=[fake.page(REFUSAL)], free_form=[fake.text(REFUSAL)])
 
@@ -765,6 +821,12 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "I'm sorry Dave, I'm afraid I can't do that.",
     "Leider kann ich das Foto nicht lesen, kannst du es nochmal schicken?",
     "No pude leer la foto, ¿me la mandas otra vez?",
+    # support replies asking for a new picture, and refusal-shaped sentences naming someone
+    "Sorry, I can't read this photo. Please send a clearer photo.",
+    "I can't read this scan. Please upload a clearer copy.",
+    "No puedo leer la imagen del recibo de Juan Pérez",
+    "Leider kann ich das Bild von Herrn Müller nicht erkennen.",
+    "很抱歉，我無法辨識王小明的照片",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])

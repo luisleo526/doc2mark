@@ -337,3 +337,38 @@ def test_withheld_fields_metrics_and_figures_leave_a_marker():
     assert "[2 illustrative metrics not transcribed]" in out
     assert "[1 illustrative figure not transcribed]" in out
     assert "$1,000" not in out
+
+
+# --------------------------------------------------------------------------- #
+# OCR text for a renderer that escapes it itself (review round 2: N1)         #
+# --------------------------------------------------------------------------- #
+from doc2mark.core.table import html_cell, markdown_cell  # noqa: E402
+from doc2mark.ocr.schema import plain_ocr_text  # noqa: E402
+
+_CELL_TEXT = "List<String> & [x](javascript:alert(1)) ![p](https://attacker.example/p.png)"
+
+
+def _cell_markdown(cell_text):
+    return "| Item | Picture |\n| --- | --- |\n| Logo | " + markdown_cell(f"[Image: {cell_text}]") + " |"
+
+
+def test_plain_ocr_text_of_a_structured_page_is_its_transcription():
+    page = OCRPage(raw=RawExtraction(text=_CELL_TEXT))
+    plain = plain_ocr_text(page.to_markdown(), page)
+    assert plain.startswith("List<String> & [x]") and "&lt;" not in plain
+    assert "List<String> &" in _rendered(_cell_markdown(plain)).get_text()
+    assert _live_links(_cell_markdown(plain)) == []
+
+
+def test_plain_ocr_text_of_a_free_form_answer_is_its_text():
+    plain = plain_ocr_text(_sanitize_markdown("**Parts:** " + _CELL_TEXT), None)
+    assert plain.startswith("Parts: List<String> &"), plain
+    assert "List<String> &" in _rendered(_cell_markdown(plain)).get_text()
+    assert _live_links(_cell_markdown(plain)) == []
+    assert "&lt;" not in BeautifulSoup(html_cell(plain), "html.parser").get_text()
+
+
+def test_plain_ocr_text_keeps_http_links_and_tables_text():
+    page = OCRPage(raw=RawExtraction(text="", tables=[Table(html="<table><tr><td>Qty</td><td>12</td></tr></table>")]))
+    assert plain_ocr_text(page.to_markdown(), page) == "Qty 12"
+    assert plain_ocr_text("see [docs](https://example.com)", None) == "see docs"

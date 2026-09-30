@@ -32,6 +32,27 @@ def scan_pdf(path: Path, pages: pdfgen.Pages = "SCANNED PAGE") -> Path:
     return pdfgen.image_pdf(path, pages)
 
 
+def docx_picture_in_cell(path: Path) -> Path:
+    """DOCX with a 2x2 table (``Item`` | ``Picture``, ``Logo`` | <picture>): the picture's OCR
+    text goes into its cell as ``[Image: <text>]``."""
+    from docx import Document
+    from docx.shared import Inches
+
+    picture = Image.new("RGB", (240, 120), "white")
+    ImageDraw.Draw(picture).rectangle((20, 30, 220, 90), outline="black", width=6)
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    document = Document()
+    document.add_paragraph("Parts list")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Item"
+    table.cell(0, 1).text = "Picture"
+    table.cell(1, 0).text = "Logo"
+    table.cell(1, 1).paragraphs[0].add_run().add_picture(io.BytesIO(buffer.getvalue()), width=Inches(0.8))
+    document.save(str(path))
+    return Path(path)
+
+
 def cjk_font(script: str = "TC", size: int = 110) -> ImageFont.FreeTypeFont:
     """The Noto Sans CJK face for ``script`` ("TC" Traditional, "SC" Simplified, "JP", "KR"),
     from the system fonts (``fonts-noto-cjk`` in the E2E image). Raises if it is not installed."""

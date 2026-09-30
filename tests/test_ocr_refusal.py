@@ -201,6 +201,16 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "Leider kann ich das Foto nicht lesen, kannst du es nochmal schicken?",
     "No pude leer la foto, ¿me la mandas otra vez?",
     "Désolé, je ne peux pas lire la photo, elle est floue.",
+    # support replies asking for a new picture
+    "Sorry, I can't read this photo. Please send a clearer photo.",
+    "I can't read this scan. Please upload a clearer copy.",
+    # refusal-shaped sentences naming someone: a name makes the answer content
+    "No puedo leer la imagen del recibo de Juan Pérez",
+    "Leider kann ich das Bild von Herrn Müller nicht erkennen.",
+    "很抱歉，我無法辨識王小明的照片",
+    "죄송하지만 김철수 씨의 사진은 인식할 수 없습니다.",
+    "Désolé, je ne peux pas lire la photo de Marie Dupont.",
+    "申し訳ありませんが、山田さんの写真の文字は読み取れません。",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -236,6 +246,11 @@ def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
     "I can't read the text in this image. It looks to be too dark.",
     "I can't read this image. Please provide a clearer image.",
+    "I can't read this image. Please provide a higher-resolution image of the page.",
+    "I'm sorry, but I can't read this image. Feel free to share a clearer image.",
+    "I'm sorry, but I can't share that.",
+    "The image is too blurry to read.",
+    "The text in the image is too small and blurry to read.",
     "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
     "If you could provide a clearer image, I'd be happy to help!",
     "Illegible",
@@ -252,8 +267,7 @@ def test_canonical_refusals_and_bare_placeholders_count_as_no_content(answer):
 @pytest.mark.parametrize("answer", [
     "There is no readable text in this image. It seems to be a decorative background graphic.",
     "Unable to process the image. Please provide a clearer scan of the page.",
-    "I'm sorry, but I can't share that.",
-    "The image is too blurry to read.",
+    "The photo is blurry.",
     "I can't read the scan. It seems to have been corrupted.",
 ])
 def test_answers_the_patterns_cannot_decide_are_left_to_the_judge(answer):

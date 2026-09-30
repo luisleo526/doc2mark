@@ -10,6 +10,7 @@ import pytest
 
 fitz = pytest.importorskip("pymupdf")
 Image = pytest.importorskip("PIL.Image")
+ImageDraw = pytest.importorskip("PIL.ImageDraw")
 
 from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader, _PAGE_RENDER_XREF
 
@@ -119,12 +120,39 @@ def test_process_page_emits_render_transcription(tmp_path):
     assert "Transcribed slide text" in out[0]["content"]
 
 
+def _scan_pdf(tmp_path, ink: bool):
+    """One image-only page: a scanned page with a few lines of ink, or a blank sheet."""
+    picture = Image.new("RGB", (1200, 1600), "white")
+    if ink:
+        draw = ImageDraw.Draw(picture)
+        for y in range(200, 1400, 90):
+            draw.rectangle((150, y, 1050, y + 30), fill="black")
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=800)
+    page.insert_image(page.rect, stream=buffer.getvalue())
+    path = tmp_path / ("ink.pdf" if ink else "blank.pdf")
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
 def test_process_page_empty_render_leaves_a_marker(tmp_path):
-    """A whole-page OCR that returned nothing (refused or empty) says so on its page."""
-    p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
+    """A whole-page OCR of a page with ink that returned nothing (refused) says so on its page."""
+    p = PDFLoader(_scan_pdf(tmp_path, ink=True), ocr=_StubOCR())
     out = p._process_page(0, extract_images=True, ocr_images=True,
                           ocr_results_map={(0, _PAGE_RENDER_XREF): "   "})
     assert [c["content"] for c in out] == ["<image_ocr_result>[page 1: OCR returned no content]</image_ocr_result>"]
+
+
+@pytest.mark.parametrize("make", ["blank scan", "solid picture"])
+def test_process_page_empty_render_of_a_blank_page_has_no_marker(tmp_path, make):
+    path = _scan_pdf(tmp_path, ink=False) if make == "blank scan" else _make_pdf(tmp_path)
+    p = PDFLoader(path, ocr=_StubOCR())
+    out = p._process_page(0, extract_images=True, ocr_images=True,
+                          ocr_results_map={(0, _PAGE_RENDER_XREF): "   "})
+    assert out == []
 
 
 def test_ocr_failure_emits_placeholder_not_base64(tmp_path):
