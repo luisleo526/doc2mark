@@ -3150,7 +3150,18 @@ _MARKDOWN_LIST_MARKER = re.compile(r'[-+*]|\d{1,9}[.)]')
 
 
 def office_to_markdown(json_data: Dict[str, Any]) -> str:
-    """Convert Office JSON data to markdown string"""
+    """Convert Office JSON data to markdown string.
+
+    Document text is escaped so it cannot turn into Markdown/HTML structure (a paragraph
+    ``# of units`` stays a paragraph, ``<img …>`` stays text); see ``doc2mark.utils.markdown``.
+    """
+    from doc2mark.utils.markdown import escape_heading_text, escape_list_item, escape_markdown_text
+
+    def escape_footnote(text: str) -> str:
+        # "[^3]: note text" -> keep the definition label, escape the note
+        match = re.match(r"(\[\^[^\]]+\]:[ \t]*)(.*)", text, re.DOTALL)
+        return match.group(1) + escape_markdown_text(match.group(2)) if match else escape_markdown_text(text)
+
     markdown_parts = []
     current_page = None
     # Depth of the deepest list item still open in the current run of list items
@@ -3184,7 +3195,7 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             if item.get("page") != list_page:
                 list_depth = -1
             depth = min(item.get("list_level", 0), list_depth + 1)
-            markdown_parts.append(f"{'    ' * depth}{item['marker']} {item['content']}\n")
+            markdown_parts.append(f"{'    ' * depth}{item['marker']} {escape_markdown_text(item['content'])}\n")
             if _MARKDOWN_LIST_MARKER.fullmatch(item["marker"]):
                 list_depth = depth
             else:  # a paragraph ("(a) ..."): it closes list items at its own depth and deeper
@@ -3194,24 +3205,25 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
         list_depth = -1
         if item["type"] in ("text:title", "text:section") and item.get("level"):
             number = f"{item['marker']} " if item.get("marker") else ""
-            markdown_parts.append(f"{'#' * item['level']} {number}{item['content']}\n")
+            markdown_parts.append(f"{'#' * item['level']} {number}{escape_heading_text(item['content'])}\n")
             continue
 
         if item["type"] == "text:title":
             # Add titles with H1 formatting and extra spacing
-            markdown_parts.append(f"# {item['content']}\n")
+            markdown_parts.append(f"# {escape_heading_text(item['content'])}\n")
         elif item["type"] == "text:section":
             # Add sections with H2 formatting
-            markdown_parts.append(f"## {item['content']}\n")
+            markdown_parts.append(f"## {escape_heading_text(item['content'])}\n")
         elif item["type"] == "text:list":
             # Add list items with proper formatting
-            markdown_parts.append(f"{item['content']}\n")
+            markdown_parts.append(f"{escape_list_item(item['content'])}\n")
         elif item["type"] == "text:caption":
-            # Add captions in italics
-            markdown_parts.append(f"*{item['content']}*\n")
+            # Add captions in italics, one emphasis per line
+            caption_lines = escape_markdown_text(item['content'].strip()).split("\n")
+            markdown_parts.append("\n".join(f"*{line.strip()}*" for line in caption_lines if line.strip()) + "\n")
         elif item["type"] == "text:normal":
             # Add normal text with paragraph spacing
-            markdown_parts.append(f"{item['content']}\n")
+            markdown_parts.append(f"{escape_markdown_text(item['content'])}\n")
         elif item["type"] == "text:image_description":
             # OCR'd-image text — strip the internal provenance wrapper and emit
             # clean text (no code-fence / <ocr_result> noise).
@@ -3226,6 +3238,6 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             # Include image as markdown with base64 data URL
             markdown_parts.append(f'![Image](data:image/png;base64,{item["content"]})\n')
         elif item["type"] == "text:footnote":
-            markdown_parts.append(f"{item['content']}\n")
+            markdown_parts.append(f"{escape_footnote(item['content'])}\n")
 
     return "\n".join(markdown_parts)

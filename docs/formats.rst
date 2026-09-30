@@ -135,6 +135,37 @@ pages that have no text layer.
    doc = loader.load("scanned.pdf", extract_images=True, ocr_images=True)
    print(doc.content)
 
+Markdown conventions for PDF text:
+
+- **Headings.** The title is ``#``: the largest heading of the first page with
+  text, when no other heading of the document is as large. Section headings are
+  ``##`` and deeper, ranked by font size across the document and by decimal outline
+  depth (``1.2`` below ``1``), without skipped levels. A heading is one line without
+  emphasis. The ``json_content`` items of type ``text:title`` / ``text:section``
+  carry the same ``level``.
+- **Lists.** Bullets become ``- `` (nested by indentation; ``*`` and ``+`` keep
+  their character) and numbered items keep their number. A bullet that carries
+  meaning stays in the item text (``- ✓ Approved``, ``- – sub-item``). Letters,
+  roman numerals and CJK or parenthesised numbers stay in the item text
+  (``- a) …``) and make a list only in a sequence; a lone ``A. Smith`` or
+  ``E. coli`` line is text.
+- **Captions.** Only numbered labels (``Figure 3:``, ``Table 2``, ``圖1``) and short,
+  caption-shaped text directly attached to an image or table are captions, rendered
+  in italics line by line.
+- **Superscripts** are written ``10^6^``, ``mc^2^``, ``$1.2bn^3^`` (footnote marks
+  included), never fused into the number. Raised ordinals and marks stay inline
+  (``1st``, ``ACME™``), and a footnote at the foot of a page whose number is raised
+  becomes ``[^1]: …``.
+- **Text** keeps its words: ligature glyphs are expanded (``ﬁ`` → ``fi``), a word
+  broken at a line-end hyphen is joined and keeps the hyphen (``top-down``), which is
+  removed only when the document spells the word without it elsewhere (``invest-`` +
+  ``ment`` next to ``investment``), the CJK lines of a wrapped paragraph or heading
+  are joined without spaces (short stacked lines stay apart), and bold/italic mark
+  only the styled words.
+- **Escaping.** Text that looks like Markdown or HTML is escaped (``\# of patients``,
+  ``&lt;img …>``) so it renders as written; the Office Markdown output follows the
+  same rule.
+
 Legacy Office formats (DOC, PPT, PPS, XLS, RTF)
 -----------------------------------------------
 

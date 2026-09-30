@@ -86,7 +86,7 @@ def make_block(lines):
 
 def classify(block, page_num=1, avg_font_size=10.0, max_font_size=12.0, loader=None):
     loader = loader or make_loader()
-    return loader._convert_block_to_markdown_with_type(
+    markdown, text_type, _ = loader._classify_block(
         block,
         avg_font_size=avg_font_size,
         max_font_size=max_font_size,
@@ -94,6 +94,7 @@ def classify(block, page_num=1, avg_font_size=10.0, max_font_size=12.0, loader=N
         image_bboxes=[],
         table_bboxes=[],
     )
+    return markdown, text_type
 
 
 def assert_not_markdown_heading(markdown):
