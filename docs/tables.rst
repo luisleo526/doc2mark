@@ -43,12 +43,13 @@ and turns every grid it finds into a ``TableData`` (``doc2mark.pipelines.pdf_tab
 
 **Cell text.** The page's characters are read once per page, from the text page
 ``find_tables()`` built (the same characters and coordinates PyMuPDF's own
-``Table.extract()`` uses, also on rotated pages). Every character goes to exactly
-one cell: the smallest cell, over all tables on the page, that contains the
-centre of the glyph. So a table nested inside another table's cell keeps its own
-text and the outer cell does not repeat it, and cells that overlap (an L-shaped
-merged region, a frame drawn around cells) never share a character. Inside a
-cell, words split at spaces and at gaps wider than 3 pt, and lines stay separate
+``Table.extract()`` uses, also on rotated pages; PyMuPDF releases before 1.27 do not
+expose it, and the page's own text is read in the same coordinates). Every character
+goes to exactly one cell: the smallest cell, over all tables on the page, that
+contains the centre of the glyph. So a table nested inside another table's cell
+keeps its own text and the outer cell does not repeat it, and cells that overlap (an
+L-shaped merged region, a frame drawn around cells) never share a character. Inside
+a cell, words split at spaces and at gaps wider than 3 pt, and lines stay separate
 (``\n``), as in ``Table.extract()``.
 
 Text drawn over other text is handled by what it is:
@@ -69,8 +70,10 @@ Text drawn over other text is handled by what it is:
 * Invisible text (an OCR layer: fully transparent, or neither filled nor stroked)
   drawn over visible text in a cell is dropped; the visible glyphs are the text and
   the hidden layer only repeats them, often with recognition errors
-  (``Acc0unt``, ``1,25O,OOO``). Invisible text with nothing visible under it, as on
-  a scanned page, is the cell's text.
+  (``Acc0unt``, ``1,25O,OOO``). A hidden line is judged as a whole: it is dropped
+  when at least half of its glyphs lie over visible ones, including any part that
+  runs on past them. Invisible text with nothing visible under it, as on a scanned
+  page, is the cell's text.
 
 **Merged cells.** PyMuPDF reports the grid as rows of cell boxes (``None`` where a
 merged box covers a position). Column ``j`` starts at the ``j``-th distinct cell
@@ -99,10 +102,12 @@ not, and its text stays with the normal text output.
 **Tables without vertical rules.** A page is also searched with PyMuPDF's text
 strategy (``find_tables(strategy="text")``) when at least three of its text lines
 break into three or more pieces at wide gaps (at least 8 pt and one font size) and
-some column of those pieces (sharing a left or right edge) is at least 60% numbers;
-a multi-column directory or article has the gaps but no such column and costs
-nothing extra. A candidate is kept only when, after caption and note lines above
-and below it are set aside:
+some column of those pieces (sharing a left edge, a right edge or a centre) holds at
+least two numbers that make up 60% of it, the least a table below needs; a
+multi-column directory or article has the gaps but no such column and costs nothing
+extra. (A page whose only aligned text is a two-column table is therefore not
+searched.) A candidate is kept only when, after caption and note lines above and
+below it are set aside:
 
 * it has at least three rows and three columns (two columns when booktabs rules
   run above and below it),
@@ -115,7 +120,9 @@ and below it are set aside:
 * at least half of its cells have text, at most a quarter of its rows have a
   single cell, and 70% of its cells are short (at most 40 characters),
 * it is not a table of contents (dot leaders, or entries whose only number is a
-  last-column page number that never goes down),
+  last-column page number that never goes down; a table without a header row whose
+  only numbers are such a column -- small counts in ascending order -- is taken for
+  one and stays text),
 * every text block that touches it lies inside it. The text output skips each text
   block that touches a table, so a caption, lead-in sentence or note set at the
   rows' own leading -- which puts it in the same block as the rows -- would
@@ -124,23 +131,25 @@ and below it are set aside:
 A wrapped line of a cell (closer to its row than rows are to each other, no
 numbers) stays in that cell. Prose, two-column articles, key/value blocks, tables
 of contents, slide text boxes and sidebars fail these checks and stay text.
-Measured on 1,379 pages of reference PDFs (reports, decks, forms, scans with a text
+Measured on 1,391 pages of reference PDFs (reports, decks, forms, scans with a text
 layer), the search found 18 tables, all real, and no false ones; a reviewer's set
 of adversarial pages (tables inside paragraphs, a free-text last column, a sidebar,
 tables of contents) keeps every word.
 
 **Header rows.** A header row that PyMuPDF finds just above the ruled cells (drawn
-without borders, for example bold names over a rule) becomes the table's header
-when it names at least two columns, and only if no text block around it reaches
-outside the table and the header. When a page's first table continues the previous
-page's last table -- consecutive pages, the same column edges, nothing after the
-previous table but the page's bottom 8%, and nothing above this one but lines in
-the top 8% that repeat a line from the previous page's top 8% (a running header;
-a heading over a new table is not one) -- its first row is kept as its header only
-if it repeats the previous header or is styled as one (bold over plain rows). Otherwise the first row stays a data row: the previous header
-is repeated when it is known to be a header (bold, or drawn above the cells), and
-an empty header row is used when it is not, because a plain first row may just as
-well be the first pair of a key/value form.
+without borders, for example bold names over a rule) becomes the table's header when
+it names at least two columns, and only if no text block around it reaches outside
+the table and the header. When a page's first table continues the previous page's
+last table -- consecutive pages, the same column edges, nothing after the previous
+table but the page's bottom 8%, and nothing above this one but lines in the top 8%
+that repeat a line from the top 8% of the previous or the next page (a running
+header, which with Word's "different first page" only the next page repeats; a
+heading over a new table is not one) -- its first row is kept as its header only if
+it repeats the previous header or is styled as one (bold over plain rows). Otherwise
+the first row stays a data row: the previous header is repeated when it is known to
+be a header (bold, or drawn above the cells), and an empty header row is used when
+it is not, because a plain first row may just as well be the first pair of a
+key/value form.
 
 A table's bounding box (including a header drawn above it) is what the text
 output skips, so table text is not emitted twice.

@@ -1245,7 +1245,8 @@ class PDFLoader:
         try:
             tables, outside = pdf_tables.extract_page_tables(page, found, getattr(finder, "textpage", None))
             self._table_carry = pdf_tables.continue_table(
-                tables, outside, page_num, page.rect.height, getattr(self, "_table_carry", None))
+                tables, outside, page_num, page.rect.height, getattr(self, "_table_carry", None),
+                lambda: pdf_tables.next_page_top_lines(page))
             renderer = TableRenderer(self.table_style)
             table_items, table_bboxes = [], []
             for table in tables:

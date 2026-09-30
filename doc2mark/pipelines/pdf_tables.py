@@ -787,9 +787,10 @@ def _looks_tabular(words: Sequence[tuple]) -> bool:
     """Cheap gate before the text-strategy search. ``words`` are ``(x0, y0, x1, y1, text, ...)``.
 
     At least three text lines must break into three or more pieces at wide gaps, and some
-    column of pieces (pieces after the first on their line that share a left or a right
-    edge within 3 pt) must have at least three pieces, 60% of them numbers. A directory or
-    a multi-column layout has the gaps but no such column.
+    column of pieces (pieces after the first on their line that share a left edge, a right
+    edge or a centre within 3 pt, the alignments PyMuPDF's text strategy looks for) must have
+    at least two numbers, 60% of its pieces -- the least a numeric column needs in
+    :func:`_text_table`. A directory or a multi-column layout has the gaps but no such column.
     """
     lines = _clusters(list(words), lambda word: round((word[1] + word[3]) / 2, 1), Y_TOLERANCE)
     columnar = 0
@@ -807,11 +808,12 @@ def _looks_tabular(words: Sequence[tuple]) -> bool:
         columnar += 1
         for piece in pieces[1:]:
             number = bool(_NUMERIC.fullmatch(" ".join(word[4] for word in piece)))
-            for key in (("left", round(piece[0][0] / 3)), ("right", round(piece[-1][2] / 3))):
+            x0, x1 = piece[0][0], piece[-1][2]
+            for key in (("left", round(x0 / 3)), ("right", round(x1 / 3)), ("centre", round((x0 + x1) / 6))):
                 counts = columns.setdefault(key, [0, 0])
                 counts[0] += 1
                 counts[1] += number
-    return columnar >= 3 and any(numbers >= 3 and numbers >= 0.6 * total for total, numbers in columns.values())
+    return columnar >= 3 and any(numbers >= 2 and numbers >= 0.6 * total for total, numbers in columns.values())
 
 
 def _ink_extent(chars: Sequence[Char]) -> Optional[Tuple[float, float, float]]:
@@ -1096,21 +1098,38 @@ def _header_is_known(table: PageTable) -> bool:
     return len(bold) > 1 and bold[0] is True and bold[1] is False
 
 
+def next_page_top_lines(page) -> Set[str]:
+    """The text lines in the top 8% of the page after ``page``, digits masked (see
+    :func:`continue_table`); empty after the last page or when that page cannot be read."""
+    try:
+        document = page.parent
+        if page.number + 1 >= document.page_count:
+            return set()
+        following = document[page.number + 1]
+        return _lines(page_chars(following), -1.0, MARGIN_BAND * following.rect.height)
+    except Exception as e:
+        logger.debug(f"Could not read the top of the page after page {page.number + 1}: {e}")
+        return set()
+
+
 def continue_table(tables: List[PageTable], outside: Sequence[Char], page_num: int, page_height: float,
-                   carry: Optional[TableCarry]) -> Optional[TableCarry]:
+                   carry: Optional[TableCarry], next_page_lines: Optional[Callable[[], Set[str]]] = None
+                   ) -> Optional[TableCarry]:
     """Keep the first data row of a table continued from the previous page out of the header.
 
-    The first table on this page continues the previous page's last table when the pages
-    are consecutive, the columns line up (same left and right edges, and each column edge of
-    this table is one of the previous table's), nothing but the bottom 8% of the previous page
-    follows the previous table, and the only text above this table is in the top 8% of this
-    page and repeats a line from the previous page's top 8% (a running header; page numbers
-    masked). A heading over a new table is not a running header. If its first row repeats
-    the previous header, or is styled as a header (bold over a non-bold row), it keeps that
-    header. Otherwise its first row is data: it gets the previous page's header row when that
-    row is known to be a header (bold over non-bold, or drawn above the ruled cells) and the
-    columns are the same, and an empty header row otherwise -- a plain first row may just as
-    well be the first key/value pair of a form, and repeating it would duplicate data.
+    The first table on this page continues the previous page's last table when the pages are
+    consecutive, the columns line up (same left and right edges, and each column edge of this
+    table is one of the previous table's), nothing but the bottom 8% of the previous page
+    follows the previous table, and the only text above this table is in the top 8% of this page
+    and repeats a line from the previous or the next page's top 8% (a running header, page
+    numbers masked; ``next_page_lines`` reads the next page's, only when needed -- with Word's
+    "different first page" only the next page has it). A heading over a new table is not a
+    running header. If its first row repeats the previous header, or is styled as a header (bold
+    over a non-bold row), it keeps that header. Otherwise its first row is data: it gets the
+    previous page's header row when that row is known to be a header (bold over non-bold, or
+    drawn above the ruled cells) and the columns are the same, and an empty header row otherwise
+    -- a plain first row may just as well be the first key/value pair of a form, and repeating
+    it would duplicate data.
 
     Returns the carry for the next page.
     """
@@ -1122,9 +1141,12 @@ def continue_table(tables: List[PageTable], outside: Sequence[Char], page_num: i
             abs(a - b) <= EDGE_TOLERANCE for a, b in zip(edges, previous))
         lined_up = (abs(edges[0] - previous[0]) <= EDGE_TOLERANCE and abs(edges[-1] - previous[-1]) <= EDGE_TOLERANCE
                     and all(any(abs(a - b) <= EDGE_TOLERANCE for b in previous) for a in edges))
-        only_running_header = (not _has_text(outside, band, first.bbox[1] - 1)
-                               and _lines(outside, -1.0, first.bbox[1] - 1) <= carry.header_lines)
-        if first.header is None and lined_up and only_running_header:
+        continued = first.header is None and lined_up and not _has_text(outside, band, first.bbox[1] - 1)
+        if continued:
+            above = _lines(outside, -1.0, first.bbox[1] - 1)
+            continued = above <= carry.header_lines or (
+                next_page_lines is not None and above <= carry.header_lines | next_page_lines())
+        if continued:
             repeated = [text for text, _ in carry.header if text]
             own = [text for text in first.first_row_texts() if text]
             if own != repeated and not _header_is_known(first):
