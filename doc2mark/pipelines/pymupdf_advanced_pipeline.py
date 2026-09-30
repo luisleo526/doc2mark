@@ -217,6 +217,9 @@ _LABEL_START = re.compile(r"[^\s：:，,。.]{1,12}[：:]")
 # Raised text that stays inline: ordinal suffixes after a number (Word raises them) and marks.
 _INLINE_RAISED_MARKS = set("\u00ae\u2122\u2120\u00a9")
 _SENTENCE_END = re.compile(r"[.!?。！？][\"'”’)\]」』]*$")
+# The first thing a wrapped line may start with: a CJK character, a Latin word or number, with the
+# opening brackets and quotes before it that cannot end the line above.
+_LINE_START_TOKEN = re.compile(r"[「『（(【《〈“‘\"']*(?:[A-Za-z0-9]+|\S)")
 # A line that ends a sentence or a lead-in: the next line starts afresh, even after a full line.
 _LEAD_IN_END = re.compile(r"[.!?。！？:：;；][\"'”’)\]」』]*$")
 # A heading number set a tab apart from its title ("1.2", "IV.", "Chapter 3", "第一章", "一、").
@@ -407,27 +410,25 @@ def _line_join(previous: str, following: str, wrap: int, cjk: str = "") -> Optio
     """How a line (``following``) attaches to the line before it (``previous``, both stripped
     text), given how it follows it on the page (``wrap``, see ``PDFLoader._line_wraps``):
 
-    - ``"soft"``: the previous line ends with a soft hyphen, which is removed;
     - ``"hyphen"``: the previous line ends with a hyphen after a letter or digit; the hyphen is
       kept and the lines are joined (``top-`` + ``down`` -> ``top-down``). Word and LibreOffice
       break lines after an existing hyphen and do not hyphenate by default, so a line-end hyphen
       is part of the word; ``PDFLoader._finalize_text_items`` removes it only when the document
-      spells the joined word without it elsewhere;
+      spells the joined word without it elsewhere. A soft hyphen (U+00AD) at a line end is
+      handled the same way and written ``-``: some text layers read the printed hyphen so;
     - ``"direct"``: CJK text on both sides of the line break (CJK has no spaces), when ``cjk``
-      says the lines are the wrapped lines of one CJK paragraph (``"paragraph"``, see
-      ``PDFLoader._cjk_paragraph``: stacked labels and items stay apart) or of a heading
+      says the break is inside a wrapped CJK paragraph (``"paragraph"``, see
+      ``PDFLoader._cjk_joins``: stacked labels and items stay apart) or inside a heading
       (``"heading"``, except after a bare heading number such as ``第一章``);
     - None: the line break stays: before a line that starts with a list or outline marker or a
       CJK form label (``提案單位：``), at a hyphen before ``and``/``or`` (``short-`` + ``and
       long-term``) and at every other line end."""
     if not previous or not following or not wrap or _parse_list_marker(following) is not None:
         return None
-    if previous.endswith("\u00ad"):  # soft hyphen
-        return "soft"
-    if previous[-1] in "-\u2010" and len(previous) >= 2 and previous[-2].isalnum() and following[0].isalnum():
+    if previous[-1] in "-\u2010\u00ad" and len(previous) >= 2 and previous[-2].isalnum() and following[0].isalnum():
         return None if following.split(None, 1)[0].lower() in _SUSPENDED_HYPHEN_WORDS else "hyphen"
     if cjk and _is_cjk(previous[-1]) and _is_cjk(following[0]) and not _LABEL_START.match(following):
-        if (cjk == "paragraph" and wrap == 2) or (cjk == "heading" and not _HEADING_NUMBER.fullmatch(previous)):
+        if cjk == "paragraph" or (cjk == "heading" and not _HEADING_NUMBER.fullmatch(previous)):
             return "direct"
     return None
 
@@ -446,13 +447,14 @@ def _strip_runs(runs: List["_Run"]) -> List["_Run"]:
 
 
 def _physical_lines(lines: List[List["_Run"]], wraps: List[int], hyphen_joins: Optional[Counter] = None,
-                    cjk: str = "") -> List[List["_Run"]]:
+                    cjk_heading: bool = False, cjk_joins: Optional[List[bool]] = None) -> List[List["_Run"]]:
     """The styled runs of a block's lines (one run list per line) after joining the line breaks
     that split a word (see ``_line_join``), one run list per output line. Emphasis is rendered
     afterwards, so a bold phrase that wraps stays one bold phrase. Each kept line-end hyphen
     between two plain words (not inside a longer compound such as ``self-`` +
     ``service-oriented``) is counted in ``hyphen_joins`` as ``(part before, part after)``,
-    lowercased. ``cjk``: see ``_line_join``."""
+    lowercased. CJK line breaks are joined inside a heading (``cjk_heading``) or where
+    ``cjk_joins`` (per line, see ``PDFLoader._cjk_joins``) says so; see ``_line_join``."""
     physical: List[List[_Run]] = []
     previous = ""
     for index, line in enumerate(lines):
@@ -460,14 +462,15 @@ def _physical_lines(lines: List[List["_Run"]], wraps: List[int], hyphen_joins: O
         text = "".join(run.text for run in runs)
         if not text:
             continue
+        cjk = "heading" if cjk_heading else "paragraph" if cjk_joins and cjk_joins[index] else ""
         join = _line_join(previous, text, wraps[index] if index < len(wraps) else 2, cjk) if physical else None
         if join is None:
             physical.append(runs)
         else:
-            if join == "soft":
-                last = physical[-1][-1]
-                physical[-1][-1] = replace(last, text=last.text[:-1])
-            elif join == "hyphen" and hyphen_joins is not None:
+            if join == "hyphen" and previous.endswith("\u00ad"):
+                last = physical[-1][-1]  # a soft hyphen read for the printed one: write the hyphen
+                physical[-1][-1] = replace(last, text=last.text[:-1] + "-")
+            if join == "hyphen" and hyphen_joins is not None:
                 before = _TRAILING_WORD.search(previous[:-1])
                 after = _WORD.match(text)
                 if before and after and "-" not in after.group(0):
@@ -959,9 +962,10 @@ class PDFLoader:
         - a line-end hyphen kept while joining two lines (``top-`` + ``down``, see ``_line_join``)
           is removed only when the document spells the joined word without it elsewhere and
           never with it outside those line ends (``invest-`` + ``ment`` next to ``investment``);
-        - heading levels: 1 for the title (``_choose_title``); sections rank the heading font
-          sizes of the document and decimal outline depths (``1.2`` is deeper than ``1``) densely
-          from 2, and a heading is at most one level deeper than the heading before it.
+        - heading levels: 1 for the title (``_choose_title``); sections are ranked by the heading
+          font sizes of the document and decimal outline depths (``1.2`` is deeper than ``1``),
+          and each is one level below the nearest open section that ranks above it, so no level
+          is skipped and sections of one rank under the same parent share a level.
         Only emitted headings count, so text in table regions (bold header cells) never takes a
         level."""
         content = document.get("content", [])
@@ -1006,14 +1010,21 @@ class PDFLoader:
             if not tiers or tiers[-1] - size > 0.25:
                 tiers.append(size)
 
-        def raw_level(size: float, depth: int) -> int:
+        def rank(size: float, depth: int) -> int:
             return max(2 + sum(1 for tier in tiers if tier > size + 0.25), 1 + depth)
 
-        rank = {level: 2 + index for index, level in enumerate(sorted({raw_level(*section) for section in sections}))}
-        previous = 1
+        # A section is one level below the nearest open section that ranks above it.
+        open_ranks: List[int] = []
         for item, size, depth in headings:
-            level = 1 if item["type"] == "text:title" else min(rank[raw_level(size, depth)], previous + 1, 6)
-            item["level"] = previous = level
+            if item["type"] == "text:title":
+                item["level"] = 1
+                open_ranks = []
+                continue
+            own = rank(size, depth)
+            while open_ranks and open_ranks[-1] >= own:
+                open_ranks.pop()
+            open_ranks.append(own)
+            item["level"] = min(1 + len(open_ranks), 6)
 
     def _detect_repeated_content(self, document: Dict[str, Any]) -> None:
         """Retype repeated page furniture that only exists as whole items.
@@ -3008,7 +3019,10 @@ class PDFLoader:
 
     def _wraps_onto_block(self, upper: Dict[str, Any], lower: Dict[str, Any], view_of: Callable) -> bool:
         """True when the last line of ``upper`` wrapped onto the first line of ``lower``: same
-        style, no sentence or lead-in end, and the first word would not have fitted."""
+        style, no sentence or lead-in end, and the first word would not have fitted. A block that
+        holds list items is not a paragraph: a marker after it starts the next item or list."""
+        if self._last_item_text(upper):
+            return False
         views = [view for view in map(view_of, upper["lines"] + lower["lines"]) if view is not None and view.bbox]
         last, first = view_of(upper["lines"][-1]), view_of(lower["lines"][0])
         if last is None or first is None or not last.bbox or not first.bbox or not views:
@@ -3120,9 +3134,8 @@ class PDFLoader:
                 return False
             if leading.bbox and first.bbox[0] < leading.bbox[0] - 2:
                 return False
-            last_marker = _parse_list_marker(self._last_item_text(previous))
-            return (first_marker.kind in ("glyph", "bullet", "ordered")
-                    or _markers_in_sequence(last_marker, first_marker))
+            # the next item of that list: a bullet after bullets, 5. after 4., b) after a)
+            return _follows(_parse_list_marker(self._last_item_text(previous)), first_marker)
         if last.bold != first.bold or _is_chromatic(last.color) != _is_chromatic(first.color):
             return False
         if _SENTENCE_END.search(last.text.strip()):
@@ -3397,19 +3410,39 @@ class PDFLoader:
         return wraps
 
     @staticmethod
-    def _cjk_paragraph(lines: List[_LineView]) -> bool:
-        """True when the lines are the wrapped lines of one CJK paragraph, so that their CJK line
-        breaks are joined without a space: CJK text wraps at any character, so every line that
-        is followed by a CJK line ends within 1.5 em of the right edge (a line before a Latin word
-        may end short). Two lines also need a first line of running text: a short first line may
-        be a label above another, and stacked labels or items differ in length."""
+    def _cjk_joins(lines: List[_LineView]) -> List[bool]:
+        """Per line, True when the CJK line break before it is inside a wrapped paragraph, so it
+        is joined without a space. The line before must have wrapped onto this one: CJK text
+        wraps at any character, so the gap it leaves at the block's right edge is narrower than
+        this line's first character, or its first Latin word or an opening bracket with the
+        character after it (which cannot end a line), plus under 1 em that line-start rules may
+        leave. And the paragraph must go on: this line wraps onto the next one too, ends a
+        sentence, lead-in or bracket, or ends a paragraph of two or more wrapped lines. Stacked
+        labels and items, of varying length and without sentence ends, stay apart, and so does a
+        paragraph from the next one in the same block. In a block of two lines the first must
+        also be running text: a short label above a sentence is not one paragraph with it."""
+        joins = [False] * len(lines)
         if len(lines) < 2 or any(line.bbox is None for line in lines):
-            return False
+            return joins
         right_edge = max(line.bbox[2] for line in lines)
-        for line, following in zip(lines, lines[1:]):
-            if _is_cjk(following.text.lstrip()[:1]) and line.bbox[2] < right_edge - 1.5 * max(line.size, 1.0):
-                return False
-        return len(lines) > 2 or _text_units(lines[0].text) >= _RUNNING_TEXT_UNITS
+
+        def wraps_onto(previous: _LineView, line: _LineView) -> bool:
+            text = line.text.strip()
+            token = _LINE_START_TOKEN.match(text)
+            char_width = (line.bbox[2] - line.bbox[0]) / max(len(text), 1)
+            first = char_width * len(token.group(0) if token else text[:1])
+            return previous.bbox[2] + first + 0.9 * max(previous.size, 1.0) > right_edge
+
+        wrapped = [False] + [wraps_onto(previous, line) for previous, line in zip(lines, lines[1:])]
+        for index in range(1, len(lines)):
+            previous, line = lines[index - 1], lines[index]
+            if not wrapped[index] or (len(lines) == 2 and _text_units(previous.text) < _RUNNING_TEXT_UNITS):
+                continue
+            text = line.text.strip()
+            goes_on = index + 1 < len(lines) and wrapped[index + 1]
+            joins[index] = bool(goes_on or _LEAD_IN_END.search(text) or text[-1:] in ")）」』】"
+                                or (index > 1 and joins[index - 1]))
+        return joins
 
     @staticmethod
     def _spread_on_row(lines: List[_LineView], wraps: List[int]) -> bool:
@@ -3446,8 +3479,8 @@ class PDFLoader:
         if text_type == "text:list":
             return self._render_list(view, markers, wraps)
         heading = text_type in ("text:title", "text:section")
-        cjk = "heading" if heading else "paragraph" if self._cjk_paragraph(view.lines) else ""
-        physical = _physical_lines([line.runs for line in view.lines], wraps, getattr(self, "_hyphen_joins", None), cjk)
+        physical = _physical_lines([line.runs for line in view.lines], wraps, getattr(self, "_hyphen_joins", None),
+                                   cjk_heading=heading, cjk_joins=None if heading else self._cjk_joins(view.lines))
         if heading:
             return escape_heading_closing(" ".join(_render_runs(runs, emphasis=False) for runs in physical))
         if text_type == "text:caption":
@@ -3508,8 +3541,8 @@ class PDFLoader:
             else:
                 indent = stack.pop()[1]
             stack.append((x0, indent, prefix))
-            cjk = "paragraph" if self._cjk_paragraph(item_views) else ""
-            lines = [_render_runs(runs) for runs in _physical_lines(item_lines, item_wraps, joins, cjk)] or [""]
+            physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
+            lines = [_render_runs(runs) for runs in physical] or [""]
             output.append(indent + prefix + escape_line_start(lines[0]))
             continuation = indent + " " * len(prefix)
             output.extend(continuation + escape_line_start(line) for line in lines[1:])

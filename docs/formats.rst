@@ -157,9 +157,10 @@ Markdown conventions for PDF text:
   (``1st``, ``ACME™``), and a footnote at the foot of a page whose number is raised
   becomes ``[^1]: …``.
 - **Text** keeps its words: ligature glyphs are expanded (``ﬁ`` → ``fi``), a word
-  broken at a line-end hyphen is joined and keeps the hyphen (``top-down``), which is
-  removed only when the document spells the word without it elsewhere (``invest-`` +
-  ``ment`` next to ``investment``), the CJK lines of a wrapped paragraph or heading
+  broken at a line-end hyphen is joined and keeps the hyphen (``top-down``, also when the
+  text layer reads the hyphen as U+00AD), which is removed only when the document spells
+  the word without it elsewhere (``invest-`` + ``ment`` next to ``investment``), the CJK
+  lines of a wrapped paragraph or heading
   are joined without spaces (short stacked lines stay apart), and bold/italic mark
   only the styled words.
 - **Escaping.** Text that looks like Markdown or HTML is escaped (``\# of patients``,
