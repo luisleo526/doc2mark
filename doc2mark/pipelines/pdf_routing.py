@@ -22,7 +22,6 @@ import math
 import os
 import re
 import unicodedata
-from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -767,79 +766,216 @@ _CJK_PIECES = re.compile(f"[{_CJK_CLASS}]|[^{_CJK_CLASS}]+")   # each CJK charac
 _TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
 _ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
 
+SHORT_LINE_WORDS = 3          # a line of at most this many words is found only in one piece
+GAPPED_CELLS_PER_WORD = 100   # the gapped search of a page aligns at most this many cells per OCR word
+_NO_PATH = 1 << 60
 
-def _tokens(text: str, markup: bool = False) -> List[str]:
+
+def _words(text: str, markup: bool = False) -> Tuple[List[str], List[bool]]:
     """Words, case-folded, punctuation dropped; CJK split per character (OCR engines space CJK text
-    unpredictably), the digits and letters between CJK characters kept as words. ``markup``: ``text`` is an OCR answer (Markdown with HTML tables), whose tags are
-    dropped, then its entities and backslash escapes undone, so ``&lt;DRAFT>`` still reads DRAFT. A text
-    layer line is not markup: ``<DRAFT>`` printed on the page is a word."""
+    unpredictably), the digits and letters between CJK characters kept as words; and for each word whether
+    it is such a run, written inside CJK text with no space or punctuation around it. ``markup``: ``text``
+    is an OCR answer (Markdown with HTML tables), whose tags are dropped, then its entities and backslash
+    escapes undone, so ``&lt;DRAFT>`` still reads DRAFT. A text layer line is not markup: ``<DRAFT>``
+    printed on the page is a word."""
     if markup:
         text = _ESCAPED.sub(r"\1", html.unescape(_TAG.sub(" ", text)))
-    words = []
+    words: List[str] = []
+    inside: List[bool] = []
     for word in re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()):
-        words.extend(_CJK_PIECES.findall(word) if _CJK_CHAR.search(word) else [word])
-    return words
-
-
-def _in_order(words: List[str], window: List[str]) -> List[int]:
-    """Positions in ``window`` of a longest run of ``words`` found there in order, other words
-    allowed between them (a longest common subsequence)."""
-    rows, columns = len(words), len(window)
-    lengths = [[0] * (columns + 1) for _ in range(rows + 1)]
-    for i in range(rows - 1, -1, -1):
-        for j in range(columns - 1, -1, -1):
-            lengths[i][j] = (lengths[i + 1][j + 1] + 1 if words[i] == window[j]
-                             else max(lengths[i + 1][j], lengths[i][j + 1]))
-    found, i, j = [], 0, 0
-    while i < rows and j < columns:
-        if words[i] == window[j]:
-            found.append(j)
-            i, j = i + 1, j + 1
-        elif lengths[i + 1][j] >= lengths[i][j + 1]:
-            i += 1
+        if _CJK_CHAR.search(word):
+            for piece in _CJK_PIECES.findall(word):
+                words.append(piece)
+                inside.append(not _CJK_CHAR.match(piece))
         else:
-            j += 1
-    return found
+            words.append(word)
+            inside.append(False)
+    return words, inside
 
 
-def _needed(words: List[str]) -> int:
-    return (4 * len(words) + 4) // 5   # 80 % of a line's words, rounded up
+def _needed(size: int) -> int:
+    return (4 * size + 4) // 5   # 80 % of a line's words, rounded up
 
 
-def _in_place(words: List[str], ocr_words: List[str]) -> Optional[List[int]]:
-    """The OCR words that reproduce a line's ``words`` in place: the first stretch of OCR words as
-    long as the line holding at least 80 % of its words at the same places; None when there is none."""
-    if not words:
-        return []
-    size, needed = len(words), _needed(words)
-    for start in range(max(1, len(ocr_words) - size + 1)):
-        window = ocr_words[start:start + size]
-        if sum(1 for a, b in zip(window, words) if a == b) >= needed:
-            return list(range(start, start + len(window)))
-    return None
+class _OcrWords:
+    """The words of an OCR answer, and which of them the page's lines have claimed: one OCR word stands for
+    one line at most (see :meth:`reproduced` for who claims first).
 
+    A line is found in place: the first stretch of OCR words as long as the line holding at least 80 % of
+    its words at the same places. A line of more than ``SHORT_LINE_WORDS`` words is also found with gaps:
+    80 % of its words in order, with the OCR words between them and the line's words it misses or reads
+    differently at most max(2, a fifth of its words) together; enough for a table cell boundary, an escaped
+    tag or a word the text layer lacks, not for the same words spread over another sentence. A line without
+    CJK characters is found only in OCR words that stand alone, not in letters or digits written inside CJK
+    text.
+    """
 
-def _with_gaps(words: List[str], ocr_words: List[Optional[str]],
-               where: Dict[str, List[int]]) -> Optional[List[int]]:
-    """The OCR words that reproduce a line's ``words`` with other words between them (a table cell
-    boundary, an escaped tag, a word the text layer lacks): at least 80 % of them, in order, within a
-    stretch of OCR words at most twice as long as the line; None when there is none. ``ocr_words``
-    holds None at positions taken by other lines; ``where`` maps each word to its positions."""
-    if not words:
-        return []
-    needed, span = _needed(words), 2 * len(words)
-    # The first word found is among the first len(words) - needed + 1 words of the line.
-    starts = sorted({position for word in words[:len(words) - needed + 1] for position in where.get(word, ())})
-    counts = Counter(words)
-    for start in starts:
-        window = ocr_words[start:start + span]
-        # How many of the line's words the window holds at most, in any order: a bound on the match.
-        if sum(min(count, counts[word]) for word, count in Counter(window).items() if word in counts) < needed:
-            continue
-        found = _in_order(words, window)
-        if len(found) >= needed:
-            return [start + offset for offset in found]
-    return None
+    def __init__(self, text: str):
+        words, inside = _words(text, markup=True)
+        self.size = len(words)
+        self._ids: Dict[str, int] = {}
+        self._codes = [self._ids.setdefault(word, len(self._ids)) for word in words]
+        codes = np.array(self._codes, dtype=np.int64)
+        self._code_array = codes
+        self._inside = np.array(inside, dtype=bool)
+        self.taken = np.zeros(self.size, dtype=bool)
+        order = np.argsort(codes, kind="stable")
+        firsts = np.flatnonzero(np.diff(codes[order], prepend=-1))
+        self._where = dict(zip(codes[order][firsts].tolist(), np.split(order, firsts[1:])))
+        self._cells = GAPPED_CELLS_PER_WORD * self.size   # what the gapped search may still spend
+
+    def reproduced(self, lines: Sequence[str]) -> List[bool]:
+        """Whether the OCR words reproduce each of the page's ``lines`` (their text). The lines of more than
+        ``SHORT_LINE_WORDS`` words claim OCR words first: in place, the line whose stretch holds the most of
+        its words first (a whole line before one missing a word, then the longer line); then those not
+        found, with gaps, longest first. The short lines come last, in place, longest first. So a short
+        heading, row or amount the OCR left out is not taken for reproduced by the words of another line,
+        and a line the OCR left out does not take the words of a line it almost repeats."""
+        lines = [([self._ids.get(word, -1) for word in _words(line)[0]], not _CJK_CHAR.search(line))
+                 for line in lines]
+        found = [not codes for codes, _ in lines]
+        order = sorted((index for index, (codes, _) in enumerate(lines) if codes),
+                       key=lambda index: -len(lines[index][0]))
+        longer = [index for index in order if len(lines[index][0]) > SHORT_LINE_WORDS]
+        held = {index: self._held_in_place(*lines[index]) for index in longer}
+        for index in sorted(longer, key=lambda index: (-held[index], held[index] < len(lines[index][0]))):
+            found[index] = self._in_place(*lines[index])
+        for index in longer:
+            found[index] = found[index] or self._with_gaps(*lines[index])
+        for index in order[len(longer):]:
+            found[index] = self._in_place(*lines[index])
+        return found
+
+    def _free(self, latin: bool) -> np.ndarray:
+        """The OCR words a line may claim: those no line claimed, and for a line without CJK characters
+        only those that stand alone."""
+        return ~(self.taken | self._inside) if latin else ~self.taken
+
+    def _diagonals(self, codes: Sequence[int], free: np.ndarray, pairs: bool = False) -> np.ndarray:
+        """For each free OCR word equal to the line's word ``k`` (with ``pairs``: and followed by a free OCR
+        word equal to word ``k + 1``), its position minus ``k``: where a stretch holding it in place starts."""
+        found = []
+        for offset, code in enumerate(codes[:-1] if pairs else codes):
+            positions = self._where.get(code)
+            if positions is None:
+                continue
+            positions = positions[free[positions]]
+            if pairs:
+                positions = positions[positions + 1 < self.size]
+                follow = positions + 1
+                positions = positions[free[follow] & (self._code_array[follow] == codes[offset + 1])]
+            found.append(positions - offset)
+        return np.concatenate(found) if found else np.zeros(0, dtype=np.int64)
+
+    def _in_place_votes(self, codes: Sequence[int], free: np.ndarray) -> np.ndarray:
+        """For each stretch start, how many of the line's words its free OCR words hold in place."""
+        starts = self._diagonals(codes, free)
+        starts = starts[(starts >= 0) & (starts <= max(0, self.size - len(codes)))]
+        return np.bincount(starts) if starts.size else starts
+
+    def _held_in_place(self, codes: Sequence[int], latin: bool) -> int:
+        """The most words of the line a stretch of OCR words holds in place, claims left aside."""
+        votes = self._in_place_votes(codes, self._free(latin))
+        return int(votes.max()) if votes.size else 0
+
+    def _in_place(self, codes: Sequence[int], latin: bool) -> bool:
+        """Find the line in place; claim the free OCR words of its stretch from its first to its last word
+        found there (a word the OCR read differently between them is the line's, a word past them is not)."""
+        free = self._free(latin)
+        hits = np.flatnonzero(self._in_place_votes(codes, free) >= _needed(len(codes)))
+        if not hits.size:
+            return False
+        stretch = np.arange(int(hits[0]), min(int(hits[0]) + len(codes), self.size))
+        held = np.flatnonzero(free[stretch] & (self._code_array[stretch] == np.array(codes[:stretch.size])))
+        stretch = stretch[held[0]:held[-1] + 1]
+        self.taken[stretch[free[stretch]]] = True
+        return True
+
+    def _with_gaps(self, codes: Sequence[int], latin: bool) -> bool:
+        """Find the line with gaps; claim the OCR words aligned with its words."""
+        size = len(codes)
+        edits = max(2, size // 5)
+        misses = min(edits, size - _needed(size))   # line words the OCR left out or read differently
+        free = self._free(latin)
+        # The words an alignment within the edits matches, and all but (misses + edits) of the line's
+        # consecutive word pairs, lie on diagonals (OCR position minus line position) at most ``edits``
+        # apart: count both over every band of diagonals that wide. A band short of either cannot hold
+        # the line; the others are searched in full.
+        shift, length = size - 1, self.size + size
+        bands = []
+        for diagonals in (self._diagonals(codes, free), self._diagonals(codes, free, pairs=True)):
+            votes = np.concatenate(([0], np.cumsum(np.bincount(diagonals + shift, minlength=length))))
+            bands.append(votes[np.minimum(np.arange(length) + edits + 1, length)] - votes[:length])
+        candidates = np.flatnonzero((bands[0] >= size - misses)
+                                    & (bands[1] >= size - 1 - misses - edits)).tolist()
+        searched = None
+        for position, low in enumerate(candidates):
+            if searched is not None and low + edits <= searched:
+                continue   # its band lies in the one just searched
+            high = low + edits
+            for later in candidates[position + 1:position + 1 + edits]:
+                if later > high:
+                    break
+                high = later + edits
+            cells = size * (high - low + 1)
+            if cells > self._cells:
+                if self._cells:
+                    logger.debug("Verbatim tail: the gapped search spent its budget on this page; lines not "
+                                 "found yet stay missing")
+                self._cells = 0
+                return False
+            self._cells -= cells
+            aligned = self._align(codes, free, low - shift, high - shift, edits, misses)
+            if aligned is not None:
+                self.taken[aligned] = True
+                return True
+            searched = high
+        return False
+
+    def _align(self, codes: Sequence[int], free: np.ndarray, low: int, high: int, edits: int,
+               misses: int) -> Optional[List[int]]:
+        """The free OCR words aligned with the line's words (matched or read differently) by the alignment
+        whose diagonals stay within ``[low, high]`` with the fewest edits (OCR words inserted, line words
+        missing or read differently), then the fewest misses (line words missing or read differently); None
+        when that takes more than ``edits`` edits or ``misses`` misses. OCR words before and after it are
+        free."""
+        size, width, total = len(codes), high - low + 1, self.size
+        weight = size + 1                                            # cost: edits * weight + misses
+        miss = weight + 1 if misses else _NO_PATH
+        ocr, usable = self._codes, free.tolist()
+        row = [0 if 0 <= low + offset <= total else _NO_PATH for offset in range(width)]   # no word yet
+        moves: List[List[int]] = []
+        for k in range(1, size + 1):
+            code, above = codes[k - 1], row
+            row, step = [_NO_PATH] * width, [0] * width
+            for offset in range(width):
+                j = k + low + offset            # line words 1..k against OCR words 1..j
+                if j < 1 or j > total:
+                    continue
+                best, move = _NO_PATH, 0
+                if above[offset] < _NO_PATH:                                 # word k on OCR word j
+                    best, move = above[offset] + (0 if ocr[j - 1] == code and usable[j - 1] else miss), 1
+                if offset + 1 < width and above[offset + 1] + miss < best:   # word k missing
+                    best, move = above[offset + 1] + miss, 2
+                if offset and row[offset - 1] + weight < best:               # OCR word j inserted
+                    best, move = row[offset - 1] + weight, 3
+                row[offset], step[offset] = best, move
+            moves.append(step)
+        end = min(range(width), key=row.__getitem__)
+        cost = row[end]
+        if cost >= _NO_PATH or cost // weight > edits or cost % weight > misses:
+            return None
+        aligned, offset = [], end
+        for k in range(size, 0, -1):
+            while moves[k - 1][offset] == 3:
+                offset -= 1
+            if moves[k - 1][offset] == 1:
+                j = k + low + offset
+                if usable[j - 1]:
+                    aligned.append(j - 1)
+            else:
+                offset += 1
+        return aligned
 
 
 def _same_line(a: Sequence[float], b: Sequence[float]) -> bool:
@@ -900,41 +1036,18 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled:
                 lines.append(spans)
     legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
                              for spans in lines])
-    ocr_words = _tokens(ocr_text, markup=True)
-    # First the lines the OCR reproduces in place; then the others, with gaps, but only on OCR words no
-    # other line explains: a short line whose words also occur, apart, in a longer one is not taken
-    # for reproduced.
-    explained: Set[int] = set()
-    unmatched = []
-    for spans, readable in zip(lines, legible):
-        text = "".join(span["text"] for span in spans).strip()
-        words = _tokens(text)
-        found = _in_place(words, ocr_words)
-        if found is not None:
-            explained.update(found)
-        else:
-            unmatched.append((spans, readable, text, words))
-    free: List[Optional[str]] = [None if position in explained else word for position, word in enumerate(ocr_words)]
-    where: Dict[str, List[int]] = {}
-    for position, word in enumerate(free):
-        if word is not None:
-            where.setdefault(word, []).append(position)
-    candidates = []
-    for spans, readable, text, words in unmatched:
-        found = _with_gaps(words, free, where)
-        if found is not None:
-            explained.update(found)
-            for position in found:
-                free[position] = None
-        elif readable:
-            candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans)), len(words)))
+    texts = ["".join(span["text"] for span in spans).strip() for spans in lines]
+    ocr = _OcrWords(ocr_text)
+    candidates = [(text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans)), len(_words(text)[0]))
+                  for spans, readable, text, found in zip(lines, legible, texts, ocr.reproduced(texts))
+                  if readable and not found]
     if candidates:
         regions = list(chrome() if callable(chrome) else chrome)
         candidates = [candidate for candidate in candidates
                       if not any(_same_line(tuple(candidate[1]), region) for region in regions)]
     if not candidates:
         return []
-    if garbled and len(ocr_words) - len(explained) >= 0.5 * sum(count for _, _, count in candidates):
+    if garbled and ocr.size - int(ocr.taken.sum()) >= 0.5 * sum(count for _, _, count in candidates):
         return []
     try:
         log = page.get_bboxlog()

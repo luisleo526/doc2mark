@@ -118,7 +118,7 @@ construction time and a *fallback* is configured via
        ttl_seconds=3600,
        max_age_seconds=43200,
        max_refreshes=10,
-       key_prefix="doc2mark:ocr:ocr-cache-v4",
+       key_prefix="doc2mark:ocr:ocr-cache-v6",
    )
 
 **Constructor parameters**
@@ -136,7 +136,7 @@ construction time and a *fallback* is configured via
 ``max_refreshes`` *(Optional[int], default 10)*
    Maximum refresh count per entry.
 
-``key_prefix`` *(str, default "doc2mark:ocr:ocr-cache-v4")*
+``key_prefix`` *(str, default "doc2mark:ocr:ocr-cache-v6")*
    Prefix prepended to every Redis key.  Change this to namespace
    multiple applications sharing the same Redis instance.
 
@@ -205,7 +205,7 @@ creates one internally when you pass ``ocr_cache`` to
    The cache backend.  If ``None``, a :class:`~doc2mark.NoOpOCRCache` is
    substituted (effectively disabling caching).
 
-``cache_version`` *(str, default "ocr-cache-v4")*
+``cache_version`` *(str, default "ocr-cache-v6")*
    Schema version embedded in every cache key.  Changing this value
    invalidates all existing entries, which is useful after a breaking
    change to the serialization format.
@@ -273,7 +273,7 @@ name to the corresponding class, forwarding common tuning parameters.
 ``max_entries`` *(int, default 1024)*
    Maximum entries (memory backend only).
 
-``key_prefix`` *(str, default "doc2mark:ocr:ocr-cache-v4")*
+``key_prefix`` *(str, default "doc2mark:ocr:ocr-cache-v6")*
    Redis key namespace (Redis backend only).
 
 **Returns**

@@ -20,7 +20,9 @@ from doc2mark.ocr.schema import OCRPage
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = "ocr-cache-v5"
+# v6: provider refusals are kept only briefly (REFUSAL_TTL_SECONDS); a refusal cached under v5 has no TTL of
+# its own and would be replayed for the cache's full sliding TTL, so v5 entries are never read.
+CACHE_SCHEMA_VERSION = "ocr-cache-v6"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 

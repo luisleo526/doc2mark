@@ -493,7 +493,10 @@ class BaseOCR(ABC):
         The recovery decides whether the image was read: when it answers (even with no
         text), a failure of the structured call is over; when it fails too (flagged
         ``failed``), the empty result is flagged ``metadata["failed"] = True`` so the next
-        run asks again instead of replaying it from a cache.
+        run asks again instead of replaying it from a cache. When the provider itself
+        refused or blocked the recovery, the empty result carries that refusal
+        (``non_content="provider_refusal"`` and ``refusal``), which may not last: the OCR
+        cache keeps it briefly and ``cache_dir`` not at all.
         """
         from doc2mark.ocr.refusal import NonContentScreen, screen_non_content
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
@@ -514,6 +517,8 @@ class BaseOCR(ABC):
                     meta.update(failed=True, error=recovered_meta.get("error") or meta.get("error"))
                 else:
                     meta.pop("failed", None)
+                if recovered_meta.get("non_content") == "provider_refusal":
+                    meta.update(non_content="provider_refusal", refusal=recovered_meta.get("refusal"))
                 results[i] = replace(results[i], metadata=meta)
                 if recovered_refused or meta.get("non_content"):
                     results[i] = self._without_content(results[i], ocr_refusal=True)

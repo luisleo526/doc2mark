@@ -10,6 +10,15 @@ import sys
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRConfig, Task
+from doc2mark.pipelines import pymupdf_compat
+
+
+def keep_stdout_for_documents():
+    """stdout is where the CLI writes a document when no output file is given: PyMuPDF's own prints (its
+    pymupdf_layout recommendation, MuPDF's errors about a damaged file) must not land there. The errors go
+    to the log on stderr as warnings instead."""
+    pymupdf_compat.quiet_layout_recommendation()
+    pymupdf_compat.messages_to_log()
 
 
 def setup_logging(log_file=None, verbose=False, quiet=False):
@@ -93,6 +102,7 @@ def print_progress(current, total, style="bar", no_color=False):
 
 def process_single_file(file_path, loader_config, processing_config):
     """Process a single file - used for parallel processing."""
+    keep_stdout_for_documents()   # a worker process does not run main()
     try:
         # Create loader with config
         loader = UnifiedDocumentLoader(
@@ -408,6 +418,7 @@ Supported formats:
 
     # Set up logging
     logger = setup_logging(args.log_file, args.verbose, args.quiet)
+    keep_stdout_for_documents()
     
     # Validate input
     input_path = Path(args.input_path)
