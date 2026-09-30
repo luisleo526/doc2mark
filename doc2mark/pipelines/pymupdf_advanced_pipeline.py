@@ -36,6 +36,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
     REASON_ILLEGIBLE as _REASON_ILLEGIBLE,
     MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
+    NO_TEXT_LIMIT as _NO_TEXT_LIMIT,
 )
 from doc2mark.pipelines import pdf_images, pdf_routing  # noqa: E402
 # OCR requests go to the provider in batches of at most _OCR_BATCH_IMAGES images (twice the
@@ -654,6 +655,10 @@ class PDFLoader:
         # Pictures the text route OCRs, per page: (pictures, placements left out by reason); see _page_pictures.
         self._pictures: Dict[int, Tuple[List["pdf_images.Picture"], Dict[str, int]]] = {}
         self._xref_content: Dict[int, str] = {}  # content class of each image XObject (see pdf_images.classify)
+        self._placements: Dict[int, List["pdf_images.Placement"]] = {}  # image placements per page
+        # (page, position_y, OCR item content, placement rect) of every picture item emitted with its OCR text,
+        # for _detect_repeated_pictures.
+        self._picture_records: List[Tuple[int, float, str, Tuple[float, float, float, float]]] = []
         self._judged_pages: set = set()    # pages the legibility judge was asked about
         self._chrome_regions: Optional[Dict[int, List[Tuple[Tuple[float, float, float, float], str, bool]]]] = None
         # OCR options of the conversion under way: the page text depends on them (see _text_page).
@@ -830,6 +835,7 @@ class PDFLoader:
         self._rendered_pages = set()
         self._unread_pages = set()
         self._pictures = {}
+        self._picture_records = []
 
         # OCR needs the images: asking for OCR implies extracting them for it.
         if ocr_images and self.ocr is None:
@@ -876,6 +882,7 @@ class PDFLoader:
         self._choose_title(document["content"])
         # Post-process: detect and tag repeated headers/footers
         self._detect_repeated_content(document)
+        self._detect_repeated_pictures(document)
         # Document-wide decisions on the text: line-end hyphens and heading levels
         self._finalize_text_items(document)
 
@@ -921,8 +928,12 @@ class PDFLoader:
             if callable(label_issues):
                 label_issues([{"page": info["page_num"] + 1} for info in batch])
 
-            # Map results back to image locations
+            # Map results back to image locations. A failed image (flagged by the provider: a
+            # timeout, a rate limit) was not read: it gets no answer, so it becomes a placeholder
+            # and counts as failed; an answer with no text is an answer.
             for info, result in zip(batch, ocr_results):
+                if (getattr(result, "metadata", None) or {}).get("failed"):
+                    continue
                 text = result.text if hasattr(result, 'text') else str(result)
                 for target in info["targets"]:
                     ocr_results_map[target] = text
@@ -1081,6 +1092,48 @@ class PDFLoader:
             for item in copies:
                 if item is not first:
                     item["type"] = f"text:{zone}"
+
+    def _detect_repeated_pictures(self, document: Dict[str, Any]) -> None:
+        """Retype pictures repeated as page furniture: the same OCR text at (nearly) the same place
+        (every edge within _CHROME_SLOT_TOLERANCE) on at least _CHROME_MIN_PAGES pages and on more
+        than _CHROME_MIN_SHARE of the document's pages -- a letterhead logo, a slide template's
+        wordmark -- is kept once, like the first copy of a running header: the first copy stays,
+        the later ones are typed ``text:header`` (top half of the page) or ``text:footer``, which
+        ``pdf_to_markdown`` leaves out. A picture shown on fewer pages, or at moving places, is
+        content and stays everywhere. Items are retyped, never removed; placeholders and page
+        renders are never retyped.
+
+        Modifies document["content"] in place.
+        """
+        records, self._picture_records = self._picture_records, []
+        total_pages = document.get("pages", 0)
+        if total_pages < _CHROME_MIN_PAGES or not records:
+            return
+        by_text: Dict[str, List[Tuple[int, float, Tuple[float, float, float, float]]]] = defaultdict(list)
+        for page, position_y, content, rect in records:
+            by_text[content].append((page, position_y, rect))
+        furniture: Dict[Tuple[int, float, str], List[Tuple[float, float, float, float]]] = defaultdict(list)
+        for content, places in by_text.items():
+            places.sort()
+            while places:
+                first = places[0]
+                slot = [place for place in places
+                        if all(abs(a - b) <= _CHROME_SLOT_TOLERANCE for a, b in zip(place[2], first[2]))]
+                places = [place for place in places if place not in slot]
+                pages = {place[0] for place in slot}
+                if len(pages) < _CHROME_MIN_PAGES or len(pages) <= _CHROME_MIN_SHARE * total_pages:
+                    continue
+                for page, position_y, rect in slot[1:]:
+                    furniture[(page, position_y, content)].append(rect)
+        for item in document.get("content", []):
+            if item.get("type") != "text:image_description":
+                continue
+            rects = furniture.get((item.get("page"), item.get("position_y"), item.get("content")))
+            if not rects:
+                continue
+            rect = rects.pop()
+            middle = (rect[1] + rect[3]) / 2
+            item["type"] = "text:header" if middle < self._page_height(item["page"] - 1) / 2 else "text:footer"
 
     def _record_rotated_crop_boxes(self) -> None:
         """Record, before any table detection runs, how to read the tables of rotated pages.
@@ -1859,11 +1912,20 @@ class PDFLoader:
             self._page_measures[page_num] = measure
         return measure.signals
 
+    def _placements_of(self, page) -> List["pdf_images.Placement"]:
+        """The page's image placements (see pdf_images.placements), measured once per page."""
+        placed = self._placements.get(page.number)
+        if placed is None:
+            placed = self._placements[page.number] = pdf_images.placements(page)
+        return placed
+
     def _ocr_image_rects(self, page) -> List[Any]:
-        """Placements the text route reads one by one: image XObjects the page shows, not tiles or
-        inline images (see pdf_images.single_rects; geometry only, no pixels)."""
+        """Placements the text route reads one by one whatever their pixels: image XObjects the page
+        shows whole that are not small (see pdf_images.single_rects; geometry only, no pixels). Small
+        pictures, tiles, inline images and cropped pictures are not, so a page without a text layer
+        that shows them is OCR'd from its render."""
         try:
-            return pdf_images.single_rects(page)
+            return pdf_images.single_rects(page, self._placements_of(page))
         except Exception as e:
             logger.debug(f"Failed to get the image placements of page {page.number + 1}: {e}")
             return []
@@ -2069,11 +2131,11 @@ class PDFLoader:
             return cached[0]
         page = self.doc.load_page(page_num)
         try:
-            pictures, skipped = pdf_images.page_pictures(page)
+            pictures, skipped = pdf_images.page_pictures(page, self._placements_of(page))
         except Exception as e:
             logger.warning(f"Failed to list the images of page {page_num + 1}: {e}")
             pictures, skipped = [], {}
-        kept = []
+        kept, shapes = [], []
         for picture in pictures:
             if picture.xref:
                 content = self._xref_content.get(picture.xref)
@@ -2084,10 +2146,26 @@ class PDFLoader:
                 content = pdf_images.classify(page, picture, None, getattr(self, "_copies", None))
             if pdf_images.ocr_worthy(page, picture, content):
                 kept.append(picture)
+            elif content == pdf_images.SHAPES:
+                shapes.append(picture)
             else:
                 skipped["no_content"] = skipped.get("no_content", 0) + len(picture.rects)
+        if shapes and not kept and self._without_text_layer(page_num):
+            # A page without a text layer shows nothing but these pictures: read them rather than
+            # emit nothing (a small photo over a printed label reads as "shapes").
+            kept = shapes
+        else:
+            skipped["no_content"] = skipped.get("no_content", 0) + sum(len(picture.rects) for picture in shapes)
         self._pictures[page_num] = (kept, skipped)
         return kept
+
+    def _without_text_layer(self, page_num: int) -> bool:
+        """Whether the page has no usable text layer (see core.strategy.NO_TEXT_LIMIT)."""
+        try:
+            return self._page_signals(page_num).visible.weight < _NO_TEXT_LIMIT
+        except Exception as e:
+            logger.debug(f"Could not measure the text layer of page {page_num + 1}: {e}")
+            return False
 
     def _ocr_jobs(self):
         """What the document's pages show for OCR, page by page (a generator: a page is rendered only
@@ -2249,7 +2327,7 @@ class PDFLoader:
     def _process_page(self, page_num: int, extract_images: bool = True, ocr_images: bool = False,
                       ocr_results_map: Dict[tuple, str] = None) -> List[Dict[str, Any]]:
         """Process a single page, routed by its OCR route (_page_route, applied in
-        _collect_all_images):
+        _ocr_jobs):
 
         - IMAGE-authoritative (a whole-page render was OCR'd): emit ONLY the OCR
           transcription. A sparse text layer on such a page is chrome
@@ -3985,11 +4063,13 @@ class PDFLoader:
                         page=page_num + 1,
                         position_y=rect.y0,
                     ))
+                    if text is not None:
+                        self._picture_records.append((page_num + 1, rect.y0, content, tuple(rect)))
             return image_items
 
         # Regular base64 extraction (OCR disabled): once per placement the page shows.
         extracted: Dict[int, Optional[Tuple[bytes, str, str]]] = {}
-        for placement in pdf_images.placements(page):
+        for placement in self._placements_of(page):
             if not placement.xref or placement.visible.is_empty:
                 continue
             try:

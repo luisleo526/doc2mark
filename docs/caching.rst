@@ -15,12 +15,16 @@ Two backends are included:
 A ``NoOpOCRCache`` is also available for testing; it accepts writes but always
 returns a miss.
 
-Only final answers are cached: a result with no text, or flagged ``failed`` in
-its metadata, is never stored, because an empty answer looks the same as an
-outage, a timeout or a refusal. The next run asks the provider again. Likewise
-``cache_dir`` (the loader's cache of converted documents) does not store a
-document whose OCR left images unanswered or answered with no text, or pages
-unread (see ``metadata.extra["ocr_images"]`` in :doc:`ocr_policy`).
+Every answer is cached, including an answer with no text and a refusal or "no
+readable text" statement: a blank page or a photo without words gets that answer
+every time. Only a failed answer (flagged ``failed`` in its metadata by the
+provider: a timeout, a rate limit, a server error) and a result that still
+withholds values after the router firewall's redo are asked again on the next
+run; an entry of either kind already in a cache is a miss, and each skipped write
+is logged at INFO. Likewise ``cache_dir`` (the loader's cache of converted
+documents) does not store a document whose OCR failed somewhere or left a page
+showing content unread (see ``metadata.extra["ocr_images"]`` in
+:doc:`ocr_policy`).
 
 Quick start
 -----------

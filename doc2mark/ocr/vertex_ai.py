@@ -20,6 +20,7 @@ from doc2mark.ocr.base import (
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    FAILURE_USAGE_KEY,
     REFUSAL_USAGE_KEY,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
@@ -266,7 +267,8 @@ class VertexAIVisionAgent:
             for res in sorted_results:
                 payload = res[1]
                 if isinstance(payload, Exception):
-                    out.append({"parsed": None, "parsing_error": str(payload), "raw": None})
+                    # The request failed (timeout, rate limit, server error): not an answer.
+                    out.append({"parsed": None, "parsing_error": str(payload), "raw": None, "failed": True})
                 else:
                     out.append(payload)
             return out
@@ -275,7 +277,8 @@ class VertexAIVisionAgent:
         for res in sorted_results:
             msg = res[1]
             if isinstance(msg, Exception):
-                out.append(("", {}))
+                # The request failed: the usage dict carries the signal (FAILURE_USAGE_KEY).
+                out.append(("", {FAILURE_USAGE_KEY: str(msg) or type(msg).__name__}))
                 continue
             blocked = _blocked_reason(msg)
             if blocked:
@@ -665,6 +668,7 @@ class VertexAIOCR(BaseOCR):
             image_size = len(images[i])
             token_usage = dict(token_usage or {})
             blocked = token_usage.pop(REFUSAL_USAGE_KEY, None)
+            failure = token_usage.pop(FAILURE_USAGE_KEY, None)
             # Screened for a refusal on the answer as written, then sanitized once at this
             # boundary (a recovery call's answers are screened by _apply_recovered).
             text_result, flags = self._free_form_answer(
@@ -689,6 +693,7 @@ class VertexAIOCR(BaseOCR):
                         "content_type": kwargs.get("content_type"),
                         "token_usage": token_usage,
                         **flags,
+                        **({"failed": True, "error": failure} if failure else {}),
                     },
                 )
             )
@@ -712,10 +717,12 @@ class VertexAIOCR(BaseOCR):
 
         results: List[OCRResult] = []
         for i, payload in enumerate(batch_results):
+            failed = False
             if isinstance(payload, dict):
                 page = payload.get("parsed")
                 aimsg = payload.get("raw")
                 parsing_error = payload.get("parsing_error")
+                failed = bool(payload.get("failed"))
             else:  # defensive: a bare AIMessage if include_raw was bypassed
                 page, aimsg, parsing_error = None, payload, None
 
@@ -777,6 +784,7 @@ class VertexAIOCR(BaseOCR):
                         "token_usage": usage,
                         **({"refusal": blocked, "non_content": "provider_refusal"} if blocked else {}),
                         **({"router_violations": violations} if violations else {}),
+                        **({"failed": True, "error": str(parsing_error)} if failed else {}),
                     },
                     document=page if isinstance(page, OCRPage) else None,
                 )

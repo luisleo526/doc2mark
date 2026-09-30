@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # free-form answer in its usage dict (the per-item channel of their public
 # ``(text, usage)`` return shape); the providers turn it into ``ocr_refusal``.
 REFUSAL_USAGE_KEY = "doc2mark_refusal"
+# Key under which they report, in the same channel, that an image's request failed (a
+# timeout, a rate limit, a server error): the providers turn it into
+# ``metadata["failed"] = True``. A failed image was not read: it is retried, never cached,
+# while an answer with no text is an answer (see doc2mark.ocr.cache).
+FAILURE_USAGE_KEY = "doc2mark_failure"
 
 
 class OCREngineError(OCRError):
@@ -459,20 +464,32 @@ class BaseOCR(ABC):
         ``metadata["ocr_refusal"] = True``, so a refusal is never indexed as page
         content -- unless the page carries other content (headings, dates, ...), which
         is kept as it is.
+
+        The recovery decides whether the image was read: when it answers (even with no
+        text), a failure of the structured call is over; when it fails too (flagged
+        ``failed``), the empty result is flagged ``metadata["failed"] = True`` so the next
+        run asks again instead of replaying it from a cache.
         """
         from doc2mark.ocr.refusal import non_content_reason
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
         judge = self._non_content_judge()
         for j, i in enumerate(empty_idx):
             text = (recovered[j].text or "").strip()
-            recovered_refused = bool((recovered[j].metadata or {}).get("ocr_refusal"))
+            recovered_meta = recovered[j].metadata or {}
+            recovered_refused = bool(recovered_meta.get("ocr_refusal"))
             if text and not recovered_refused and non_content_reason(text, judge):
                 recovered_refused, text = True, ""
             if not text:
                 doc = results[i].document
                 if isinstance(doc, OCRPage) and self._has_content_besides_text(doc):
                     continue
-                if recovered_refused or (results[i].metadata or {}).get("non_content"):
+                meta = dict(results[i].metadata or {})
+                if recovered_meta.get("failed"):
+                    meta.update(failed=True, error=recovered_meta.get("error") or meta.get("error"))
+                else:
+                    meta.pop("failed", None)
+                results[i] = replace(results[i], metadata=meta)
+                if recovered_refused or meta.get("non_content"):
                     results[i] = self._without_content(results[i], ocr_refusal=True)
                 continue
             doc = results[i].document
@@ -483,6 +500,7 @@ class BaseOCR(ABC):
             meta = dict(results[i].metadata or {})
             meta["structured_fallback"] = "free_form"
             meta.pop("non_content", None)
+            meta.pop("failed", None)
             results[i] = OCRResult(
                 text=_sanitize_markdown(text),
                 confidence=results[i].confidence,

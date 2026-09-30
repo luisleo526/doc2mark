@@ -4,14 +4,16 @@ A *placement* is one place where the page draws a raster image (an image XObject
 directly or through a Form XObject, or an inline image). A *picture* is what the
 text route OCRs as one unit and emits once per place it shows:
 
-- an image XObject shown on its own: one OCR request per image, however often the
-  document shows it, and one item per placement;
+- an image XObject the page shows whole: one OCR request per image, however often
+  the document shows it, and one item per placement;
 - tiles: placements that abut edge to edge and together show one picture (a scan cut
   into strips or a grid): the region they cover, rendered, is OCR'd as one picture;
-- an inline image (it has no xref): its region, rendered.
+- an inline image (it has no xref), or a picture the page shows only in part (cropped
+  by a clip path or by the page edge): the part the page shows, rendered.
 
-A placement the page does not show (off the page, or only a sliver of it on the page)
-is no picture. A picture is only sent to OCR when its pixels carry content; see
+What a placement shows is measured with its clip path and the page applied. A placement
+the page does not show (off the page, clipped away, or only a sliver of it) is no
+picture. A picture is only sent to OCR when its pixels carry content; see
 :func:`picture_content`. Everything here is geometry and pixels, never OCR.
 """
 import logging
@@ -25,18 +27,18 @@ import pymupdf
 logger = logging.getLogger(__name__)
 
 # --- What the page shows --------------------------------------------------------
-# A picture shows on the page when it lies on the visible page (CropBox) entirely, or,
-# when only part of it does, when that part is at least MIN_VISIBLE_SHARE of it and
-# measures at least MIN_PICTURE_POINTS on both sides, or fills at least FILLS_PAGE of
-# the page (a poster cut into page-sized tiles by CropBoxes). A picture placed off the
-# page, clipped away by the CropBox, or bleeding onto the page by a sliver shows
-# nothing a reader could read. A picture of fewer than MIN_PICTURE_PIXELS pixels on a
-# side holds nothing legible (rules, bullets, spacers). These rules apply to whole
-# pictures, after tiles are joined: a figure stored as thin bands shows as the figure.
-MIN_VISIBLE_SHARE = 0.1
+# What a placement shows is its clipped extent: the image's box cut by the clip paths
+# around it and by the visible page (CropBox), as MuPDF's text device reports it. A
+# picture the page shows whole always shows, however thin (a line of text kept as an
+# image). A picture shown only in part shows when the part is at least
+# MIN_PICTURE_POINTS on both sides: a picture placed off the page, clipped away, or
+# bleeding onto the page by a sliver shows nothing a reader could read. A picture of
+# fewer than MIN_PICTURE_PIXELS pixels on a side holds nothing legible (rules, bullets,
+# spacers). These rules apply to whole pictures, after tiles are joined: a figure
+# stored as thin bands shows as the figure.
 MIN_PICTURE_POINTS = 12.0
-FILLS_PAGE = 0.5
 MIN_PICTURE_PIXELS = 12
+WHOLE_SHARE = 0.99   # a placement showing at least this share of its box shows whole
 
 # --- Tiles ------------------------------------------------------------------------
 # Two placements are tiles of one picture when they share an edge: they touch (at most
@@ -71,8 +73,9 @@ SMALL_PICTURE_SHARE = 0.10
 SMALL_PICTURE_POINTS = 48.0
 
 # --- Rendering regions ------------------------------------------------------------
-# A region (tiles, an inline image) is rendered at the resolution its images carry
-# (at least REGION_MIN_DPI, at most REGION_MAX_DPI) and at most REGION_MAX_PIXELS in all.
+# A region (tiles, an inline image, a cropped picture) is rendered at the resolution its
+# images carry (at least REGION_MIN_DPI, at most REGION_MAX_DPI) and at most
+# REGION_MAX_PIXELS in all.
 REGION_MIN_DPI = 150
 REGION_MAX_DPI = 300
 REGION_MAX_PIXELS = 16_000_000
@@ -86,13 +89,17 @@ def page_area(page) -> pymupdf.Rect:
     return pymupdf.Rect(0, 0, page.cropbox.width, page.cropbox.height)
 
 
+def _area(rect: pymupdf.Rect) -> float:
+    return 0.0 if rect.is_empty else abs(rect.width * rect.height)
+
+
 @dataclass(frozen=True)
 class Placement:
     """One place where the page draws a raster image (unrotated page coordinates)."""
 
     xref: int                 # 0 for an inline image
     bbox: pymupdf.Rect        # where the image is drawn
-    visible: pymupdf.Rect     # the part of it on the visible page
+    visible: pymupdf.Rect     # the part of it the page shows (clip paths and the visible page applied)
     width: int = 0            # image pixels
     height: int = 0
 
@@ -100,34 +107,61 @@ class Placement:
     def tiny(self) -> bool:
         return 0 < min(self.width, self.height) < MIN_PICTURE_PIXELS
 
+    @property
+    def partial(self) -> bool:
+        """Whether the page shows only part of it (cropped by a clip path or by the page edge)."""
+        return _area(self.visible) < WHOLE_SHARE * _area(self.bbox)
 
-def _area(rect: pymupdf.Rect) -> float:
-    return 0.0 if rect.is_empty else abs(rect.width * rect.height)
 
-
-def shows(visible: pymupdf.Rect, whole: pymupdf.Rect, page) -> bool:
-    """Whether a picture drawn at ``whole`` of which ``visible`` is on the page shows (see MIN_VISIBLE_SHARE)."""
-    shown, drawn = _area(visible), _area(whole)
+def shows(visible: pymupdf.Rect, whole: pymupdf.Rect) -> bool:
+    """Whether a picture drawn at ``whole`` of which the page shows ``visible`` shows (see MIN_PICTURE_POINTS)."""
+    shown = _area(visible)
     if not shown:
         return False
-    if shown >= 0.99 * drawn or shown >= FILLS_PAGE * _area(page_area(page)):
-        return True
-    return shown >= MIN_VISIBLE_SHARE * drawn and min(visible.width, visible.height) >= MIN_PICTURE_POINTS
+    return shown >= WHOLE_SHARE * _area(whole) or min(visible.width, visible.height) >= MIN_PICTURE_POINTS
+
+
+def _clipped_image_boxes(page) -> Optional[List[pymupdf.Rect]]:
+    """The extent the page shows of each image it draws, in drawing order: MuPDF's text device, asked to keep
+    images and to clip, reports each image's box cut by the clip paths around it and by the page (an image
+    clipped away comes back as an empty box). None when this PyMuPDF cannot tell."""
+    clip = getattr(pymupdf, "TEXT_CLIP", None)
+    if clip is None:
+        return None
+    try:
+        textpage = page.get_textpage(flags=pymupdf.TEXT_PRESERVE_IMAGES | clip)
+        blocks = [block for block in textpage.extractBLOCKS() if block[6] == 1]
+    except Exception as exc:
+        logger.debug(f"Could not measure the clipped images of page {page.number + 1}: {exc}")
+        return None
+    return [pymupdf.Rect(block[:4]) if block[0] < block[2] and block[1] < block[3] else pymupdf.Rect()
+            for block in blocks]
 
 
 def placements(page) -> List[Placement]:
     """Every raster image placement of ``page``, each once (``get_image_info`` walks what the page draws:
-    an image listed twice in the resources, directly and through a Form XObject, is drawn once)."""
+    an image listed twice in the resources, directly and through a Form XObject, is drawn once), with the
+    part the page shows (see :func:`_clipped_image_boxes`; the box on the visible page when the clipped
+    extents cannot be matched to the placements one to one)."""
     area = page_area(page)
+    infos = page.get_image_info(xrefs=True)
+    clipped = _clipped_image_boxes(page)
+    if clipped is not None and len(clipped) != len(infos):
+        logger.debug(f"Page {page.number + 1}: {len(clipped)} clipped image boxes for {len(infos)} images; "
+                     f"measuring the images unclipped")
+        clipped = None
     seen = set()
     result = []
-    for info in page.get_image_info(xrefs=True):
+    for index, info in enumerate(infos):
         bbox = pymupdf.Rect(info["bbox"])
         key = (info.get("xref") or 0, tuple(round(value, 1) for value in bbox))
         if key in seen or bbox.is_empty:
             continue
         seen.add(key)
-        result.append(Placement(xref=info.get("xref") or 0, bbox=bbox, visible=bbox & area,
+        visible = bbox & area
+        if clipped is not None:
+            visible = visible & clipped[index] if not clipped[index].is_empty else pymupdf.Rect()
+        result.append(Placement(xref=info.get("xref") or 0, bbox=bbox, visible=visible,
                                 width=int(info.get("width") or 0), height=int(info.get("height") or 0)))
     return result
 
@@ -200,11 +234,12 @@ def _native_dpi(group: Sequence[Placement]) -> float:
     return min(REGION_MAX_DPI, max([REGION_MIN_DPI] + dpis))
 
 
-def page_pictures(page) -> Tuple[List[Picture], Dict[str, int]]:
+def page_pictures(page, placed: Optional[Sequence[Placement]] = None) -> Tuple[List[Picture], Dict[str, int]]:
     """The pictures of ``page`` in reading order (top to bottom), before any pixel check, and how many
     placements were left out: the page does not show them (``not_shown``), or they are too small to hold
-    anything legible (``no_content``). Tiles are joined first; the rules then judge whole pictures."""
-    everything = placements(page)
+    anything legible (``no_content``). Tiles are joined first; the rules then judge whole pictures.
+    ``placed`` is the page's :func:`placements` when the caller has them already."""
+    everything = placements(page) if placed is None else list(placed)
     skipped = {"not_shown": 0, "no_content": 0}
     pictures: List[Picture] = []
     by_xref: Dict[int, Picture] = {}
@@ -215,17 +250,18 @@ def page_pictures(page) -> Tuple[List[Picture], Dict[str, int]]:
         for placement in group:
             region |= placement.visible
             whole |= placement.bbox
-        if not shows(region, whole, page):
+        if not shows(region, whole):
             skipped["not_shown"] += len(group)
             continue
-        if len(group) > 1 or not group[0].xref:
+        placement = group[0]
+        if len(group) == 1 and placement.tiny:
+            skipped["no_content"] += 1
+            continue
+        if len(group) > 1 or not placement.xref or placement.partial:
+            # Rendered as the page shows it: tiles joined, an inline image, a cropped picture.
             pictures.append(Picture(key=f"region-{regions}", rects=[region], region=region,
                                     dpi=_native_dpi(group), placements=list(group)))
             regions += 1
-            continue
-        placement = group[0]
-        if placement.tiny:
-            skipped["no_content"] += 1
             continue
         picture = by_xref.get(placement.xref)
         if picture is None:
@@ -236,13 +272,15 @@ def page_pictures(page) -> Tuple[List[Picture], Dict[str, int]]:
     return pictures, skipped
 
 
-def single_rects(page) -> List[pymupdf.Rect]:
-    """Visible rectangles of the image XObjects the text route OCRs one by one (not tiles, not inline
-    images, not placements the page does not show). Geometry only: cheap enough for routing."""
+def single_rects(page, placed: Optional[Sequence[Placement]] = None) -> List[pymupdf.Rect]:
+    """Visible rectangles of the pictures the text route reads one by one whatever their pixels: image
+    XObjects the page shows whole that are not small (see :func:`is_small`). Tiles, inline images, cropped
+    pictures and small pictures (icons, thumbnails: read only when they look like text) are not counted, so
+    a page without a text layer that shows them is left to its render. Geometry only: cheap for routing."""
     rects = []
-    for picture in page_pictures(page)[0]:
+    for picture in page_pictures(page, placed)[0]:
         if picture.xref:
-            rects.extend(picture.rects)
+            rects.extend(rect for rect in picture.rects if not is_small(rect, page))
     return rects
 
 

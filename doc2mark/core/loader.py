@@ -643,10 +643,14 @@ class UnifiedDocumentLoader:
                     # Convert to plain text
                     result.content = result.text
 
-            # Cache result, unless OCR failed or came back empty on a page showing content: a
-            # re-run with a healthy provider must read those pages (see _ocr_incomplete).
-            if self.cache_dir and not self._ocr_incomplete(result):
-                self._cache_result(file_path, output_format, result, cache_options)
+            # Cache result, unless its OCR failed somewhere: a re-run with a healthy provider
+            # must read what this one could not (see _ocr_incomplete).
+            if self.cache_dir:
+                incomplete = self._ocr_incomplete(result)
+                if incomplete:
+                    logger.info(f"Not caching {file_path.name}: {incomplete}; the next run converts it again")
+                else:
+                    self._cache_result(file_path, output_format, result, cache_options)
 
             return result
 
@@ -1194,16 +1198,22 @@ class UnifiedDocumentLoader:
         )
 
     @staticmethod
-    def _ocr_incomplete(result: ProcessedDocument) -> bool:
-        """Whether the document's OCR is not a final answer: images the provider did not answer or
-        answered with no text, pages showing content whose OCR returned nothing
-        (``metadata.extra["ocr_images"]``), or OCR issues reported by the provider (``ocr_issues``).
-        An empty answer looks the same as a per-image timeout or rate limit, so such a result is not
-        cached (a picture with nothing to read is not sent to OCR in the first place)."""
+    def _ocr_incomplete(result: ProcessedDocument) -> Optional[str]:
+        """Why the document's OCR is not a final answer, or None when it is: images whose OCR
+        failed (flagged ``failed`` by the provider, or left without an answer by a failed batch;
+        ``metadata.extra["ocr_images"]["failed"]`` and ``["ocr_issues"]["failed"]``), or pages
+        showing content whose render OCR returned nothing (``unread_pages``). Such a document is
+        not written to ``cache_dir``. An answer with no text, or a refusal, is an answer: a blank
+        page or a photo without words gets it again on every run."""
         extra = getattr(result.metadata, "extra", None) or {}
         images = extra.get("ocr_images") or {}
-        return bool(images.get("failed") or images.get("empty") or images.get("unread_pages")
-                    or extra.get("ocr_issues"))
+        issues = extra.get("ocr_issues") or {}
+        failed = max(int(images.get("failed") or 0), int(issues.get("failed") or 0))
+        if failed:
+            return f"OCR failed on {failed} image(s)"
+        if images.get("unread_pages"):
+            return f"unread page(s) {images['unread_pages']}: they show content but their OCR returned nothing"
+        return None
 
     def _get_cached(
             self,

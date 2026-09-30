@@ -423,13 +423,13 @@ def test_real_empty_answers_are_cached_and_only_failed_ones_are_retried(require_
     runs = json.loads(proc.stdout.strip().splitlines()[-1])
     sent = [run["sent"] for run in runs]
     assert sent[0] >= 4, sent
-    assert "SHEET 1" not in words(runs[0]["content"]) and "OCR unavailable" in runs[0]["content"], runs[0]
-    for run in runs[1:]:
-        assert "SHEET 1 ALPHA" in words(run["content"]) and "SHEET 3 CHARLIE" in words(run["content"]), run
     if cache == "cache_dir":
         assert sent[1:] == [sent[0], 0], sent  # no OCR cache: run 2 reads everything again, then it is stored
     else:
         assert sent[1:] == [1, 0], sent  # only the failed image is asked again
+    assert "SHEET 1" not in words(runs[0]["content"]) and "OCR unavailable" in runs[0]["content"], runs[0]
+    for run in runs[1:]:
+        assert "SHEET 1 ALPHA" in words(run["content"]) and "SHEET 3 CHARLIE" in words(run["content"]), run
 
 
 def test_textless_page_of_small_labelled_pictures_is_read(run_cli, require_tool, e2e_dir):

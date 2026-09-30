@@ -272,13 +272,15 @@ rule looks at what the page shows, never at the file's structure alone:
   it (the text layer already emits that text), and OCR'd as one picture, so words
   are not cut at tile edges. An inline image (``BI``/``ID``/``EI``, it has no
   xref) is rendered the same way.
-- **Shown.** Once tiles are joined, a picture the page does not show is left out:
-  one lying on the visible page (CropBox) only in part, when that part is less
-  than 10 % of it or less than 12 pt on a side (placed off the page, clipped away
-  by the CropBox, or bleeding onto the page by a sliver) -- unless what shows
-  fills half the page or more (a poster cut into page-sized tiles by CropBoxes).
-  A picture wholly on the page always shows, however thin (a line of text kept as
-  an image). An image of fewer than 12 pixels a side holds nothing legible.
+- **Shown.** What a picture shows is measured with its clip path and the visible
+  page (CropBox) applied: MuPDF's text device reports each image's box cut by the
+  clips around it. A picture the page shows whole always shows, however thin (a
+  line of text kept as an image). A picture shown only in part (cropped by a clip
+  path, or running off the page) shows when the part is at least 12 pt on both
+  sides, and is OCR'd as the page shows it: the visible part is rendered like a
+  region, so the text the crop hides is not read. A picture off the page, clipped
+  away, or showing a sliver is left out, as is an image of fewer than 12 pixels a
+  side. These rules judge whole pictures, after tiles are joined.
 - **Content.** A picture is judged on a grey copy of at most 1024 pixels a side:
 
   * *plain* -- fewer than 24 edge pixels (neighbours at least 16 grey levels
@@ -307,26 +309,47 @@ rule looks at what the page shows, never at the file's structure alone:
   context for embedded images (``context_pages=2``) the answer depends on the
   page, so the request is made once per page.
 
-A picture whose OCR is missing (a failed batch) leaves the placeholder
-``[image: OCR unavailable]`` at each place it shows; one whose OCR returned no
-text leaves nothing. What was sent is reported in
+A picture whose OCR failed (the provider flags the answer ``failed``: a timeout,
+a rate limit, a server error) or is missing (a failed batch) leaves the
+placeholder ``[image: OCR unavailable]`` at each place it shows; one whose OCR
+returned no text leaves nothing. What was sent is reported in
 ``metadata.extra["ocr_images"]``: ``ocr_requests`` (images sent to the
 provider), ``page_renders``, ``batches`` and ``largest_batch``, ``empty`` and
 ``failed`` (requests answered with no text, or not answered), ``skipped``
 (placements not OCR'd because the page does not show them, ``not_shown``, or
 they carry nothing to read, ``no_content``) and ``unread_pages``.
 
-Routing counts a page's pictures the same way: for *uncaptured content* (see
-*Per-page routes*), the image XObjects the page shows are what the text route
-reads one by one; tiles and inline images are not, so a page without a text layer
-that shows a tiled or inline-image scan is OCR'd from its render.
+On a page without a usable text layer the pictures are all the page shows, so
+such a page never emits nothing: when every picture on it reads as *shapes*,
+they are OCR'd anyway.
 
-Neither an OCR result with no text or flagged ``failed`` is ever cached
-(``ocr_cache``), nor a converted document with unanswered images, images
-answered with no text, or unread pages (``cache_dir``): an empty answer looks
-the same as an outage, a per-image timeout or a refusal, so the next run asks
-the provider again. (Pictures with nothing to read are not sent to OCR at all,
-so this costs little.)
+A picture repeated as page furniture -- the same OCR text at (nearly) the same
+place, every edge within 4 pt, on at least 3 pages and on more than half of the
+document's pages, like a letterhead logo or a slide template's wordmark -- is
+kept once, like the first copy of a running header: the later copies are typed
+``text:header`` / ``text:footer`` (kept in the JSON, left out of the Markdown). A
+picture shown on fewer pages, or at moving places, stays everywhere.
+
+Routing counts a page's pictures the same way: for *uncaptured content* (see
+*Per-page routes*), the pictures the text route reads one by one whatever their
+pixels are the image XObjects the page shows whole that are not small. Small
+pictures (read only when they look like text), tiles, inline images and cropped
+pictures are not, so a page without a text layer that shows them -- a catalogue
+sheet of labelled thumbnails, a tiled or inline-image scan -- is OCR'd from its
+render, one request for the whole page.
+
+What is cached: an OCR answer is cached (``ocr_cache``) whatever it says,
+including an answer with no text and a refusal or "no readable text" statement
+-- a blank page or a photo without words gets that answer every time, and
+asking again would cost a call (with the LLM providers two: the structured call
+and the free-form recovery behind it) on every run. Only a failed answer, and a
+result that still withholds values after the router firewall's redo, are asked
+again on the next run, never replayed; an entry of either kind already in a
+cache is a miss. A converted document is not written to ``cache_dir`` when its
+OCR failed somewhere (``failed`` requests, ``ocr_issues["failed"]``) or left a
+page showing content unread (``unread_pages``); answers with no text and
+refusals do not keep it out. A skipped cache write is logged at INFO with the
+reason.
 
 Text-layer quality gate
 ~~~~~~~~~~~~~~~~~~~~~~~
