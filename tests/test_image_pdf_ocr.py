@@ -99,13 +99,14 @@ def test_image_doc_renders_every_page(tmp_path):
     assert renders == {0, 1, 2}
 
 
-def test_text_doc_collects_embedded_skips_tiny(tmp_path):
-    # text-strategy document (mixed/mostly-text): no whole-page renders; embedded
-    # figures collected for per-image OCR, tiny decorative image skipped.
+def test_text_doc_renders_only_its_picture_page_and_skips_tiny(tmp_path):
+    # text-strategy document (mostly text): the text pages are not rendered, and the
+    # tiny decorative image on page 2 is skipped; the full-page picture page 0
+    # overrides the document route and is rendered on its own (per-page route).
     p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
+    assert p._document_image_strategy() == "text"
     work = p._collect_all_images()
-    assert not any(w.get("is_page_render") for w in work)   # no whole-doc OCR
-    assert any(w["page_num"] == 0 for w in work)            # full image collected
+    assert {w["page_num"] for w in work if w.get("is_page_render")} == {0}
     assert all(w["page_num"] != 2 for w in work)            # tiny decorative skipped
 
 

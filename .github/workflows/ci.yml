@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'pyproject.toml'
       - 'setup.py'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [ main ]
@@ -61,6 +62,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Report every Python version instead of cancelling the rest on the first failure.
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
@@ -79,12 +82,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[all,dev]
 
+      # tests/e2e needs Tesseract, LibreOffice and CJK fonts: it runs in the e2e job's image.
       - name: Run unit tests with coverage
         env:
           # Ensure no accidental OpenAI calls in CI
           OPENAI_API_KEY: ""
         run: |
-          python -m pytest -m "not integration and not requires_api_key" -q \
+          python -m pytest -m "not integration and not requires_api_key and not e2e" -q \
             --cov=doc2mark --cov-branch \
             --cov-report=term-missing \
             --cov-report=xml \
@@ -98,6 +102,17 @@ jobs:
           files: ./coverage.xml
           flags: unittests
           fail_ci_if_error: false
+
+  e2e:
+    name: E2E (CLI in docker, Tesseract + LibreOffice)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run the CLI E2E suite (scripts/run_e2e_docker.sh, D2M_E2E_STRICT=1)
+        run: scripts/run_e2e_docker.sh -q -p no:cacheprovider
 
   test-ocr:
     name: OCR tests (OpenAI)

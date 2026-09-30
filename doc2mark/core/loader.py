@@ -19,6 +19,7 @@ from doc2mark.core.base import (
     ProcessingError,
     UnsupportedFormatError
 )
+from doc2mark.core.strategy import ROUTING_VERSION
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache
 from doc2mark.ocr.prompts import PromptTemplate
@@ -61,7 +62,9 @@ class UnifiedDocumentLoader:
             structured: Optional[bool] = None,
             detail: Optional[str] = None,
             # Table output configuration
-            table_style: Optional[str] = None
+            table_style: Optional[str] = None,
+            # Optional text-layer legibility judge (PDF quality gate)
+            legibility_judge: Optional[Callable[[str], Optional[float]]] = None,
     ):
         """Initialize the document loader with enhanced OCR configuration.
 
@@ -109,6 +112,14 @@ class UnifiedDocumentLoader:
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
                 - 'markdown_grid': Markdown with merge annotations
                 - 'styled_html': Full HTML with inline styles (legacy)
+
+            # Text-layer quality gate (PDF):
+            legibility_judge: Optional ``judge(page_text) -> Optional[float]``
+                returning the probability that a page's extracted text is legible, or
+                None when it cannot judge. Consulted only when OCR is active
+                (``ocr_images=True`` with an OCR provider) and only for text layers the
+                deterministic garbage detector does not flag; see
+                doc2mark.core.strategy.judge_text_layer for the full contract.
         """
         logger.info("🚀 Initializing UnifiedDocumentLoader with enhanced OCR configuration")
 
@@ -146,6 +157,7 @@ class UnifiedDocumentLoader:
         # Table output style (default: minimal_html for cleaner output)
         self.table_style = table_style if table_style else "minimal_html"
         logger.info(f"📊 Table style: {self.table_style}")
+        self.legibility_judge = legibility_judge
 
         # Registry of format processors
         self._processors: Dict[DocumentFormat, BaseProcessor] = {}
@@ -390,7 +402,8 @@ class UnifiedDocumentLoader:
 
             # Initialize processors with OCR support
             office_processor = OfficeProcessor(ocr=ocr, table_style=self.table_style)
-            pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style)
+            pdf_processor = PDFProcessor(ocr=ocr, table_style=self.table_style,
+                                         legibility_judge=getattr(self, "legibility_judge", None))
             text_processor = TextProcessor()
             markup_processor = MarkupProcessor()
             legacy_processor = LegacyProcessor(ocr=ocr)
@@ -450,6 +463,28 @@ class UnifiedDocumentLoader:
         except ImportError:
             logger.debug("Email processor not available; skipping .eml support")
 
+    def _judge_identity(self) -> Optional[str]:
+        """A stable name for the configured legibility judge (for cache keys).
+
+        A judge can name its own configuration with a ``cache_key`` attribute; otherwise
+        its qualified name (plus the arguments of a ``functools.partial``) is used.
+        """
+        judge = getattr(self, "legibility_judge", None)
+        if judge is None:
+            return None
+        try:
+            explicit = getattr(judge, "cache_key", None)
+            if explicit is not None:
+                return str(explicit)
+            target = getattr(judge, "func", None) or getattr(judge, "__func__", None) or judge
+            name = getattr(target, "__qualname__", None) or type(target).__qualname__
+            identity = f"{getattr(target, '__module__', type(target).__module__)}.{name}"
+            if getattr(judge, "func", None) is not None:  # functools.partial
+                identity += repr((getattr(judge, "args", ()), getattr(judge, "keywords", {})))
+            return identity
+        except Exception:
+            return type(judge).__qualname__
+
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
         """Normalize string output format names to OutputFormat enum values."""
@@ -480,7 +515,7 @@ class UnifiedDocumentLoader:
             file_path: Path to the document
             output_format: Desired output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images as base64 (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             show_progress: Whether to show progress messages during processing
             
             # Format-specific parameters:
@@ -515,6 +550,12 @@ class UnifiedDocumentLoader:
                 f"Unsupported format: {doc_format.value}"
             )
 
+        # OCR needs the images: ocr_images=True with the default extract_images=False
+        # means "OCR my images", not "do nothing".
+        if ocr_images and not extract_images and self.ocr is not None:
+            logger.info("ocr_images=True implies extract_images=True (images are extracted for OCR)")
+            extract_images = True
+
         # Check cache
         if self.cache_dir:
             cache_options = {
@@ -525,6 +566,10 @@ class UnifiedDocumentLoader:
                 "delimiter": delimiter,
                 "table_style": self.table_style,
                 "ocr_provider": type(self._unwrap_ocr(self.ocr)).__name__ if self.ocr else None,
+                # A different judge, or routing that changed what a page emits, must not
+                # be answered from an older cached result.
+                "legibility_judge": self._judge_identity(),
+                "routing_version": ROUTING_VERSION,
             }
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
@@ -757,7 +802,7 @@ class UnifiedDocumentLoader:
             output_dir: Optional output directory (default: same as input)
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             recursive: Whether to process subdirectories
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
@@ -928,7 +973,7 @@ class UnifiedDocumentLoader:
             output_dir: Optional output directory
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
-            ocr_images: Whether to perform OCR on extracted images (requires extract_images=True)
+            ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
             show_progress: Whether to show progress messages
             save_files: Whether to save output files
             encoding: Text encoding for text/markup files

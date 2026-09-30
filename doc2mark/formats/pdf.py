@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from doc2mark.core.base import (
     BaseProcessor,
@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 class PDFProcessor(BaseProcessor):
     """Processor for PDF documents using advanced pipeline."""
 
-    def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None):
+    def __init__(self, ocr: Optional[BaseOCR] = None, table_style: Optional[str] = None,
+                 legibility_judge: Optional[Callable[[str], Optional[float]]] = None):
         """Initialize PDF processor.
         
         Args:
@@ -28,9 +29,12 @@ class PDFProcessor(BaseProcessor):
                 - 'minimal_html': Clean HTML with only rowspan/colspan (default)
                 - 'markdown_grid': Markdown with merge annotations
                 - 'styled_html': Full HTML with inline styles (legacy)
+            legibility_judge: Optional ``judge(page_text) -> Optional[float]`` for the
+                text-layer quality gate (see doc2mark.core.strategy.judge_text_layer)
         """
         self.ocr = ocr
         self.table_style = table_style
+        self.legibility_judge = legibility_judge
 
     def can_process(self, file_path: Union[str, Path]) -> bool:
         """Check if this processor can handle the file."""
@@ -51,7 +55,7 @@ class PDFProcessor(BaseProcessor):
         Args:
             file_path: Path to PDF file
             extract_images: Whether to extract images as base64
-            use_ocr: Whether to perform OCR on images (requires extract_images=True)
+            use_ocr: Whether to perform OCR on images (implies image extraction)
             extract_tables: Whether to extract tables (always True for advanced pipeline)
             show_progress: Whether to show processing progress
             **kwargs: Additional parameters
@@ -68,8 +72,8 @@ class PDFProcessor(BaseProcessor):
             # Import and use the advanced pipeline
             from doc2mark.pipelines import pdf_to_simple_json, pdf_to_markdown
             
-            # Convert parameters
-            ocr_images = use_ocr and extract_images  # OCR only if both are True
+            # OCR needs the images, so asking for OCR implies extracting them for it.
+            ocr_images = bool(use_ocr)
             
             # Process with advanced pipeline
             logger.info(f"Processing PDF with advanced pipeline: {file_path.name}")
@@ -79,7 +83,8 @@ class PDFProcessor(BaseProcessor):
                 ocr_images=ocr_images,
                 show_progress=show_progress,
                 ocr=self.ocr,  # Pass the OCR instance
-                table_style=kwargs.get('table_style', self.table_style)  # Pass table style
+                table_style=kwargs.get('table_style', self.table_style),  # Pass table style
+                legibility_judge=self.legibility_judge,
             )
             
             # Convert to markdown using the advanced converter
@@ -98,6 +103,12 @@ class PDFProcessor(BaseProcessor):
             # Add table count to metadata
             if tables_count > 0:
                 metadata.extra['tables_count'] = tables_count
+
+            # Per-page routing facts (which pages were OCR'd and why, garbled or
+            # hidden text layers), see PDFLoader._record_routing.
+            for key in ('ocr_routing', 'text_layer_quality', 'hidden_text'):
+                if key in json_data:
+                    metadata.extra[key] = json_data[key]
             
             return ProcessedDocument(
                 content=markdown_content,
