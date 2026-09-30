@@ -183,7 +183,8 @@ class TestPipelines:
 
     @pytest.mark.requires_api_key
     def test_xlsx_ocr_embeds_in_cell(self, sample_documents_dir):
-        """XLSX: OCR result should be embedded in the table cell placeholder (first occurrence only)."""
+        """XLSX: a picture's OCR result is placed where the picture is anchored (its cell, or the
+        title line above the table), never as a #VALUE! placeholder."""
         xlsx = sample_documents_dir / 'sample_spreadsheet.xlsx'
         if not xlsx.exists():
             pytest.skip("sample_spreadsheet.xlsx not found")
@@ -205,9 +206,15 @@ class TestPipelines:
         # Ensure no literal placeholder remains
         assert '#VALUE!' not in result.content
 
-        # Ensure at least one OCR analysis div injected (first occurrence replacement)
-        injected = result.content.count('📷 OCR Analysis:')
-        assert injected >= 1
+        # The picture anchored at A4 ("Sample Image:", a title row) is marked on that line:
+        # "[Image: <text>]" when the model reads text in it, "[Image]" when it reads none.
+        line = next((line for line in result.content.splitlines() if line.startswith("Sample Image:")), "")
+        assert "[Image" in line, result.content[:1500]
+
+        # The internal OCR wrapper never leaks, and an empty OCR result is not an item
+        assert "image_ocr_result>" not in result.content
+        leaked = [item for item in result.json_content or [] if "image_ocr_result>" in (item.get("content") or "")]
+        assert not leaked, leaked
 
     def test_pptx_ocr_uses_self_ocr_not_visionagent(self, sample_documents_dir):
         """PPTX: OCR should run when self.ocr is configured, regardless of VisionAgent availability."""
