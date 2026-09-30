@@ -80,6 +80,16 @@ _REFUSED = (
 )
 # Refused only after an apology: "I'm sorry, but I can't do that." (bare, it is a quote).
 _APOLOGY_REFUSED = rf"(?:{_REFUSED}|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?\s*[.!]?\s*$)"
+_END = r"\s*[.!]?\s*$"
+# Without an apology the refusal must end at its object ("I can't read the scans until
+# Dr. Lee signs off." is a note); only the model's own verb, "transcribe", may go on.
+_BARE_REFUSED = (
+    rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request))?{_END}"
+    rf"|comply\s+with\s+(?:that|this|the)\s+request{_END}"
+    rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
+    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}{_END}"
+    rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?{_END})"
+)
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
 # Absence of text, not quality ("The photo is blurry." is also an app's hint to the user).
 _BLANK = (
@@ -88,6 +98,11 @@ _BLANK = (
 )
 _IN_THE_IMAGE = rf"(?:in|on|within)\s+(?:this|the)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b"
 _ZH_IMAGE = r"(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
+# ... the image (中的文字 / 的內容), and nothing after it but the full stop.
+_ZH_IMAGE_END = (
+    r"(?:這張|这张|此|該|该|本|這個|这个)?[^。，,\n]{0,6}?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
+    r"(?:中|裡|里|上|內|内)?(?:的)?(?:文字|內容|内容|字|資訊|信息)?[。.!！]?\s*$"
+)
 _ZH_READ = r"(?:辨識|辨识|識別|识别|讀取|读取|處理|处理|轉錄|转录|解析|看清|判讀|判读)"
 
 # Patterns anchored at the start of the (normalized) answer. Case-insensitive. Each one
@@ -98,9 +113,9 @@ _START_PATTERNS = [
     rf"\b(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|must\s+not))\s+(?:\w+\s+){{0,3}}?{_APOLOGY_REFUSED}",
     rf"(?:unfortunately|apologies|my\s+apologies|i\s+apologi[sz]e)\b[^.!?\n]{{0,60}}?\b{_I_NEG}\s+"
     rf"(?:\w+\s+){{0,3}}?{_APOLOGY_REFUSED}",
-    # "I can't transcribe copyrighted book pages", "I am unable to read the text in this image"
-    rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_REFUSED}",
-    rf"as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,\s*"
+    # "I can't transcribe copyrighted book pages", "I am unable to read the text in this image."
+    rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_BARE_REFUSED}",
+    rf"(?=[^.\n]*\b{_IMAGE_NOUN}\b)as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,\s*"
     rf"(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|am\s+not|have\s+no))",
     # "The image appears to be blank", "The page seems to be mostly empty" (a page or
     # document only with the hedge: "This page is intentionally left blank." is page text)
@@ -121,12 +136,12 @@ _START_PATTERNS = [
     r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\][.!]?$",
     r"(?:no\s+(?:readable\s+)?text(?:\s+(?:found|detected|available))?|illegible|unreadable)[.!]?$",
     # Chinese: first person (我) cannot read the image
-    rf"(?=[^。\n]*我)(?=[^。\n]*{_ZH_IMAGE})(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
-    rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n]{{0,6}}?{_ZH_READ}",
-    rf"我(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}[^。\n]{{0,12}}?{_ZH_IMAGE}",
+    rf"(?=[^。\n]*我)(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
+    rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
+    rf"我(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
     r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
     r"(?:中|裡|里|上|內|内)?(?:並|并)?(?:沒有|没有|無|无|不含|未包含|未發現|未发现|找不到|未能找到)"
-    r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)",
+    r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)[。.!！]?\s*$",
     # Japanese
     r"(?=[^。\n]*(?:画像|写真|イメージ))(?![^\n]*(?:アップロード|お客様|現在))"
     r"(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n]{0,40}?"
@@ -160,7 +175,7 @@ _START_RE = re.compile("|".join(f"(?:{p})" for p in _START_PATTERNS), re.IGNOREC
 # A refusal clause anywhere in a short answer: "..., so I won't transcribe it."
 _ANYWHERE_RE = re.compile(
     rf"\bi\s*(?:won{_APOS}?t|will\s+not|can(?:no|{_APOS})?t|can\s+not|(?:am|{_APOS}m)\s+(?:unable|not\s+able)\s+to)\s+"
-    r"(?:transcribe|provide\s+(?:a\s+)?transcription\s+of|extract\s+(?:the\s+)?text\s+from|read\s+the\s+text\s+(?:in|on|from))"
+    r"(?:transcribe|provide\s+(?:a\s+)?transcription\s+of|extract\s+(?:the\s+)?text\s+from)"
     rf"\s+(?:it|this|that)(?:\s+{_IMAGE_NOUN})?\s*(?:[.!,]|$)",
     re.IGNORECASE,
 )
