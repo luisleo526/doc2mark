@@ -1,6 +1,7 @@
 """Shared table rendering utilities for doc2mark pipelines."""
 
 import logging
+import re
 from enum import Enum
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -11,6 +12,57 @@ logger = logging.getLogger(__name__)
 # Module-level cached singletons (created once, reused everywhere)
 _EMPTY_CELL = None
 _CONTINUATION_CELL = None
+
+# Set once TableData has had to shrink a span that would have hidden a value, so the
+# warning is logged once per process instead of once per table.
+_SPAN_OVERLAP_LOGGED = False
+
+# --- Cell text escaping ------------------------------------------------------------
+# Every renderer passes cell text through these, following the escaping policy shared
+# with the Markdown body-text path: escape only what would change the table's
+# Markdown/HTML structure or make characters disappear, keep everything else verbatim.
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\x0b\x0c\x85  ]")
+_CONTROL_CHAR = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")  # C0 controls except \t and \n
+_ENTITY_START = re.compile(r"&(?=#[0-9]+;|#[xX][0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]*;)")
+_TAG_START = re.compile(r"<(?=[A-Za-z/!?])")
+_CONSUMED_BACKSLASH = re.compile(r"\\(?=[!-/:-@\[-`{-~]|$)")  # before ASCII punctuation or at the end
+
+
+def _plain_cell_text(text: str) -> str:
+    """Every line-break form (CR/LF, CR, VT, FF, NEL, LS, PS) becomes ``\\n`` and the other
+    C0 control characters (except tab) are removed."""
+    return _CONTROL_CHAR.sub("", _LINE_BREAK.sub("\n", text))
+
+
+def markdown_cell(text: str) -> str:
+    """Cell text for a pipe table: line breaks as ``<br>`` (GFM; ASCII spaces around them and
+    blank lines at the ends dropped, full-width indentation kept), ``|`` escaped as ``\\|``, a
+    backslash doubled where a Markdown renderer would consume it (before ASCII punctuation,
+    before a line break, at the end of the cell), and ``<`` / ``&`` escaped only where they
+    would start an HTML tag or an entity. ``x < 5 & y`` stays as is."""
+    lines = [line.strip(" \t") for line in _plain_cell_text(text).split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "<br>".join(_markdown_cell_line(line) for line in lines)
+
+
+def _markdown_cell_line(line: str) -> str:
+    line = _CONSUMED_BACKSLASH.sub(r"\\\\", line)  # first: it looks at the characters as written
+    line = _ENTITY_START.sub("&amp;", line)
+    line = _TAG_START.sub("&lt;", line)
+    return line.replace("|", "\\|")
+
+
+def html_cell(text: str, quote: bool = False) -> str:
+    """Cell text for an HTML table: ``&``, ``<``, ``>`` (and ``"`` with ``quote``) escaped,
+    line breaks as ``<br>``."""
+    text = _plain_cell_text(text).strip("\n")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if quote:
+        text = text.replace('"', "&quot;")
+    return text.replace("\n", "<br>")
 
 
 class TableStyle(Enum):
@@ -89,6 +141,9 @@ class TableData(BaseModel):
     Invariants enforced by validators:
     - cells is always rectangular (ragged rows padded)
     - All spans clamped to table bounds
+    - A span never covers a cell holding other text (empty cells and cells repeating the
+      span's own text are absorbed): such spans are shrunk (widest first, then tallest) so
+      every value stays visible
     - Continuation cells marked for spanned regions
     - is_complex auto-detected from spans
     - No None values — empty Cell() for missing data
@@ -161,22 +216,64 @@ class TableData(BaseModel):
                     )
             padded.append(new_row)
 
-        # Pass 2: Mark continuation cells
+        # Pass 2: Mark continuation cells. A span may cover cells no earlier span claimed that
+        # are empty or repeat its own text (a merged range reported on, or filled into, every
+        # position it covers); a span that would cover other text is shrunk (keep the widest
+        # run of free cells in its first row, then as many rows as stay free across that
+        # width), so no value is ever hidden.
         claimed = set()
+
+        def is_free(r, c, text):
+            covered = padded[r][c].text.strip()
+            return (r, c) not in claimed and (not covered or covered == text)
+
+        shrunk = 0
         for r in range(row_count):
             for c in range(col_count):
                 cell = padded[r][c]
-                if cell.is_continuation:
+                if cell.is_continuation or (cell.rowspan == 1 and cell.colspan == 1):
                     continue
-                if cell.rowspan > 1 or cell.colspan > 1:
-                    for sr in range(r, r + cell.rowspan):
-                        for sc in range(c, c + cell.colspan):
-                            if (sr, sc) != (r, c) and (sr, sc) not in claimed:
-                                claimed.add((sr, sc))
-                                padded[sr][sc] = Cell.continuation()
+                text = cell.text.strip()
+                width = 1
+                while width < cell.colspan and is_free(r, c + width, text):
+                    width += 1
+                height = 1
+                while height < cell.rowspan and all(is_free(r + height, c + k, text) for k in range(width)):
+                    height += 1
+                if (height, width) != (cell.rowspan, cell.colspan):
+                    shrunk += 1
+                    padded[r][c] = Cell.model_construct(
+                        text=cell.text,
+                        rowspan=height,
+                        colspan=width,
+                        is_header=cell.is_header,
+                        is_continuation=False
+                    )
+                for sr in range(r, r + height):
+                    for sc in range(c, c + width):
+                        if (sr, sc) != (r, c):
+                            claimed.add((sr, sc))
+                            padded[sr][sc] = Cell.continuation()
 
-        # Auto-detect complexity
-        if not self.is_complex and has_any_span:
+        # A continuation cell that no span covers would leave a hole in the rendered row.
+        for r in range(row_count):
+            for c in range(col_count):
+                if padded[r][c].is_continuation and (r, c) not in claimed:
+                    padded[r][c] = Cell.empty()
+
+        if shrunk:
+            global _SPAN_OVERLAP_LOGGED
+            log = logger.debug if _SPAN_OVERLAP_LOGGED else logger.warning
+            _SPAN_OVERLAP_LOGGED = True
+            log("TableData: shrank %d merged-cell span(s) that would have covered non-empty cells; "
+                "the covered values are kept as separate cells", shrunk)
+
+        # Complexity follows the spans that are left: a table whose spans were all shrunk away
+        # renders as a simple table
+        has_span = any(c.rowspan > 1 or c.colspan > 1 for row in padded for c in row)
+        if shrunk:
+            self.is_complex = has_span
+        elif has_span:
             self.is_complex = True
 
         self.cells = padded
@@ -316,12 +413,7 @@ class TableRenderer:
 
         markdown_lines = []
         for row_idx, row_cells in table.iter_rows():
-            cells_text = []
-            for cell in row_cells:
-                text = "<br>".join(cell.text.split('\n'))
-                text = text.replace("|", "\\|")
-                cells_text.append(text)
-
+            cells_text = [markdown_cell(cell.text) for cell in row_cells]
             markdown_lines.append("| " + " | ".join(cells_text) + " |")
 
             if row_idx == 0:
@@ -341,8 +433,7 @@ class TableRenderer:
                 if cell.is_continuation:
                     continue
 
-                cell_text = cell.text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                cell_text = cell_text.replace('\n', '<br>')
+                cell_text = html_cell(cell.text)
 
                 attrs = []
                 if cell.rowspan > 1:
@@ -365,41 +456,42 @@ class TableRenderer:
 
         lines = []
 
-        # Collect merge notes
+        # Collect merge notes, and which anchor row covers each continuation cell
         merge_notes = []
+        anchor_row = {}
         for row_idx, row_cells in table.iter_rows():
             for col_idx, cell in enumerate(row_cells):
                 if not cell.is_continuation and (cell.rowspan > 1 or cell.colspan > 1):
                     merge_notes.append(f"R{row_idx+1}C{col_idx+1}:{cell.rowspan}x{cell.colspan}")
+                    for r in range(row_idx, row_idx + cell.rowspan):
+                        for c in range(col_idx, col_idx + cell.colspan):
+                            anchor_row[(r, c)] = row_idx
         if merge_notes:
             lines.append(f"<!-- Merged: {', '.join(merge_notes)} -->")
 
-        # Calculate column widths
-        col_widths = [3] * table.col_count
-        for _, row_cells in table.iter_rows():
-            for i, cell in enumerate(row_cells):
-                if not cell.is_continuation:
-                    col_widths[i] = max(col_widths[i], len(cell.text))
-
-        # Render rows
+        # Cell texts: escaped like any pipe-table cell; ⊕ marks a merged cell's origin,
+        # ↓ / → the positions it covers below / to the right
+        grid_rows = []
         for row_idx, row_cells in table.iter_rows():
-            cells_text = []
+            texts = []
             for col_idx, cell in enumerate(row_cells):
                 if cell.is_continuation:
-                    # Determine direction marker
-                    is_vertical = any(
-                        r < row_idx
-                        and not table.cell(r, col_idx).is_continuation
-                        and table.cell(r, col_idx).rowspan > 1
-                        for r in range(row_idx)
-                    )
-                    cells_text.append(("↓" if is_vertical else "→").ljust(col_widths[col_idx]))
+                    texts.append("↓" if anchor_row.get((row_idx, col_idx), row_idx) < row_idx else "→")
                 else:
-                    text = cell.text
+                    text = markdown_cell(cell.text)
                     if cell.rowspan > 1 or cell.colspan > 1:
                         text = f"{text} ⊕" if text else "⊕"
-                    cells_text.append(text.ljust(col_widths[col_idx]))
+                    texts.append(text)
+            grid_rows.append(texts)
 
+        col_widths = [3] * table.col_count
+        for texts in grid_rows:
+            for i, text in enumerate(texts):
+                col_widths[i] = max(col_widths[i], len(text))
+
+        # Render rows
+        for row_idx, texts in enumerate(grid_rows):
+            cells_text = [text.ljust(col_widths[i]) for i, text in enumerate(texts)]
             lines.append("| " + " | ".join(cells_text) + " |")
 
             if row_idx == 0:
@@ -421,8 +513,7 @@ class TableRenderer:
                 if cell.is_continuation:
                     continue
 
-                cell_text = cell.text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
-                cell_text = cell_text.replace('\n', '<br>')
+                cell_text = html_cell(cell.text, quote=True)
 
                 cell_attrs = []
                 if cell.rowspan > 1:

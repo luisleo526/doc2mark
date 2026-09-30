@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from doc2mark.core.table import Cell, TableData, TableRenderer, TableStyle
+from doc2mark.core.table import Cell, TableData, TableRenderer, TableStyle, markdown_cell
 
 
 # ---------------------------------------------------------------------------
@@ -133,15 +133,15 @@ class TestTableData:
     def test_span_clamping(self):
         cells = [
             [Cell(text="X", rowspan=100)],
-            [Cell(text="Y")],
-            [Cell(text="Z")],
+            [Cell()],
+            [Cell()],
         ]
         table = TableData(cells=cells)
         assert table.cell(0, 0).rowspan == 3  # clamped to table height
 
     def test_colspan_clamping(self):
         cells = [
-            [Cell(text="X", colspan=10), Cell(text="Y")],
+            [Cell(text="X", colspan=10), Cell()],
         ]
         table = TableData(cells=cells)
         assert table.cell(0, 0).colspan == 2  # clamped to table width
@@ -149,11 +149,44 @@ class TestTableData:
     def test_continuation_marking(self):
         cells = [
             [Cell.merged("X", rowspan=2), Cell(text="A")],
-            [Cell(text="B"), Cell(text="C")],
+            [Cell(), Cell(text="C")],
         ]
         table = TableData(cells=cells)
         assert table.cell(1, 0).is_continuation is True
         assert table.cell(1, 1).is_continuation is False
+
+    def test_span_never_hides_a_value(self):
+        # a 2x2 span over "B", "D" and "E" would silently drop them: it shrinks instead
+        table = TableData.from_raw([["A", "B", "C"], ["D", "E", "F"]], {"cell_spans": {(0, 0): (2, 2)}})
+        assert [[c.text for c in row] for row in table.cells] == [["A", "B", "C"], ["D", "E", "F"]]
+        assert not any(c.is_continuation for row in table.cells for c in row)
+        assert table.cell(0, 0).rowspan == 1 and table.cell(0, 0).colspan == 1
+
+    def test_span_absorbs_empty_cells_that_repeat_it(self):
+        # a merged range reported on each of its positions (the DOCX reader does this)
+        data = [["H", "Q", "R", "S"], ["Grand Total", "", "", "$55,000"]]
+        spans = {(1, 0): (1, 3), (1, 1): (1, 3), (1, 2): (1, 3)}
+        table = TableData.from_raw(data, {"cell_spans": spans, "is_complex": True})
+        assert (table.cell(1, 0).rowspan, table.cell(1, 0).colspan) == (1, 3)
+        assert table.cell(1, 3).text == "$55,000" and not table.cell(1, 3).is_continuation
+
+    def test_covered_cells_repeating_the_merged_value_are_absorbed(self):
+        # "fill merged cells": every position of a merged range carries the merged value
+        data = [["Region", "Q1", "Q2"], ["North", "10", "20"], ["North", "11", "21"]]
+        table = TableData.from_raw(data, {"cell_spans": {(1, 0): (2, 1)}, "is_complex": True})
+        assert table.cell(1, 0).rowspan == 2
+        assert table.cell(2, 0).is_continuation
+
+    def test_table_whose_spans_were_all_shrunk_is_simple(self):
+        table = TableData.from_raw([["A", "B"], ["C", "D"]], {"cell_spans": {(0, 0): (2, 2)}, "is_complex": True})
+        assert table.is_complex is False
+        assert "<table>" not in TableRenderer().render(table)
+
+    def test_span_shrinks_to_the_empty_cells(self):
+        # widest run of empty cells in the first row, then as many rows as stay empty
+        table = TableData.from_raw([["A", "", "C"], ["", "", "x"], ["y", "", ""]], {"cell_spans": {(0, 0): (3, 3)}})
+        assert (table.cell(0, 0).rowspan, table.cell(0, 0).colspan) == (2, 2)
+        assert table.cell(0, 2).text == "C" and table.cell(1, 2).text == "x" and table.cell(2, 0).text == "y"
 
     def test_colspan_continuation(self):
         cells = [
@@ -422,11 +455,33 @@ class TestTableRenderer:
     def test_rowspan_in_html(self):
         cells = [
             [Cell.merged("Span", rowspan=2, is_header=True), Cell.header("B")],
-            [Cell(text="placeholder"), Cell(text="D")],
+            [Cell(), Cell(text="D")],
         ]
         table = TableData(cells=cells)
         result = TableRenderer(table_style=TableStyle.MINIMAL_HTML).render(table)
         assert 'rowspan="2"' in result
+
+
+@pytest.mark.unit
+class TestMarkdownCell:
+    """Pipe-table cell escaping: structure-changing characters only (policy shared with body text)."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("line1\nline2", "line1<br>line2"),  # a line break stays one (GFM <br>)
+        ("line1\r\n\r\nline3\n", "line1<br><br>line3"),  # CR/LF normalised, blank line kept, ends trimmed
+        ("a | b", "a \\| b"),
+        ("C:\\Users\\*.txt", "C:\\Users\\\\*.txt"),  # before ASCII punctuation: doubled
+        ("\\\\server\\share", "\\\\\\server\\share"),  # before a backslash: doubled; before a letter: kept
+        ("ends with \\", "ends with \\\\"),  # at the end of the cell: doubled
+        ("C:\\temp\\\nD:\\data", "C:\\temp\\\\<br>D:\\data"),  # before a line break: doubled
+        ("a \\| b", "a \\\\\\| b"),  # the backslash before a pipe is doubled, the pipe escaped
+        ("x \\y \\。", "x \\y \\。"),  # before a letter or non-ASCII punctuation: kept
+        ("<b> & &amp; x < 5", "&lt;b> & &amp;amp; x < 5"),
+        ("bell\x07here", "bellhere"),
+        ("a \n" + chr(0x3000) * 2 + "b", "a<br>" + chr(0x3000) * 2 + "b"),  # full-width indentation kept
+    ])
+    def test_escaping(self, text, expected):
+        assert markdown_cell(text) == expected
 
 
 # ---------------------------------------------------------------------------

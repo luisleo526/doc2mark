@@ -98,7 +98,8 @@ def process_single_file(file_path, loader_config, processing_config):
         loader = UnifiedDocumentLoader(
             ocr_provider=loader_config['ocr_provider'],
             api_key=loader_config['api_key'],
-            ocr_config=loader_config.get('ocr_config')
+            ocr_config=loader_config.get('ocr_config'),
+            table_style=loader_config.get('table_style')
         )
         
         # Process with retry logic
@@ -270,6 +271,13 @@ Supported formats:
     )
     
     output_group.add_argument(
+        "--table-style",
+        choices=["minimal_html", "markdown_grid", "styled_html"],
+        default=None,
+        help="Output style for tables with merged cells (default: minimal_html)"
+    )
+
+    output_group.add_argument(
         "--preserve-structure",
         action="store_true",
         help="Preserve original document structure in output"
@@ -415,7 +423,8 @@ Supported formats:
         loader = UnifiedDocumentLoader(
             ocr_provider=ocr_provider,
             api_key=args.api_key,
-            ocr_config=ocr_config
+            ocr_config=ocr_config,
+            table_style=args.table_style
         )
 
         if input_path.is_file():
@@ -519,6 +528,7 @@ Supported formats:
                 'ocr_provider': ocr_provider,
                 'api_key': args.api_key,
                 'ocr_config': ocr_config,
+                'table_style': args.table_style,
             }
             
             processing_config = {

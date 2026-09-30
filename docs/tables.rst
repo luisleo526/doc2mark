@@ -19,7 +19,7 @@ A whole-page OCR pass *describes* a table; the rule-based path *reconstructs* it
 from ground truth:
 
 * **PDFs** carry vector cell boundaries. doc2mark asks PyMuPDF for the table
-  grid and the per-cell bounding boxes, then infers ``rowspan`` / ``colspan``
+  grid and the per-cell bounding boxes, then measures ``rowspan`` / ``colspan``
   from the geometry -- no model guessing required.
 * **Office files** (DOCX / PPTX / XLSX) store merges explicitly in OOXML
   (``w:gridSpan`` / ``w:vMerge`` for Word, ``gridSpan`` / ``vMerge`` for
@@ -34,39 +34,128 @@ cell -- which silently corrupts the grid. Because the rule-based path is exact
 where OCR is lossy, complex tables in digital documents stay on the rule-based
 path and never round-trip through the vision model.
 
-The PDF path: geometric span detection
---------------------------------------
+The PDF path: tables from the drawn grid
+----------------------------------------
 
-For each page, :class:`~doc2mark.core.loader.UnifiedDocumentLoader` (via its
-PyMuPDF pipeline) calls ``page.find_tables()`` and, for every detected table,
-runs ``_convert_table_to_markdown_enhanced``. That method:
+For each page, the PyMuPDF pipeline behind
+:class:`~doc2mark.core.loader.UnifiedDocumentLoader` calls ``page.find_tables()``
+and turns every grid it finds into a ``TableData`` (``doc2mark.pipelines.pdf_tables``).
 
-#. Extracts cell text per cell with de-duplication of overlapping spans, so
-   text that visually straddles a boundary is not double-counted.
-#. Calls ``_analyze_table_with_boundaries`` to build a normalized grid.
+**Cell text.** The page's characters are read once per page, from the text page
+``find_tables()`` built (the same characters and coordinates PyMuPDF's own
+``Table.extract()`` uses, also on rotated pages; PyMuPDF releases before 1.27 do not
+expose it, and the page's own text is read in the same coordinates). Every character
+goes to exactly one cell: the smallest cell, over all tables on the page, that
+contains the centre of the glyph. So a table nested inside another table's cell
+keeps its own text and the outer cell does not repeat it, and cells that overlap (an
+L-shaped merged region, a frame drawn around cells) never share a character. Inside
+a cell, words split at spaces and at gaps wider than 3 pt, and lines stay separate
+(``\n``), as in ``Table.extract()``. A glyph's height is taken from its baseline and
+font size: the text page ``find_tables()`` builds in PyMuPDF 1.28 measures glyphs by
+their ink, which put an underscore below its line (``user_id`` read as ``user id``
+and ``_``).
 
-``_analyze_table_with_boundaries`` prefers **true geometry** when PyMuPDF exposes
-per-cell boxes: ``_get_cell_boundaries`` reads each cell's bounding box, and
-``_detect_merges_from_boundaries`` checks, via ``_bboxes_overlap_significantly``
-(default 80% overlap), how many logical grid positions a single physical box
-covers. A box that covers two columns becomes ``colspan=2``; one that covers two
-rows becomes ``rowspan=2``.
+Text drawn over other text is handled by what it is:
 
-When per-cell boxes are unavailable, it falls back to a conservative
-**empty-cell** heuristic with explicit guards against false positives on sparse
-data:
+* A run of text that redraws another run's text over it is a duplicate: its
+  characters (spaces aside) appear in the same order in the other run, it is at
+  least half as long, at about the same size (within 20%) and baseline, and within
+  the other run's extent. That is fake-bold overprint, or a second text layer from
+  design software (``385 / 1 405`` drawn over ``385 / 491 / 1 405``). Only the
+  longer run is kept. A run of one or two characters must sit exactly on the same
+  glyphs to count.
+* Anything else is kept: a value typed over a ``____`` placeholder in a flattened
+  form, a tick drawn over a checkbox, a watermark crossing a row. Where such runs
+  overlap, each run is split into words on its own and the words are read left to
+  right, so a typed value stays in one piece next to its label
+  (``Name: John Smith ____``, ``姓名：＿＿＿ 王小明``); a single glyph dropped onto
+  text stays in place (``[X] Yes [ ] No``).
+* Invisible text (an OCR layer: fully transparent, or neither filled nor stroked)
+  drawn over visible text in a cell is dropped; the visible glyphs are the text and
+  the hidden layer only repeats them, often with recognition errors
+  (``Acc0unt``, ``1,25O,OOO``). A hidden line is judged as a whole: it is dropped
+  when at least half of its glyphs lie over visible ones, including any part that
+  runs on past them. Invisible text with nothing visible under it, as on a scanned
+  page, is the cell's text.
 
-* It pre-computes, per column, the fraction of empty cells. A column that is
-  more than 50% empty is treated as *legitimately sparse* (``col_mostly_empty``)
-  and is **not** read as a merge.
-* **First pass -- colspans:** a non-empty cell absorbs trailing empty cells to
-  its right *only* when those columns are not mostly-empty; absorbed positions
-  are recorded so they cannot also be claimed as rowspans.
-* **Second pass -- rowspans:** a non-empty cell (not already part of a colspan,
-  not in a mostly-empty column) absorbs empty cells directly below it.
+**Merged cells.** PyMuPDF reports the grid as rows of cell boxes (``None`` where a
+merged box covers a position). Column ``j`` starts at the ``j``-th distinct cell
+left edge and row ``i`` at the top of row ``i``. A drawn cell box spans every
+column and row line it crosses by more than 1 pt, which gives its ``colspan`` and
+``rowspan``; a span that would cover another drawn cell is shrunk (widest first)
+so every drawn cell keeps its position. Blank cells are blank cells: they never
+become merges, and a merge is detected however much of its column it covers. A
+grid position that no drawn cell covers (an open corner of a header row) is an
+empty cell, and text drawn there (``Unit: NT$ thousand``) is kept in it.
 
-The result is a ``TableData`` object (from ``doc2mark.core.table``) with the
-spans attached.
+**Which grids are tables.** ``find_tables()`` also finds grids in page decoration:
+a logo built from two filled rectangles, a slide background with panels. A grid is
+emitted as a table only if
+
+* it has more than one cell and some text, and
+* it has text in at least two rows and two columns, its cells do not overlap, and
+  it covers less than 85% of the page -- **or** its cell borders are drawn as lines
+  (at least two cell edges covered by stroked lines or hairline fills of at most
+  2 pt; large filled areas do not count).
+
+A ruled single-row table (a signature line) is kept; a logo made of filled shapes
+(one row of text), a frame of overlapping panels or a page-sized background is
+not, and its text stays with the normal text output.
+
+**Tables without vertical rules.** A page is also searched with PyMuPDF's text
+strategy (``find_tables(strategy="text")``) when at least three of its text lines
+break into three or more pieces at wide gaps (at least 8 pt and one font size) and
+some column of those pieces (sharing a left edge, a right edge or a centre) holds at
+least two numbers that make up 60% of it, the least a table below needs; a
+multi-column directory or article has the gaps but no such column and costs nothing
+extra. (A page whose only aligned text is a two-column table is therefore not
+searched.) A candidate is kept only when, after caption and note lines above and
+below it are set aside:
+
+* it has at least three rows and three columns (two columns when booktabs rules
+  run above and below it),
+* at least one column besides the first is mostly numbers,
+* no row's text runs across a column boundary with ordinary word spacing (a
+  boundary that splits a label in most rows, such as ``Line item | 1``, is merged
+  instead), and no word straddles a column boundary or the table's left or right
+  edge (text running on past the last column, such as a long comment or a sidebar
+  set on the same lines, would be cut off),
+* at least half of its cells have text, at most a quarter of its rows have a
+  single cell, and 70% of its cells are short (at most 40 characters),
+* it is not a table of contents (dot leaders, or entries whose only number is a
+  last-column page number that never goes down; a table without a header row whose
+  only numbers are such a column -- small counts in ascending order -- is taken for
+  one and stays text),
+* every text block that touches it lies inside it. The text output skips each text
+  block that touches a table, so a caption, lead-in sentence or note set at the
+  rows' own leading -- which puts it in the same block as the rows -- would
+  otherwise be lost; such a table stays text instead.
+
+A wrapped line of a cell (closer to its row than rows are to each other, no
+numbers) stays in that cell. Prose, two-column articles, key/value blocks, tables
+of contents, slide text boxes and sidebars fail these checks and stay text.
+Measured on 1,391 pages of reference PDFs (reports, decks, forms, scans with a text
+layer), the search found 18 tables, all real, and no false ones; a reviewer's set
+of adversarial pages (tables inside paragraphs, a free-text last column, a sidebar,
+tables of contents) keeps every word.
+
+**Header rows.** A header row that PyMuPDF finds just above the ruled cells (drawn
+without borders, for example bold names over a rule) becomes the table's header when
+it names at least two columns, and only if no text block around it reaches outside
+the table and the header. When a page's first table continues the previous page's
+last table -- consecutive pages, the same column edges, nothing after the previous
+table but the page's bottom 8%, and nothing above this one but lines in the top 8%
+that repeat a line from the top 8% of the previous or the next page (a running
+header, which with Word's "different first page" only the next page repeats; a
+heading over a new table is not one) -- its first row is kept as its header only if
+it repeats the previous header or is styled as one (bold over plain rows). Otherwise
+the first row stays a data row: the previous header is repeated when it is known to
+be a header (bold, or drawn above the cells), and an empty header row is used when
+it is not, because a plain first row may just as well be the first pair of a
+key/value form.
+
+A table's bounding box (including a header drawn above it) is what the text
+output skips, so table text is not emitted twice.
 
 The Office path: OOXML grid spans
 ---------------------------------
@@ -97,16 +186,40 @@ From ``TableData`` to clean HTML
 * pad ragged rows to a rectangle,
 * clamp every span to the table bounds (a ``rowspan`` can never run past the last
   row),
+* never let a span cover a cell with other text: a span absorbs empty cells and
+  cells that repeat its own text (a merged range reported on, or filled into, every
+  position it covers), and is otherwise shrunk to the widest run of such cells in
+  its first row, then to as many rows as stay free across that width, so no value
+  is ever hidden (a warning is logged the first time this happens),
 * mark the positions covered by a span as *continuation* cells, and
-* auto-set ``is_complex = True`` when any span is present.
+* set ``is_complex = True`` when any span is present -- and back to ``False`` when
+  the spans that made a table complex were all shrunk away.
 
 A ``TableRenderer`` then renders it. The renderer chooses its output from the
 ``table_style`` you configured (see below). For a complex table the default
 **minimal HTML** renderer emits one ``<tr>`` per visual row, writes ``<th>`` for
 the first physical row and ``<td>`` elsewhere, attaches ``rowspan`` / ``colspan``
-only when greater than 1, **skips continuation cells entirely**, and
-HTML-escapes ``&``, ``<``, ``>``. Simple (span-free) tables render as ordinary
-pipe-delimited Markdown instead.
+only when greater than 1 and **skips continuation cells entirely**. Simple
+(span-free) tables render as ordinary pipe-delimited Markdown instead.
+
+Cell text is escaped only as far as the table structure needs, or to keep
+characters from disappearing, the same way in every style:
+
+* Line breaks of every kind (``\r\n``, ``\r``, vertical tab -- a soft line break in
+  PowerPoint --, form feed, U+2028/U+2029) become ``<br>`` in HTML and in Markdown
+  cells (a GFM pipe table has no other way to break a line; in Markdown cells ASCII
+  spaces around a break and blank lines at the start and end of a cell are dropped,
+  full-width indentation stays); other C0 control characters (except tab) are
+  removed.
+* HTML cells escape ``&``, ``<`` and ``>`` (``styled_html`` also ``"``); backslashes
+  are kept as they are.
+* Markdown cells (pipe tables and ``markdown_grid``) escape ``|`` as ``\|``, ``<``
+  only where it would start a tag (``<img …>`` becomes ``&lt;img …>``; ``x < 5``
+  stays as is) and ``&`` only where it would start an entity (``&lt;`` in the text
+  becomes ``&amp;lt;``). A backslash that a Markdown renderer would consume is
+  doubled, as in body text: before ASCII punctuation (``C:\*.txt`` becomes
+  ``C:\\*.txt``, ``\|`` becomes ``\\\|``), before a line break and at the end of
+  the cell. Everything else, including ``*``, ``_`` and backticks, is kept verbatim.
 
 Choosing the output style
 -------------------------
@@ -119,6 +232,12 @@ The loader exposes ``table_style``, which maps to :class:`~doc2mark.TableStyle`:
 
    loader = UnifiedDocumentLoader(table_style="minimal_html")
    doc = loader.load("quarterly_report.pdf")
+
+From the command line, pass ``--table-style``:
+
+.. code-block:: bash
+
+   doc2mark quarterly_report.pdf --table-style markdown_grid
 
 The three accepted values (string or enum) are:
 
