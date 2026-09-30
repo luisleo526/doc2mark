@@ -988,9 +988,9 @@ class CachedOCR(BaseOCR):
                 cache_version=self.cache_version,
             )
             cached = self.cache.get(key)
-            # An empty or failed entry (written before such answers stopped being
-            # cached) is not an answer: ask the provider again.
-            if cached is not None and _is_final_answer(cached):
+            # An empty, failed or refused entry (written before such answers stopped
+            # being cached) is not an answer: ask the provider again.
+            if cached is not None and _is_cacheable(cached) and _is_final_answer(cached):
                 # Cache hit: no fresh provider spend this batch -> flag it so a
                 # usage consumer does not re-bill tokens that were never spent.
                 results[index] = _mark_from_cache(cached)
