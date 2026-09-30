@@ -447,19 +447,22 @@ else applies by default.
   are never read, so each image cached before is sent to the provider once more after upgrading. (#26)
 - **The verbatim tail no longer loses a printed line to the words of another.** One OCR word stands for
   one printed line: a page printing `Total` twice where the OCR read it once keeps its second copy.
-  Longer lines claim their words first whatever the line order, so a missed `Tax 1,200` is appended even
-  when the OCR read `Net loss before tax 1,200` as a table row with a `Note 4` cell in between; a line of
-  three words or fewer must appear in one piece; a line matched with gaps may gain or miss only max(2, a
-  fifth of its words), so `Revenue 2024 up 12 percent` is no longer taken for reproduced by a chart's
-  `Revenue by year 2024 up from 2023 12 percent growth`; and a line without CJK characters is not
-  matched inside CJK text (`AI` in `財務AI使用介面`). (#26)
+  Whole copies of lines claim their words first, then the best fitting alignments, whatever the line
+  order: a missed `Tax 1,200` is appended even when the OCR read `Net loss before tax 1,200` as a table
+  row with a `Note 4` cell in between, and a total row the OCR left out no longer takes the words of the
+  revenue row it read. A line of three words or fewer must appear in one piece; a longer line may gain
+  or miss only max(2, a fifth of its words), so `Revenue 2024 up 12 percent` is no longer taken for
+  reproduced by a chart's `Revenue by year 2024 up from 2023 12 percent growth`; no word may come between
+  two characters of one CJK word (`營業收入` is not `營業外收入`); a one-word line without CJK characters
+  is not matched inside CJK text (`AI` in `財務AI使用介面`); and when either of two lines could be the OCR
+  text, both are kept. (#26)
 - **The verbatim tail is fast again on CJK pages whose OCR answer holds the layer's characters in another
-  order:** 25 lines of 200 characters took 87 s per page (50 lines of 100: 6 s), now 0.06 s, below the
-  0.4 s of the matcher before #25. (#26)
+  order:** 25 lines of 200 characters took 87 s per page (50 lines of 100: 6 s), now under 0.1 s, below
+  the 0.4 s of the matcher before #25. (#26)
 - **The CLI's stdout holds only the document for damaged PDFs too.** MuPDF's errors (`MuPDF error:
   library error: zlib error: ...` for a stream that does not inflate) went to stdout, so the Markdown
   carried them and `--format json` did not parse; they are logged as warnings on stderr instead (shown
-  by default and with `-v`, not with `-q`). (#26)
+  by default and with `-v`, not with `-q`, also from `--parallel` workers). (#26)
 - **Importing doc2mark leaves PyMuPDF's own output alone.** The PDF pipeline switched PyMuPDF's
   `pymupdf_layout` recommendation off for the whole process when imported; now only the CLI does. (#26)
 - **One clip-path warning per PDF.** When MuPDF's clipped image extents do not pair up with a page's
