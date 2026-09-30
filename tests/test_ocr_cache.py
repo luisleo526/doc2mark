@@ -881,3 +881,71 @@ def test_packaging_declares_redis_extra():
 
 def test_value_schema_version_is_private_value_schema():
     assert OCR_CACHE_VALUE_SCHEMA_VERSION == "ocr-cache-value-v2"
+
+
+class _FlaggedOCR(FakeOCR):
+    """Returns one result per image carrying ``flags`` in its metadata."""
+
+    def __init__(self, flags):
+        super().__init__()
+        self.flags = flags
+
+    def batch_process_images(self, images, **kwargs):
+        self.calls.append(list(images))
+        return [OCRResult(text="t", metadata=dict(self.flags)) for _ in images]
+
+
+@pytest.mark.parametrize("flags", [
+    pytest.param({"router_fallback": "unresolved"}, id="firewall-unresolved"),
+    pytest.param({"ocr_refusal": True}, id="refusal"),
+    pytest.param({"failed": True}, id="failed"),
+])
+def test_unstable_results_are_retried_not_replayed(flags):
+    provider = _FlaggedOCR(flags)
+    cached = CachedOCR(provider, MemoryOCRCache())
+
+    cached.batch_process_images([b"img"])
+    cached.batch_process_images([b"img"])
+
+    assert len(provider.calls) == 2
+
+
+def test_a_clean_firewall_redo_is_cached():
+    provider = _FlaggedOCR({"router_fallback": "verbatim"})
+    cached = CachedOCR(provider, MemoryOCRCache())
+
+    cached.batch_process_images([b"img"])
+    cached.batch_process_images([b"img"])
+
+    assert len(provider.calls) == 1
+
+
+def _judge_one(text):
+    return None
+
+
+def _judge_two(text):
+    return None
+
+
+class _VersionedJudge:
+    def __init__(self, version):
+        self.version = version
+
+    def __call__(self, text):
+        return None
+
+
+def test_cache_key_depends_on_the_non_content_judge():
+    """An answer the patterns kept is cached; enabling or changing a judge must screen it
+    again instead of replaying it."""
+    from doc2mark.ocr.openai import OpenAIOCR
+
+    def key(judge):
+        return build_ocr_cache_key(OpenAIOCR(api_key="k", config=OCRConfig(non_content_judge=judge)), b"img")
+
+    assert key(None) != key(_judge_one)
+    assert key(_judge_one) != key(_judge_two)
+    assert key(_judge_one) == key(_judge_one)
+    assert key(_VersionedJudge("1")) == key(_VersionedJudge("1"))
+    assert key(_VersionedJudge("1")) != key(_VersionedJudge("2"))

@@ -6,6 +6,7 @@ from doc2mark import UnifiedDocumentLoader
 from doc2mark.core.base import DocumentFormat, OutputFormat, ProcessedDocument, ProcessingError
 from pathlib import Path
 import os
+import shutil
 import re
 from unittest.mock import Mock
 
@@ -221,6 +222,9 @@ class TestPipelines:
         pptx_files = list(sample_documents_dir.glob('*.pptx'))
         if not pptx_files:
             pytest.skip("No PPTX files found")
+        if shutil.which("tesseract") is None:
+            # Without Tesseract the OCR engine cannot run, and the load fails (by design).
+            pytest.skip("Tesseract is not installed")
 
         loader = UnifiedDocumentLoader(ocr_provider='tesseract')
         result = loader.load(

@@ -12,10 +12,10 @@ import pytest
 from PIL import Image
 
 from doc2mark.core.base import OCRError
-from doc2mark.ocr.base import REFUSAL_USAGE_KEY, OCRConfig, OCRResult
+from doc2mark.ocr.base import REFUSAL_USAGE_KEY, TASK_PROMPTS, OCRConfig, OCRResult, Task
 from doc2mark.ocr.openai import OpenAIOCR
 from doc2mark.ocr.refusal import matches_non_content_pattern, non_content_reason
-from doc2mark.ocr.schema import OCRPage, RawExtraction
+from doc2mark.ocr.schema import Figure, Interpretation, KeyValue, Metric, OCRPage, RawExtraction, Table
 from doc2mark.ocr.vertex_ai import VertexAIOCR, VertexAIVisionAgent
 
 # (answer, is_non_content): 41 of the 42 hand-labelled answers of the Jev spike B dataset
@@ -73,10 +73,12 @@ JSON_ERROR = '{"error": "image could not be read"}'
 
 
 # Refusals the deterministic patterns deliberately leave to the judge, because the same
-# words also appear as real page text (an app's upload error, an API error screenshot).
+# words also appear as real page text (an app's upload error, an API error screenshot), or
+# because the answer describes the image, which is content.
 LEFT_TO_THE_JUDGE = {
     "Unable to process the image. Please provide a clearer scan of the page.",
     "很抱歉，這張圖片解析度過低，無法進行文字轉錄。",  # no first person: a system notice reads the same
+    "There is no readable text in this image. It seems to be a decorative background graphic.",  # a description
 }
 
 
@@ -89,7 +91,8 @@ def test_patterns_on_the_jev_labelled_answers(answer, is_non_content):
 def test_patterns_catch_most_jev_refusals_without_false_alarms():
     refusals = [answer for answer, label in JEV_ANSWERS if label] + [JSON_ERROR]
     content = [answer for answer, label in JEV_ANSWERS if not label]
-    assert sum(map(matches_non_content_pattern, refusals)) >= 17  # of 20 (the Jev regex baseline: 17, 1 false alarm)
+    # of 20: only whole-answer refusals (the Jev regex baseline: 17, 1 false alarm)
+    assert sum(map(matches_non_content_pattern, refusals)) >= 16
     assert not any(map(matches_non_content_pattern, content))
 
 
@@ -176,6 +179,28 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "I'm sorry, I can't do that. It involves the budget for Q3, see attached.",
     "I can't help. If you need the keys, ask Tom at reception.",
     "I cannot assist. Let me know if the meeting moves to 3pm.",
+    # a refusal or "no text" clause, then content: a partial transcription, a description, a quote
+    "There is no text in this image. It shows a bar chart with revenue rising from 120 to 171 across Q1-Q4.",
+    "I can't transcribe the handwritten text, but the printed part reads:\nInvoice No. 2026-0917\nTotal due: $450",
+    "Invoice No. 2026-0917\nTotal due: $450\n(The signature at the bottom is illegible, so I can't transcribe it.)",
+    "Invoice 2026-0917, Total $450. The stamp is unreadable and I won't transcribe it.",
+    "The image is mostly blank except for a small caption: 'Figure 3 - Plant layout'.",
+    "The image is blank apart from the company logo ACME Corp.",
+    "There is no readable text in this image; it is a photograph of a factory floor with two workers at a CNC machine.",
+    "There are no words in the image, only a map of Taiwan with Taipei, Taichung and Kaohsiung marked.",
+    "I don't see any text in the image, but it shows a red octagonal stop sign on a pole.",
+    "I don't see any text in this image besides the watermark 'CONFIDENTIAL'.",
+    "No text detected in the image apart from the logo 'TSMC'.",
+    "As an AI, I can't identify the person in the photo, but the name badge reads 'Dr. Lee, Chief Engineer'.",
+    "I'm sorry, I can't read the handwritten notes in this image, but the typed heading says 'Q3 Board Minutes'.",
+    "すみません、この画像の手書き部分は読み取れませんが、印刷部分は以下の通りです。\n請求書番号 2026-0917\n合計 45,000円",
+    "죄송하지만 이 이미지의 손글씨는 인식할 수 없습니다. 인쇄된 부분: 청구서 번호 2026-0917 합계 45,000원",
+    "Leider kann ich den handschriftlichen Text im Bild nicht erkennen. Gedruckt: Rechnung Nr. 4711, Betrag 450 EUR",
+    # quotes and chats: a person talking to someone
+    "I'm sorry Dave, I'm afraid I can't do that.",
+    "Leider kann ich das Foto nicht lesen, kannst du es nochmal schicken?",
+    "No pude leer la foto, ¿me la mandas otra vez?",
+    "Désolé, je ne peux pas lire la photo, elle est floue.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -190,6 +215,29 @@ def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     "I'm sorry, but I can't do that.",
     "I'm sorry, I can't help with identifying people in images.",
     "Sorry, I can't provide a transcription of copyrighted material.",
+    "No text detected in image",  # doc2mark's own free-form prompt asks for this phrase
+    "The image does not contain any text.",
+    "This image contains no text.",
+    "There's no text visible in this image.",
+    "I'm sorry, I can't comply with that.",
+    "I can't provide assistance with that.",
+    "Sorry, I can't help with this image.",
+    "I'm sorry, I can't provide the text from this image.",
+    "I'm unable to transcribe the text from this image.",
+    # with a reason made only of image-quality or sensitivity words
+    "I can't read the text in this image because it's too blurry.",
+    "I apologize, but I cannot provide the text from this image as it appears to contain copyrighted material.",
+    # with a stock courtesy tail or a reason of its own
+    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
+    "I'm sorry, but I can't assist with that.\nIf you have any other questions, feel free to ask!",
+    "I'm sorry, I can't help with that. Is there anything else I can do for you?",
+    "I'm sorry, but I can't read the text in this image. It appears to be too blurry.",
+    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
+    "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
+    "I can't read the text in this image. It looks to be too dark.",
+    "I can't read this image. Please provide a clearer image.",
+    "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
+    "If you could provide a clearer image, I'd be happy to help!",
     "Illegible",
     "[Blank]",
     "No readable text",
@@ -202,18 +250,16 @@ def test_canonical_refusals_and_bare_placeholders_count_as_no_content(answer):
 
 
 @pytest.mark.parametrize("answer", [
-    "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
-    "I'm sorry, but I can't assist with that.\nIf you have any other questions, feel free to ask!",
-    "I'm sorry, I can't help with that. Is there anything else I can do for you?",
-    "I'm sorry, but I can't read the text in this image. It appears to be too blurry.",
-    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
-    "I'm sorry, I can't provide a description of this image. It may contain sensitive content.",
-    "I can't read the text in this image. It looks to be too dark.",
+    "There is no readable text in this image. It seems to be a decorative background graphic.",
+    "Unable to process the image. Please provide a clearer scan of the page.",
+    "I'm sorry, but I can't share that.",
+    "The image is too blurry to read.",
+    "I can't read the scan. It seems to have been corrupted.",
 ])
-def test_refusals_followed_by_more_sentences_are_left_to_the_judge(answer):
-    """A model's refusal with a stock follow-up reads the same as a note or a chat that
-    starts with a refusal ("I can't help. It is too late to change the order."), so the
-    high-precision patterns keep it and a judge decides."""
+def test_answers_the_patterns_cannot_decide_are_left_to_the_judge(answer):
+    """A description of the image, a notice without a first person, a refusal that does
+    not name the image and a statement about quality alone read the same as page text:
+    the high-precision patterns keep them and a judge decides."""
     assert not matches_non_content_pattern(answer)
     assert non_content_reason(answer) is None
     assert non_content_reason(answer, lambda text: 0.9) == "judge"
@@ -311,6 +357,133 @@ class TestProviderJudgeHook:
         ocr._screen_structured_answers(results)
 
         assert results[0].text == JSON_ERROR
+
+
+class TestStructuredScreening:
+    """Only an otherwise empty structured page can be a refusal: a page that also has
+    figures, metrics, headings, tables or fields is content whatever raw.text says."""
+
+    NO_TEXT = "There is no text in this image."
+
+    @staticmethod
+    def _provider(monkeypatch, recovered_text="unused", judge=None):
+        ocr = OpenAIOCR(api_key="test-key", config=OCRConfig(non_content_judge=judge))
+        monkeypatch.setattr(ocr, "_ensure_vision_agent", lambda *a, **k: None)
+        monkeypatch.setattr(ocr, "_batch_process_with_vision_agent",
+                            lambda imgs, *a, **k: [OCRResult(text=recovered_text) for _ in imgs])
+        return ocr
+
+    @staticmethod
+    def _result(page):
+        return OCRResult(text=page.to_markdown(), document=page, metadata={})
+
+    @pytest.mark.parametrize("page", [
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT), interpretation=Interpretation(
+            figures=[Figure(kind="bar", title="Quarterly revenue", meaning="Revenue grows every quarter")])),
+            id="figures"),
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT, metrics=[Metric(label="Q4", value="171")])), id="metrics"),
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT, headings=["Plant layout"])), id="headings"),
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT, tables=[Table(html="<table><tr><td>1</td></tr></table>")])),
+                     id="tables"),
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT, fields=[KeyValue(label="Total", value="450")])), id="fields"),
+        pytest.param(OCRPage(raw=RawExtraction(text=NO_TEXT), interpretation=Interpretation(
+            summary="A photograph of a factory floor with two workers.")), id="description"),
+    ])
+    def test_page_with_other_content_is_kept(self, monkeypatch, page):
+        ocr = self._provider(monkeypatch)
+        results = [self._result(page)]
+        rendered = results[0].text
+
+        ocr._screen_structured_answers(results)
+        out = ocr._recover_empty_structured(results, [b"img"])
+
+        assert out[0].text == rendered and out[0].document is page
+        assert not out[0].metadata.get("non_content") and not out[0].metadata.get("ocr_refusal")
+
+    def test_otherwise_empty_page_is_screened(self, monkeypatch):
+        ocr = self._provider(monkeypatch, recovered_text="I'm sorry, I can't help with that.")
+        page = OCRPage(raw=RawExtraction(text=self.NO_TEXT),
+                       interpretation=Interpretation(summary="I'm sorry, I can't help with that."))
+        results = [self._result(page)]
+
+        ocr._screen_structured_answers(results)
+        out = ocr._recover_empty_structured(results, [b"img"])
+
+        assert out[0].text == "" and out[0].metadata["ocr_refusal"] is True
+
+    def test_refused_recovery_keeps_a_page_with_other_content(self, monkeypatch):
+        ocr = self._provider(monkeypatch, recovered_text="I'm sorry, I can't help with that.")
+        page = OCRPage(raw=RawExtraction(text="", headings=["Q3 Board Minutes"]))
+        results = [OCRResult(text="", document=page, metadata={})]
+
+        out = ocr._recover_empty_structured(results, [b"img"])
+
+        assert out[0].document is page and page.raw.headings == ["Q3 Board Minutes"]
+        assert not out[0].metadata.get("ocr_refusal")
+
+
+class TestJudgeSeesTheAnswerAsWritten:
+    """The judge gets the model's answer, not its Markdown-escaped rendering."""
+
+    ANSWER = "- Use <div> & List<String>\n# not a heading"
+
+    def test_structured_raw_text(self):
+        seen = []
+        ocr = OpenAIOCR(api_key="test-key", config=OCRConfig(non_content_judge=lambda t: seen.append(t) or 0.0))
+        page = OCRPage(raw=RawExtraction(text=self.ANSWER))
+        results = [OCRResult(text=page.to_markdown(), document=page, metadata={})]
+        assert results[0].text != self.ANSWER  # the rendering is escaped
+
+        ocr._screen_structured_answers(results)
+
+        assert seen == [self.ANSWER]
+
+    def test_openai_free_form_answer(self):
+        seen = []
+        ocr = OpenAIOCR(api_key="test-key", config=OCRConfig(non_content_judge=lambda t: seen.append(t) or 0.9))
+
+        [result] = ocr._results_from_batch([b"img"], [(self.ANSWER, {})], None, {})
+
+        assert seen == [self.ANSWER]
+        assert result.text == "" and result.metadata["ocr_refusal"] is True
+        assert result.metadata["non_content"] == "judge"
+
+    def test_gemini_free_form_answer(self):
+        seen = []
+        ocr = VertexAIOCR(api_key="test-key", config=OCRConfig(non_content_judge=lambda t: seen.append(t) or 0.0))
+
+        [result] = ocr._build_legacy_results([(self.ANSWER, {})], [b"img"])
+
+        assert seen == [self.ANSWER]
+        assert "&lt;div>" in result.text and not result.metadata.get("ocr_refusal")
+
+
+class TestFirewallRedoKeepsInstructions:
+    """The router firewall's verbatim redo keeps the caller's instructions."""
+
+    def test_openai(self, monkeypatch):
+        ocr = OpenAIOCR(api_key="test-key", config=OCRConfig())
+        calls = []
+        monkeypatch.setattr(ocr, "_batch_process_with_vision_agent", lambda imgs, **kw: calls.append(kw) or [])
+
+        ocr._redo_verbatim([0], [b"img"], None, "full", {"instructions": "Keep the units.", "_recovery": True})
+
+        assert calls[0]["instructions"] == "Keep the units."
+        assert calls[0]["tasks"] == [Task.DOCUMENT] and calls[0]["_firewall_retry"] is True
+        assert "_recovery" not in calls[0]
+
+    def test_gemini_redo_prompt_is_the_verbatim_task_plus_the_instructions(self, monkeypatch):
+        ocr = VertexAIOCR(api_key="test-key", config=OCRConfig())
+        calls = []
+        monkeypatch.setattr(ocr, "_batch_process_with_vision_agent", lambda imgs, **kw: calls.append(kw) or [])
+
+        ocr._redo_verbatim([0], [b"img"], {"instructions": "Keep the units.", "task": Task.AUTO})
+        [prompt] = ocr._build_structured_prompts([b"img"], **calls[0])
+
+        assert calls[0]["instructions"] == "Keep the units." and calls[0]["tasks"] == [Task.DOCUMENT]
+        assert prompt.startswith(TASK_PROMPTS[Task.DOCUMENT]) and prompt.endswith("Keep the units.")
+        # outside the firewall redo, custom instructions still replace the prompt
+        assert ocr._build_structured_prompts([b"img"], instructions="Keep the units.") == ["Keep the units."]
 
 
 def _png() -> bytes:

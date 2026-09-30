@@ -196,6 +196,85 @@ def test_t10_text_before_a_sanitized_table_cannot_complete_a_tag(run_cli, fake_l
     assert "Hello" in result.markdown, result.describe()
 
 
+def test_t8_long_blank_run_in_a_cell_does_not_stall_the_conversion(run_cli, fake_llm, scan):
+    """400,000 blanks inside one cell: the line-break cleanup used to take minutes on them."""
+    html = "<table><tr><td>Net" + " " * 400_000 + "income</td><td>1,200</td></tr></table>"
+    fake_llm.script(structured=[fake.page("Income", tables=[fake.table(html)])])
+
+    result = run_llm(run_cli, scan, fake_llm, timeout=30)
+
+    assert result.exit_code == 0, result.describe()
+    assert re.search(r"Net\s+income", result.markdown) and "1,200" in result.markdown
+
+
+_LINK_INJECTIONS = (
+    "![x](javascript:alert(1)) [click](javascript:alert(2)) ![](https://attacker.example/pixel.png) "
+    "[y](java&#115;cript:alert(3))"
+)
+
+
+def _links_and_images(markdown):
+    rendered = build.render(markdown)
+    hrefs = [a.get("href", "") for a in rendered.find_all("a")]
+    return rendered.find_all("img") + [h for h in hrefs if not h.lower().startswith(("http:", "https:", "mailto:"))]
+
+
+@pytest.mark.parametrize("where", ["raw.text", "page_markdown", "table.markdown", "free-form"])
+def test_t10_ocr_text_cannot_create_images_or_script_links(run_cli, fake_llm, scan, where):
+    if where == "raw.text":
+        fake_llm.script(structured=[fake.page("Links " + _LINK_INJECTIONS + "\n\n[a]: javascript:alert(4)\n\n[a]")])
+    elif where == "page_markdown":
+        fake_llm.script(structured=[fake.page("Links", interpretation=fake.interpretation(
+            page_markdown="## Links\n\n" + _LINK_INJECTIONS + "\n\n[a]: javascript:alert(4)\n\n[a]"))])
+    elif where == "table.markdown":
+        fake_llm.script(structured=[fake.page("Links", tables=[fake.table(
+            markdown="| a |\n|---|\n| " + _LINK_INJECTIONS + " |")])])
+    else:
+        fake_llm.script(free_form=[fake.text("Links " + _LINK_INJECTIONS)])
+    args = ("--no-structured",) if where == "free-form" else ()
+
+    result = run_llm(run_cli, scan, fake_llm, *args)
+
+    assert result.exit_code == 0, result.describe()
+    assert _links_and_images(result.markdown) == [], result.describe()
+    assert build.active_html(result.markdown) == [], result.describe()
+    assert "click" in build.visible_text(result.markdown), "the text is kept, only neutralized"
+
+
+def test_t10_code_lists_and_entities_render_as_written(run_cli, fake_llm, scan):
+    page_markdown = (
+        "## Setup\n\nUse `<div>` and `List<String>` here.\n\n```html\n<div>code</div>\n```\n\n"
+        "- Fast\n- Cheap\n\n&copy; 2026 Acme"
+    )
+    fake_llm.script(structured=[fake.page(
+        "Setup\nUse div and List String here.\ncode\nFast\nCheap\n2026 Acme",
+        interpretation=fake.interpretation(page_markdown=page_markdown))])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    rendered = build.render(result.markdown)
+    codes = [code.get_text() for code in rendered.find_all("code")]
+    assert "<div>" in codes and "List<String>" in codes, codes
+    assert any("<div>code</div>" in code for code in codes), codes
+    assert [li.get_text() for li in rendered.find_all("li")] == ["Fast", "Cheap"], result.describe()
+    assert "© 2026 Acme" in build.visible_text(result.markdown), result.describe()
+    assert build.active_html(result.markdown) == [], result.describe()
+
+
+def test_t10_transcribed_list_stays_a_list(run_cli, fake_llm, scan):
+    """raw.text is a verbatim transcription: its bullets and numbered items are real lists,
+    so the Markdown keeps them (no backslashes in the RAG text)."""
+    fake_llm.script(structured=[fake.page("Agenda\n- Fast\n- Cheap\n1. Budget\n2. Hiring")])
+
+    result = run_llm(run_cli, scan, fake_llm)
+
+    assert result.exit_code == 0, result.describe()
+    assert "- Fast" in result.markdown and "1. Budget" in result.markdown, result.describe()
+    rendered = build.render(result.markdown)
+    assert [li.get_text() for li in rendered.find_all("li")] == ["Fast", "Cheap", "Budget", "Hiring"]
+
+
 def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_llm, scan):
     """raw.text is a verbatim transcription: a line that happens to start with '#' or '>' is
     text on the page, not a heading or a quote, so the reader must see the characters."""
@@ -457,6 +536,25 @@ def test_rf14_rows_still_withheld_after_the_retry_leave_a_visible_marker(run_cli
     assert ocr_issues(result).get("withheld") == 1, result.json
 
 
+def test_rf14_withheld_metrics_and_figures_leave_a_visible_marker(run_cli, fake_llm, scan):
+    withheld = fake.page(
+        "Sales dashboard",
+        metrics=[{"label": "MRR", "value": "$12,000", "unit": "", "illustrative": True},
+                 {"label": "Churn", "value": "2%", "unit": "", "illustrative": True}],
+        interpretation=fake.interpretation(
+            document_type="chart", summary="A sales dashboard.",
+            figures=[{"kind": "line", "title": "Signups", "meaning": "Signups grow", "illustrative": True}]),
+    )
+    fake_llm.script(structured=[withheld])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert "[2 illustrative metrics not transcribed]" in result.markdown, result.describe()
+    assert "[1 illustrative figure not transcribed]" in result.markdown, result.describe()
+    assert ocr_issues(result).get("withheld") == 1, result.json
+
+
 def test_rf14_router_is_told_context_is_absent_when_no_context_pdf_is_attached(run_cli, fake_llm, scan):
     fake_llm.script(structured=[fake.page("Plain page text")])
 
@@ -507,13 +605,31 @@ def test_multilingual_no_text_answers_are_not_indexed(run_cli, fake_llm, scan, a
 
 
 @pytest.mark.parametrize("answer", [
+    "No text detected in image",
+    "The image does not contain any text.",
+    "I apologize, but I cannot provide the text from this image as it appears to contain copyrighted material.",
     "I'm sorry, but I can't assist with that. If you have any other questions, feel free to ask!",
-    "Sorry, I cannot process this image. It seems to contain sensitive personal information.",
+    "I'm unable to read the text in this image. It appears to be blurry or low resolution.\n"
+    "If you could provide a clearer image, I'd be happy to help!",
 ])
-def test_refusal_followed_by_more_sentences_is_left_to_the_judge(run_cli, fake_llm, scan, answer):
-    """The deterministic check is high-precision: a refusal that goes on reads the same as
-    a note that starts with one, so it is left to OCRConfig.non_content_judge; the CLI
-    has no judge, so the answer is kept (verbatim first)."""
+def test_whole_answer_refusal_with_a_reason_or_a_courtesy_tail_is_not_indexed(run_cli, fake_llm, scan, answer):
+    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert build.squash(answer[:24]) not in build.squash(result.markdown), result.describe()
+    assert ocr_issues(result).get("refused") == 1, result.json
+
+
+@pytest.mark.parametrize("answer", [
+    "There is no readable text in this image. It seems to be a decorative background graphic.",
+    "Unable to process the image. Please provide a clearer scan of the page.",
+])
+def test_answer_the_patterns_cannot_decide_is_left_to_the_judge(run_cli, fake_llm, scan, answer):
+    """A description of the image, or a notice without a first person, reads the same as
+    page text: it is left to OCRConfig.non_content_judge; the CLI has no judge, so the
+    answer is kept (verbatim first)."""
     fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text("unused")])
 
     result = run_llm(run_cli, scan, fake_llm, fmt="both")
@@ -522,6 +638,78 @@ def test_refusal_followed_by_more_sentences_is_left_to_the_judge(run_cli, fake_l
     assert build.normalize(answer) in build.normalize(result.markdown), result.describe()
     assert not ocr_issues(result), result.json
     assert fake_llm.requests_of("free_form") == [], "kept content must not be re-OCR'd"
+
+
+# Short answers that open with a refusal or "no text" clause and go on with content (a
+# partial transcription, a description, a quote): the content must stay.
+_CLAUSE_THEN_CONTENT = [
+    ("There is no text in this image. It shows a bar chart with revenue rising from 120 to 171 across Q1-Q4.",
+     "120 to 171"),
+    ("I can't transcribe the handwritten text, but the printed part reads:\nInvoice No. 2026-0917\nTotal due: $450",
+     "2026-0917"),
+    ("Invoice No. 2026-0917\nTotal due: $450\n(The signature at the bottom is illegible, so I can't transcribe it.)",
+     "2026-0917"),
+    ("The image is mostly blank except for a small caption: 'Figure 3 - Plant layout'.", "Plant layout"),
+    ("I don't see any text in the image, but it shows a red octagonal stop sign on a pole.", "stop sign"),
+    ("As an AI, I can't identify the person in the photo, but the name badge reads 'Dr. Lee, Chief Engineer'.",
+     "Chief Engineer"),
+    ("죄송하지만 이 이미지의 손글씨는 인식할 수 없습니다. 인쇄된 부분: 청구서 번호 2026-0917 합계 45,000원", "45,000"),
+    ("Leider kann ich den handschriftlichen Text im Bild nicht erkennen. Gedruckt: Rechnung Nr. 4711, Betrag 450 EUR",
+     "4711"),
+]
+
+
+@pytest.mark.parametrize("answer, content", _CLAUSE_THEN_CONTENT)
+def test_answer_that_goes_on_with_content_after_a_refusal_clause_is_kept(run_cli, fake_llm, scan, answer, content):
+    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text("unused")])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert content in result.markdown, result.describe()
+    assert not ocr_issues(result), result.json
+    assert fake_llm.requests_of("free_form") == [], "content must not be re-OCR'd"
+
+
+def test_free_form_answer_that_goes_on_with_content_is_kept(run_cli, fake_llm, scan):
+    answer, content = _CLAUSE_THEN_CONTENT[0]
+    fake_llm.script(free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert content in result.markdown, result.describe()
+    assert not ocr_issues(result), result.json
+
+
+def test_no_text_answer_does_not_wipe_the_figures_and_metrics_of_its_page(run_cli, fake_llm, scan):
+    page = fake.page(
+        "There is no text in this image.",
+        metrics=[{"label": "Revenue Q4", "value": "171", "unit": "", "illustrative": False}],
+        interpretation=fake.interpretation(
+            document_type="chart",
+            figures=[{"kind": "bar", "title": "Quarterly revenue", "meaning": "Revenue grows every quarter"}]),
+    )
+    fake_llm.script(structured=[page], free_form=[fake.text("unused")])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert "Quarterly revenue" in result.markdown and "Revenue Q4" in result.markdown, result.describe()
+    assert not ocr_issues(result), result.json
+    assert fake_llm.requests_of("free_form") == [], "a page with content must not be re-OCR'd"
+
+
+def test_refused_page_leaves_a_marker_and_its_location(run_cli, fake_llm, scan):
+    fake_llm.script(structured=[fake.page(REFUSAL)], free_form=[fake.text(REFUSAL)])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert "[page 1: OCR returned no content]" in build.visible_text(result.markdown), result.describe()
+    issues = ocr_issues(result)
+    assert issues.get("refused") == 1, result.json
+    assert issues.get("locations") == [{"issue": "refused", "image": 1, "page": 1}], result.json
 
 
 def test_free_form_refusal_is_reported(run_cli, fake_llm, scan):
@@ -572,6 +760,9 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "I can't help. It is too late to change the order. Ref #4411",
     "Sorry, I can't help with that. However, I can ask Mark tomorrow.",
     "I can't read the scan. It seems to have been corrupted. Total: $500",
+    "I'm sorry Dave, I'm afraid I can't do that.",
+    "Leider kann ich das Foto nicht lesen, kannst du es nochmal schicken?",
+    "No pude leer la foto, ¿me la mandas otra vez?",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])
