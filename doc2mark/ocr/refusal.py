@@ -68,27 +68,25 @@ _TRANSCRIPTION_OBJECT = (
     rf"{_MODEL_DETERMINER}{_FILLER}(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
     rf"{_NOT_THE_USERS}"
 )
-# What a refusal refuses ("I can't help falling in love" and "I cannot describe this
-# picture in words" are not refusals).
-_REFUSED = (
-    r"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request"
-    r"|identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing)\b|\s*[.!]?\s*$)"
-    r"|comply\s+with\s+(?:that|this|the)\s+request\b"
-    rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
-    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}"
-    r"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)\b)"
-)
-# Refused only after an apology: "I'm sorry, but I can't do that." (bare, it is a quote).
-_APOLOGY_REFUSED = rf"(?:{_REFUSED}|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?\s*[.!]?\s*$)"
 _END = r"\s*[.!]?\s*$"
-# Without an apology the refusal must end at its object ("I can't read the scans until
-# Dr. Lee signs off." is a note); only the model's own verb, "transcribe", may go on.
+# What a refusal refuses. It must end at its object ("I can't read the scans until Dr.
+# Lee signs off." is a note, "I can't help falling in love" a lyric); only the model's
+# own words -- "transcribe" and, after an apology, "help with identifying ..." or "a
+# transcription of ..." -- may go on.
 _BARE_REFUSED = (
     rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request))?{_END}"
     rf"|comply\s+with\s+(?:that|this|the)\s+request{_END}"
     rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
     rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}{_END}"
     rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?{_END})"
+)
+# After an apology also: "I'm sorry, but I can't do that.", "... help with identifying
+# people in images", "... provide a transcription of copyrighted material".
+_APOLOGY_REFUSED = (
+    rf"(?:{_BARE_REFUSED}"
+    r"|(?:help|assist)\s+(?:you\s+)?with\s+(?:identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing)\b"
+    r"|provide\s+(?:a\s+|the\s+|any\s+)?transcription\b"
+    rf"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?{_END})"
 )
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
 # Absence of text, not quality ("The photo is blurry." is also an app's hint to the user).

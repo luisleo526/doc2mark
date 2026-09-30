@@ -286,11 +286,34 @@ def _tidy_breaks(cell) -> None:
         _remove_keep_tail(last_kept)
 
 
+def _wrap_loose_cells(container) -> None:
+    """Cells placed directly in a table or row group (no <tr>) get a row of their own,
+    as a browser would give them."""
+    run: List = []
+
+    def flush() -> None:
+        if run:
+            row = container.makeelement("tr", {})
+            run[0].addprevious(row)
+            for cell in run:
+                row.append(cell)
+            run.clear()
+
+    for child in list(container):
+        if _tag(child) in ("td", "th"):
+            run.append(child)
+        else:
+            flush()
+    flush()
+
+
 def _tidy_table(table) -> None:
     """Clean one table's own structure: no text or <br> between rows/cells (it moves to
     the caption, verbatim), no pretty-printing whitespace, <br> for in-cell newlines."""
     stray: List[str] = []
     containers = [table] + [child for child in table if _tag(child) in _ROW_GROUP_TAGS]
+    for container in containers:
+        _wrap_loose_cells(container)
     rows = [row for container in containers for row in container if _tag(row) == "tr"]
     for node in containers + rows:
         stray.extend(_text_lines(node.text))
@@ -805,7 +828,8 @@ def _escape_cell(text: str) -> str:
 _TABLE_TAG_RE = re.compile(r"<(/?)table\b[^>]*>", re.I)
 # What follows an opening <table> tag in real markup (prose that merely mentions
 # "<table>" goes on with words).
-_TABLE_BODY_START_RE = re.compile(r"\s*<(?:tr|thead|tbody|tfoot|caption|colgroup|col)\b", re.I)
+_TABLE_BODY_START_RE = re.compile(
+    r"\s*(?:<!--.*?-->\s*)*<(?:tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b", re.I | re.S)
 
 
 def _sanitize_markdown(text: str) -> str:
