@@ -69,24 +69,46 @@ _TRANSCRIPTION_OBJECT = (
     rf"{_NOT_THE_USERS}"
 )
 _END = r"\s*[.!]?\s*$"
+# A model's stock follow-up to its refusal: "If you have any other questions, feel free
+# to ask!", "It appears to be blurry.", "It would violate copyright.", "However, I can
+# summarize it."
+_FOLLOW_UP = (
+    r"(?:if\s+you\s+(?:have|need|would\s+like|want|can|could|provide|share)\b"
+    r"|is\s+there\s+(?:anything|something)\s+else\b|let\s+me\s+know\s+if\b|feel\s+free\s+to\b"
+    rf"|however,?\s+i\b|i(?:{_APOS}d|\s+would)\s+be\s+happy\s+to\b"
+    rf"|(?:it|(?:the|this)\s+(?:{_IMAGE_NOUN}|request|content|text|resolution))\s+"
+    r"(?:(?:appears|seems|looks)\s+to\s+(?:be|contain|have|show)|(?:may|might|could)\s+(?:contain|violate|infringe)"
+    r"|would\s+(?:violate|infringe)|contains|involves|is\s+too)\b)"
+)
+# A refusal ends the answer, or its sentence with only such a follow-up after it ("I
+# can't read the scans. It seems Dr. Lee has them." is a note).
+_REFUSAL_END = rf"(?:{_END}|(?:\s*[.!]\s+|\s*[.!]?\s*\n\s*){_FOLLOW_UP}[\s\S]*$)"
 # What a refusal refuses. It must end at its object ("I can't read the scans until Dr.
 # Lee signs off." is a note, "I can't help falling in love" a lyric); only the model's
-# own words -- "transcribe" and, after an apology, "help with identifying ..." or "a
-# transcription of ..." -- may go on.
+# own verb, "transcribe", may go on.
 _BARE_REFUSED = (
-    rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request))?{_END}"
-    rf"|comply\s+with\s+(?:that|this|the)\s+request{_END}"
+    rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request))?{_REFUSAL_END}"
+    rf"|comply\s+with\s+(?:that|this|the)\s+request{_REFUSAL_END}"
     rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
-    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}{_END}"
-    rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?{_END})"
+    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}{_REFUSAL_END}"
+    rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?{_REFUSAL_END})"
+)
+# What a model declines to help with: people, or the image and its text -- never "your
+# ..." ("... help with identifying or making assumptions about people in images").
+_MODEL_TOPIC = (
+    r"(?:(?!\byour\b)[^.!?\n]){0,60}?"
+    rf"\b(?:people|persons?|individuals|faces?|texts?|contents?|{_IMAGE_NOUN})\b"
+    rf"(?:\s+(?:in|on|from|of|within)\s+{_MODEL_DETERMINER}{_IMAGE_NOUN}\b)?"
 )
 # After an apology also: "I'm sorry, but I can't do that.", "... help with identifying
 # people in images", "... provide a transcription of copyrighted material".
 _APOLOGY_REFUSED = (
     rf"(?:{_BARE_REFUSED}"
     r"|(?:help|assist)\s+(?:you\s+)?with\s+(?:identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing)\b"
-    r"|provide\s+(?:a\s+|the\s+|any\s+)?transcription\b"
-    rf"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?{_END})"
+    rf"{_MODEL_TOPIC}{_REFUSAL_END}"
+    r"|provide\s+(?:a\s+|the\s+|any\s+)?transcription\s+of\s+"
+    rf"(?:{_TRANSCRIPTION_OBJECT}|(?:the\s+|this\s+|any\s+)?copyrighted\s+\w+(?:\s+\w+)?){_REFUSAL_END}"
+    rf"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?{_REFUSAL_END})"
 )
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
 # Absence of text, not quality ("The photo is blurry." is also an app's hint to the user).

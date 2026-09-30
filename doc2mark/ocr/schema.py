@@ -18,6 +18,7 @@ satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 
 import html as _html
 import re
+from bisect import bisect_left
 from collections import Counter
 from typing import Dict, List, Optional, Literal, Tuple
 
@@ -309,20 +310,26 @@ def _wrap_loose_cells(container) -> None:
 
 def _tidy_table(table) -> None:
     """Clean one table's own structure: no text or <br> between rows/cells (it moves to
-    the caption, verbatim), no pretty-printing whitespace, <br> for in-cell newlines."""
+    the caption, verbatim and in reading order), no pretty-printing whitespace, <br> for
+    in-cell newlines."""
     stray: List[str] = []
     containers = [table] + [child for child in table if _tag(child) in _ROW_GROUP_TAGS]
     for container in containers:
         _wrap_loose_cells(container)
     rows = [row for container in containers for row in container if _tag(row) == "tr"]
-    for node in containers + rows:
+
+    def collect(node) -> None:
         stray.extend(_text_lines(node.text))
         node.text = None
         for child in list(node):
+            if (_tag(child) == "tr" and _tag(node) != "tr") or (node is table and _tag(child) in _ROW_GROUP_TAGS):
+                collect(child)
             stray.extend(_text_lines(child.tail))
             child.tail = None
             if _tag(child) == "br":
                 node.remove(child)
+
+    collect(table)
     for row in rows:
         for cell in row:
             if _tag(cell) in ("td", "th"):
@@ -825,11 +832,28 @@ def _escape_cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
-_TABLE_TAG_RE = re.compile(r"<(/?)table\b[^>]*>", re.I)
-# What follows an opening <table> tag in real markup (prose that merely mentions
-# "<table>" goes on with words).
-_TABLE_BODY_START_RE = re.compile(
-    r"\s*(?:<!--.*?-->\s*)*<(?:tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b", re.I | re.S)
+_TABLE_TAG_RE = re.compile(r"<(/?)table\b[^<>]*>", re.I)
+# What follows an opening <table> tag in real markup, after whitespace and at most a
+# few comments (prose that merely mentions "<table>" goes on with words).
+_TABLE_BODY_TAG_RE = re.compile(r"<(?:tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b", re.I)
+_SPACES_RE = re.compile(r"\s*")
+_COMMENT_END_RE = re.compile("-->")
+_MAX_LEADING_COMMENTS = 8
+
+
+def _opens_table_body(text: str, pos: int, comment_ends: List[int]) -> bool:
+    """Whether table markup follows ``pos``. A comment ends at the first "-->" after it
+    (``comment_ends``: where every "-->" in ``text`` starts, in order), so a check costs
+    a few lookups however many comments or tags the text repeats."""
+    for _ in range(_MAX_LEADING_COMMENTS + 1):
+        pos = _SPACES_RE.match(text, pos).end()
+        if not text.startswith("<!--", pos):
+            return _TABLE_BODY_TAG_RE.match(text, pos) is not None
+        index = bisect_left(comment_ends, pos + 4)
+        if index == len(comment_ends):
+            return False  # a comment that never ends
+        pos = comment_ends[index] + 3
+    return False
 
 
 def _sanitize_markdown(text: str) -> str:
@@ -838,11 +862,12 @@ def _sanitize_markdown(text: str) -> str:
     through the ``Table.html`` sanitizer and normalizer, and every other piece of raw
     HTML except the inert ``<br>`` is neutralized. Apply it once, to the final text."""
     text = _clean_controls(text)
+    comment_ends = [match.start() for match in _COMMENT_END_RE.finditer(text)]
     out: List[str] = []
     depth, start, last = 0, 0, 0
     for match in _TABLE_TAG_RE.finditer(text):
         if not match.group(1):
-            if not _TABLE_BODY_START_RE.match(text, match.end()):
+            if not _opens_table_body(text, match.end(), comment_ends):
                 continue  # "<table>" mentioned in prose, not table markup
             if depth == 0:
                 start = match.start()
