@@ -28,7 +28,10 @@ _QUOTED_OR_ESCAPED = re.compile(r'"[^"]*"|\\.')
 _DIGIT_PLACEHOLDERS = "0#?"
 _EMPTY_SLOT = {"0": "0", "#": "", "?": " "}
 
-Token = Tuple[str, str]  # (kind, text): "lit" literal text, "ph" one of 0#?.,%, "exp" E+/E-, "text" @
+# (kind, text): "lit" a bare or backslash-escaped literal character, "quoted" the text of a
+# "..." string, "ph" one of 0#?.,%, "exp" E+/E-, "text" @.
+Token = Tuple[str, str]
+_LITERALS = ("lit", "quoted")
 
 
 def format_cell_value(value, number_format="General") -> str:
@@ -145,9 +148,11 @@ def _pick_section(sections: List[str], value) -> Tuple[str, bool]:
 
 
 def _writes_sign(tokens: List[Token]) -> bool:
-    """Whether a section prints the sign itself: a literal ``-`` or ``(`` (``-#,##0``,
-    ``(#,##0)``). A negative section told apart only by colour (``[Red]#,##0``) does not."""
-    return any(kind == "lit" and ("-" in text or "(" in text) for kind, text in tokens)
+    """Whether a section prints the sign itself: a bare or backslash-escaped ``-`` or ``(``
+    (``-#,##0``, ``(#,##0)``, ``\\(#,##0\\)``). Quoted text is a label even when it contains
+    one (``" (est)"``, ``"US-$"``, ``"("``), and a section told apart only by colour
+    (``[Red]#,##0``) prints no sign either."""
+    return any(kind == "lit" and text in ("-", "(") for kind, text in tokens)
 
 
 # --------------------------------------------------------------------------- numbers
@@ -178,7 +183,7 @@ def _tokens(section: str) -> List[Token]:
         if ch == '"':
             end = section.find('"', i + 1)
             end = len(section) if end < 0 else end
-            tokens.append(("lit", section[i + 1:end]))
+            tokens.append(("quoted", section[i + 1:end]))
             i = end + 1
         elif ch == "\\" and i + 1 < len(section):
             tokens.append(("lit", section[i + 1]))
@@ -208,7 +213,7 @@ def _plain(tokens: List[Token], value) -> str:
     """Render literal/percent/text tokens outside the digit body."""
     out = []
     for kind, text in tokens:
-        if kind == "lit":
+        if kind in _LITERALS:
             out.append(text)
         elif kind == "text":
             out.append(_general(value))
@@ -288,7 +293,7 @@ def _fixed(number: Decimal, body: List[Token]) -> str:
     # Integer part: fill placeholders right to left; the leftmost one takes any overflow.
     int_tokens = [token for token in int_part if token != ("ph", ",")]
     slots = [i for i, token in enumerate(int_tokens) if _is_digit(token)]
-    out = [text if kind == "lit" else "" for kind, text in int_tokens]
+    out = [text if kind in _LITERALS else "" for kind, text in int_tokens]
     remaining = int_str.lstrip("0")
     for n, position in enumerate(reversed(slots)):
         placeholder = int_tokens[position][1]
@@ -312,7 +317,7 @@ def _fixed(number: Decimal, body: List[Token]) -> str:
         dec[i] = _EMPTY_SLOT[dec_slots[i]]
     if point is None:
         return int_text
-    dec_literals = "".join(text for kind, text in dec_part if kind == "lit")
+    dec_literals = "".join(text for kind, text in dec_part if kind in _LITERALS)
     return f"{int_text}.{''.join(dec).rstrip()}{dec_literals}"
 
 

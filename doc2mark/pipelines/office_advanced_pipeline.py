@@ -481,9 +481,9 @@ def _formula_uncached(cell) -> bool:
     return not (value.text or '').strip() and cell.get('t') != 'str'
 
 
-# A formula element or a value-metadata attribute, with or without a namespace prefix
-# (openpyxl writes <f>, the Open XML SDK writes <x:f>).
-_FORMULA_OR_RICH_VALUE = re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s/>]|\svm="')
+# A formula element (with or without a namespace prefix: openpyxl writes <f>, the Open XML
+# SDK <x:f>) or a value-metadata attribute (vm="1" or vm='1'; XML allows either quote).
+_FORMULA_OR_RICH_VALUE = re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s/>]|\svm\s*=\s*["\']')
 _ZIP_SCAN_OVERLAP = 256  # longer than any tag prefix the pattern has to see whole
 
 

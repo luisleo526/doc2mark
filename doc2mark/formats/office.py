@@ -22,11 +22,24 @@ try:
         _W_T, _attr_int, _docx_rendered,
     )
     ADVANCED_PIPELINE_AVAILABLE = True
-except ImportError:
+    _PIPELINE_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as _exc:
     ADVANCED_PIPELINE_AVAILABLE = False
+    _PIPELINE_IMPORT_ERROR = _exc
     logging.warning("Advanced Office pipeline not available. Using basic processing.")
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pipeline_helpers() -> None:
+    """The route signals walk OOXML with the Office pipeline's helpers (``_docx_rendered``,
+    ``_attr_int``, ``_W_T``); without the pipeline, fail with that reason instead of a
+    NameError. The route records the error and the document stays on native extraction."""
+    if not ADVANCED_PIPELINE_AVAILABLE:
+        raise ProcessingError(
+            "Office image-route signals need doc2mark.pipelines.office_advanced_pipeline, "
+            f"which failed to import: {_PIPELINE_IMPORT_ERROR}"
+        )
 
 _P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 _A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
@@ -361,6 +374,7 @@ class OfficeProcessor(BaseProcessor):
         layout and master draw on it. Text counts every visible text frame and
         table cell, grouped ones included. Hidden shapes count for neither.
         """
+        _require_pipeline_helpers()
         from pptx import Presentation
         prs = Presentation(str(file_path))
         width, height = float(prs.slide_width or 0), float(prs.slide_height or 0)
@@ -394,6 +408,7 @@ class OfficeProcessor(BaseProcessor):
         easily exceeds the 200-char text limit, and a document it flags is converted
         so the converted PDF decides.
         """
+        _require_pipeline_helpers()
         import docx
         d = docx.Document(str(file_path))
         roots = [d.element.body]
