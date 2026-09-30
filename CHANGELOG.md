@@ -581,7 +581,9 @@ else applies by default.
   now shows `[image: OCR unavailable]`, as in PDFs; `ocr_issues["failed"]` counts it (for every format,
   also the images of any OCR request that raised) with its page, slide or sheet in `locations`; the
   pictures of a batch request that raised are not sent again one by one; and the document is not stored
-  in `cache_dir`, so the next run reads the pictures. (#30)
+  in `cache_dir`, so the next run reads the pictures. When an OCR cache (`ocr_cache=`) holds the answers
+  for some pictures of a batch whose request raised, those answers are used (the cache wrapper raised for
+  the whole batch), and a PDF batch that raised reports the page of each of its pictures. (#30)
 - **PowerPoint slides no longer carry their layout's prompts and fields.** "Click to edit Master title
   style", the layout's date and `‹#›` were added to every slide as captions, and so were slide-level date
   and slide-number fields; only text a slide sets in its placeholders is kept (a typed footer or date).
@@ -592,23 +594,30 @@ else applies by default.
   gave 1); decks taken through the Office image route now report it too. (#30)
 - **Word text boxes are read.** Text in text boxes and shapes (also grouped, in table cells and in
   headers, and the VML text boxes of older files) was not extracted at all; it now follows the text of
-  the paragraph it is anchored in, once (not from both copies Word saves). (#30)
+  the paragraph it is anchored in, once (not from both copies Word saves); its lists are numbered on their
+  own. (#30)
 - **Word headers and footers are in the Markdown, with their tables and pictures.** They were only
   `text:header` / `text:footer` items of `json_content`, header tables were lost, and a header picture
   was looked up in the body's relationships (the Markdown got another part's bytes as a PNG). Each header
   and footer a section shows is now written once, between `<!-- header -->` / `<!-- /header -->` (or
   `footer`) lines where the section starts (ends), its items typed like body text with `"region":
-  "header"` / `"footer"`; a header or footer that only shows a page number is left out. (#30)
+  "header"` / `"footer"` (a heading-styled header line is a plain line); a header repeating the text of
+  one already written is not written again, a line that only shows a page number is left out, and header
+  lists are numbered apart from the body's. (#30)
 - **Only caption-shaped Word paragraphs are captions.** Any paragraph starting with Table, Figure, Chart,
   Image and similar words became an italic caption ("Tablets are popular ..."); a caption is now a
   paragraph in a caption style or one that starts with the word, a number and a separator ("Figure 2:
   ..."). (#30)
 - **Word bold, italics and links are kept.** Runs are written `**bold**`, `*italic*` and `[text](url)` in
-  paragraphs and list items (where the markers keep words whole; links only to http(s) and mailto
-  addresses), the text itself escaped as before; the JSON item keeps the text as written in `content` and
-  gets the Markdown in `markdown`. Headings, captions and table cells stay plain. (#30)
+  paragraphs and list items, only where that changes nothing a reader sees: markers keep words whole, a
+  backslash before a marker is kept, no emphasis next to a literal `*` and no markup on a line with a
+  backtick, links only to http(s) and mailto addresses, set off from the text and not after `!`. The text
+  itself is escaped as before; the JSON item keeps it as written in `content` and gets the Markdown in
+  `markdown`. Headings, captions and table cells stay plain. (#30)
 - **Excel results report `sheet_names` and `total_cells`.** Both were set only by the basic fallback
   converter; `total_cells` counts the cells that show a value, in all sheets. (#30)
+- **Word `word_count` counts words.** It counted the words of the Markdown's `<!-- page N -->` marker
+  comments too. (#30)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is

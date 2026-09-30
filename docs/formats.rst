@@ -65,21 +65,28 @@ their cell) is kept; deleted text is not. Footnotes become ``[^N]`` / ``[^N]: ..
 
 - **Text boxes** and shapes with text (also grouped, in table cells and in headers) are read once
   (Word saves each twice, as a drawing and as a fallback copy for old readers) and follow the text
-  of the paragraph they are anchored in; in a table cell they are further lines of the cell.
+  of the paragraph they are anchored in; in a table cell they are further lines of the cell. A
+  numbered list in a text box is numbered on its own, as are those of headers and footers: they
+  never move the body's numbers.
 - **Headers and footers** that a section shows (a first-page or even-page one when the section
   uses it) are written once each, with their tables and pictures: headers before the section's
   first paragraph, footers after its last, each block between ``<!-- header -->`` and
   ``<!-- /header -->`` (``<!-- footer -->`` / ``<!-- /footer -->``) lines. A header or footer that
-  a later section inherits is not repeated, and one that only shows a page number (a ``PAGE`` or
-  ``NUMPAGES`` field, whose number is just the page Word last showed it on) is left out. Their
-  ``json_content`` items carry ``"region": "header"`` / ``"footer"``.
+  a later section inherits, or that shows the same text and pictures as one already written, is
+  not repeated, and a line that only shows a page number (a ``PAGE`` or ``NUMPAGES`` field, whose
+  number is just the page Word last showed it on) is left out. A heading-styled line of a header is
+  a plain line there, not a heading of the document. Their ``json_content`` items carry
+  ``"region": "header"`` / ``"footer"``.
 - **Bold, italics and links** are written ``**bold**``, ``*italic*`` and ``[text](url)`` in
-  paragraphs and list items; headings, captions and table cells stay plain. Markers are placed
-  only where they keep words whole and a Markdown renderer can read them (a bold syllable inside
-  a word stays unmarked). A link is written as a link only when it points to an ``http``,
-  ``https`` or ``mailto`` address and is set off from the text around it; any other link (a
-  ``javascript:`` target, a bookmark in the document) keeps its text. The item's ``content`` keeps
-  the text as written; the Markdown of such a paragraph is in its ``markdown`` key.
+  paragraphs and list items; headings, captions and table cells stay plain. The markup is added
+  only where it changes nothing a reader sees: markers only where they keep words whole and a
+  Markdown renderer can read them (a bold syllable inside a word stays unmarked), no emphasis on
+  a line that holds a literal ``*`` and no markup at all on a line that holds a backtick. A link
+  is written as a link only when it points to an ``http``, ``https`` or ``mailto`` address, is set
+  off from the text around it, is not preceded by ``!`` and has no bracket in its text; any other
+  link (a ``javascript:`` target, a bookmark in the document) keeps its text. The item's
+  ``content`` keeps the text as written; the Markdown of such a paragraph is in its ``markdown``
+  key.
 - A paragraph is a caption (``text:caption``, written in italics) when it has a caption style,
   or starts with a caption word and a number followed by a separator or nothing (*Figure 2:
   Revenue*, *Table 3. Totals*), or with *Source:* / *Note:*. *Tablets are ...*, *Table of

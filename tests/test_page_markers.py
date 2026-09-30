@@ -129,7 +129,8 @@ class TestDOCXPageBreaks:
 # ---------------------------------------------------------------------------
 
 class TestDOCXHeaderFooterSeparation:
-    """Verify DOCX headers/footers are tagged and excluded from body."""
+    """DOCX headers/footers are items marked ``region`` (written once, in their own Markdown blocks),
+    never the PDF-only ``text:header`` / ``text:footer`` types."""
 
     @pytest.fixture
     def sample_docx(self, sample_documents_dir):
@@ -139,7 +140,7 @@ class TestDOCXHeaderFooterSeparation:
         return path
 
     def test_header_footer_types_in_json(self, sample_docx):
-        """If doc has headers/footers, they should be typed text:header/text:footer."""
+        """No leftover header/footer item types."""
         result = _load_doc(sample_docx)
         types = {item["type"] for item in result.json_content}
         # Not all docs have headers/footers, so just verify no crash
@@ -148,12 +149,8 @@ class TestDOCXHeaderFooterSeparation:
             assert item["type"] not in ("text:header_old", "text:footer_old")
 
     def test_headers_not_in_markdown_body(self, sample_docx):
-        """Headers/footers should not appear as normal text in markdown."""
+        """The document converts with its items (tests/test_rag_e2e.py checks the header blocks)."""
         result = _load_doc(sample_docx)
-        # The key invariant: text:header and text:footer types are
-        # skipped by office_to_markdown (handled by the if/elif chain
-        # which silently skips unknown types)
-        # Verify json_content is complete (all items preserved)
         assert result.json_content is not None
 
 

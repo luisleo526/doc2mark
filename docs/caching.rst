@@ -79,7 +79,9 @@ What is cached
 
 Every answer, including an answer with no text and a "no readable text" statement: a blank page
 or a photo without words gets the same answer every time, and asking again would cost a call.
-Never cached, so the next run asks again: an answer the provider flagged ``failed`` (timeout,
+When the provider's call raises (a missing key, an outage) for the images the cache does not hold,
+the answers it holds for the other images of the batch are still used, and those images come back
+failed. Never cached, so the next run asks again: an answer the provider flagged ``failed`` (timeout,
 rate limit, server error), a result that still withholds values after the router firewall's
 verbatim redo, and an answer the optional judge could not screen. An entry of such a kind already
 in a cache is treated as a miss. Each skipped write is logged at ``INFO``.

@@ -123,9 +123,10 @@ def _is_punctuation(char: str) -> bool:
 
 
 def _continues_word(char: str) -> bool:
-    """A letter or digit of a script that separates words with spaces: markup next to it would
-    split a word for lexical retrieval (``A**I**``). CJK characters need no spaces between words."""
-    return char.isalnum() and not _is_cjk(char)
+    """A letter or digit of a script that separates words with spaces, fullwidth Latin letters and
+    digits included: markup next to it would split a word for lexical retrieval (``A**I**``). CJK
+    characters need no spaces between words."""
+    return char.isalnum() and (not _is_cjk(char) or 0xFF10 <= ord(char) <= 0xFF5A)
 
 
 def emphasis_fits(before: str, core: str, after: str) -> bool:

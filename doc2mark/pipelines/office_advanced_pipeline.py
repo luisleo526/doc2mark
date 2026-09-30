@@ -6,6 +6,7 @@ import logging
 import re
 import unicodedata
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
@@ -266,62 +267,131 @@ def _sets_off_link(char: str) -> bool:
     character or CJK punctuation (CJK text has no spaces between words)."""
     if not char or char.isspace() or char in _LINK_NEIGHBOURS:
         return True
-    if ord(char) < 0x2E80:  # a letter, digit or mark of a script that separates words with spaces
-        return False
+    if ord(char) < 0x2E80 or (0xFF10 <= ord(char) <= 0xFF5A and char.isalnum()):
+        return False  # a letter or digit of a word (fullwidth Latin letters and digits too)
     return char.isalnum() or unicodedata.category(char).startswith('P')
+
+
+def _markup_edges(markdown: str) -> Tuple[str, str, str]:
+    """``(leading spaces, core, trailing spaces)`` of a piece of inline Markdown."""
+    core = markdown.strip()
+    if not core:
+        return markdown, '', ''
+    start = len(markdown) - len(markdown.lstrip())
+    return markdown[:start], core, markdown[start + len(core):]
 
 
 def _markdown_line(pieces) -> str:
     """Inline Markdown for one line of styled runs (``(text, bold, italic, link target)``, no line
-    breaks): the line is escaped at once (``escape_inline_pieces``, so a ``<`` in one run sees the
-    letter in the next), runs are written ``**bold**`` / ``*italic*`` where the markers keep words
-    whole and CommonMark can close them (``emphasis_fits``), and the runs of a web or mail link
-    ``[text](address)`` where the brackets keep words whole. Otherwise the text is kept as it is."""
-    escaped = escape_inline_pieces(''.join(piece[0] for piece in pieces))
-    groups: List[List[Any]] = []   # [markdown, plain text, (bold, italic), link target]
+    breaks). The line is escaped at once (``escape_inline_pieces``, so a ``<`` in one run sees the
+    letter in the next); then runs are written ``**bold**`` / ``*italic*`` and the runs of a web or
+    mail link ``[text](address)``, only where that changes nothing a reader sees:
+
+    - emphasis only where its markers keep words whole and CommonMark can close them
+      (``emphasis_fits``), never on a line holding a literal ``*`` (it would pair with the markers),
+      and never touching the markers of the run before it;
+    - a link only when its text has no bracket, it is set off from the text around it and not
+      preceded by ``!`` (which would make it an image);
+    - nothing on a line holding a backtick (a code span could swallow the markup);
+    - a backslash right before inserted markup is doubled, so it does not escape the markup.
+
+    Otherwise the text is kept as it is; runs of one style and one written link are merged."""
+    text = ''.join(piece[0] for piece in pieces)
+    escaped = escape_inline_pieces(text)
+    if '`' in text:
+        return ''.join(escaped)
+
+    def grouped(segments: List[List[Any]]) -> List[List[Any]]:
+        merged: List[List[Any]] = []
+        for segment in segments:
+            if merged and merged[-1][3] == segment[3] and (merged[-1][2] == segment[2] or not segment[1].strip()):
+                merged[-1][0] += segment[0]
+                merged[-1][1] += segment[1]
+            else:
+                merged.append(list(segment))
+        return merged
+
+    segments: List[List[Any]] = []   # [markdown, plain text, (bold, italic), link target]
     offset = 0
-    for text, bold, italic, target, *_ in pieces:
-        markdown = ''.join(escaped[offset:offset + len(text)])
-        offset += len(text)
-        if groups and groups[-1][3] == target and (groups[-1][2] == (bold, italic) or not text.strip()):
-            groups[-1][0] += markdown
-            groups[-1][1] += text
-        else:
-            groups.append([markdown, text, (bold, italic), target])
+    for piece_text, bold, italic, target, *_ in pieces:
+        segments.append([''.join(escaped[offset:offset + len(piece_text)]), piece_text, (bold, italic), target])
+        offset += len(piece_text)
+    segments = grouped(segments)
 
     def neighbours(first: int, last: int) -> Tuple[str, str]:
-        """The characters just outside groups ``first``..``last`` ("" at the line edge)."""
-        head, tail = groups[first][1][:1], groups[last][1][-1:]
-        before = head if head.isspace() else (groups[first - 1][1][-1:] if first else '')
-        after = tail if tail.isspace() else (groups[last + 1][1][:1] if last + 1 < len(groups) else '')
+        """The characters just outside segments ``first``..``last`` ("" at the line edge)."""
+        head, tail = segments[first][1][:1], segments[last][1][-1:]
+        before = head if head.isspace() else (segments[first - 1][1][-1:] if first else '')
+        after = tail if tail.isspace() else (segments[last + 1][1][:1] if last + 1 < len(segments) else '')
         return before, after
 
-    out: List[str] = []
-    first = 0
-    while first < len(groups):
-        target = groups[first][3]
-        last = first
-        while last + 1 < len(groups) and groups[last + 1][3] == target:
-            last += 1
-        destination = _link_destination(target)
+    def spans() -> List[Tuple[int, int]]:
+        found, first = [], 0
+        while first < len(segments):
+            last = first
+            while last + 1 < len(segments) and segments[last + 1][3] == segments[first][3]:
+                last += 1
+            found.append((first, last))
+            first = last + 1
+        return found
+
+    # A link that is not written keeps its text: its runs join the runs around them.
+    for first, last in spans():
+        if segments[first][3] is None:
+            continue
+        plain = ''.join(segment[1] for segment in segments[first:last + 1])
         before, after = neighbours(first, last)
-        linked = bool(destination) and any(group[1].strip() for group in groups[first:last + 1]) and all(
-            _sets_off_link(char) for char in (before, after))
-        span = []
+        if not (_link_destination(segments[first][3]) and plain.strip() and '[' not in plain and ']' not in plain
+                and before != '!' and _sets_off_link(before) and _sets_off_link(after)):
+            for segment in segments[first:last + 1]:
+                segment[3] = None
+    segments = grouped(segments)
+
+    tokens: List[Tuple[bool, str]] = []   # (inserted markup, text)
+    emphasis = '*' not in text
+    marked_before = False   # the previous run ends with an emphasis marker
+    for first, last in spans():
+        destination = _link_destination(segments[first][3]) if segments[first][3] is not None else None
+        inner: List[Tuple[bool, str]] = []
         for position in range(first, last + 1):
-            markdown, text, (bold, italic), _ = groups[position]
-            if linked:
-                markdown = markdown.replace('[', '\\[').replace(']', '\\]')
+            markdown, plain, (bold, italic), _ = segments[position]
             marker = '***' if bold and italic else '**' if bold else '*' if italic else ''
-            core = text.strip()
-            if marker and any(char.isalnum() for char in core):
-                left, right = neighbours(position, position)
-                if emphasis_fits(left, core, right):
-                    markdown = wrap_inline(markdown, marker)
-            span.append(markdown)
-        joined = ''.join(span)
-        out.append(wrap_inline(joined, '[', f']({destination})') if linked else joined)
-        first = last + 1
+            lead, core, trail = _markup_edges(markdown)
+            left, right = neighbours(position, position)
+            if (emphasis and marker and any(char.isalnum() for char in plain)
+                    and emphasis_fits(left, plain.strip(), right) and not (marked_before and not lead)):
+                inner += [(False, lead), (True, marker), (False, core), (True, marker), (False, trail)]
+                marked_before = not trail
+            else:
+                inner.append((False, markdown))
+                marked_before = False
+        if destination:
+            # The spaces around the link's text stay outside its brackets.
+            head, tail = inner[0][1], inner[-1][1]
+            lead = head[:len(head) - len(head.lstrip())]
+            trail = tail[len(tail.rstrip()):]
+            if lead:
+                inner[0] = (False, head[len(lead):])
+            if trail:
+                inner[-1] = (False, inner[-1][1][:len(inner[-1][1]) - len(trail)])
+            inner = [(False, lead), (True, '[')] + inner + [(True, f']({destination})'), (False, trail)]
+            marked_before = False
+        tokens += inner
+
+    out: List[str] = []
+    backslashes = 0   # backslashes at the end of the output so far
+    for markup, chunk in tokens:
+        if not chunk:
+            continue
+        if markup:
+            if backslashes % 2:
+                out.append('\\')   # a backslash right before inserted markup would escape it
+            out.append(chunk)
+            backslashes = 0
+        else:
+            out.append(chunk)
+            kept = chunk.rstrip('\\')
+            backslashes = backslashes + len(chunk) if not kept else len(chunk) - len(kept)
     return ''.join(out)
 
 
@@ -569,6 +639,17 @@ class _DocxStructure:
             yield style_id, style
             based_on = style.find(qn('w:basedOn'))
             style_id = based_on.get(_W_VAL) if based_on is not None else None
+
+    @contextmanager
+    def separate_numbering(self):
+        """Count list numbers apart while a header, footer or text box (a story of its own) is read, so
+        its lists neither take nor move the body's numbers; the body's counters are restored after."""
+        saved = (self._counters, self._started)
+        self._counters, self._started = {}, set()
+        try:
+            yield
+        finally:
+            self._counters, self._started = saved
 
     def run_emphasis(self, run) -> Tuple[bool, bool]:
         """(bold, italic) of a run: its own ``w:b`` / ``w:i``, else those of its character style
@@ -1351,7 +1432,7 @@ class DocxLoader(BaseOfficeLoader):
             even_and_odd = False
         related = self.doc.part.related_parts
         references: Dict[Tuple[str, str], Optional[str]] = {}
-        seen = set()
+        seen = set()   # part names and contents already listed
         stories = []
         for sect_pr in sect_prs:
             shown: Dict[str, list] = {"header": [], "footer": []}
@@ -1365,11 +1446,31 @@ class DocxLoader(BaseOfficeLoader):
                     for kind in kinds:
                         rid = references.get((region, kind))
                         part = related.get(rid) if rid else None
-                        if part is not None and part.partname not in seen:
-                            seen.add(part.partname)
-                            shown[region].append(part)
+                        if part is None or part.partname in seen:
+                            continue
+                        seen.add(part.partname)
+                        signature = self._story_signature(part)
+                        if signature in seen:
+                            continue  # the same text and pictures as a header or footer already listed
+                        seen.add(signature)
+                        shown[region].append(part)
             stories.append(shown)
         return stories
+
+    def _story_signature(self, part) -> Tuple[str, ...]:
+        """What a header or footer part shows: its text (whitespace collapsed) and its pictures. Sections
+        that each have their own part with the same content (unlinked headers, merged documents) show
+        one header, written once, like the first copy of a PDF running header."""
+        texts, pictures = [], []
+        for element in _docx_rendered(part.element):
+            if element.tag == _W_T:
+                texts.append(element.text or '')
+            elif element.tag.endswith(('}inline', '}anchor')):
+                rid = _drawing_blip_rid(element)
+                target = part.related_parts.get(rid) if rid else None
+                if target is not None and getattr(target, 'blob', None):
+                    pictures.append(_image_hash(target.blob))
+        return ('story', ' '.join(''.join(texts).split())) + tuple(pictures)
 
     def _add_story_items(self, stories: Dict[str, list], region: str, page: int, content: List[Dict],
                          extract_images: bool, ocr_images: bool, ocr_results_map: Dict[Any, Optional[str]],
@@ -1381,9 +1482,10 @@ class DocxLoader(BaseOfficeLoader):
             previous, self._part = self._part, part
             self._location = {'page': page}
             try:
-                for block in _docx_blocks(part.element):
-                    self._add_block(block, content, extract_images, ocr_images, ocr_results_map,
-                                    processed_image_hashes)
+                with self._structure.separate_numbering():
+                    for block in _docx_blocks(part.element):
+                        self._add_block(block, content, extract_images, ocr_images, ocr_results_map,
+                                        processed_image_hashes)
             except Exception as e:
                 logger.warning(f"Failed to read a {region} ({part.partname}): {e}")
             finally:
@@ -1391,6 +1493,13 @@ class DocxLoader(BaseOfficeLoader):
             for item in content[start:]:
                 item["page"] = page
                 item["region"] = region
+                if item["type"] in ("text:title", "text:section"):
+                    # A heading-styled header line is not a heading of the document's outline.
+                    item["type"] = "text:normal"
+                    item.pop("level", None)
+                    marker = item.pop("marker", None)
+                    if marker:
+                        item["markdown"] = escape_markdown_text(f"{marker} {item['content']}")
 
     def _add_block(self, block, content: List[Dict], extract_images: bool, ocr_images: bool,
                    ocr_results_map: Dict[Any, Optional[str]], processed_image_hashes: set) -> None:
@@ -1409,15 +1518,6 @@ class DocxLoader(BaseOfficeLoader):
             table_md = self._table_text_fallback(block)
         if table_md:
             content.append({"type": "table", "content": table_md})
-
-    def _iter_block_items(self):
-        """Yield each paragraph and table in document order, including those inside
-        block-level content controls and custom XML."""
-        for block in _docx_blocks(self.doc.element.body):
-            if block.tag == _W_P:
-                yield Paragraph(block, self.doc)
-            else:
-                yield Table(block, self.doc)
 
     def _load_footnotes(self) -> Dict[str, str]:
         """Extract footnotes and endnotes from the DOCX ZIP.
@@ -1493,9 +1593,8 @@ class DocxLoader(BaseOfficeLoader):
         # page Word last showed it on, as the slide number of a PowerPoint footer.
         pieces = _strip_pieces(self._paragraph_pieces(p_el))
         text = ''.join(piece[0] for piece in pieces)
-        if text and self._part is not self.doc.part and all(
-                field in _PAGE_NUMBER_FIELDS for text_part, *_, field in pieces
-                if any(char.isalnum() for char in text_part)):
+        numbered_by = [field for text_part, *_, field in pieces if any(char.isalnum() for char in text_part)]
+        if self._part is not self.doc.part and numbered_by and all(field in _PAGE_NUMBER_FIELDS for field in numbered_by):
             text = ''
         if text:
             # Footnote/endnote references in the paragraph
@@ -1509,9 +1608,12 @@ class DocxLoader(BaseOfficeLoader):
             content.append(item)
 
         # Text boxes and shapes anchored in the paragraph, after its own text, in document order.
+        # A text box is a story of its own: its lists do not move the numbers of the body's.
         for box in _docx_paragraph_text_boxes(p_el):
-            for block in _docx_blocks(box):
-                self._add_block(block, content, extract_images, ocr_images, ocr_results_map, processed_image_hashes)
+            with self._structure.separate_numbering():
+                for block in _docx_blocks(box):
+                    self._add_block(block, content, extract_images, ocr_images, ocr_results_map,
+                                    processed_image_hashes)
 
     @staticmethod
     def _note_references(p_el) -> List[str]:
@@ -1808,7 +1910,8 @@ class DocxLoader(BaseOfficeLoader):
                 if text:
                     lines.append(text)
                 for box in _docx_paragraph_text_boxes(block):
-                    lines.extend(self._tc_lines(box, extract_images, ocr_images, ocr_results_map))
+                    with self._structure.separate_numbering():
+                        lines.extend(self._tc_lines(box, extract_images, ocr_images, ocr_results_map))
             else:
                 texts, _ = self._docx_table_grid(
                     block, lambda tc: " ".join(self._tc_lines(tc, extract_images, ocr_images, ocr_results_map)))
@@ -2087,9 +2190,11 @@ class PptxLoader(BaseOfficeLoader):
                 if key in self._inherited_seen:
                     continue
                 self._inherited_seen.add(key)
-                text_item = self._extract_text_from_shape(shape)
-                if text_item:
-                    items.append({"type": "text:normal", "content": text_item["content"], "page": slide_num,
+                # Fields (a slide number, a date) show the layout's cached text, not the slide's.
+                lines = [_soft_breaks(_pptx_typed_text(paragraph)).strip() for paragraph in shape.text_frame.paragraphs]
+                text = "\n".join(line for line in lines if line)
+                if text:
+                    items.append({"type": "text:normal", "content": text, "page": slide_num,
                                   "_top": shape.top or 0, "_left": shape.left or 0})
         return items
 
@@ -3366,6 +3471,7 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
         if item.get("region") != region and region:
             markdown_parts.append(f"<!-- /{region} -->\n")
             region = None
+            list_depth = -1
         # Add page/slide/sheet separator if needed
         if "page" in item and item["page"] != current_page:
             if markdown_parts:

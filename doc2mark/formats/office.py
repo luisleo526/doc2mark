@@ -1,6 +1,7 @@
 """Office format processors (DOCX, XLSX, PPTX)."""
 
 import logging
+import re
 import zipfile
 import base64
 from pathlib import Path
@@ -510,7 +511,8 @@ class OfficeProcessor(BaseProcessor):
             
             # Add format-specific metadata
             if file_path.suffix.lower() == '.docx':
-                metadata['word_count'] = len(content.split())
+                # Words of the Markdown, not of its <!-- page N --> / <!-- header --> marker comments
+                metadata['word_count'] = len(re.sub(r'<!--.*?-->', ' ', content, flags=re.DOTALL).split())
             elif file_path.suffix.lower() == '.xlsx':
                 metadata['sheet_names'] = json_data.get('sheet_names')
                 metadata['total_cells'] = json_data.get('total_cells')

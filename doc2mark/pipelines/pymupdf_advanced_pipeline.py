@@ -930,11 +930,14 @@ class PDFLoader:
 
             # Always use batch processing for efficiency
             logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
-            ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
-            # Tell the loader's OCR issue record which page each image is on.
             label_issues = getattr(self.ocr, "label_last_batch", None)
-            if callable(label_issues):
-                label_issues([{"page": info["page_num"] + 1} for info in batch])
+            try:
+                ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
+            finally:
+                # Tell the loader's OCR issue record which page each image is on, also when the
+                # call raised (its images are then counted as failed).
+                if callable(label_issues):
+                    label_issues([{"page": info["page_num"] + 1} for info in batch])
 
             # Map results back to image locations. A failed image (flagged by the provider: a
             # timeout, a rate limit) was not read: it gets no answer, so it becomes a placeholder
