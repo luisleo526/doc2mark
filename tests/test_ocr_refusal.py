@@ -147,6 +147,16 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "I'm sorry, Dave. I'm afraid I can't do that.",
     "I cannot describe this picture in words.",
     "The document is empty.",
+    # first-person sentences that go on past the object (notes, letters, chats)
+    "I can't read the scans until Dr. Lee signs off.",
+    "I couldn't process the photos from the wedding yet.",
+    "I can't identify any photos from 1962 in the archive.",
+    "I cannot provide a description of the driver.",
+    "I cannot comply with the request to extend the lease.",
+    "I can't help with that, but our billing team can: billing@acme.com",
+    "Grandma's recipe card is so faded I can't read the text on it.",
+    "很抱歉，我無法處理這批照片，下週一再處理。",
+    "As an AI assistant, I cannot give legal advice.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)
@@ -154,6 +164,10 @@ def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
 
 @pytest.mark.parametrize("answer", [
     "Sorry, I can't help with that.",
+    "I can't help with that.",
+    "I can't comply with that request.",
+    "I'm unable to read the text in this image.",
+    "I am unable to transcribe this image because the resolution is too low.",
     "I'm sorry, but I can't do that.",
     "Illegible",
     "[Blank]",

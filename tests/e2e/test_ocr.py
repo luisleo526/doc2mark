@@ -233,6 +233,17 @@ def test_t10_model_markdown_that_mentions_a_table_tag_keeps_its_structure(run_cl
     assert sentence in build.visible_text(result.markdown)
 
 
+def test_t10_prose_mention_before_a_real_table_keeps_the_table(run_cli, fake_llm, scan):
+    answer = "Use the <table> element, for example:\n\n<table><tr><td>A</td><td>B</td></tr></table>"
+    fake_llm.script(free_form=[fake.text(answer)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured")
+
+    assert result.exit_code == 0, result.describe()
+    assert build.html_tables(result.markdown) == [[["A", "B"]]], result.describe()
+    assert "Use the <table> element, for example:" in build.visible_text(result.markdown)
+
+
 def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
     """A free-form answer cut off inside a table (max_tokens) still yields a sanitized table,
     not the table's markup as escaped text."""
@@ -478,6 +489,8 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "I can't read the picture, it's too blurry. Can you retake it?",
     "There is no visible content in this folder.",
     "Leider kann ich Ihre Bildungsnachweise nicht verarbeiten, da die Unterschrift fehlt.",
+    "I can't read the scans until Dr. Lee signs off.",
+    "很抱歉，我無法處理這批照片，下週一再處理。",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
     fake_llm.script(structured=[fake.page(content)], free_form=[fake.text("unused")])
