@@ -385,12 +385,17 @@ def screen_non_content(text: str, judge: Optional[NonContentJudge] = None) -> No
     except Exception as exc:  # the hook must never break OCR
         logger.warning("non_content_judge failed (%s); keeping the OCR answer", exc)
         return NonContentScreen(unanswered=True)
-    if isinstance(probability, bool) or not isinstance(probability, numbers.Real) \
-            or not (math.isfinite(float(probability)) and 0.0 <= float(probability) <= 1.0):
+    value = None
+    if not isinstance(probability, bool) and isinstance(probability, numbers.Real):
+        try:
+            value = float(probability)
+        except (OverflowError, ValueError):  # an int too large for a float is not a probability either
+            value = None
+    if value is None or not (math.isfinite(value) and 0.0 <= value <= 1.0):
         if probability is not None:
             logger.warning("non_content_judge returned %r, not a probability; keeping the OCR answer", probability)
         return NonContentScreen(unanswered=True)
-    probability = float(probability)
+    probability = value
     if probability >= JUDGE_THRESHOLD:
         return NonContentScreen(reason="judge")
     return NonContentScreen(suspected=probability >= SUSPECT_THRESHOLD)

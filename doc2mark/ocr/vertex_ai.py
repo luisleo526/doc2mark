@@ -395,6 +395,9 @@ class VertexAIOCR(BaseOCR):
                     f"Unknown prompt template: {self.prompt_template}. Available: {available}"
                 )
 
+        # A default_prompt of the caller's own replaces the template's text in free-form
+        # requests; without one the template (prompt_template, also when changed later) decides.
+        self._custom_default_prompt = bool(default_prompt)
         if default_prompt:
             self.default_prompt = default_prompt
         elif self.prompt_template in PROMPTS:
@@ -471,13 +474,15 @@ class VertexAIOCR(BaseOCR):
 
         self.prompt_template = template_name
         self.default_prompt = PROMPTS[template_name]
+        self._custom_default_prompt = False
         logger.info(f"Updated prompt template to: {template_name.value}")
 
     def _build_prompt(self, **kwargs) -> str:
-        """Build prompt based on configuration and kwargs. Without a per-request template the
-        provider's ``default_prompt`` is the prompt text: the template's, or the caller's own."""
+        """Build prompt based on configuration and kwargs. Without a per-request template, a
+        ``default_prompt`` of the caller's own is the prompt text; otherwise the template's."""
         template_name = kwargs.get("prompt_template")
-        base_prompt = self.default_prompt if template_name is None else None
+        custom = template_name is None and getattr(self, "_custom_default_prompt", False)
+        base_prompt = self.default_prompt if custom else None
         if template_name is None:
             template_name = self.prompt_template
         language = kwargs.get("language") or (self.config.language if self.config else None)

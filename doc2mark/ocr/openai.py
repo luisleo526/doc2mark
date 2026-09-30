@@ -481,6 +481,9 @@ class OpenAIOCR(BaseOCR):
                 available = [template.value for template in PromptTemplate]
                 raise ValueError(f"Unknown prompt template: {self.prompt_template}. Available: {available}")
 
+        # A default_prompt of the caller's own replaces the template's text in free-form
+        # requests; without one the template (prompt_template, also when changed later) decides.
+        self._custom_default_prompt = bool(default_prompt)
         if default_prompt:
             self.default_prompt = default_prompt
         elif self.prompt_template in PROMPTS:
@@ -527,8 +530,10 @@ class OpenAIOCR(BaseOCR):
         The chain's final stage depends on ``structured``, so when a request
         toggles structured output relative to the cached agent we rebuild it.
         """
-        if self._vision_agent is not None and getattr(self._vision_agent, "structured", False) == structured:
-            return self._vision_agent
+        agent = self._vision_agent
+        if (agent is not None and getattr(agent, "structured", False) == structured
+                and (not structured or getattr(agent, "response_model", None) is response_model)):
+            return agent
 
         if not LANGCHAIN_AVAILABLE:
             logger.error("❌ LangChain is required but not available")
@@ -597,6 +602,7 @@ class OpenAIOCR(BaseOCR):
 
         self.prompt_template = template_name
         self.default_prompt = PROMPTS[template_name]
+        self._custom_default_prompt = False
         logger.info(f"📝 Updated prompt template to: {template_name.value}")
 
     def update_model_config(
@@ -625,6 +631,12 @@ class OpenAIOCR(BaseOCR):
         if max_tokens is not None:
             self.max_tokens = max_tokens
             logger.info(f"📊 Updated max_tokens to: {max_tokens}")
+
+        # The request timeout and retries are the provider's own settings, not request settings.
+        for name in ("timeout", "max_retries"):
+            if name in kwargs:
+                setattr(self, name, kwargs.pop(name))
+                logger.info(f"Updated {name} to: {getattr(self, name)}")
 
         if kwargs:
             self.model_kwargs.update(kwargs)
@@ -708,10 +720,11 @@ class OpenAIOCR(BaseOCR):
         Returns:
             Prompt string
         """
-        # Extract parameters for the build_prompt function. Without a per-request template the
-        # provider's default_prompt is the prompt text: the template's, or the caller's own.
+        # Extract parameters for the build_prompt function. Without a per-request template, a
+        # default_prompt of the caller's own is the prompt text; otherwise the template's.
         template_name = kwargs.get('prompt_template')
-        base_prompt = self.default_prompt if template_name is None else None
+        custom = template_name is None and getattr(self, "_custom_default_prompt", False)
+        base_prompt = self.default_prompt if custom else None
         if template_name is None:
             template_name = self.prompt_template
         # Use language from kwargs, or fall back to config.language if available
@@ -893,7 +906,10 @@ class OpenAIOCR(BaseOCR):
                 [images[i] for i in empty_idx], structured=False, language=language, **sub_kwargs
             )
         finally:
-            self._ensure_vision_agent(structured=True)
+            # Back to the structured agent, with the caller's response model: later requests
+            # must not fall back to OCRPage (nor be cached under the other model's key).
+            self._ensure_vision_agent(
+                structured=True, response_model=self.config.response_model if self.config else None)
 
         return self._apply_recovered(results, empty_idx, recovered)
 

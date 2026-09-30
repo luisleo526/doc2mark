@@ -484,13 +484,14 @@ else applies by default.
   project, location and other settings as `"vertex_ai"` (they were dropped). (#29)
 - **The OCR cache no longer answers with a result made under other settings.** Its key left out
   `OCRConfig.task`, so a shared cache replayed a receipt answer for a table request; it now holds every
-  setting that changes an answer (task, parse-error mode, neighbour-page context tier, the config's model
-  settings, the response model and its schema, and the text of doc2mark's own prompts) and no longer
-  `max_concurrency`, which changes no answer. Key version `ocr-cache-v7` (default Redis prefix
+  setting that changes an answer (task, parse-error mode, the model settings as the provider sends them,
+  the response model and its schema, and the text of doc2mark's own prompts and page schema) and no
+  longer `max_concurrency`, which changes no answer. Key version `ocr-cache-v7` (default Redis prefix
   `doc2mark:ocr:ocr-cache-v7`): entries of earlier versions are not read. (#29)
 - **`cache_dir` no longer returns OCR text made with other OCR settings.** Its key named only the OCR
   provider's class, so after a change of model, task, language, detail, structured mode or prompt the
-  old OCR text came back; it now holds the same answer-changing settings as the OCR cache key. The
+  old OCR text came back; it now holds the same answer-changing settings as the OCR cache key and the
+  neighbour-page context tier. The
   document cache schema is `doc2mark-document-cache-v2`, so files cached by earlier versions are
   converted again once. (#29)
 - **A `non_content_judge` value that is not a probability is no verdict**, as it already was for the
@@ -500,9 +501,10 @@ else applies by default.
   tokens were missing from the result's and the document's `token_usage`. (#29)
 - **OpenAI with a custom `OCRConfig.response_model` works.** Every image failed with `OCRError:
   '<Model>' object has no attribute 'interpretation'`; the answer is now parsed into your model, as
-  documented: `OCRResult.document` is that object and `OCRResult.text` its fields as escaped JSON. Vertex
-  AI does the same (it returned `document=None` and the model's `str()`), and the OCR cache, Redis
-  included, returns the parsed model. (#29)
+  documented: `OCRResult.document` is that object and `OCRResult.text` its fields as JSON, escaped for
+  Markdown. Vertex AI does the same (it returned `document=None` and the model's `str()`), the provider
+  keeps the model after a free-form retry, and the OCR cache, Redis included, returns the parsed model.
+  (#29)
 - **The DeprecationWarning for inert `OCRConfig` fields names your code.** It named a doc2mark line, so
   Python's default filters hid it; it now names the line that created the provider or the loader, and a
   script shows it without `-W`. (#29)

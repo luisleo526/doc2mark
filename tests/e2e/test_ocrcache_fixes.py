@@ -424,6 +424,35 @@ def test_openai_parses_into_a_custom_response_model(e2e_dir, fake_llm, receipt, 
         assert output["type"] == "Invoice" and output["fields"] == {"merchant": "ACME STORE", "total": "12.50"}, output
 
 
+RESPONSE_MODEL_RETRY_SCRIPT = (
+    "import json, sys\n"
+    "from pydantic import BaseModel\n"
+    "from doc2mark import OCR\n"
+    "class Invoice(BaseModel):\n"
+    "    merchant: str\n"
+    "    total: str\n"
+    "ocr = OCR('openai', response_model=Invoice)\n"
+    "image = open(sys.argv[1], 'rb').read()\n"
+    "results = [ocr.read_one(image), ocr.read_one(image)]\n"
+    "print(json.dumps([type(result.document).__name__ for result in results]))\n"
+)
+
+
+def test_a_custom_response_model_outlives_a_free_form_retry(e2e_dir, fake_llm, receipt):
+    """Review of #29: after the free-form retry of an answer the model refused, the OpenAI provider rebuilt its
+    structured client without the response model, so every later request asked for (and returned, and cached
+    under the response model's key) an ``OCRPage``. The refused answer comes back as an ``OCRPage`` read in free
+    form; the next request asks for the ``Invoice`` again."""
+    invoice = json.dumps({"merchant": "ACME STORE", "total": "12.50"})
+    fake_llm.script(structured=[fake.refusal(REFUSAL), fake.text(invoice)], free_form=[fake.text("ACME STORE 12.50")])
+
+    output = last_json(run_api(e2e_dir, RESPONSE_MODEL_RETRY_SCRIPT, receipt, env=fake_llm.env))
+
+    schemas = [body["response_format"]["json_schema"]["name"] for body in fake_llm.requests_of("structured")]
+    assert schemas == ["Invoice", "Invoice"], schemas
+    assert output == ["OCRPage", "Invoice"], output
+
+
 # --------------------------------------------------------------------------------------------------------------
 # 18. The DeprecationWarning of inert OCRConfig fields
 

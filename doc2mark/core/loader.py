@@ -38,6 +38,13 @@ DOCUMENT_CACHE_SCHEMA = "doc2mark-document-cache-v2"
 # not sent (some models, such as OpenAI's reasoning models, may reject the parameters).
 _SAMPLING_DEFAULTS = {"top_p": 1.0, "frequency_penalty": 0.0, "presence_penalty": 0.0}
 
+# Arguments _create_ocr_provider passes to a provider by name: an older provider's model_kwargs
+# (kept by set_ocr_provider) must not pass them a second time.
+_NAMED_PROVIDER_ARGUMENTS = frozenset({
+    "api_key", "config", "model", "temperature", "max_tokens", "max_workers", "prompt_template", "timeout",
+    "max_retries", "default_prompt", "base_url", "project", "location",
+})
+
 
 class UnifiedDocumentLoader:
     """Main document loader with unified API for all formats and enhanced OCR configuration."""
@@ -296,7 +303,8 @@ class UnifiedDocumentLoader:
         # the provider and the structured defaults apply even when no config was
         # supplied. This config is passed through to every provider branch below.
         ocr_config = self._resolve_ocr_config(ocr_config, task=task, structured=structured, detail=detail)
-        extra_model_kwargs = dict(model_kwargs or {})
+        extra_model_kwargs = {key: value for key, value in (model_kwargs or {}).items()
+                              if key not in _NAMED_PROVIDER_ARGUMENTS}
         # Sampling settings are sent only when set to something other than the API's default.
         sampling = {"top_p": top_p, "frequency_penalty": frequency_penalty, "presence_penalty": presence_penalty}
         for name, value in sampling.items():
@@ -671,6 +679,9 @@ class UnifiedDocumentLoader:
                 # language, structured mode, detail, prompts, ...): another one must not be
                 # answered with the OCR text of an older run.
                 "ocr": ocr_settings_identity(self._unwrap_ocr(self.ocr), strict=False) if self.ocr else None,
+                # Which PDF images carry neighbour pages as context (the OCR cache keys the
+                # context a request carries; a converted document depends on the tier).
+                "context_pages": getattr(getattr(self._unwrap_ocr(self.ocr), "config", None), "context_pages", None),
                 # A different judge, or routing that changed what a page emits, must not
                 # be answered from an older cached result.
                 "legibility_judge": self._judge_identity(),

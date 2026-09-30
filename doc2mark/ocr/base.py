@@ -465,7 +465,8 @@ class BaseOCR(ABC):
         deterministic multilingual check plus the optional ``non_content_judge`` (see
         :mod:`doc2mark.ocr.refusal`), on ``raw.text`` as the model wrote it. Only an
         otherwise empty page can be one: a page with anything else (see
-        :meth:`_has_content_besides_text`) is content.
+        :meth:`_has_content_besides_text`) is content. An answer parsed into the caller's own
+        ``response_model`` is that model's answer and is not screened.
         """
         from doc2mark.ocr.refusal import prefetch_non_content, screen_non_content
         from doc2mark.ocr.schema import OCRPage
@@ -477,7 +478,7 @@ class BaseOCR(ABC):
                 if self._has_content_besides_text(doc):
                     continue
                 answers[index] = doc.raw.text or ""
-            else:  # a caller's own response model: its rendering is all there is
+            elif not self._is_custom_document(doc):  # no page: the rendering is all there is
                 answers[index] = result.text or ""
         if judge is not None and len(answers) > 1:
             prefetch_non_content(answers.values(), judge)
@@ -575,6 +576,7 @@ class BaseOCR(ABC):
             if not text:
                 doc = results[i].document
                 if isinstance(doc, OCRPage) and self._has_content_besides_text(doc):
+                    results[i] = replace(results[i], metadata={**(results[i].metadata or {}), "token_usage": usage})
                     continue
                 meta = dict(results[i].metadata or {})
                 meta["token_usage"] = usage

@@ -24,14 +24,15 @@ OCR cache
 The same ``ocr_cache`` argument is accepted by :func:`~doc2mark.load`,
 :func:`~doc2mark.document_to_markdown` and the batch functions. The loader wraps its provider in
 :class:`~doc2mark.ocr.cache.CachedOCR`, which also sends identical images of one batch once. Keys
-are built from the image bytes and every setting that changes an answer: the provider class, its
-model, temperature, token limit, endpoint, project and location, its prompt template and
-``default_prompt``, its sampling settings, the ``OCRConfig`` task, language, structured mode,
-detail, response model (with its schema), parse-error mode and neighbour-page context tier, the
-per-call options, the non-content judge, and the text of doc2mark's own prompts (so another
-doc2mark version with other prompt wording does not replay these answers). API keys enter only
-as a hash. The request timeout, retries and concurrency are not part of the key. The schema
-version ``ocr-cache-v7`` is part of every key: entries written by older versions are never read.
+are built from the image bytes and every setting that changes an answer: the provider class, the
+model, temperature, token limit and endpoint it sends, its project and location, its prompt
+template and ``default_prompt``, its sampling settings, the ``OCRConfig`` task, language,
+structured mode, detail, response model (with its schema) and parse-error mode, the per-call
+options (including a neighbour-page PDF sent as context), the non-content judge, and the text of
+doc2mark's own prompts and page schema (so another doc2mark version with other wording does not
+replay these answers). API keys enter only as a hash. The request timeout, retries, concurrency
+and client objects such as a rate limiter are not part of the key. The schema version
+``ocr-cache-v7`` is part of every key: entries written by older versions are never read.
 
 Backends
 ~~~~~~~~
@@ -103,8 +104,8 @@ Each entry is a JSON file named by a hash of the file's path, modification time 
 output format, the ``load()`` options (``extract_images``, ``ocr_images``, ``encoding``,
 ``delimiter``), the table style, the OCR provider with the settings that change its answers (the
 same ones as in the OCR cache key above: model, task, language, structured mode, detail,
-prompts, ...), the judges in use and the routing version of the PDF pipeline, so a changed OCR
-setting converts the file again. The schema ``doc2mark-document-cache-v2`` is part of the name:
+prompts, ...) and the neighbour-page context tier (``OCRConfig.context_pages``), the judges in use
+and the routing version of the PDF pipeline, so a changed OCR setting converts the file again. The schema ``doc2mark-document-cache-v2`` is part of the name:
 entries written by older versions are never read. Entries never expire; delete the folder to
 clear it. A replayed document's ``metadata.extra["token_usage"]`` is
 renamed ``token_usage_cached``, because it cost nothing this time (``metadata.extra["judge"]`` is

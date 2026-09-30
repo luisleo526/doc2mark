@@ -180,9 +180,11 @@ OpenAI asks the model to leave it out. ``structured=False`` returns free-form Ma
 
 With ``OCRConfig(response_model=YourModel)`` (a pydantic model; OpenAI and Vertex AI, for
 example ``OCR("openai", response_model=Receipt)``) the answer is parsed into your model instead:
-``result.document`` is that object (``result.document.total``) and ``result.text`` its fields as
-JSON, escaped like a transcription. The free-form retry of an empty answer and the router
-firewall apply to ``OCRPage`` answers only.
+``result.document`` is that object (``result.document.total``; read the values there) and
+``result.text`` its fields as JSON, escaped for Markdown like a transcription. Such an answer is
+not screened for refusals and has no router firewall. When the model refuses, the request fails
+or the answer cannot be parsed, the result is what it would be without a response model (an
+``OCRPage``, after the free-form retry), so check ``isinstance(result.document, YourModel)``.
 
 ``result.confidence`` is the model's ``self_confidence`` for structured answers (``None``
 without an interpretation or for your own model, 1.0 for free-form answers, ``None`` for
