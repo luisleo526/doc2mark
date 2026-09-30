@@ -11,7 +11,7 @@ import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 from doc2mark import UnifiedDocumentLoader
-from doc2mark.pipelines import pdf_routing
+from doc2mark.pipelines import pdf_routing, pymupdf_compat
 from tests.e2e import builders_route
 
 
@@ -266,6 +266,56 @@ def test_without_invisible_only_redaction_hidden_text_still_leaves_table_cells(m
     cells, spans = _cells_and_spans(_table_with_hidden_word())
     assert "Pumps" in cells and "HIDDENCELL" not in cells
     assert "Pumps" in spans and "HIDDENCELL" not in spans
+
+
+def test_without_invisible_only_redaction_the_run_says_what_it_cannot_remove(monkeypatch, caplog):
+    """A hidden word drawn over a visible one needs PyMuPDF 1.27.1's invisible-only redaction to leave the page
+    copy the table finder reads; without it the word may stay in a table cell, and the run now says so, once."""
+    monkeypatch.delattr(pymupdf, "PDF_REDACT_TEXT_REMOVE_INVISIBLE", raising=False)
+    monkeypatch.setattr(pymupdf_compat, "_warned", set())
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for r in range(4):
+        page.draw_line((72, 300 + 30 * r), (372, 300 + 30 * r))
+    for c in range(3):
+        page.draw_line((72 + 150 * c, 300), (72 + 150 * c, 390))
+    for r, row in enumerate([["Item", "Qty"], ["Pumps", "12"], ["Seals", "40"]]):
+        for c, value in enumerate(row):
+            page.insert_text((77 + 150 * c, 320 + 30 * r), value, fontsize=10)
+    page.insert_text((80, 350), "OVERPRINTED", fontsize=10, render_mode=3)
+    doc = pymupdf.open("pdf", doc.tobytes())
+    page, copies = doc[0], pdf_routing.PageCopies(doc)
+    measure = pdf_routing.measure_page(page, copies=copies)
+    assert len(measure.hidden_rects) == 1
+    with caplog.at_level(logging.WARNING, logger=pymupdf_compat.__name__):
+        for _ in range(2):
+            pdf_routing.text_source(page, measure, copies).find_tables()
+    copies.close()
+    warnings = [record.getMessage() for record in caplog.records if record.name == pymupdf_compat.__name__]
+    assert len(warnings) == 1 and "PDF_REDACT_TEXT_REMOVE_INVISIBLE" in warnings[0]
+
+
+def test_without_the_table_finders_text_page_tables_come_out_the_same(tmp_path, monkeypatch, caplog):
+    """PyMuPDF before 1.27.1 does not hand out the text page its table finder read: the page's characters are
+    read once more for the tables, with the same result, and the run says so once (INFO: only time differs)."""
+    doc = _table_with_hidden_word()
+    path = tmp_path / "table.pdf"
+    doc.save(str(path))
+    expected = UnifiedDocumentLoader(ocr_provider=None).load(str(path)).content
+    find_tables = pymupdf.Page.find_tables
+
+    class FinderWithoutTextPage:
+        def __init__(self, finder):
+            self.tables = finder.tables
+
+    monkeypatch.setattr(pymupdf.Page, "find_tables",
+                        lambda page, *args, **kwargs: FinderWithoutTextPage(find_tables(page, *args, **kwargs)))
+    monkeypatch.setattr(pymupdf_compat, "_warned", set())
+    with caplog.at_level(logging.INFO, logger=pymupdf_compat.__name__):
+        content = UnifiedDocumentLoader(ocr_provider=None).load(str(path)).content
+    assert content == expected and "Pumps" in content
+    notes = [record for record in caplog.records if record.name == pymupdf_compat.__name__]
+    assert len(notes) == 1 and notes[0].levelno == logging.INFO and "TableFinder.textpage" in notes[0].getMessage()
 
 
 @pytest.mark.parametrize("inherited", ["Resources", "MediaBox"])

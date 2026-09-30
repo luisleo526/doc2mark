@@ -5,6 +5,7 @@ The E2E suite (tests/e2e/test_images.py) covers these through the CLI with Tesse
 tests pin the edge cases of the thresholds that no realistic fixture reaches cheaply.
 """
 import io
+import logging
 
 import numpy as np
 import pymupdf
@@ -13,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from doc2mark.ocr.base import BaseOCR, OCRResult
 from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache
-from doc2mark.pipelines import pdf_images
+from doc2mark.pipelines import pdf_images, pymupdf_compat
 from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
 
 
@@ -300,6 +301,21 @@ def test_what_a_picture_shows_is_measured_with_its_clip_path():
     assert [(picture.xref, picture.region) for picture in pictures] == [(0, pymupdf.Rect(700, 300, 950, 530))]
     assert skipped == {"not_shown": 0, "no_content": 0}
     assert pdf_images.single_rects(page) == []   # rendered as the page shows it, not read one by one
+
+
+def test_without_text_clip_pictures_are_measured_unclipped_and_the_run_says_so(monkeypatch, caplog):
+    """PyMuPDF before 1.27.1 has no TEXT_CLIP: the part of a picture its clip path shows cannot be measured, so
+    the picture is taken whole. That used to happen silently; the run now warns, once per process."""
+    monkeypatch.delattr(pymupdf, "TEXT_CLIP", raising=False)
+    monkeypatch.setattr(pymupdf_compat, "_warned", set())
+    doc = pymupdf.open()
+    page = _clipped_page(doc, (700, 300, 1900, 975), (700, 300, 950, 530))
+    with caplog.at_level(logging.WARNING, logger=pymupdf_compat.__name__):
+        [placement] = pdf_images.placements(page)
+        pdf_images.shown_boxes(page)
+    assert placement.visible == placement.bbox & pdf_images.page_area(page)
+    warnings = [record.getMessage() for record in caplog.records if record.name == pymupdf_compat.__name__]
+    assert len(warnings) == 1 and "TEXT_CLIP" in warnings[0] and "1.27.1" in warnings[0]
 
 
 def test_a_picture_clipped_away_entirely_is_not_shown():
