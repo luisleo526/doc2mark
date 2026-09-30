@@ -4,8 +4,9 @@ Content-aware OCR policy
 doc2mark decides *how* to OCR a document from the document's **content**, not
 from its file extension. The same content-based routing applies to PDFs and to
 Office files, and it runs automatically: there are no routing flags to set. You
-turn OCR on (``ocr_images=True``) and doc2mark chooses the cheapest correct path
-for every page and every embedded image.
+turn OCR on (``ocr_images=True``; it implies ``extract_images=True``) and
+doc2mark chooses the cheapest correct path for every page and every embedded
+image.
 
 The guiding principle
 ---------------------
@@ -19,11 +20,15 @@ is preserved character-for-character.
 Only a **true image-page** -- a slide or scan whose content is baked into
 pixels with no usable text layer -- is sent to an LLM vision model. The model is
 asked to transcribe that page verbatim and *also* synthesize a clean Markdown
-re-layout, but it is never allowed to drop real printed values.
+re-layout, but it is never allowed to drop real printed values. A text layer
+that exists but cannot be trusted -- undecodable glyphs, an invisible scanner-OCR
+layer, content drawn as vector outlines -- sends *that page* to OCR as well.
 
 The policy is layered. Each layer narrows the decision:
 
-#. **Document strategy** -- one ``"image"`` vs ``"text"`` decision per document.
+#. **Document strategy and page routes** -- one ``"image"`` vs ``"text"``
+   decision per document, which every page follows unless its own signals
+   clearly disagree.
 #. **Office image route** -- image-dominant ``.docx``/``.pptx`` borrow the PDF
    image strategy; text/table Office docs stay native.
 #. **Per-image job-router** -- when a single image is OCR'd, the model
@@ -36,19 +41,23 @@ The shared thresholds
 ~~~~~~~~~~~~~~~~~~~~~~
 
 Both the document strategy and the Office route call one function,
-``doc2mark.core.strategy.decide_doc_strategy``, the single source of truth so
-the PDF and Office paths never diverge:
+``doc2mark.core.strategy.decide_doc_strategy``, and the PDF page routes come from
+``decide_page_route`` in the same module: it is the single source of truth for
+what the signals mean, the thresholds and the decisions, so the PDF and Office
+paths never diverge. The pipelines only measure.
 
 .. code-block:: python
 
    from doc2mark.core.strategy import decide_doc_strategy
 
-   # decide_doc_strategy(mean_image_coverage, mean_text_chars_per_page)
-   decide_doc_strategy(0.92, 35)    # -> "image"   (mostly pictures, no text layer)
-   decide_doc_strategy(0.70, 900)   # -> "text"    (large figures, but real text)
-   decide_doc_strategy(0.10, 1200)  # -> "text"    (ordinary text document)
+   # decide_doc_strategy(mean_image_coverage, mean_text_chars_per_page,
+   #                     text_illegibility=0.0)
+   decide_doc_strategy(0.92, 35)         # -> "image"  (mostly pictures, no text layer)
+   decide_doc_strategy(0.70, 900)        # -> "text"   (large figures, but real text)
+   decide_doc_strategy(0.10, 1200)       # -> "text"   (ordinary text document)
+   decide_doc_strategy(0.95, 900, 0.5)   # -> "image"  (pictures, half the text pages garbled)
 
-The two module constants are the only knobs, and they are deliberately not
+The module constants are the only knobs, and they are deliberately not
 user-facing:
 
 .. list-table::
@@ -64,50 +73,163 @@ user-facing:
        ``"image"`` strategy.
    * - ``IMAGE_PAGE_TEXT_LIMIT``
      - ``200``
-     - The mean selectable-text characters per page must be **below** this for
-       the ``"image"`` strategy.
+     - The mean legible text per page (see ``text_weight`` below) must be
+       **below** this for the ``"image"`` strategy.
+   * - ``IDEOGRAPH_WEIGHT`` / ``SYLLABLE_WEIGHT``
+     - ``3.0`` / ``2.0``
+     - What one CJK ideograph / one kana or hangul syllable counts in the text
+       density, in Latin-character equivalents.
+   * - ``ILLEGIBLE_TEXT_RATIO``
+     - ``0.3``
+     - ``decide_doc_strategy(..., text_illegibility)``: share of garbled text
+       pages at or above which an image-dominant document routes ``"image"``.
+       Kept for API compatibility: no doc2mark route passes it any more (the PDF
+       route gates every page on its own, the Office route measures no text
+       quality).
+   * - ``GARBAGE_TEXT_RATIO`` / ``MIN_GARBAGE_GLYPHS``
+     - ``0.1`` / ``3``
+     - A page's text layer is garbled when at least 3 undecodable glyphs make up
+       at least 10 % of its prominence-weighted text (see *Text-layer quality
+       gate*).
+   * - ``PAGE_OVERRIDE_MARGIN``
+     - ``0.5``
+     - How far a page's own coverage and text must clear the thresholds before it
+       overrides its document's route (see *Per-page routes*).
+   * - ``LEGIBILITY_JUDGE_THRESHOLD``
+     - ``0.7``
+     - An optional legibility judge's probability below which a page counts as
+       garbled.
 
-The rule is a logical AND::
+The document rule (the PDF route)::
 
-   "image"  iff  mean_image_coverage >= 0.55  AND  mean_text_chars_per_page < 200
+   "image"  iff  mean_image_coverage >= 0.55  AND  mean_legible_text < 200
    "text"   otherwise
+
+Garbled text layers do not move the document route: every page is checked on
+its own and a garbled page is OCR'd alone, so it never takes clean pages with it.
 
 Text density is the decisive signal. Coverage alone would misclassify a normal
 text document that merely carries a few large figures; requiring low text
 density as well keeps such documents on the deterministic ``"text"`` path.
 
-Layer 1 -- the document strategy
---------------------------------
+Text density is script-aware: ``text_weight`` counts only non-whitespace,
+legible characters (undecodable glyphs do not count), and a CJK ideograph counts
+three (a kana or hangul syllable two), because one such character carries about
+as much content as three (two) Latin letters. The same six statements measure
+about 290 in English and 260 in Chinese, where a raw character count saw 339
+versus 91 and sent only the Chinese deck to OCR.
 
-For a PDF, ``PDFLoader._document_image_strategy`` computes the two signals
-deterministically and caches the result once per document:
+Layer 1 -- the document strategy and page routes
+-------------------------------------------------
 
-- ``mean_image_coverage`` -- the mean per-page fraction of page area covered by
-  raster images (capped at ``1.0``).
-- ``mean_text_chars_per_page`` -- the mean length of the page's stripped
-  selectable text.
+For a PDF, ``PDFLoader`` measures every page once
+(``doc2mark.pipelines.pdf_routing``):
 
-It feeds them to ``decide_doc_strategy`` and logs the decision, e.g.::
+- **image coverage** -- the share of the visible page covered by raster images:
+  the *union* of the image placements, clipped to the page (CropBox), inline
+  (``BI``/``ID``/``EI``) images included. Parts of a picture outside the page
+  (CropBox) and a picture placed twice or stacked on another are not counted.
+  Clip paths inside the page are not considered.
+- **legible text** -- ``text_weight`` of the *painted* text. Invisible text
+  (render mode 3, fully transparent) is kept apart (see *Invisible text*).
+- **text-layer quality** -- whether the text layer is garbled (see *Text-layer
+  quality gate*).
+- **uncaptured content** -- on a page with (almost) no usable text that is not a
+  searchable scan: the share of the page covered by pictures the text route does
+  not OCR one by one (inline images, picture tiles too small to count as
+  figures), and the share showing other ink, any colour (vector-outlined text),
+  on a 72 DPI render. Line art is not content by itself and does not count:
+  horizontal and vertical strokes, rectangle outlines and fills thinner than
+  2 pt (rules, frames, table grids).
 
-   📑 Document OCR strategy: image (mean coverage 0.94, mean text 12 chars/page)
+``_document_image_strategy`` feeds the page means to ``decide_doc_strategy``,
+caches the result and logs it, e.g.::
 
-A single uniform strategy is chosen for the whole document so that OCR-only and
-rule-based pages are never mixed.
+   📑 Document OCR strategy: image (mean coverage 0.94, mean legible text 12/page, garbled text pages 0%)
 
-The ``"image"`` strategy
-~~~~~~~~~~~~~~~~~~~~~~~~~
+(the garbled-page share is reported, not used).
 
-Every page is rasterized to a single PNG (at 150 DPI) and OCR'd as one
-whole-page image. The whole-page transcription **is** the page's content: a
-sparse text layer on such a page is chrome (a logo, footer, or page number) that
-the whole-page OCR already captures, so the deterministic text layer is *not*
-also emitted -- emitting it would just duplicate tokens and add junk
-header/footer mini-tables.
+Per-page routes
+~~~~~~~~~~~~~~~
+
+With OCR on, the document route is every page's default, and a page overrides
+it only when its own signals clearly disagree (``decide_page_route``; the first
+matching rule wins):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 20 54
+
+   * - Reason
+     - Page route
+     - When
+   * - ``searchable_scan``
+     - ``image``
+     - An invisible OCR layer lying over raster images that cover the page
+       (Acrobat "searchable image", ocrmypdf, scanner software), with little
+       painted text. The render is OCR'd and the invisible layer dropped: one
+       source per page, never both.
+   * - ``illegible_text_layer``
+     - ``image``
+     - The text layer is garbled (detector or legibility judge).
+   * - ``no_text_layer``
+     - ``image``
+     - Less than 50 legible characters, but pictures the text route cannot OCR
+       cover at least 5 % of the page (scans stored as inline images or tiles),
+       or other ink covers at least 0.1 % of it (text drawn as vector outlines;
+       rules, frames and table grids do not count, so a blank page with a
+       header rule and a page number keeps its text path).
+   * - ``image_dominant_page``
+     - ``image``
+     - In a ``"text"`` document: pictures cover at least 0.825 of the page
+       (0.55 x 1.5) and it has less than 100 legible characters (200 x 0.5) --
+       a scanned page in a text report, including scans cut into tiles.
+   * - ``dense_text_page``
+     - ``text``
+     - In an ``"image"`` document: pictures cover less than 0.275 of the page
+       (0.55 x 0.5) and it has at least 300 legible characters (200 x 1.5) -- a
+       text appendix in a slide deck keeps its verbatim text layer.
+
+A page overridden to render OCR as a searchable scan, a page without a usable
+text layer, a page with a garbled text layer or a scanned page may still carry
+real, legible text (a caption, a heading, a stamp, the clean body under a garbled
+title). Whatever legible line of it the OCR did not reproduce, and the page
+visibly shows, is kept verbatim after the OCR text, so an override never loses
+real text; garbled lines are not kept (the OCR read them from the render). On a
+garbled page only the garbage detector can vouch for a line, so nothing is kept
+when the legibility judge alone found the layer garbled, or when the OCR text
+holds words no line of the layer accounts for, as many as half the words to
+keep: the OCR then read those lines differently, and their text layer is wrong,
+not missed.
+
+The margins are hysteresis: a page near a threshold follows its document, so a
+deck or a report keeps one consistent treatment, and only clear outliers switch.
+For example, a Traditional-Chinese product deck with about 82 characters of
+slide labels per page over full-bleed artwork (about 160 legible text units
+per page against the limit of 200) routes ``"image"``; its densest slide (470
+characters, over artwork covering the whole page) stays ``"image"`` with it,
+because its labels sit on artwork that carries text the text layer does not
+have.
+
+Without OCR there is nothing to route: every page takes the text path.
+
+The ``"image"`` route
+~~~~~~~~~~~~~~~~~~~~~
+
+The page is rasterized to a single PNG (at 150 DPI) and OCR'd as one whole-page
+image. The whole-page transcription **is** the page's content: a sparse text
+layer on such a page is chrome (a logo, footer, or page number) that the
+whole-page OCR already captures, an invisible scanner-OCR layer, or a garbled
+layer, so the deterministic text layer is *not* also emitted -- emitting it
+would duplicate tokens or add garbage.
+
+If the render's OCR comes back empty (a blank page, a refusal, a failure), the
+page falls back to its own text layer, with a warning, instead of disappearing.
 
 These whole-page renders also request ``page_markdown`` synthesis (Layer 4).
 
-The ``"text"`` strategy
-~~~~~~~~~~~~~~~~~~~~~~~~
+The ``"text"`` route
+~~~~~~~~~~~~~~~~~~~~
 
 The deterministic rule-based layer is authoritative:
 
@@ -121,6 +243,151 @@ The deterministic rule-based layer is authoritative:
   icons, bullets -- smaller than 10% of the page in *both* width and height) are
   skipped before paying for extraction or an OCR call.
 
+Text-layer quality gate
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Every page's text layer is checked, whatever its image coverage. Designed and
+print PDFs often draw text with subset fonts that have no, or a broken,
+ToUnicode map: the page renders correctly, but the extracted text is garbage.
+The deterministic detector (``text_layer_stats``) counts as garbage glyphs:
+
+- U+FFFD replacement characters and ``(cid:N)`` placeholders;
+- control codes (raw character IDs);
+- runs of private-use characters, except icons, which count as neither text nor
+  garbage: a lone private-use glyph (a bullet), the private-use glyphs of icon
+  and symbol font families (Font Awesome, Wingdings, Webdings, Zapf Dingbats,
+  Symbol, Material Icons and the like, recognised by the start of the font
+  name), and a row of up to 5 of one repeated glyph on a page that otherwise
+  reads as text (a star rating). Adobe's private-use letters and figures
+  (U+F6BE-U+F7FF: old-style digits, small capitals) are text a font failed to
+  map, and always count as garbage;
+- mojibake sequences (UTF-8 read as Latin-1 or cp1252), in a layer that has a
+  typical one -- a Latin-1 letter read back as two characters (``Ã©``) or
+  typographic punctuation (``â€™``) -- or at least two distinct ones: mojibake
+  mangles every accented letter of a layer, while a lone match is ordinary
+  punctuation after an accented letter (``fermé…”`` reads as one).
+
+Each character is weighted by its prominence, ``(font size / the page's body
+size)`` squared, capped at 4 squared: an unreadable 38 pt title weighs as much as
+the body lines it visually outweighs, while one decorative glyph does not tip a
+page. A page is **garbled** when at least ``MIN_GARBAGE_GLYPHS`` (3) garbage
+glyphs make up at least ``GARBAGE_TEXT_RATIO`` (10 %) of its weighted text.
+
+- With an OCR provider, a garbled page is OCR'd from its render
+  (``illegible_text_layer``).
+- Without one, the text is kept as extracted (there is nothing better), the page
+  is listed in ``metadata.extra["text_layer_quality"]`` and a warning names it.
+
+Garbled pages never decide for the document, neither the worst page nor a share
+of them: a brochure whose cover title (or cover and one more page) is unreadable
+keeps its other pages on the text path, and only those pages are OCR'd.
+``test-table.pdf`` in the sample
+documents is such a page: its title "Technical Specifications" extracts as
+U+FFFD, its two pictures lie almost entirely off the page (coverage 0.15), and
+the quality gate, not the coverage, sends it to OCR.
+
+The legibility judge
+^^^^^^^^^^^^^^^^^^^^
+
+Some broken text layers are valid Unicode -- letters shifted or substituted by a
+wrong ToUnicode map, a bad invisible OCR layer -- and no character rule can see
+them. For those, pass an optional judge:
+
+.. code-block:: python
+
+   def judge(page_text: str) -> float | None:
+       ...  # probability (0..1) that page_text is legible, or None
+
+   loader = UnifiedDocumentLoader(ocr_provider="openai", legibility_judge=judge)
+
+The contract (``doc2mark.core.strategy.judge_text_layer``):
+
+- ``page_text`` is one page's text layer as extracted, lines joined with
+  ``"\n"``: the painted text, or the invisible OCR layer of a searchable scan.
+- The judge returns the probability that the text is legible content a person
+  could read (prose, tables, code, identifiers, any script), or ``None`` when it
+  cannot judge.
+- It is consulted only with OCR on (an OCR provider and ``ocr_images=True``):
+  its verdict can only send a page to OCR, so without OCR it is never called.
+  It is asked at most once per page, only for layers of at least 20 characters
+  that the deterministic detector did not already flag, and only for pages that
+  would keep their text layer.
+- Below ``LEGIBILITY_JUDGE_THRESHOLD`` (0.7) the page is treated as garbled.
+  ``None``, an exception or a value outside 0..1 mean "cannot judge": the text
+  is kept, exactly as without a judge.
+
+Without a judge the deterministic gate alone decides, conservatively: when it
+cannot tell, the text is kept.
+
+Invisible text
+~~~~~~~~~~~~~~
+
+Text drawn in render mode 3 (or fully transparent) is not shown on the page.
+Each invisible span is classified by what the page shows under it, with or
+without OCR:
+
+- **A copy of the painted text it lies on**, on the same line (the invisible
+  duplicate some exporters and OCR tools add), is dropped; the painted text
+  stays.
+- **Over a picture** it is the picture's text -- a scanner's OCR layer, or the
+  transparent copy a slide export keeps of text it baked into the artwork --
+  unless the picture is blank under it: fewer than 1 % of the span's pixels differ
+  from the region's background by more than 12 grey levels, on a 100 DPI render
+  of the page with its text removed. A watermark or stamp painted over a scan
+  therefore does not hide the scan, and faint or low-contrast scans still count.
+- **Over other ink** it is the text of glyph-like ink (text drawn as vector
+  outlines): ink spread over the span and broken into strokes along its rows.
+  Rules, table grids, the edges of filled boxes and bands, and chart lines
+  crossing the span do not count.
+- **Over nothing but painted text, or over nothing**, it is hidden text -- a
+  known prompt-injection vector in RAG.
+
+In doubt the text is kept: when the page cannot be checked (a render or a copy
+fails), all of its invisible text but the copies of painted text is kept and a
+warning is logged, because losing a scan's only text is worse than emitting a
+hidden line.
+
+Text of what the page shows is emitted, except over a picture whose OCR in this
+run returned text: that OCR replaces it, so each picture gives one source, not
+two, while the invisible text over other pictures and over outlines on the same
+page stays. A page that is mostly such a layer over a page-covering scan is a
+*searchable scan* and is OCR'd from its render.
+
+Hidden text is left out of paragraphs and of table cells (when a table meets it,
+the table finder reads a copy of the page with that text removed); the pages are
+listed in ``metadata.extra["hidden_text"]`` and a warning names them.
+
+What this cannot catch: invisible text laid over a region of a picture that
+shows something (a photo, scanned text) or over outlined glyphs (or other ink
+broken into strokes, such as a dense hatching) looks exactly like an OCR layer
+and is kept as the page's text. With PyMuPDF older than 1.27,
+which cannot remove only the invisible glyphs where they touch painted text,
+hidden text touching painted text inside a table can reach that table's cells
+(paragraphs are not affected).
+
+What the output records
+~~~~~~~~~~~~~~~~~~~~~~~
+
+PDF results carry the routing facts in ``metadata.extra`` (the ``json`` output
+includes them):
+
+- ``ocr_routing`` (OCR on): ``{"document_route": "text", "overrides": [{"page":
+  1, "route": "image", "reason": "illegible_text_layer"}]}`` -- only the pages
+  whose route differs from the document's are listed.
+- ``text_layer_quality``: one entry per garbled page, with ``garbage_ratio``,
+  ``garbage_glyphs``, ``judge_legibility`` and ``action`` (``"ocr"`` or
+  ``"kept"``).
+- ``hidden_text``: pages whose hidden text was left out, with its length
+  (invisible duplicates of painted text are dropped without being counted).
+
+A document that yields no text at all never does so silently: a warning says so
+and, without OCR, points at the pages that need it (scans, vector outlines);
+with OCR, pages that show content but produced no text are named too.
+
+Converted documents cached by ``UnifiedDocumentLoader(cache_dir=...)`` are keyed
+by the legibility judge and by ``strategy.ROUTING_VERSION``, so a new judge or a
+routing change is never answered from an older result.
+
 Layer 2 -- the Office image route
 ---------------------------------
 
@@ -130,12 +397,12 @@ extraction and is gated tightly:
 
 - Only ``.docx`` and ``.pptx`` are eligible. **``.xlsx`` never routes** -- a
   spreadsheet is a data grid, always read natively.
-- OCR must be requested (both ``ocr_images=True`` and ``extract_images=True``)
-  and an OCR provider must be configured.
+- OCR must be requested (``ocr_images=True``; the loader turns
+  ``extract_images`` on for it) and an OCR provider must be configured.
 
 ``_is_image_dominant`` then computes the two signals straight from the OOXML
 structure -- no rendering required -- and calls the same
-``decide_doc_strategy``:
+``decide_doc_strategy`` (the OOXML text count is a plain character count):
 
 - **PPTX** (``_pptx_image_signals``): mean picture-shape coverage and mean text
   characters **per slide**.
@@ -145,8 +412,9 @@ structure -- no rendering required -- and calls the same
   undercounting floating images biases toward ``"text"`` -- the safe direction.
 
 When the decision is ``"image"``, ``_process_as_image_dominant`` converts the
-file to PDF via LibreOffice and runs it through the PDF **image strategy**
-(whole-page render OCR + ``page_markdown`` synthesis), then restores the original
+file to PDF via LibreOffice and runs it through the PDF pipeline, which measures
+the converted pages and routes them (Layer 1: whole-page render OCR +
+``page_markdown`` synthesis for the image pages), then restores the original
 Office identity in the metadata and records ``metadata.extra['routed_via'] =
 'pdf'``. Text/table Office docs stay on the native pipeline. The route never
 raises: any failure (including no LibreOffice on the host) falls back cleanly to
@@ -288,15 +556,17 @@ Because the routing is automatic, the only thing you do is enable OCR:
    loader = UnifiedDocumentLoader(ocr_provider="openai")
 
    # A slide deck or scan -> "image" strategy: whole-page render OCR + page_markdown.
-   deck = loader.load("pitch_deck.pdf", extract_images=True, ocr_images=True)
+   deck = loader.load("pitch_deck.pdf", ocr_images=True)
 
-   # A text report -> "text" strategy: deterministic text/tables, verbatim,
-   # with only its embedded figures sent to the model.
-   report = loader.load("annual_report.pdf", extract_images=True, ocr_images=True)
+   # A text report -> "text" strategy: deterministic text/tables, verbatim, with
+   # only its embedded figures sent to the model -- and, page by page, its scanned
+   # appendix, a garbled title page or a vector-outlined flyer OCR'd from the render.
+   report = loader.load("annual_report.pdf", ocr_images=True)
+   print(report.metadata.extra.get("ocr_routing"))
 
    # Same content-based decision for Office; an image-dominant .pptx is routed
    # through the PDF image strategy, an ordinary .docx stays native.
-   slides = loader.load("slides.pptx", extract_images=True, ocr_images=True)
+   slides = loader.load("slides.pptx", ocr_images=True)
 
 See :doc:`/ocr` for the OCR facade, providers, tasks, and the structured-output
 schema, and :doc:`/api/schema` for the full model reference.

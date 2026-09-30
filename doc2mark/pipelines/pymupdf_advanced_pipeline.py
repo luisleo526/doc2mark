@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
@@ -20,11 +20,19 @@ from doc2mark.core.table import TableStyle, TableRenderer, TableData
 # that single image instead. Heuristic thresholds (general, not file-specific):
 _PAGE_RENDER_XREF = -1          # sentinel xref marking a whole-page render
 _PAGE_RENDER_DPI = 150          # rasterization DPI for page-level OCR
-# Document strategy decision lives in core.strategy (shared with the Office route).
+# Document and page strategy decisions live in core.strategy (shared with the Office
+# route); pdf_routing measures the per-page signals they are made from.
 from doc2mark.core.strategy import (  # noqa: E402
     decide_doc_strategy as _decide_doc_strategy,
-    IMAGE_PAGE_COVERAGE as _IMAGE_PAGE_COVERAGE,
+    decide_page_route as _decide_page_route,
+    document_signals as _document_signals,
+    judge_text_layer as _judge_text_layer,
+    pages_without_text as _pages_without_text,
+    VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
+    REASON_ILLEGIBLE as _REASON_ILLEGIBLE,
+    MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
 )
+from doc2mark.pipelines import pdf_routing  # noqa: E402
 _TINY_IMAGE_FRACTION = 0.10     # images smaller than this (of page w AND h) are decorative
 
 # --- Neighbor-page PDF context for OCR --------------------------------------
@@ -66,11 +74,23 @@ class _HeadingFeatures:
 class PDFLoader:
     """PDF loader that extracts content in reading order and exports to various formats"""
 
-    def __init__(self, pdf_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None):
+    def __init__(self, pdf_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None,
+                 legibility_judge=None):
+        """Open ``pdf_path``.
+
+        ``legibility_judge`` is the optional ``judge(page_text) -> Optional[float]``
+        hook of the text-layer quality gate; see
+        :func:`doc2mark.core.strategy.judge_text_layer` for its contract.
+        """
         self.pdf_path = Path(pdf_path)
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
         self._first_text_page_num = None
+        self._legibility_judge = legibility_judge
+        self._page_measures: Dict[int, "pdf_routing.PageMeasure"] = {}
+        self._page_routes: Dict[int, Tuple[str, str]] = {}
+        self._rendered_pages: set = set()  # pages whose content is the OCR of their render
+        self._judged_pages: set = set()    # pages the legibility judge was asked about
 
         # Neighbor-page PDF context (off by default). Resolve the context tier
         # once from the OCR instance's config (NOT self.config, which does not
@@ -95,6 +115,7 @@ class PDFLoader:
                 logger.info(f"🌍 OCR Language setting: {self.ocr.config.language}")
 
         self._open_document()
+        self._copies = pdf_routing.PageCopies(self.doc)  # editable page copies for the routing checks
 
     def _open_document(self):
         """Open PDF document with error handling"""
@@ -210,9 +231,10 @@ class PDFLoader:
         
         Args:
             extract_images: Whether to extract images as base64
-            ocr_images: Whether to use OCR to convert images to text descriptions (requires extract_images=True)
+            ocr_images: Whether to use OCR to convert images to text descriptions
+                (implies image extraction; needs an OCR instance)
             show_progress: Whether to show progress messages
-        
+
         Returns:
             Simplified JSON with content array containing:
             - text:title - Main document title
@@ -227,6 +249,8 @@ class PDFLoader:
                 * Line breaks in cells preserved using <br> tags
                 * Automatic detection and labeling of merged cells
             - image - Base64-encoded images (when ocr_images=False)
+            plus, when applicable, ``ocr_routing``, ``text_layer_quality`` and
+            ``hidden_text`` (see _record_routing).
         """
         # Initialize document structure
         document = {
@@ -234,6 +258,17 @@ class PDFLoader:
             "pages": len(self.doc),
             "content": []  # Simple array of content items
         }
+
+        self._rendered_pages = set()
+
+        # OCR needs the images: asking for OCR implies extracting them for it.
+        if ocr_images and self.ocr is None:
+            logger.warning(f"{self.pdf_path.name}: ocr_images=True but no OCR provider is configured; "
+                           f"images are not OCR'd")
+            ocr_images = False
+        if ocr_images and not extract_images:
+            logger.info("ocr_images=True implies image extraction for OCR")
+            extract_images = True
 
         # If OCR is requested, collect all images first for batch processing
         ocr_results_map = {}
@@ -248,63 +283,16 @@ class PDFLoader:
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
 
-                try:
-                    # Use the configured OCR instance for batch processing
-                    if self.ocr:
-                        # Prepare image data for batch processing
-                        image_data_list = [base64.b64decode(info["base64"]) for info in all_images_info]
-                        # Per-image neighbor-page PDF context (aligned positionally
-                        # with image_data_list). All None when the feature is off.
-                        context_pdfs = [info.get("context_pdf_b64") for info in all_images_info]
-
-                        # Pass language configuration if available
-                        kwargs = {}
-                        if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
-                            kwargs['language'] = self.ocr.config.language
-                            logger.info(f"🌍 Passing language configuration to OCR: {self.ocr.config.language}")
-
-                        # Only inject context when at least one image carries it, so
-                        # the off-default path stays byte-identical (cache keys + call).
-                        if any(context_pdfs):
-                            kwargs['context_pdfs'] = context_pdfs
-
-                        # Image strategy (whole-page renders): ask the model to ALSO
-                        # synthesize structured page_markdown, so the rendered output is
-                        # a readable document instead of a flat OCR dump. Text-strategy
-                        # batches (embedded figures) carry no page render -> never set.
-                        if any(info.get("is_page_render") for info in all_images_info):
-                            kwargs['synthesis_markdown'] = True
-
-                        # Always use batch processing for efficiency
-                        logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
-                        ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
-
-                        # Extract text from results
-                        ocr_texts = []
-                        for result in ocr_results:
-                            if hasattr(result, 'text'):
-                                ocr_texts.append(result.text)
-                            else:
-                                ocr_texts.append(str(result))
-
-                        # Map results back to image locations
-                        for info, ocr_text in zip(all_images_info, ocr_texts):
-                            key = (info["page_num"], info["xref"])
-                            ocr_results_map[key] = ocr_text
-
-                        if show_progress:
-                            logger.info(f"Successfully processed {len(ocr_texts)} images with configured OCR")
-                    else:
-                        logger.error("No OCR instance available")
-                        ocr_images = False  # Disable OCR processing
-
-                except Exception as e:
-                    # Do NOT fall back to base64 extraction here: dumping megabytes of
-                    # base64 image data into a text/RAG output is useless and harmful.
-                    # Keep ocr_images on with the empty/partial map so missing images
-                    # become lightweight placeholders (see _extract_images_simple),
-                    # while the deterministic text/table layer is still emitted.
-                    logger.error(f"Batch OCR processing failed: {e}; emitting image placeholders")
+                # Whole-page renders ask the model to ALSO synthesize structured
+                # page_markdown (a readable document instead of a flat OCR dump);
+                # embedded figures never do. The flag applies to a whole batch, so the
+                # two kinds go in separate batches when a document mixes them.
+                renders = [info for info in all_images_info if info.get("is_page_render")]
+                figures = [info for info in all_images_info if not info.get("is_page_render")]
+                for batch, synthesis in ((renders, True), (figures, False)):
+                    if batch:
+                        self._ocr_batch(batch, ocr_results_map, synthesis_markdown=synthesis,
+                                        show_progress=show_progress)
 
         # Process each page
         for page_num in range(len(self.doc)):
@@ -324,7 +312,52 @@ class PDFLoader:
         # Post-process: detect and tag repeated headers/footers
         self._detect_repeated_content(document)
 
+        self._record_routing(document, ocr_active=bool(ocr_images))
+
         return document
+
+    def _ocr_batch(self, batch: List[Dict[str, Any]], ocr_results_map: Dict[tuple, str], *,
+                   synthesis_markdown: bool, show_progress: bool) -> None:
+        """OCR one batch of collected images into ``ocr_results_map`` (keyed by page and xref).
+
+        A failed batch leaves its images without results: they become lightweight
+        placeholders (see _extract_images_simple) while the deterministic text/table
+        layer is still emitted. Never fall back to base64 extraction: dumping
+        megabytes of base64 image data into a text/RAG output is useless and harmful.
+        """
+        try:
+            # Prepare image data for batch processing
+            image_data_list = [base64.b64decode(info["base64"]) for info in batch]
+            # Per-image neighbor-page PDF context (aligned positionally
+            # with image_data_list). All None when the feature is off.
+            context_pdfs = [info.get("context_pdf_b64") for info in batch]
+
+            # Pass language configuration if available
+            kwargs = {}
+            if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
+                kwargs['language'] = self.ocr.config.language
+                logger.info(f"🌍 Passing language configuration to OCR: {self.ocr.config.language}")
+
+            # Only inject context when at least one image carries it, so
+            # the off-default path stays byte-identical (cache keys + call).
+            if any(context_pdfs):
+                kwargs['context_pdfs'] = context_pdfs
+            if synthesis_markdown:
+                kwargs['synthesis_markdown'] = True
+
+            # Always use batch processing for efficiency
+            logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
+            ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
+
+            # Map results back to image locations
+            for info, result in zip(batch, ocr_results):
+                ocr_results_map[(info["page_num"], info["xref"])] = (
+                    result.text if hasattr(result, 'text') else str(result))
+
+            if show_progress:
+                logger.info(f"Successfully processed {len(image_data_list)} images with configured OCR")
+        except Exception as e:
+            logger.error(f"Batch OCR processing failed: {e}; emitting image placeholders")
 
     def _detect_repeated_content(self, document: Dict[str, Any]) -> None:
         """Detect repeated headers/footers across pages and retype them.
@@ -461,31 +494,63 @@ class PDFLoader:
         self._first_text_page_num = 0
         return 0
 
-    def _page_image_coverage(self, page) -> float:
-        """Fraction of the page area covered by raster images (capped at 1.0)."""
-        page_area = abs(page.rect.width * page.rect.height) or 1.0
-        covered = 0.0
+    def _page_measure(self, page_num: int) -> "pdf_routing.PageMeasure":
+        """Routing signals of one page (measured once, see pdf_routing.measure_page)."""
+        measure = self._page_measures.get(page_num)
+        if measure is None:
+            page = self.doc.load_page(page_num)
+            measure = pdf_routing.measure_page(
+                page,
+                ocr_rects=self._ocr_image_rects,
+                keep_text=self._legibility_judge is not None and self.ocr is not None,
+                copies=self._copies,
+            )
+            self._page_measures[page_num] = measure
+        return measure
+
+    def _judged_signals(self, page_num: int):
+        """The page's signals with the optional legibility judge's verdict (asked once,
+        only for text layers the deterministic detector did not flag)."""
+        measure = self._page_measure(page_num)
+        if self._legibility_judge is None or page_num in self._judged_pages:
+            return measure.signals
+        self._judged_pages.add(page_num)
+        verdict = _judge_text_layer(self._legibility_judge, measure.signals.text_layer, measure.text or "")
+        if verdict is not None:
+            measure = replace(measure, signals=replace(measure.signals, judge_legibility=verdict))
+            self._page_measures[page_num] = measure
+        return measure.signals
+
+    def _ocr_image_rects(self, page) -> List[Any]:
+        """Placements the text route OCRs one by one (non-decorative image XObjects)."""
+        rects = []
         for img_info in page.get_images(full=True):
-            for rect in page.get_image_rects(img_info[0]):
-                covered += abs(rect.width * rect.height)
-        return min(covered / page_area, 1.0)
+            try:
+                rects.extend(r for r in page.get_image_rects(img_info[0]) if not self._is_decorative_image(r, page))
+            except Exception as e:
+                logger.debug(f"Failed to get image rects for xref {img_info[0]}: {e}")
+        return rects
+
+    def _page_signals(self, page_num: int):
+        return self._page_measure(page_num).signals
 
     def _document_image_strategy(self) -> str:
-        """High-level DOCUMENT route from two deterministic signals: mean per-page
-        image coverage AND mean per-page selectable-text density.
+        """High-level DOCUMENT route (core.strategy.decide_doc_strategy) from the
+        pages' signals: mean visible image coverage and mean legible text density
+        (script-aware, see core.strategy.text_weight). Text-layer quality is not a
+        document signal here: every page is checked and garbled pages are OCR'd one
+        by one (see _page_route), so they never take clean pages with them.
 
         - "image": pages are mostly pictures (mean coverage high) AND carry little
-          selectable text (mean chars/page low) — the real content is baked into the
-          page images. Every page is rendered and OCR'd as a whole image (with
-          neighbor-page context when enabled); the OCR is authoritative.
-        - "text": there is a usable selectable-text layer (mean chars/page not low)
-          OR little image coverage. The deterministic rule-based layer (complex
-          tables + text, preserved verbatim for BM42 RAG) is authoritative, and
-          embedded figures are OCR'd individually.
+          legible text — the real content is in the page images. Pages are rendered
+          and OCR'd as whole images (with neighbor-page context when enabled); the
+          OCR is authoritative.
+        - "text": there is a usable text layer or little image coverage. The
+          deterministic rule-based layer (complex tables + text, preserved verbatim
+          for BM42 RAG) is authoritative, and embedded figures are OCR'd individually.
 
-        Text density is the decisive signal: image coverage alone misclassifies a
-        text document that happens to carry large figures. Decided once per document
-        (cached); a uniform strategy avoids mixing OCR-only and rule-based pages.
+        This is every page's default; a page whose own signals clearly disagree
+        overrides it (see _page_route). Decided once per document (cached).
         """
         if self._doc_strategy is not None:
             return self._doc_strategy
@@ -493,47 +558,141 @@ class PDFLoader:
         if n == 0:
             self._doc_strategy = "text"
             return self._doc_strategy
-        mean_cov = sum(self._page_image_coverage(self.doc.load_page(i)) for i in range(n)) / n
-        mean_text = sum(len(self.doc.load_page(i).get_text().strip()) for i in range(n)) / n
-        # Text-layer quality only matters for image-dominant docs (the sole case the
-        # quality gate can flip the route), so measure it lazily — pure-text docs
-        # skip the extra dict extraction entirely.
-        illegibility = self._headline_illegibility() if mean_cov >= _IMAGE_PAGE_COVERAGE else 0.0
-
-        self._doc_strategy = _decide_doc_strategy(mean_cov, mean_text, illegibility)
+        mean_cov, mean_text, illegible = _document_signals([self._page_signals(i) for i in range(n)])
+        self._doc_strategy = _decide_doc_strategy(mean_cov, mean_text)
         logger.info(f"📑 Document OCR strategy: {self._doc_strategy} "
-                    f"(mean coverage {mean_cov:.2f}, mean text {mean_text:.0f} chars/page, "
-                    f"headline illegibility {illegibility:.2f})")
+                    f"(mean coverage {mean_cov:.2f}, mean legible text {mean_text:.0f}/page, "
+                    f"garbled text pages {illegible:.0%})")
         return self._doc_strategy
 
-    def _headline_illegibility(self) -> float:
-        """Worst-page fraction of the most prominent (largest-font) text that is
-        unmappable (U+FFFD).
+    def _page_route(self, page_num: int) -> Tuple[str, str]:
+        """``(route, reason)`` of one page when an OCR provider is active: the
+        document route, unless the page's own signals clearly disagree (a
+        searchable scan, a garbled text layer, content only as vector outlines or
+        inline images, a scanned page in a text report, a dense text page in an
+        image deck). See core.strategy.decide_page_route."""
+        route = self._page_routes.get(page_num)
+        if route is None:
+            document_route = self._document_image_strategy()
+            route = _decide_page_route(self._page_signals(page_num), document_route)
+            if route[0] == "text" and self._legibility_judge is not None:
+                # Only a page that would keep its text layer needs the judge's opinion.
+                route = _decide_page_route(self._judged_signals(page_num), document_route)
+            self._page_routes[page_num] = route
+        return route
 
-        High on designed/print PDFs whose titles are drawn with subset fonts that
-        carry no ToUnicode map: the glyphs render fine but cannot be decoded to
-        text, so the selectable-text layer misrepresents the visible page. Uses
-        ``dict`` extraction because plain ``get_text`` silently DROPS glyphs it
-        cannot map (hiding the problem), whereas ``dict`` emits U+FFFD for them.
+    def _text_source(self, page, page_num: int, ocr_images: bool, ocr_results_map: Optional[Dict[tuple, str]]):
+        """The page as the text and table extractors should read it (discard
+        ``self._copies`` once they are done).
+
+        Invisible (render mode 3) text over nothing the page shows is hidden text, and
+        an invisible copy of the painted text it lies on is a duplicate: neither reaches
+        them (H-F15). Invisible text over what the page shows (a scanner's OCR layer, a
+        transparent copy of text baked into artwork or drawn as outlines) is that
+        content's text: kept, except over a picture whose OCR in this run returned text,
+        so each picture gives one source, not two (R-F1).
         """
-        worst = 0.0
-        for i in range(len(self.doc)):
-            page = self.doc.load_page(i)
-            text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
-            spans = [
-                (span["size"], span.get("text", ""))
-                for block in text_dict["blocks"]
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
-                if span.get("text", "").strip()
-            ]
-            if not spans:
+        measure = self._page_measure(page_num)
+        if not measure.has_invisible_text:
+            return page
+        ocrd = self._ocrd_picture_rects(page, page_num, ocr_images, ocr_results_map)
+        return pdf_routing.text_source(page, measure, self._copies, ocrd_rects=ocrd)
+
+    def _ocrd_picture_rects(self, page, page_num: int, ocr_images: bool,
+                            ocr_results_map: Optional[Dict[tuple, str]]) -> List[Any]:
+        """Placements on this page whose OCR in this run returned text (the batch results;
+        the legacy per-page OCR runs after text extraction, so its results are unknown
+        here and the invisible text over its pictures is kept)."""
+        if not ocr_images or self.ocr is None or not ocr_results_map:
+            return []
+        rects = []
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if not (ocr_results_map.get((page_num, xref)) or "").strip():
                 continue
-            max_size = max(size for size, _ in spans)
-            headline = "".join(text for size, text in spans if size >= 0.9 * max_size)
-            if headline:
-                worst = max(worst, headline.count("�") / len(headline))
-        return worst
+            try:
+                rects.extend(r for r in page.get_image_rects(xref) if not self._is_decorative_image(r, page))
+            except Exception as e:
+                logger.debug(f"Failed to get image rects for xref {xref}: {e}")
+        return rects
+
+    def _record_routing(self, document: Dict[str, Any], ocr_active: bool) -> None:
+        """Record the routing facts in ``document`` and warn about text that cannot be trusted or extracted.
+
+        - ``ocr_routing`` (OCR active only): the document route and the pages that
+          overrode it, with the reason (see core.strategy.decide_page_route).
+        - ``text_layer_quality``: pages whose text layer is garbled (the detector, or
+          the legibility judge when OCR is active), and whether it was replaced by OCR
+          of the render (``"ocr"``) or kept as extracted (``"kept"``, with a warning).
+        - ``hidden_text``: pages whose invisible (render mode 3) text over nothing the
+          page shows was left out.
+        - Warnings when the output is empty, when pages showing content produced no
+          text (OCR returned nothing), or, without OCR, for pages that have no usable
+          text layer but show content (scans, vector outlines).
+        """
+        n = len(self.doc)
+        if n == 0:
+            return
+        name = self.pdf_path.name
+        if ocr_active:
+            doc_route = self._document_image_strategy()
+            overrides = []
+            for i in range(n):
+                route, reason = self._page_route(i)
+                if route != doc_route:
+                    overrides.append({"page": i + 1, "route": route, "reason": reason})
+            document["ocr_routing"] = {"document_route": doc_route, "overrides": overrides}
+        # The legibility judge was asked (by _page_route) only when OCR is active: its
+        # verdict can only choose OCR for a page, so without OCR it is never consulted.
+        signals = [self._page_signals(i) for i in range(n)]
+
+        quality, kept = [], []
+        for i, page in enumerate(signals):
+            if not page.text_layer_illegible:
+                continue
+            ocrd = i in self._rendered_pages
+            layer = page.text_layer
+            quality.append({
+                "page": i + 1,
+                "legible": False,
+                "garbage_ratio": round(layer.garbage_ratio, 3),
+                "garbage_glyphs": layer.garbage_glyphs,
+                "judge_legibility": page.judge_legibility,
+                "action": "ocr" if ocrd else "kept",
+            })
+            if not ocrd:
+                kept.append(i)
+        if quality:
+            document["text_layer_quality"] = quality
+        if kept:
+            logger.warning(f"{name} {pdf_routing.describe_pages(kept)}: the text layer looks garbled (undecodable "
+                           f"glyphs or unreadable text) and was kept as extracted; OCR of the page render (an OCR "
+                           f"provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) reads it instead")
+
+        hidden = [i for i, page in enumerate(signals) if page.hidden_chars]
+        if hidden:
+            document["hidden_text"] = [{"page": i + 1, "chars": signals[i].hidden_chars} for i in hidden]
+            logger.warning(f"{name} {pdf_routing.describe_pages(hidden)}: invisible (render mode 3) text over "
+                           f"nothing the page shows was left out of the output")
+
+        emitted = {item.get("page") for item in document.get("content", []) if str(item.get("content", "")).strip()}
+        if not emitted:
+            hint = ("" if ocr_active else "; its pages carry no usable text layer, enable OCR (an OCR provider "
+                    "with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read scanned or drawn pages")
+            logger.warning(f"{name}: no text could be extracted from its {n} page(s){hint}")
+        elif ocr_active:
+            silent = [i for i, page in enumerate(signals) if i + 1 not in emitted
+                      and (page.image_coverage >= _MIN_UNCAPTURED_RASTER or page.uncaptured_content
+                           or page.invisible.chars)]
+            if silent:
+                logger.warning(f"{name} {pdf_routing.describe_pages(silent)}: no text was extracted although the "
+                               f"page shows content (the OCR returned nothing)")
+        else:
+            missing = _pages_without_text(signals)
+            if missing:
+                logger.warning(f"{name} {pdf_routing.describe_pages(missing)}: little or no text layer; content "
+                               f"shown only as scanned images or drawn outlines was not extracted; enable OCR (an "
+                               f"OCR provider with ocr_images=True; CLI: --ocr <provider> --ocr-images) to read it")
 
     def _render_page_png(self, page) -> bytes:
         """Rasterize a whole page to PNG bytes for page-level OCR."""
@@ -576,22 +735,19 @@ class PDFLoader:
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect images for batch OCR.
 
-        Image-dominant pages contribute ONE whole-page render (xref
-        ``_PAGE_RENDER_XREF``); other pages contribute their embedded images,
+        Pages routed "image" (see _page_route) contribute ONE whole-page render
+        (xref ``_PAGE_RENDER_XREF``); other pages contribute their embedded images,
         skipping decorative thumbnails. Each entry has page_num, xref, base64,
         mime_type, position, and (for renders) is_page_render=True.
         """
         all_images = []
 
-        # Document-level route: when the doc is mostly pictures, OCR EVERY page
-        # as a whole image; otherwise OCR only the embedded figures per page.
-        doc_image_strategy = self.ocr is not None and self._document_image_strategy() == "image"
-
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
 
-            # Whole-page OCR for the image-strategy document (every page rendered).
-            if doc_image_strategy:
+            # Whole-page OCR for pages routed "image" (by the document route or
+            # their own signals); the other pages OCR only their embedded figures.
+            if self.ocr is not None and self._page_route(page_num)[0] == "image":
                 try:
                     png = self._render_page_png(page)
                     ctx = self._build_window_pdf(page_num) if self._context_tier >= 1 else None
@@ -643,40 +799,69 @@ class PDFLoader:
 
     def _process_page(self, page_num: int, extract_images: bool = True, ocr_images: bool = False,
                       ocr_results_map: Dict[tuple, str] = None) -> List[Dict[str, Any]]:
-        """Process a single page, routed by the high-level OCR strategy.
+        """Process a single page, routed by its OCR route (_page_route, applied in
+        _collect_all_images):
 
-        The document-level route (_document_image_strategy, applied in
-        _collect_all_images) selects the strategy:
-
-        - IMAGE-authoritative (a whole-page render exists): emit ONLY the OCR
-          transcription. The sparse text layer on such a page is chrome
-          (logo / footer / page number) that the whole-page OCR already
-          captures, so emitting the text layer too would just duplicate it and
-          add junk header/footer mini-tables.
+        - IMAGE-authoritative (a whole-page render was OCR'd): emit ONLY the OCR
+          transcription. A sparse text layer on such a page is chrome
+          (logo / footer / page number), the invisible layer of a searchable scan,
+          or a garbled layer; the whole-page OCR already captures what it shows,
+          so emitting it too would duplicate content or add garbage. When the
+          render OCR'd to nothing, the page falls back to its own text layer
+          instead of disappearing.
         - TEXT-authoritative: emit the deterministic text/table layer (preserved
           verbatim for the BM42 RAG flow) plus per-image OCR for embedded figures.
+
+        Invisible (render mode 3) text is content only over what the page shows (a
+        scanner's OCR layer, text drawn as outlines) and only where no OCR of that
+        picture replaced it; see _text_source.
         """
         page = self.doc.load_page(page_num)
 
-        # --- IMAGE-authoritative strategy: the whole-page OCR IS the content. ---
+        # --- IMAGE-authoritative page: the whole-page OCR IS the content. ---
         if (ocr_images and ocr_results_map is not None
                 and (page_num, _PAGE_RENDER_XREF) in ocr_results_map):
             render_text = (ocr_results_map.get((page_num, _PAGE_RENDER_XREF)) or "").strip()
-            if not render_text:
-                return []
-            return [{
-                "type": "text:image_description",
-                "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
-                "page": page_num + 1,
-                "position_y": 0.0,
-            }]
+            if render_text:
+                self._rendered_pages.add(page_num)
+                items = [{
+                    "type": "text:image_description",
+                    "content": f"<image_ocr_result>{render_text}</image_ocr_result>",
+                    "page": page_num + 1,
+                    "position_y": 0.0,
+                }]
+                # A page overridden to render OCR keeps whatever real painted text the
+                # OCR did not reproduce (verbatim first).
+                reason = self._page_routes.get(page_num, (None, None))[1]
+                if reason in _VERBATIM_TAIL_REASONS:
+                    missing = pdf_routing.missing_painted_lines(page, self._page_measure(page_num), render_text,
+                                                                garbled=reason == _REASON_ILLEGIBLE)
+                    if missing:
+                        items.append({
+                            "type": "text:normal",
+                            "content": "\n".join(missing),
+                            "page": page_num + 1,
+                            "position_y": float(page.rect.height),
+                        })
+                return items
+            # Blank render, refusal or OCR failure: keep the page's own text layer
+            # (verbatim first) rather than drop the page.
+            fallback = self._process_page(page_num, extract_images=False, ocr_images=False)
+            if fallback:
+                logger.warning(f"{self.pdf_path.name} page {page_num + 1}: OCR of the page render returned "
+                               f"no text; keeping the page's own text layer")
+            return fallback
 
-        # --- TEXT-authoritative strategy: rule-based text/tables + per-image OCR. ---
+        # --- TEXT-authoritative page: rule-based text/tables + per-image OCR. ---
+        text_page = self._text_source(page, page_num, ocr_images, ocr_results_map)
         content_items = []
-        table_items, table_bboxes = self._extract_tables_as_markdown(page, page_num)
-        content_items.extend(table_items)
-        text_items = self._extract_text_as_markdown(page, page_num, table_bboxes)
-        content_items.extend(text_items)
+        try:
+            table_items, table_bboxes = self._extract_tables_as_markdown(text_page, page_num)
+            content_items.extend(table_items)
+            text_items = self._extract_text_as_markdown(text_page, page_num, table_bboxes)
+            content_items.extend(text_items)
+        finally:
+            self._copies.discard()
         if extract_images:
             content_items.extend(self._extract_images_simple(
                 page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map))
@@ -1884,7 +2069,7 @@ class PDFLoader:
         
         Args:
             extract_images: Whether to extract images as base64
-            ocr_images: Whether to use OCR to convert images to text descriptions (requires extract_images=True)
+            ocr_images: Whether to use OCR to convert images to text descriptions (implies image extraction)
             show_progress: Whether to show progress messages
         
         Returns:
@@ -1899,7 +2084,7 @@ class PDFLoader:
         
         Args:
             extract_images: Whether to extract images as base64
-            ocr_images: Whether to use OCR to convert images to text descriptions (requires extract_images=True)
+            ocr_images: Whether to use OCR to convert images to text descriptions (implies image extraction)
             show_progress: Whether to show progress messages
         
         Returns:
@@ -1935,6 +2120,8 @@ class PDFLoader:
 
     def close(self):
         """Close the document"""
+        if getattr(self, "_copies", None) is not None:
+            self._copies.close()
         if self.doc:
             self.doc.close()
             logger.info("Document closed")
@@ -1949,23 +2136,26 @@ def pdf_to_simple_json(
         ocr_images: bool = False,
         show_progress: bool = True,
         ocr=None,
-        table_style: Union[str, TableStyle] = None
+        table_style: Union[str, TableStyle] = None,
+        legibility_judge=None,
 ) -> Dict[str, Any]:
     """
     Convert PDF to simplified JSON with content in reading order
-    
+
     Args:
         pdf_path: Path to the PDF file
         output_path: Optional path to save JSON output
         output_markdown: Also save as markdown file
         extract_images: Extract images as base64
-        ocr_images: Use OCR to convert images to text descriptions (requires extract_images=True)
+        ocr_images: Use OCR to convert images to text descriptions (implies image extraction)
         show_progress: Show progress messages
         ocr: OCR instance for image processing
         table_style: Output style for complex tables:
             - 'minimal_html': Clean HTML with only rowspan/colspan (default)
             - 'markdown_grid': Markdown with merge annotations
             - 'styled_html': Full HTML with inline styles (legacy)
+        legibility_judge: Optional ``judge(page_text) -> Optional[float]`` for the
+            text-layer quality gate (see doc2mark.core.strategy.judge_text_layer)
     
     Returns:
         Simplified JSON data with content array containing:
@@ -1982,7 +2172,7 @@ def pdf_to_simple_json(
             * Automatic detection and labeling of merged cells
         - image - Base64-encoded images (when ocr_images=False)
     """
-    converter = PDFLoader(pdf_path, ocr=ocr, table_style=table_style)
+    converter = PDFLoader(pdf_path, ocr=ocr, table_style=table_style, legibility_judge=legibility_judge)
 
     try:
         json_data = converter.convert_to_json(
