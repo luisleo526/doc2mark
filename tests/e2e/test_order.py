@@ -98,6 +98,16 @@ def test_sidebar_and_pull_quote_do_not_split_the_main_flow(run_cli, e2e_dir):
     assert not re.search(r"\w", between), result.describe()
 
 
+def test_pull_quote_across_the_gutter_is_read_after_the_columns(run_cli, e2e_dir):
+    path, tags = b.pull_quote_pdf(e2e_dir / "pull_quote.pdf")
+    result = convert(run_cli, path)
+    found = tags_in(result.markdown)
+
+    assert [tag for tag in found if tag.lstrip("[/").startswith("Q")] == pairs(tags), result.describe()
+    assert found.index("[/PQ]") == found.index("[PQ]") + 1, result.describe()
+    assert found.index("[PQ]") > found.index(f"[/{tags[-1]}]"), result.describe()
+
+
 def test_rotated_pages_read_in_their_displayed_orientation(run_cli, e2e_dir):
     path, order = b.rotated_pages_pdf(e2e_dir / "rotated.pdf")
     result = convert(run_cli, path)

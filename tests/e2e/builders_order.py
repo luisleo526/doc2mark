@@ -61,11 +61,13 @@ Block = Tuple[str, str]
 
 
 def flow(pages: Sequence, frames: Sequence[Tuple[int, float, float, float, float]], blocks: Sequence[Block],
-         size: float = 9.5, leading: float = 11.5, gap: float = 7.0) -> None:
+         size: float = 9.5, leading: float = 11.5, gap: float = 7.0,
+         avoid: Sequence[Tuple[int, float, float, float, float]] = ()) -> None:
     """Set ``blocks`` into ``frames`` ((page index, x0, y0, x1, y1) column boxes, in reading order),
     breaking lines first-fit to the width of the frame they land in. A paragraph continues in the
-    next frame when the current one is full; a heading moves on with the line after it. Raises when
-    the text does not fit."""
+    next frame when the current one is full; a heading moves on with the line after it. Lines wrap
+    around the ``avoid`` boxes ((page index, x0, y0, x1, y1), 8pt apart). Raises when the text does
+    not fit."""
     frame_index, y = 0, None
     for kind, text in blocks:
         font = "hebo" if kind == "h" else "helv"
@@ -79,11 +81,18 @@ def flow(pages: Sequence, frames: Sequence[Tuple[int, float, float, float, float
             if y > y1 or (kind == "h" and y + leading > y1):
                 frame_index, y = frame_index + 1, None
                 continue
+            left, right = x0, x1
+            for page_avoid, ax0, ay0, ax1, ay1 in avoid:
+                if page_avoid == page_index and ay0 - 3 < y and y - line_size < ay1 + 3:
+                    if ax0 <= left + 1 < ax1:
+                        left = ax1 + 8
+                    elif left < ax0 < right:
+                        right = ax0 - 8
             count = 1
             while count < len(words) and pymupdf.get_text_length(
-                    " ".join(words[:count + 1]), font, line_size) <= x1 - x0:
+                    " ".join(words[:count + 1]), font, line_size) <= right - left:
                 count += 1
-            pages[page_index].insert_text((x0, y), " ".join(words[:count]), fontsize=line_size, fontname=font)
+            pages[page_index].insert_text((left, y), " ".join(words[:count]), fontsize=line_size, fontname=font)
             words = words[count:]
             y += leading
         y += gap
@@ -168,6 +177,27 @@ def sidebar_pdf(path: Path) -> Tuple[Path, List[str]]:
     quote = wrap("[PQ] Growth came from the regions we had nearly given up on. [/PQ]", 150, 14, "heit")
     page.insert_text((392, 470), "\n".join(quote), fontsize=14, fontname="heit", lineheight=1.2)
     return _save(doc, path), main
+
+
+def pull_quote_pdf(path: Path) -> Tuple[Path, List[str]]:
+    """One A4 page in two columns with a pull-quote set across the gutter, the text of both columns
+    wrapped around it (magazine style), under a full-width headline. Returns the paragraph tags in
+    order."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 70), "The Harbour Towns Come Back", fontsize=22, fontname="hebo")
+    quote_box = (0, 185, 330, 410, 420)
+    tags = [f"Q{k}" for k in range(1, 9)]
+    flow([page], [(0, 50, 100, 290, 790), (0, 305, 100, 545, 790)],
+         [("p", tagged(tag, 62, 900 + k)) for k, tag in enumerate(tags)], size=10, leading=12.5, gap=8,
+         avoid=[quote_box])
+    _, qx0, qy0, qx1, qy1 = quote_box
+    page.draw_line((qx0, qy0), (qx1, qy0), color=(0.2, 0.2, 0.2), width=1.2)
+    page.draw_line((qx0, qy1), (qx1, qy1), color=(0.2, 0.2, 0.2), width=1.2)
+    quote = wrap("[PQ] We rebuilt the quay with our own hands and the ships came back. [/PQ]",
+                 qx1 - qx0 - 10, 14, "heit")
+    page.insert_text((qx0 + 5, qy0 + 22), "\n".join(quote), fontsize=14, fontname="heit", lineheight=1.25)
+    return _save(doc, path), tags
 
 
 def _visual_text(page, x: float, y: float, text: str, size: float, font: str = "helv") -> None:

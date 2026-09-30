@@ -16,9 +16,10 @@ only on clear evidence of columns:
 
 A band that passes is read left side, then right side (each side can hold further columns); a
 narrow side beside a much wider one (a sidebar, a pull-quote, margin notes) is read after it as a
-whole. Anything else keeps the top-to-bottom order. Running headers and footers and footnotes are
-never part of a column: they are placed by their height, so a header opens the page and a footnote
-or page number closes it. Pieces of one text block always stay together and in order.
+whole. Anything else keeps the top-to-bottom order. Running headers and footers, footnotes and
+pictures with text over them (backgrounds) are never part of a column: they are placed by their
+height, so a header opens the page and a footnote or page number closes it. Pieces of one text
+block always stay together and in order.
 
 Everything here is deterministic geometry on item boxes; the result is always a permutation of the
 items, so reordering can neither drop nor duplicate text.
@@ -87,6 +88,13 @@ def reading_order(regions: Sequence[Region]) -> List[int]:
     indexes. It is ``0, 1, 2, …`` unless the page shows columns (see the module docstring)."""
     identity = list(range(len(regions)))
     units, anchored = _units(regions)
+    # a picture with text drawn over it (a background, a watermark, a banner) is not a column item
+    centres = [((unit.box[0] + unit.box[2]) / 2, unit.middle) for unit in units if unit.kind == "text"]
+    behind = [unit for unit in units if unit.kind == "image" and any(
+        unit.box[0] <= x <= unit.box[2] and unit.box[1] <= y <= unit.box[3] for x, y in centres)]
+    if behind:
+        units = [unit for unit in units if unit not in behind]
+        anchored = sorted(anchored + [index for unit in behind for index in unit.members])
     if len(units) < 2 or len(units) > _MAX_UNITS:
         return identity
     ordered = _order(units, 0)
@@ -201,35 +209,52 @@ def _column_split(units: List[_Unit]):
 
     Every candidate gutter whose crossing items all sit between the items beside it is used at
     once: the crossing items (spanning titles, figures, captions, page numbers) cut the region
-    into bands, and in each band the items fall into the slots between the gutters."""
+    into bands, and in each band the items fall into the slots between the gutters. A pull-quote
+    set across the gutter with the column text wrapped around it (an island) is read after the
+    columns of its band."""
     if sum(1 for unit in units if unit.kind == "text") < 2:
         return None
-    gutters = sorted(gutter for gutter in _gutters(units) if _clean(units, gutter))
+    gutters, islands = [], []
+    for gutter in _gutters(units):
+        found = _clean(units, gutter)
+        if found is not None:
+            gutters.append(gutter)
+            islands.extend(unit for unit in found if unit not in islands)
     if not gutters:
         return None
-    crossing = [unit for unit in units if any(_crosses(unit, gutter) for gutter in gutters)]
+    gutters.sort()
+    island_ids = set(map(id, islands))
+    crossing = [unit for unit in units if id(unit) not in island_ids
+                and any(_crosses(unit, gutter) for gutter in gutters)]
     crossing_ids = set(map(id, crossing))
     separators = sorted(crossing, key=lambda unit: unit.middle)
+
+    def band_of(unit: _Unit) -> int:
+        return sum(1 for separator in separators if separator.middle < unit.middle)
+
     bands: List[List[_Unit]] = [[] for _ in range(len(separators) + 1)]
+    floating: List[List[_Unit]] = [[] for _ in range(len(separators) + 1)]
     for unit in units:
-        if id(unit) not in crossing_ids:
-            bands[sum(1 for separator in separators if separator.middle < unit.middle)].append(unit)
+        if id(unit) in island_ids:
+            floating[band_of(unit)].append(unit)
+        elif id(unit) not in crossing_ids:
+            bands[band_of(unit)].append(unit)
     segments, columns_found = [], False
     for number, band in enumerate(bands):
         slots: List[List[_Unit]] = [[] for _ in range(len(gutters) + 1)]
         for unit in band:
             slots[sum(1 for _, high in gutters if unit.box[0] >= high - 1.0)].append(unit)
         filled = [slot for slot in slots if slot]
-        if len(filled) >= 2:
-            if _is_columns(filled):
-                if len(filled) == 2 and _secondary(filled[0], filled[1]):
-                    filled = [filled[1], filled[0]]
-                segments.append(("columns", filled))
-                columns_found = True
-            else:
-                segments.append(("keep", [band]))
-        elif band:
-            segments.append(("band", [band]))
+        if len(filled) >= 2 and _is_columns(filled):
+            if len(filled) == 2 and _secondary(filled[0], filled[1]):
+                filled = [filled[1], filled[0]]
+            segments.append(("columns", filled))
+            if floating[number]:
+                segments.append(("keep", [floating[number]]))
+            columns_found = True
+        elif band or floating[number]:
+            rest = sorted(band + floating[number], key=lambda unit: unit.members[0])
+            segments.append(("keep" if len(filled) >= 2 or floating[number] else "band", [rest]))
         if number < len(separators):
             segments.append(("keep", [[separators[number]]]))
     return segments if columns_found else None
@@ -240,20 +265,35 @@ def _crosses(unit: _Unit, gutter: Tuple[float, float]) -> bool:
     return unit.box[2] > low + 1.0 and unit.box[0] < high - 1.0
 
 
-def _clean(units: List[_Unit], gutter: Tuple[float, float]) -> bool:
-    """Is ``gutter`` a column gutter: text on both sides, and every item across it sitting between
-    the items beside it (above or below them, never next to them)?"""
+def _clean(units: List[_Unit], gutter: Tuple[float, float]) -> Optional[List[_Unit]]:
+    """The islands of ``gutter`` when it is a column gutter, None when it is not.
+
+    A column gutter has text on both sides, and every item across it sits between the items
+    beside it (above or below them, never next to them), except for at most two islands: text
+    items across the whole gutter, clear of the outer quarter of the columns on both sides and
+    lower than 40% of the text beside them (a pull-quote with the columns wrapped around it)."""
     low, high = gutter
     left = [unit for unit in units if unit.box[2] <= low + 1.0]
     right = [unit for unit in units if unit.box[0] >= high - 1.0]
     if not any(unit.kind == "text" for unit in left) or not any(unit.kind == "text" for unit in right):
-        return False
+        return None
     beside = left + right
+    outer_left = min(unit.box[0] for unit in left)
+    outer_right = max(unit.box[2] for unit in right)
+    extent = max(unit.box[3] for unit in beside) - min(unit.box[1] for unit in beside)
+    islands = []
     for unit in units:
-        if _crosses(unit, gutter) and any(
+        if not _crosses(unit, gutter) or not any(
                 _overlap(unit, other) > max(1.5, 0.25 * min(unit.height, other.height)) for other in beside):
-            return False
-    return True
+            continue
+        island = (unit.kind == "text" and unit.box[0] < low - 1.0 and unit.box[2] > high + 1.0
+                  and unit.box[0] >= outer_left + 0.25 * (low - outer_left)
+                  and unit.box[2] <= outer_right - 0.25 * (outer_right - high)
+                  and unit.height <= 0.4 * extent)
+        if not island or len(islands) == 2:
+            return None
+        islands.append(unit)
+    return islands
 
 
 def _is_columns(slots: List[List[_Unit]]) -> bool:

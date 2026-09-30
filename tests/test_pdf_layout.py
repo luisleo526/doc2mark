@@ -68,3 +68,12 @@ def test_pieces_of_one_block_stay_together_and_the_result_is_a_permutation():
     first, second = [k for k, region in enumerate(regions) if region.group == 7]
     assert order.index(second) == order.index(first) + 1
     assert order != list(range(len(regions)))   # the columns were reordered
+
+
+def test_background_picture_does_not_hide_the_columns():
+    background = Region((0, 0, 595, 842), "image")
+    left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
+    right = [paragraph(305, 100, 15), paragraph(305, 300, 25)]
+    regions = by_top([background] + left + right)
+    order = [regions[k] for k in reading_order(regions)]
+    assert order == [background] + left + right
