@@ -18,14 +18,161 @@ from doc2mark.ocr.base import BaseOCR
 # Import the advanced pipeline loader
 try:
     from doc2mark.pipelines.office_advanced_pipeline import (
-        DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader
+        DocxLoader, PptxLoader, XlsxLoader, UniversalOfficeLoader,
+        _W_T, _attr_int, _docx_rendered,
     )
     ADVANCED_PIPELINE_AVAILABLE = True
-except ImportError:
+    _PIPELINE_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as _exc:
     ADVANCED_PIPELINE_AVAILABLE = False
+    _PIPELINE_IMPORT_ERROR = _exc
     logging.warning("Advanced Office pipeline not available. Using basic processing.")
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pipeline_helpers() -> None:
+    """The route signals walk OOXML with the Office pipeline's helpers (``_docx_rendered``,
+    ``_attr_int``, ``_W_T``); without the pipeline, fail with that reason instead of a
+    NameError. The route records the error and the document stays on native extraction."""
+    if not ADVANCED_PIPELINE_AVAILABLE:
+        raise ProcessingError(
+            "Office image-route signals need doc2mark.pipelines.office_advanced_pipeline, "
+            f"which failed to import: {_PIPELINE_IMPORT_ERROR}"
+        )
+
+_P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+_WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+_WP_INLINE = f'{{{_WP_NS}}}inline'
+_WP_ANCHOR = f'{{{_WP_NS}}}anchor'
+_WP_EXTENT = f'{{{_WP_NS}}}extent'
+_PIC_PIC = '{http://schemas.openxmlformats.org/drawingml/2006/picture}pic'
+
+
+def _union_area(rects, width: float, height: float) -> float:
+    """Area covered by the union of ``(x0, y0, x1, y1)`` rectangles clipped to the page."""
+    clipped = []
+    for x0, y0, x1, y1 in rects:
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        x0, y0, x1, y1 = max(x0, 0.0), max(y0, 0.0), min(x1, width), min(y1, height)
+        if x1 > x0 and y1 > y0:
+            clipped.append((x0, y0, x1, y1))
+    xs = sorted({x for rect in clipped for x in (rect[0], rect[2])})
+    area = 0.0
+    for left, right in zip(xs, xs[1:]):
+        spans = sorted((r[1], r[3]) for r in clipped if r[0] <= left and r[2] >= right)
+        covered, start, end = 0.0, None, None
+        for top, bottom in spans:
+            if end is None or top > end:
+                covered += 0.0 if end is None else end - start
+                start, end = top, bottom
+            else:
+                end = max(end, bottom)
+        covered += 0.0 if end is None else end - start
+        area += covered * (right - left)
+    return area
+
+
+def _pptx_background_picture(slide):
+    """The ``a:blipFill`` of the background shown on ``slide`` (its own, else its
+    layout's, else its master's), or None when that background is not a picture."""
+    layout = slide.slide_layout
+    for owner in (slide, layout, layout.slide_master):
+        background = owner._element.find(f'{{{_P_NS}}}cSld/{{{_P_NS}}}bg')
+        if background is not None:
+            return background.find(f'{{{_P_NS}}}bgPr/{{{_A_NS}}}blipFill')
+    return None
+
+
+def _pptx_inherited_shapes(slide) -> list:
+    """Shape trees of the layout and master that are drawn on ``slide``."""
+    if slide._element.get('showMasterSp') in ('0', 'false'):
+        return []
+    layout = slide.slide_layout
+    trees = [layout.shapes]
+    if layout._element.get('showMasterSp') not in ('0', 'false'):
+        trees.append(layout.slide_master.shapes)
+    return trees
+
+
+def _pptx_hidden(shape) -> bool:
+    c_nv_pr = shape._element.find(f'./*/{{{_P_NS}}}cNvPr')
+    return c_nv_pr is not None and c_nv_pr.get('hidden') in ('1', 'true')
+
+
+def _pptx_walk_shapes(shapes, transform=(1.0, 0.0, 1.0, 0.0)):
+    """Yield ``(shape, (x0, y0, x1, y1))`` for every visible shape, recursing into
+    groups; rectangles are in slide coordinates (group child offsets/extents applied)."""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    sx, dx, sy, dy = transform
+    for shape in shapes:
+        if _pptx_hidden(shape):
+            continue
+        try:
+            left, top = float(shape.left or 0), float(shape.top or 0)
+            width, height = float(shape.width or 0), float(shape.height or 0)
+        except (AttributeError, TypeError, ValueError):
+            left = top = width = height = 0.0
+        yield shape, (left * sx + dx, top * sy + dy, (left + width) * sx + dx, (top + height) * sy + dy)
+        try:
+            is_group = shape.shape_type == MSO_SHAPE_TYPE.GROUP
+        except (AttributeError, NotImplementedError):
+            is_group = False
+        if not is_group:
+            continue
+        xfrm = shape._element.find(f'{{{_P_NS}}}grpSpPr/{{{_A_NS}}}xfrm')
+        child = (1.0, 0.0, 1.0, 0.0)
+        if xfrm is not None:
+            off, ext = xfrm.find(f'{{{_A_NS}}}off'), xfrm.find(f'{{{_A_NS}}}ext')
+            ch_off, ch_ext = xfrm.find(f'{{{_A_NS}}}chOff'), xfrm.find(f'{{{_A_NS}}}chExt')
+            if None not in (off, ext, ch_off, ch_ext):
+                csx = _attr_int(ext, 'cx') / _attr_int(ch_ext, 'cx') if _attr_int(ch_ext, 'cx') else 1.0
+                csy = _attr_int(ext, 'cy') / _attr_int(ch_ext, 'cy') if _attr_int(ch_ext, 'cy') else 1.0
+                child = (csx, _attr_int(off, 'x') - _attr_int(ch_off, 'x') * csx,
+                         csy, _attr_int(off, 'y') - _attr_int(ch_off, 'y') * csy)
+        yield from _pptx_walk_shapes(shape.shapes, (child[0] * sx, child[1] * sx + dx, child[2] * sy, child[3] * sy + dy))
+
+
+def _pptx_is_picture(shape) -> bool:
+    """A picture shape (placeholder pictures included) or a shape filled with a picture."""
+    element = shape._element
+    if element.tag == f'{{{_P_NS}}}pic':
+        return True
+    sp_pr = element.find(f'{{{_P_NS}}}spPr')
+    return sp_pr is not None and sp_pr.find(f'{{{_A_NS}}}blipFill') is not None
+
+
+def _pptx_text_length(shape) -> int:
+    length = 0
+    if getattr(shape, 'has_text_frame', False):
+        length += len(shape.text_frame.text)
+    if getattr(shape, 'has_table', False):
+        length += sum(len(cell.text) for row in shape.table.rows for cell in row.cells)
+    return length
+
+
+def _pdf_document_route(pdf_path, ocr=None, table_style=None) -> Optional[str]:
+    """The PDF pipeline's document-level route for ``pdf_path``: ``"image"`` or ``"text"``,
+    or None when the PDF side does not answer in that shape.
+
+    The only call the Office route makes into the PDF pipeline's internals
+    (``PDFLoader._document_image_strategy``, owned by the PDF route); callers treat None
+    as "stay native". ``tests/test_office_route.py`` pins this contract, so a change on
+    the PDF side fails a test instead of silently re-routing Office documents.
+    """
+    from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
+    loader = PDFLoader(pdf_path, ocr=ocr, table_style=table_style)
+    try:
+        decide = getattr(loader, '_document_image_strategy', None)
+        route = decide() if callable(decide) else None
+    finally:
+        loader.close()
+    if route in ('image', 'text'):
+        return route
+    logger.warning(f"PDF route for {Path(pdf_path).name} answered {route!r} instead of 'image'/'text'")
+    return None
 
 
 class OfficeProcessor(BaseProcessor):
@@ -111,8 +258,10 @@ class OfficeProcessor(BaseProcessor):
         # text layer) have no faithful OOXML text to extract — route them through the
         # PDF image strategy (whole-page render OCR + page_markdown synthesis), the
         # same content-based decision the PDF pipeline already makes. Text/table office
-        # docs stay on the native path; any failure falls back to native extraction.
-        routed = self._maybe_route_image_dominant(file_path, file_size, **kwargs)
+        # docs stay on the native path; any failure falls back to native extraction
+        # and is recorded in ``metadata.extra`` (``routed_via``/``route_error``).
+        route_info: Dict[str, Any] = {}
+        routed = self._maybe_route_image_dominant(file_path, file_size, route_info=route_info, **kwargs)
         if routed is not None:
             return routed
 
@@ -149,6 +298,8 @@ class OfficeProcessor(BaseProcessor):
             size_bytes=file_size,
             **metadata
         )
+        if route_info:
+            doc_metadata.extra.update(route_info)
 
         return ProcessedDocument(
             content=content,
@@ -161,12 +312,21 @@ class OfficeProcessor(BaseProcessor):
     # Office image-dominance route — delegates to the PDF image strategy   #
     # ------------------------------------------------------------------ #
     def _maybe_route_image_dominant(
-        self, file_path: Path, file_size: int, **kwargs
+        self, file_path: Path, file_size: int, route_info: Optional[Dict[str, Any]] = None, **kwargs
     ) -> Optional[ProcessedDocument]:
         """Return a ProcessedDocument via the PDF image strategy when this office
         doc is image-dominant; else None so the caller continues with native
         extraction. Gated to docx/pptx with OCR enabled; never raises (any failure
-        — including no LibreOffice — falls back to native)."""
+        — including no LibreOffice — falls back to native).
+
+        The OOXML signals are only a cheap pre-filter. A document they flag is
+        converted to PDF, and the converted PDF's own route decision is final: when
+        it routes ``text`` the document goes back to native extraction. Whenever
+        routing was attempted but the document stays native, ``route_info`` gets
+        ``routed_via='native'`` plus ``route_reason`` (the PDF routes text) or
+        ``route_error`` (conversion or PDF processing failed), so the caller can
+        record it in ``metadata.extra`` instead of falling back silently.
+        """
         ext = file_path.suffix.lower().lstrip('.')
         if ext not in ('docx', 'pptx'):                 # xlsx (data grids) never routes
             return None
@@ -176,11 +336,14 @@ class OfficeProcessor(BaseProcessor):
         try:
             if not self._is_image_dominant(file_path):
                 return None
-            return self._process_as_image_dominant(file_path, file_size, **kwargs)
+            return self._process_as_image_dominant(file_path, file_size, route_info=route_info, **kwargs)
         except Exception as e:
             logger.warning(
                 f"Office image-dominance route unavailable ({e}); using native extraction"
             )
+            if route_info is not None:
+                route_info['routed_via'] = 'native'
+                route_info['route_error'] = str(e).strip()[:500] or type(e).__name__
             return None
 
     def _is_image_dominant(self, file_path: Path) -> bool:
@@ -201,57 +364,100 @@ class OfficeProcessor(BaseProcessor):
         return strategy == 'image'
 
     def _pptx_image_signals(self, file_path: Path) -> Tuple[float, float]:
-        """Mean picture coverage + mean text chars per slide (python-pptx)."""
+        """Mean picture coverage + mean text chars per slide, counted the way the
+        converted PDF shows them.
+
+        Coverage is the union area, clipped to the slide, of every visible picture:
+        picture shapes at any group depth, pictures in placeholders, shapes filled
+        with a picture, the background picture fill that shows on the slide (its
+        own, else its layout's, else its master's) and non-placeholder pictures the
+        layout and master draw on it. Text counts every visible text frame and
+        table cell, grouped ones included. Hidden shapes count for neither.
+        """
+        _require_pipeline_helpers()
         from pptx import Presentation
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
         prs = Presentation(str(file_path))
-        slide_area = float((prs.slide_width or 0) * (prs.slide_height or 0)) or 1.0
+        width, height = float(prs.slide_width or 0), float(prs.slide_height or 0)
+        slide_area = (width * height) or 1.0
         covs: List[float] = []
         texts: List[int] = []
         for slide in prs.slides:
-            img_area = 0.0
+            rects: List[Tuple[float, float, float, float]] = []
+            if _pptx_background_picture(slide) is not None:
+                rects.append((0.0, 0.0, width, height))
+            for shapes in _pptx_inherited_shapes(slide):
+                rects.extend(rect for shape, rect in _pptx_walk_shapes(shapes)
+                             if not shape.is_placeholder and _pptx_is_picture(shape))
             txt = 0
-            for shape in slide.shapes:
-                try:
-                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                        img_area += float((shape.width or 0) * (shape.height or 0))
-                except Exception:
-                    pass
-                if getattr(shape, 'has_text_frame', False):
-                    txt += len(shape.text_frame.text)
-            covs.append(min(img_area / slide_area, 1.0))
+            for shape, rect in _pptx_walk_shapes(slide.shapes):
+                if _pptx_is_picture(shape):
+                    rects.append(rect)
+                txt += _pptx_text_length(shape)
+            covs.append(min(_union_area(rects, width, height) / slide_area, 1.0))
             texts.append(txt)
         n = len(covs) or 1
         return sum(covs) / n, sum(texts) / n
 
     def _docx_image_signals(self, file_path: Path) -> Tuple[float, float]:
-        """Total picture coverage (vs one page) + total text chars (python-docx).
+        """Total picture coverage (vs one page) + total text chars, counted the way
+        the converted PDF shows them: text and pictures in the body (paragraphs,
+        tables, content controls, text boxes) and in every header and footer.
+        Deleted revisions and ``mc:Fallback`` copies of drawings are skipped.
 
-        Totals (not per-page) suffice for the decision: a real multi-page text doc
-        easily exceeds the 200-char text limit, while python-docx undercounting
-        anchored/floating images biases toward 'text' — the safe direction.
+        Totals (not per-page) suffice for this pre-filter: a real multi-page text doc
+        easily exceeds the 200-char text limit, and a document it flags is converted
+        so the converted PDF decides.
         """
+        _require_pipeline_helpers()
         import docx
         d = docx.Document(str(file_path))
-        text_len = sum(len(p.text) for p in d.paragraphs)
+        roots = [d.element.body]
+        for rel in d.part.rels.values():
+            if rel.reltype.endswith(('/header', '/footer')) and not rel.is_external:
+                roots.append(rel.target_part.element)
+        text_len = 0
+        img_area = 0.0
+        for root in roots:
+            for el in _docx_rendered(root):
+                if el.tag == _W_T:
+                    text_len += len(el.text or '')
+                elif el.tag in (_WP_INLINE, _WP_ANCHOR) and el.find(f'.//{_PIC_PIC}') is not None:
+                    extent = el.find(_WP_EXTENT)
+                    if extent is not None:
+                        img_area += _attr_int(extent, 'cx') * float(_attr_int(extent, 'cy'))
         sect = d.sections[0]
         page_area = float((sect.page_width or 0) * (sect.page_height or 0)) or 1.0
-        img_area = sum(float((s.width or 0) * (s.height or 0)) for s in d.inline_shapes)
         return min(img_area / page_area, 1.0), float(text_len)
 
     def _process_as_image_dominant(
-        self, file_path: Path, file_size: int, **kwargs
-    ) -> ProcessedDocument:
-        """Convert the office doc to PDF and process it with the PDF image strategy
-        (whole-page render OCR + page_markdown synthesis), then restore the office
-        identity in the metadata."""
+        self, file_path: Path, file_size: int, route_info: Optional[Dict[str, Any]] = None, **kwargs
+    ) -> Optional[ProcessedDocument]:
+        """Convert the office doc to PDF and, when the converted PDF routes
+        ``image``, process it with the PDF image strategy (whole-page render OCR +
+        page_markdown synthesis), then restore the office identity in the metadata.
+
+        Only the converted PDF's decision counts, and only ``image`` routes: when it is
+        ``text`` (the OOXML pre-filter over-estimated the pictures) or cannot be read
+        (:func:`_pdf_document_route` answers None), this returns None and the caller uses
+        native extraction, which keeps the OOXML tables and structure. The PDF pipeline
+        evaluates the same rule on the same file, so an ``image`` decision here cannot
+        turn into a PDF text-route extraction.
+        """
         import tempfile
         from doc2mark.utils.libreoffice import convert_office_to
         from doc2mark.formats.pdf import PDFProcessor
         ext = file_path.suffix.lower().lstrip('.')
         doc_format = DocumentFormat.DOCX if ext == 'docx' else DocumentFormat.PPTX
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             pdf_path = convert_office_to(file_path, 'pdf', tmp, timeout=300)
+            route = _pdf_document_route(pdf_path, ocr=self.ocr, table_style=self.table_style)
+            if route != 'image':
+                reason = 'converted PDF routes text' if route == 'text' else 'converted PDF route unavailable'
+                logger.info(f"📑 {file_path.name}: {reason}; using native extraction")
+                if route_info is not None:
+                    route_info['routed_via'] = 'native'
+                    route_info['route_reason'] = reason
+                return None
             pdf_proc = PDFProcessor(ocr=self.ocr, table_style=self.table_style)
             result = pdf_proc.process(
                 pdf_path,

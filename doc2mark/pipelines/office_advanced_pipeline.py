@@ -1,8 +1,10 @@
 import base64
+import bisect
 import hashlib
 import json
 import logging
 import re
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
 
@@ -30,6 +32,7 @@ def _safe_lxml_parser():
 
 
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
+from doc2mark.utils.number_format import format_cell_value  # noqa: E402
 
 # Office document libraries
 try:
@@ -39,8 +42,6 @@ try:
     from docx.shape import InlineShape
     from docx.enum.shape import WD_INLINE_SHAPE
     from docx.oxml.ns import qn
-    import docx.oxml.text.paragraph
-    import docx.oxml.table
 except ImportError:
     raise ImportError("python-docx is required. Install with: pip install python-docx")
 
@@ -56,11 +57,6 @@ try:
 except ImportError:
     raise ImportError("openpyxl is required. Install with: pip install openpyxl")
 
-try:
-    import pandas as pd
-except ImportError:
-    raise ImportError("pandas is required. Install with: pip install pandas")
-
 # Import VisionAgent for OCR functionality (optional)
 try:
     from doc2mark.ocr.openai import VisionAgent
@@ -71,6 +67,537 @@ except ImportError:
     logging.warning("OCR functionality not available. Install VisionAgent to enable OCR.")
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# WordprocessingML text walking                                                #
+# --------------------------------------------------------------------------- #
+# python-docx only reads runs that are direct children of a paragraph (or of a
+# hyperlink) and paragraphs/tables that are direct children of the body or a cell.
+# Text inside content controls, tracked insertions, simple fields, smart tags,
+# custom XML and nested tables was silently dropped, so DOCX text is read from
+# the XML tree instead.
+
+_W_P, _W_R, _W_T = qn('w:p'), qn('w:r'), qn('w:t')
+_W_TAB, _W_PTAB, _W_BR, _W_CR = qn('w:tab'), qn('w:ptab'), qn('w:br'), qn('w:cr')
+_W_NO_BREAK_HYPHEN = qn('w:noBreakHyphen')
+_W_TYPE, _W_VAL = qn('w:type'), qn('w:val')
+_W_TBL, _W_TR, _W_TC = qn('w:tbl'), qn('w:tr'), qn('w:tc')
+_W_TR_PR, _W_TC_PR = qn('w:trPr'), qn('w:tcPr')
+_W_GRID_BEFORE, _W_GRID_AFTER, _W_GRID_SPAN = qn('w:gridBefore'), qn('w:gridAfter'), qn('w:gridSpan')
+_W_V_MERGE, _W_H_MERGE = qn('w:vMerge'), qn('w:hMerge')
+_W_TBL_GRID, _W_GRID_COL = qn('w:tblGrid'), qn('w:gridCol')
+_W_SDT, _W_SDT_CONTENT, _W_CUSTOM_XML = qn('w:sdt'), qn('w:sdtContent'), qn('w:customXml')
+_W_DEL, _W_MOVE_FROM, _W_DRAWING = qn('w:del'), qn('w:moveFrom'), qn('w:drawing')
+_W_PPR, _W_P_STYLE, _W_NUM_PR = qn('w:pPr'), qn('w:pStyle'), qn('w:numPr')
+_W_NUM_ID, _W_ILVL, _W_OUTLINE_LVL = qn('w:numId'), qn('w:ilvl'), qn('w:outlineLvl')
+_M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+_M_OMATH, _M_OMATH_PARA, _M_T = f'{{{_M_NS}}}oMath', f'{{{_M_NS}}}oMathPara', f'{{{_M_NS}}}t'
+_MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
+_MC_ALTERNATE_CONTENT = f'{{{_MC_NS}}}AlternateContent'
+_MC_CHOICE, _MC_FALLBACK = f'{{{_MC_NS}}}Choice', f'{{{_MC_NS}}}Fallback'
+
+# Paragraph-level elements whose content the reader does not see: properties,
+# deleted revisions and the moved-from copy of moved text.
+_DOCX_UNSEEN = frozenset({
+    _W_PPR, qn('w:rPr'), _W_DEL, _W_MOVE_FROM, qn('w:sdtPr'), qn('w:sdtEndPr'),
+})
+
+
+def _docx_paragraph_content(element):
+    """Yield the runs (``w:r``) and math zones of a paragraph in reading order.
+
+    Descends into hyperlinks, content controls (``w:sdt``), tracked insertions
+    (``w:ins``) and moves (``w:moveTo``), simple fields (``w:fldSimple``), smart
+    tags and custom XML; skips deleted text (``w:del``) and ``w:moveFrom``.
+    """
+    for child in element:
+        tag = child.tag
+        if not isinstance(tag, str) or tag in _DOCX_UNSEEN:
+            continue
+        if tag == _W_R or tag in (_M_OMATH, _M_OMATH_PARA):
+            yield child
+        elif tag == _MC_ALTERNATE_CONTENT:
+            branch = child.find(_MC_CHOICE)
+            if branch is None:
+                branch = child.find(_MC_FALLBACK)
+            if branch is not None:
+                yield from _docx_paragraph_content(branch)
+        else:
+            yield from _docx_paragraph_content(child)
+
+
+def _docx_run_text(run) -> str:
+    """Text of a run as python-docx reads it (``w:t``, tabs, line breaks, non-breaking
+    hyphens; field instructions and deleted text excluded), or of a math zone."""
+    if run.tag != _W_R:
+        return ''.join(t.text or '' for t in run.iter(_M_T))
+    parts = []
+    for child in run:
+        tag = child.tag
+        if tag == _W_T:
+            parts.append(child.text or '')
+        elif tag in (_W_TAB, _W_PTAB):
+            parts.append('\t')
+        elif tag == _W_BR:
+            parts.append('\n' if child.get(_W_TYPE, 'textWrapping') == 'textWrapping' else '')
+        elif tag == _W_CR:
+            parts.append('\n')
+        elif tag == _W_NO_BREAK_HYPHEN:
+            parts.append('-')
+    return ''.join(parts)
+
+
+def _docx_blocks(container):
+    """Yield the paragraphs and tables of a body, cell or content control in document
+    order, looking inside block-level content controls and custom XML."""
+    for child in container:
+        tag = child.tag
+        if tag == _W_P or tag == _W_TBL:
+            yield child
+        elif tag == _W_SDT:
+            content = child.find(_W_SDT_CONTENT)
+            if content is not None:
+                yield from _docx_blocks(content)
+        elif tag == _W_CUSTOM_XML:
+            yield from _docx_blocks(child)
+
+
+def _docx_children(element, tag):
+    """``tag`` children (rows of a table, cells of a row), including those wrapped in
+    content controls or custom XML."""
+    for child in element:
+        if child.tag == tag:
+            yield child
+        elif child.tag == _W_SDT:
+            content = child.find(_W_SDT_CONTENT)
+            if content is not None:
+                yield from _docx_children(content, tag)
+        elif child.tag == _W_CUSTOM_XML:
+            yield from _docx_children(child, tag)
+
+
+def _docx_int(element, default: int = 0) -> int:
+    """``w:val`` of ``element`` as an int; ``default`` when absent or malformed."""
+    if element is None:
+        return default
+    try:
+        return int(element.get(_W_VAL, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _docx_rendered(root):
+    """Every element under ``root`` in document order, minus deleted revisions,
+    moved-from copies and ``mc:Fallback`` duplicates."""
+    unseen = (_W_DEL, _W_MOVE_FROM, _MC_FALLBACK)
+    stack = [iter(root)]
+    while stack:
+        for element in stack[-1]:
+            if not isinstance(element.tag, str) or element.tag in unseen:
+                continue
+            yield element
+            stack.append(iter(element))
+            break
+        else:
+            stack.pop()
+
+
+def _attr_int(element, name: str, default: int = 0) -> int:
+    try:
+        return int(element.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _roman(number: int) -> str:
+    numerals = ((1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'), (100, 'C'), (90, 'XC'),
+                (50, 'L'), (40, 'XL'), (10, 'X'), (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I'))
+    out = []
+    for value, symbol in numerals:
+        count, number = divmod(number, value)
+        out.append(symbol * count)
+    return ''.join(out)
+
+
+_CJK_DIGITS = '〇一二三四五六七八九'
+_CJK_COUNTING = ('零一二三四五六七八九', '千百十', True)
+_CJK_LEGAL_TRADITIONAL = ('零壹貳參肆伍陸柒捌玖', '仟佰拾', False)
+_CJK_LEGAL_SIMPLIFIED = ('零壹贰叁肆伍陆柒捌玖', '仟佰拾', False)
+
+
+def _cjk_counting(number: int, numerals=_CJK_COUNTING) -> str:
+    """一, 十, 十一, 二十, 一百零一 (or 壹, 壹拾, 壹拾壹 ... in the legal forms) for
+    numbers below 10,000; larger ones stay Arabic."""
+    if not 0 < number < 10000:
+        return str(number)
+    digits, units, bare_ten = numerals
+    out, zero_pending = [], False
+    for unit_value, unit in ((1000, units[0]), (100, units[1]), (10, units[2]), (1, '')):
+        digit, number = divmod(number, unit_value)
+        if digit:
+            if zero_pending:
+                out.append(digits[0])
+                zero_pending = False
+            leading_ten = bare_ten and unit_value == 10 and digit == 1 and not out
+            out.append(('' if leading_ten else digits[digit]) + unit)
+        elif out:
+            zero_pending = True
+    return ''.join(out)
+
+
+def _format_list_number(number: int, fmt: str) -> str:
+    """One list counter in a Word ``w:numFmt``."""
+    if fmt == 'decimalZero':
+        return f'{number:02d}'
+    if fmt in ('upperRoman', 'lowerRoman'):
+        text = _roman(number) if number > 0 else str(number)
+        return text if fmt == 'upperRoman' else text.lower()
+    if fmt in ('upperLetter', 'lowerLetter'):
+        if number <= 0:
+            return str(number)
+        letter = chr(ord('A') + (number - 1) % 26) * ((number - 1) // 26 + 1)
+        return letter if fmt == 'upperLetter' else letter.lower()
+    if fmt in ('decimalFullWidth', 'decimalFullWidth2'):
+        return ''.join(chr(ord(ch) + 0xFEE0) for ch in str(number))
+    if fmt.startswith('decimalEnclosedCircle') and 0 < number <= 20:
+        return chr(0x2460 + number - 1)
+    if fmt in ('chineseCounting', 'chineseCountingThousand', 'taiwaneseCounting',
+               'taiwaneseCountingThousand', 'japaneseCounting'):
+        return _cjk_counting(number)
+    if fmt == 'ideographLegalTraditional':
+        return _cjk_counting(number, _CJK_LEGAL_TRADITIONAL)
+    if fmt == 'chineseLegalSimplified':
+        return _cjk_counting(number, _CJK_LEGAL_SIMPLIFIED)
+    if fmt in ('ideographDigital', 'taiwaneseDigital', 'japaneseDigitalTenThousand'):
+        return ''.join(_CJK_DIGITS[int(ch)] for ch in str(number))
+    if fmt == 'ideographTraditional' and 0 < number <= 10:
+        return '甲乙丙丁戊己庚辛壬癸'[number - 1]
+    if fmt == 'ideographZodiac' and 0 < number <= 12:
+        return '子丑寅卯辰巳午未申酉戌亥'[number - 1]
+    return str(number)
+
+
+class _DocxStructure:
+    """Paragraph structure Word shows but python-docx does not expose: list numbers
+    and bullets (``word/numbering.xml``) and outline (heading) levels.
+
+    ``list_marker`` must be called once per paragraph in document order: counters are
+    kept per abstract numbering definition, deeper levels restart when a shallower
+    level advances, and a ``w:startOverride`` restarts a level when its list instance
+    is first used.
+    """
+
+    _MAX_STYLE_DEPTH = 20
+
+    def __init__(self, document):
+        self._styles: Dict[str, Any] = {}
+        self._default_style: Optional[str] = None
+        self._nums: Dict[int, Tuple[Optional[int], Dict[int, int]]] = {}
+        self._levels: Dict[int, Dict[int, Tuple[str, Optional[str], int, bool]]] = {}
+        self._level_styles: Dict[int, Dict[str, int]] = {}
+        self._style_links: Dict[int, str] = {}
+        self._counters: Dict[int, Dict[int, int]] = {}
+        self._started: set = set()
+        try:
+            for style in document.styles.element.findall(qn('w:style')):
+                style_id = style.get(qn('w:styleId'))
+                self._styles[style_id] = style
+                if style.get(qn('w:type')) == 'paragraph' and style.get(qn('w:default')) in ('1', 'true', 'on'):
+                    self._default_style = style_id
+        except Exception as e:
+            logger.debug(f"DOCX styles unavailable: {e}")
+        try:
+            numbering = document.part.numbering_part.element
+        except Exception:
+            numbering = None  # the package has no numbering part
+        if numbering is None:
+            return
+        for abstract in numbering.findall(qn('w:abstractNum')):
+            abstract_id = _attr_int(abstract, qn('w:abstractNumId'))
+            levels, level_styles = {}, {}
+            for lvl in abstract.findall(qn('w:lvl')):
+                ilvl = _attr_int(lvl, _W_ILVL)
+                fmt = lvl.find(qn('w:numFmt'))
+                text = lvl.find(qn('w:lvlText'))
+                picture_bullet = lvl.find(qn('w:lvlPicBulletId')) is not None
+                levels[ilvl] = (
+                    'bullet' if picture_bullet else (fmt.get(_W_VAL, 'decimal') if fmt is not None else 'decimal'),
+                    text.get(_W_VAL) if text is not None else None,
+                    _docx_int(lvl.find(qn('w:start')), 1) if lvl.find(qn('w:start')) is not None else 1,
+                    lvl.find(qn('w:isLgl')) is not None,
+                )
+                p_style = lvl.find(_W_P_STYLE)
+                if p_style is not None:
+                    level_styles[p_style.get(_W_VAL)] = ilvl
+            self._levels[abstract_id] = levels
+            self._level_styles[abstract_id] = level_styles
+            link = abstract.find(qn('w:numStyleLink'))
+            if link is not None:
+                self._style_links[abstract_id] = link.get(_W_VAL)
+        for num in numbering.findall(qn('w:num')):
+            abstract_ref = num.find(qn('w:abstractNumId'))
+            overrides = {}
+            for override in num.findall(qn('w:lvlOverride')):
+                start = override.find(qn('w:startOverride'))
+                if start is not None:
+                    overrides[_attr_int(override, _W_ILVL)] = _docx_int(start, 1)
+            self._nums[_attr_int(num, qn('w:numId'))] = (
+                _docx_int(abstract_ref, -1) if abstract_ref is not None else None, overrides)
+
+    def _style_chain(self, p_el):
+        ppr = p_el.find(_W_PPR)
+        style_ref = ppr.find(_W_P_STYLE) if ppr is not None else None
+        style_id = style_ref.get(_W_VAL) if style_ref is not None else self._default_style
+        seen = set()
+        while style_id and style_id not in seen and len(seen) < self._MAX_STYLE_DEPTH:
+            seen.add(style_id)
+            style = self._styles.get(style_id)
+            if style is None:
+                return
+            yield style_id, style
+            based_on = style.find(qn('w:basedOn'))
+            style_id = based_on.get(_W_VAL) if based_on is not None else None
+
+    def outline_level(self, p_el) -> Optional[int]:
+        """The outline level set on the paragraph or, failing that, the nearest style of its
+        chain: 0-8 for heading levels 1-9, 9 for body text; None when none is set."""
+        ppr = p_el.find(_W_PPR)
+        if ppr is not None and ppr.find(_W_OUTLINE_LVL) is not None:
+            return min(max(_docx_int(ppr.find(_W_OUTLINE_LVL), 9), 0), 9)
+        for _, style in self._style_chain(p_el):
+            style_ppr = style.find(_W_PPR)
+            if style_ppr is not None and style_ppr.find(_W_OUTLINE_LVL) is not None:
+                return min(max(_docx_int(style_ppr.find(_W_OUTLINE_LVL), 9), 0), 9)
+        return None
+
+    def _num_pr(self, p_el) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+        """(numId, ilvl, id of the style that supplied the numbering)."""
+        num_id = ilvl = None
+        source_style = None
+        ppr = p_el.find(_W_PPR)
+        num_pr = ppr.find(_W_NUM_PR) if ppr is not None else None
+        if num_pr is not None:
+            if num_pr.find(_W_NUM_ID) is not None:
+                num_id = _docx_int(num_pr.find(_W_NUM_ID), 0)
+            if num_pr.find(_W_ILVL) is not None:
+                ilvl = _docx_int(num_pr.find(_W_ILVL), 0)
+        for style_id, style in self._style_chain(p_el):
+            if num_id is not None and ilvl is not None:
+                break
+            style_ppr = style.find(_W_PPR)
+            style_num = style_ppr.find(_W_NUM_PR) if style_ppr is not None else None
+            if style_num is None:
+                continue
+            if num_id is None and style_num.find(_W_NUM_ID) is not None:
+                num_id = _docx_int(style_num.find(_W_NUM_ID), 0)
+                source_style = style_id
+            if ilvl is None and style_num.find(_W_ILVL) is not None:
+                ilvl = _docx_int(style_num.find(_W_ILVL), 0)
+        return num_id, ilvl, source_style
+
+    def _abstract_for(self, num_id: int) -> Optional[int]:
+        abstract_id = self._nums.get(num_id, (None, {}))[0]
+        # A list that only links to a numbering style takes that style's definition.
+        link = self._style_links.get(abstract_id)
+        if link and not self._levels.get(abstract_id):
+            style = self._styles.get(link)
+            style_ppr = style.find(_W_PPR) if style is not None else None
+            style_num = style_ppr.find(_W_NUM_PR) if style_ppr is not None else None
+            linked = _docx_int(style_num.find(_W_NUM_ID), 0) if style_num is not None else 0
+            if linked and linked != num_id:
+                abstract_id = self._nums.get(linked, (None, {}))[0]
+        return abstract_id
+
+    def list_marker(self, p_el) -> Optional[Tuple[str, int]]:
+        """(marker, level) for a list paragraph: ``"1."``, ``"a)"``, ``"1.2."`` from
+        the level's text and number format, ``"-"`` for bullets; None otherwise."""
+        num_id, ilvl, source_style = self._num_pr(p_el)
+        if not num_id or num_id not in self._nums:
+            return None
+        abstract_id = self._abstract_for(num_id)
+        levels = self._levels.get(abstract_id)
+        if not levels:
+            return None
+        if ilvl is None:
+            ilvl = self._level_styles.get(abstract_id, {}).get(source_style, 0)
+        ilvl = max(0, min(ilvl, 8))
+        if ilvl not in levels:
+            return None
+        counters = self._counters.setdefault(abstract_id, {})
+        if num_id not in self._started:
+            self._started.add(num_id)
+            for level, start in self._nums[num_id][1].items():
+                counters[level] = start - 1
+        fmt, text, start, _ = levels[ilvl]
+        counters[ilvl] = counters[ilvl] + 1 if ilvl in counters else start
+        for deeper in [level for level in counters if level > ilvl]:
+            del counters[deeper]
+        if fmt == 'bullet':
+            return '-', ilvl
+        if fmt == 'none' or not text:  # no number shown; any literal level text still is
+            literal = re.sub(r'%[1-9]', '', text or '').strip()
+            return (literal, ilvl) if literal else None
+
+        def counter(match):
+            level = int(match.group(1)) - 1
+            level_fmt, _, level_start, _ = levels.get(level, ('decimal', None, 1, False))
+            value = counters.get(level, level_start)
+            return _format_list_number(value, 'decimal' if levels[ilvl][3] else level_fmt)
+
+        marker = re.sub(r'%([1-9])', counter, text).strip()
+        return (marker, ilvl) if marker else None
+
+
+def _style_list_depth(style_name: str) -> int:
+    """Nesting depth implied by Word's numbered list styles ("List Bullet 2" -> 1)."""
+    match = re.fullmatch(r'list(?: (?:bullet|number|continue))? ([2-9])', (style_name or '').strip().lower())
+    return int(match.group(1)) - 1 if match else 0
+
+
+def _soft_breaks(text: str) -> str:
+    """python-pptx returns a soft line break (``a:br``) as a vertical tab; make it a newline."""
+    return text.replace('\x0b', '\n') if text else text
+
+
+# --------------------------------------------------------------------------- #
+# SpreadsheetML package reading (what openpyxl does not expose)                #
+# --------------------------------------------------------------------------- #
+_CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+_SML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+_SML_C, _SML_F, _SML_V = f'{{{_SML_NS}}}c', f'{{{_SML_NS}}}f', f'{{{_SML_NS}}}v'
+_PKG_REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+_OFFICE_REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+_RD_NS = 'http://schemas.microsoft.com/office/spreadsheetml/2017/richdata'
+_RVREL_NS = 'http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel'
+
+
+def _formula_uncached(cell) -> bool:
+    """A formula cell saved without a cached result: no ``<v>``, or an empty one on a
+    cell that is not a string result (an empty string is a real cached result)."""
+    value = cell.find(_SML_V)
+    if value is None:
+        return True
+    return not (value.text or '').strip() and cell.get('t') != 'str'
+
+
+# A formula element (with or without a namespace prefix: openpyxl writes <f>, the Open XML
+# SDK <x:f>) or a value-metadata attribute (vm="1" or vm='1'; XML allows either quote).
+_FORMULA_OR_RICH_VALUE = re.compile(rb'<(?:[A-Za-z_][\w.-]*:)?f[\s/>]|\svm\s*=\s*["\']')
+_ZIP_SCAN_OVERLAP = 256  # longer than any tag prefix the pattern has to see whole
+
+
+def _zip_member_matches(archive, name: str, pattern) -> bool:
+    """Whether a zip member matches ``pattern`` anywhere (streamed in 1 MiB chunks)."""
+    tail = b''
+    with archive.open(name) as stream:
+        while True:
+            chunk = stream.read(1 << 20)
+            if not chunk:
+                return False
+            window = tail + chunk
+            if pattern.search(window):
+                return True
+            tail = window[-_ZIP_SCAN_OVERLAP:]
+
+
+def _part_path(base_dir: str, target: str) -> str:
+    """Resolve a relationship target against the directory of its source part."""
+    if target.startswith('/'):
+        return target.lstrip('/')
+    parts = [piece for piece in base_dir.split('/') if piece]
+    for piece in target.split('/'):
+        if piece == '..':
+            if parts:
+                parts.pop()
+        elif piece and piece != '.':
+            parts.append(piece)
+    return '/'.join(parts)
+
+
+def _read_xml(archive, name: str):
+    from lxml import etree
+    return etree.fromstring(archive.read(name), parser=_safe_lxml_parser())
+
+
+def _relationships(archive, source_part: str) -> Dict[str, Tuple[str, str]]:
+    """{Id: (type, part name)} for the internal relationships of ``source_part``
+    (``""`` for the package itself)."""
+    base, _, filename = source_part.rpartition('/')
+    rels_name = f"{base + '/' if base else ''}_rels/{filename}.rels"
+    try:
+        root = _read_xml(archive, rels_name)
+    except KeyError:
+        return {}
+    return {rel.get('Id'): (rel.get('Type', ''), _part_path(base, rel.get('Target', '')))
+            for rel in root.findall(f'{{{_PKG_REL_NS}}}Relationship')
+            if rel.get('TargetMode') != 'External'}
+
+
+def _xlsx_sheet_parts(archive) -> Dict[str, str]:
+    """{sheet title: worksheet part name}."""
+    workbook = next((target for kind, target in _relationships(archive, '').values()
+                     if kind.endswith('/officeDocument')), 'xl/workbook.xml')
+    rels = _relationships(archive, workbook)
+    parts = {}
+    for sheet in _read_xml(archive, workbook).iter(f'{{{_SML_NS}}}sheet'):
+        rel = rels.get(sheet.get(f'{{{_OFFICE_REL_NS}}}id'))
+        if rel:
+            parts[sheet.get('name')] = rel[1]
+    return parts
+
+
+def _xlsx_rich_value_images(archive, names) -> Dict[int, str]:
+    """{cell ``vm`` index (1-based): media part} for pictures placed in cells.
+
+    Excel stores such a cell as the error ``#VALUE!`` with a value-metadata index; the
+    picture is found through ``metadata.xml`` (valueMetadata -> XLRICHVALUE future
+    metadata) -> ``rdrichvalue.xml`` (a rich value whose structure has
+    ``_rvRel:LocalImageIdentifier``) -> ``richValueRel.xml`` -> its relationship target.
+    """
+    def member(suffix: str) -> Optional[str]:
+        return next((name for name in sorted(names) if name.lower().endswith(suffix)), None)
+
+    metadata_name = 'xl/metadata.xml' if 'xl/metadata.xml' in names else member('/metadata.xml')
+    values_name, structures_name = member('/rdrichvalue.xml'), member('/rdrichvaluestructure.xml')
+    rel_name = member('/richvaluerel.xml')
+    if not (metadata_name and values_name and structures_name and rel_name):
+        return {}
+    metadata = _read_xml(archive, metadata_name)
+    types = [kind.get('name') for kind in metadata.iter(f'{{{_SML_NS}}}metadataType')]
+    future = next((f for f in metadata.iter(f'{{{_SML_NS}}}futureMetadata') if f.get('name') == 'XLRICHVALUE'), None)
+    value_metadata = next(metadata.iter(f'{{{_SML_NS}}}valueMetadata'), None)
+    if future is None or value_metadata is None:
+        return {}
+    rich_of_future = []
+    for block in future.findall(f'{{{_SML_NS}}}bk'):
+        rvb = next(block.iter(f'{{{_RD_NS}}}rvb'), None)
+        rich_of_future.append(_attr_int(rvb, 'i', -1) if rvb is not None else -1)
+    structures = [[key.get('n') for key in structure.findall(f'{{{_RD_NS}}}k')]
+                  for structure in _read_xml(archive, structures_name).findall(f'{{{_RD_NS}}}s')]
+    rel_of_rich = {}
+    for index, value in enumerate(_read_xml(archive, values_name).findall(f'{{{_RD_NS}}}rv')):
+        structure = _attr_int(value, 's', -1)
+        keys = structures[structure] if 0 <= structure < len(structures) else []
+        entries = value.findall(f'{{{_RD_NS}}}v')
+        if '_rvRel:LocalImageIdentifier' in keys:
+            entry = keys.index('_rvRel:LocalImageIdentifier')
+            if entry < len(entries) and (entries[entry].text or '').strip().isdigit():
+                rel_of_rich[index] = int(entries[entry].text)
+    rel_ids = [rel.get(f'{{{_OFFICE_REL_NS}}}id') for rel in _read_xml(archive, rel_name).iter(f'{{{_RVREL_NS}}}rel')]
+    targets = _relationships(archive, rel_name)
+    images = {}
+    for vm, block in enumerate(value_metadata.findall(f'{{{_SML_NS}}}bk'), start=1):
+        record = block.find(f'{{{_SML_NS}}}rc')
+        if record is None:
+            continue
+        kind, future_index = _attr_int(record, 't') - 1, _attr_int(record, 'v', -1)
+        if not (0 <= kind < len(types) and types[kind] == 'XLRICHVALUE' and 0 <= future_index < len(rich_of_future)):
+            continue
+        rel_index = rel_of_rich.get(rich_of_future[future_index])
+        if rel_index is not None and rel_index < len(rel_ids) and rel_ids[rel_index] in targets:
+            images[vm] = targets[rel_ids[rel_index]][1]
+    return images
 
 
 class BaseOfficeLoader:
@@ -110,344 +637,34 @@ class BaseOfficeLoader:
     def _convert_table_to_markdown(self, table_data: Union[List[List[str]], Any],
                                    extract_images: bool = True, ocr_images: bool = False,
                                    ocr_results_map: Optional[Dict[str, str]] = None) -> str:
-        """Convert table data to markdown format with complex structure support
-        
-        This enhanced version handles:
-        - Merged cells detection
-        - Complex table structures
-        - Automatic HTML conversion for complex tables
-        - Line breaks preservation
-        - Images within cells (with OCR support)
-        
-        Library-specific merged cell handling:
-        - DOCX: Merged cells share the same cell object (_tc), detected by comparing object IDs
-        - PPTX: Merged cells have empty strings '' in non-origin cells, with gridSpan/vMerge properties
-        - XLSX: Merged cells have None in non-origin cells, with explicit merged_cells.ranges
+        """Render a table given as rows of cell values.
+
+        Merged cells are never guessed from blank cells: a blank cell is a blank cell.
+        Loaders that know real merges (``w:gridSpan``/``w:vMerge`` in DOCX,
+        ``gridSpan``/``vMerge`` in PPTX, ``merged_cells.ranges`` in XLSX) build their
+        spans from the file and render them themselves.
         """
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        # Handle different table input types
-        if hasattr(table_data, 'rows'):  # DOCX Table object
-            rows_data = []
-            merged_cells_info = []
-
-            # Get table dimensions
-            num_rows = len(table_data.rows)
-            num_cols = len(table_data.columns)
-
-            logger.debug(f"DOCX Table dimensions: {num_rows}x{num_cols}")
-
-            # Initialize a 2D array to track cell content and merged status
-            table_array = [[None for _ in range(num_cols)] for _ in range(num_rows)]
-            processed_positions = set()
-
-            # O(nm) merge detection using XML attributes (gridSpan, vMerge)
-            # instead of O(n^2*m^2) brute-force cell ID comparison
-            for row_idx, row_obj in enumerate(table_data.rows):
-                col_idx = 0
-                for tc in row_obj._tr.findall(qn('w:tc')):
-                    if col_idx >= num_cols:
-                        break
-
-                    # Read colspan from gridSpan attribute
-                    tc_pr = tc.find(qn('w:tcPr'))
-                    colspan = 1
-                    if tc_pr is not None:
-                        grid_span = tc_pr.find(qn('w:gridSpan'))
-                        if grid_span is not None:
-                            colspan = int(grid_span.get(qn('w:val'), 1))
-
-                    # Read vMerge to detect rowspan continuation
-                    is_vmerge_continue = False
-                    if tc_pr is not None:
-                        v_merge = tc_pr.find(qn('w:vMerge'))
-                        if v_merge is not None:
-                            # vMerge with val="restart" starts a new vertical merge
-                            # vMerge without val (or val="continue") continues from above
-                            val = v_merge.get(qn('w:val'), '')
-                            is_vmerge_continue = (val != 'restart')
-
-                    if is_vmerge_continue:
-                        # This cell is a continuation of a vertical merge from above
-                        for c in range(col_idx, min(col_idx + colspan, num_cols)):
-                            table_array[row_idx][c] = ""
-                            processed_positions.add((row_idx, c))
-                        col_idx += colspan
-                        continue
-
-                    if (row_idx, col_idx) in processed_positions:
-                        col_idx += colspan
-                        continue
-
-                    # Extract cell content
-                    cell = table_data.cell(row_idx, col_idx)
-                    cell_text = self._extract_cell_content_with_images(
-                        cell, extract_images, ocr_images, ocr_results_map
-                    )
-
-                    table_array[row_idx][col_idx] = cell_text
-
-                    # Mark spanned columns
-                    for c in range(col_idx, min(col_idx + colspan, num_cols)):
-                        processed_positions.add((row_idx, c))
-                        if c != col_idx:
-                            table_array[row_idx][c] = ""
-
-                    col_idx += colspan
-
-            # Second pass: calculate rowspans from vMerge="restart" cells
-            for col_idx in range(num_cols):
-                row_idx = 0
-                while row_idx < num_rows:
-                    tc = table_data.rows[row_idx]._tr.findall(qn('w:tc'))
-                    # Find the tc element for this col_idx by counting gridSpans
-                    current_col = 0
-                    target_tc = None
-                    for t in tc:
-                        tc_pr = t.find(qn('w:tcPr'))
-                        gs = 1
-                        if tc_pr is not None:
-                            gs_el = tc_pr.find(qn('w:gridSpan'))
-                            if gs_el is not None:
-                                gs = int(gs_el.get(qn('w:val'), 1))
-                        if current_col <= col_idx < current_col + gs:
-                            target_tc = t
-                            break
-                        current_col += gs
-
-                    if target_tc is not None:
-                        tc_pr = target_tc.find(qn('w:tcPr'))
-                        v_merge = tc_pr.find(qn('w:vMerge')) if tc_pr is not None else None
-                        if v_merge is not None and v_merge.get(qn('w:val'), '') == 'restart':
-                            # Count how many rows this spans
-                            rowspan = 1
-                            for check_row in range(row_idx + 1, num_rows):
-                                if table_array[check_row][col_idx] == "" and (check_row, col_idx) in processed_positions:
-                                    # Verify it's actually a vMerge continuation, not just empty
-                                    check_tcs = table_data.rows[check_row]._tr.findall(qn('w:tc'))
-                                    cc = 0
-                                    check_tc = None
-                                    for t in check_tcs:
-                                        tp = t.find(qn('w:tcPr'))
-                                        gs = 1
-                                        if tp is not None:
-                                            gs_el = tp.find(qn('w:gridSpan'))
-                                            if gs_el is not None:
-                                                gs = int(gs_el.get(qn('w:val'), 1))
-                                        if cc <= col_idx < cc + gs:
-                                            check_tc = t
-                                            break
-                                        cc += gs
-                                    if check_tc is not None:
-                                        cp = check_tc.find(qn('w:tcPr'))
-                                        vm = cp.find(qn('w:vMerge')) if cp is not None else None
-                                        if vm is not None and vm.get(qn('w:val'), '') != 'restart':
-                                            rowspan += 1
-                                        else:
-                                            break
-                                    else:
-                                        break
-                                else:
-                                    break
-
-                            # Also get colspan for this cell
-                            gs_el = tc_pr.find(qn('w:gridSpan')) if tc_pr is not None else None
-                            colspan = int(gs_el.get(qn('w:val'), 1)) if gs_el is not None else 1
-
-                            if rowspan > 1 or colspan > 1:
-                                merged_cells_info.append({
-                                    'row': row_idx,
-                                    'col': col_idx,
-                                    'rowspan': rowspan,
-                                    'colspan': colspan
-                                })
-                            row_idx += rowspan
-                            continue
-                        elif v_merge is None:
-                            # No vMerge at all - check if it has a colspan
-                            gs_el = tc_pr.find(qn('w:gridSpan')) if tc_pr is not None else None
-                            colspan = int(gs_el.get(qn('w:val'), 1)) if gs_el is not None else 1
-                            if colspan > 1:
-                                merged_cells_info.append({
-                                    'row': row_idx,
-                                    'col': col_idx,
-                                    'rowspan': 1,
-                                    'colspan': colspan
-                                })
-
-                    row_idx += 1
-
-            # Convert array to list format
-            for row in table_array:
-                rows_data.append([cell if cell is not None else "" for cell in row])
-
-            table_data = rows_data
-            is_complex = len(merged_cells_info) > 0
-
-            logger.debug(f"DOCX Table: Detected {len(merged_cells_info)} merged cells, complex={is_complex}")
-
-            # Build cell_spans and render via TableData
-            cell_spans = {}
-            for merge_info in merged_cells_info:
-                key = (merge_info['row'], merge_info['col'])
-                cell_spans[key] = (merge_info['rowspan'], merge_info['colspan'])
-
-            table_obj = TableData.from_raw(table_data, {
-                'is_complex': is_complex,
-                'cell_spans': cell_spans,
-            })
-            renderer = TableRenderer(self.table_style)
-            return renderer.render(table_obj)
-        else:
-            # For non-DOCX tables (e.g., from PPTX or XLSX), still analyze structure
-            is_complex = False
-
         if not table_data or not any(table_data):
             return ""
-
-        # Only analyze table structure for non-DOCX tables
-        table_obj = self._analyze_table_structure(table_data)
-
-        # Render using shared TableRenderer
-        renderer = TableRenderer(self.table_style)
-        return renderer.render(table_obj)
-
-    def _analyze_table_structure(self, table_data: List[List]) -> TableData:
-        """Analyze table structure to detect merged cells and complexity.
-        Returns TableData.
-
-        This method is used for non-DOCX tables (PPTX and XLSX) where we need to detect merges
-        based on empty cells. DOCX tables handle merges differently using cell object IDs.
-        """
-        if not table_data:
-            return TableData.empty()
-
-        row_count = len(table_data)
-        col_count = max(len(row) for row in table_data) if table_data else 0
-
-        # Initialize analysis structures
-        cell_spans = {}
-        is_complex = False
-
-        # Create a normalized table (all rows same length)
-        normalized = []
-        for row in table_data:
-            normalized_row = list(row) + [""] * (col_count - len(row))
-            normalized.append(normalized_row)
-
-        # Detect merged cells by looking for patterns
-        for row_idx in range(row_count):
-            for col_idx in range(col_count):
-                cell = normalized[row_idx][col_idx]
-
-                if cell == "":
-                    # Check if this is part of a merged cell
-                    span_info = self._detect_cell_span(normalized, row_idx, col_idx)
-                    if span_info:
-                        is_complex = True
-                else:
-                    # Check if this cell spans multiple rows/cols
-                    rowspan, colspan = self._calculate_cell_span(normalized, row_idx, col_idx, str(cell))
-                    if rowspan > 1 or colspan > 1:
-                        cell_spans[(row_idx, col_idx)] = (rowspan, colspan)
-                        is_complex = True
-
-        return TableData.from_raw(normalized, {
-            'is_complex': is_complex,
-            'cell_spans': cell_spans,
-        })
-
-    def _detect_cell_span(self, table: List[List], row: int, col: int) -> Optional[Dict]:
-        """Detect if an empty cell is part of a span from another cell
-        
-        Empty cells are represented as:
-        - None in XLSX (openpyxl)
-        - '' (empty string) in PPTX (python-pptx)
-        """
-        cell_value = table[row][col]
-        
-        # Check if this cell is truly empty (None or empty string)
-        if not (cell_value is None or (isinstance(cell_value, str) and cell_value == '')):
-            return None
-            
-        # Check if empty cell is part of a row span from above
-        if row > 0:
-            above_cell = table[row - 1][col]
-            # Check if cell above has content
-            if above_cell is not None and str(above_cell).strip() != '':
-                # Check if cells below are also empty (indicating rowspan)
-                span_rows = 1
-                for check_row in range(row, len(table)):
-                    check_cell = table[check_row][col]
-                    if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
-                        span_rows += 1
-                    else:
-                        break
-
-                if span_rows > 1:
-                    return {
-                        'type': 'rowspan_continuation',
-                        'source_row': row - 1,
-                        'source_col': col,
-                        'span_rows': span_rows
-                    }
-
-        # Check if empty cell is part of a col span from left
-        if col > 0:
-            left_cell = table[row][col - 1]
-            # Check if cell to the left has content
-            if left_cell is not None and str(left_cell).strip() != '':
-                # Check if cells to right are also empty (indicating colspan)
-                span_cols = 1
-                for check_col in range(col, len(table[row])):
-                    check_cell = table[row][check_col]
-                    if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
-                        span_cols += 1
-                    else:
-                        break
-
-                if span_cols > 1:
-                    return {
-                        'type': 'colspan_continuation',
-                        'source_row': row,
-                        'source_col': col - 1,
-                        'span_cols': span_cols
-                    }
-
-        return None
-
-    def _calculate_cell_span(self, table: List[List], row: int, col: int, cell_content: str) -> Tuple[int, int]:
-        """Calculate how many rows and columns a cell spans
-        
-        Only counts consecutive None or empty string cells as part of the span
-        """
-        rowspan = 1
-        colspan = 1
-
-        # Check colspan: count consecutive empty cells to the right
-        for check_col in range(col + 1, len(table[row])):
-            check_cell = table[row][check_col]
-            if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
-                colspan += 1
-            else:
-                break
-
-        # Check rowspan: count consecutive empty cells below
-        for check_row in range(row + 1, len(table)):
-            if col < len(table[check_row]):
-                check_cell = table[check_row][col]
-                if check_cell is None or (isinstance(check_cell, str) and check_cell == ''):
-                    rowspan += 1
-                else:
-                    break
-            else:
-                break
-
-        return rowspan, colspan
+        col_count = max(len(row) for row in table_data)
+        rows = [["" if cell is None else str(cell) for cell in row] + [""] * (col_count - len(row))
+                for row in table_data]
+        return TableRenderer(self.table_style).render(TableData.from_raw(rows, {'is_complex': False}))
 
     def _extract_image_as_base64(self, image_data: bytes, image_format: str = 'png') -> str:
         """Convert image bytes to base64 string"""
         return base64.b64encode(image_data).decode('utf-8')
+
+    @staticmethod
+    def _ocr_description(ocr_text: Optional[str], **fields) -> Optional[Dict[str, Any]]:
+        """The ``text:image_description`` item for a picture's OCR text (inside the internal
+        ``<image_ocr_result>`` provenance wrapper that the Markdown render strips), or None
+        when OCR found no text in the picture: an empty description is never emitted, as on
+        the PDF path, which skips images that OCR to nothing."""
+        text = (ocr_text or "").strip()
+        if not text:
+            return None
+        return {"type": "text:image_description", "content": f"<image_ocr_result>{text}</image_ocr_result>", **fields}
 
     def _ocr_image(self, image_bytes: bytes) -> str:
         """Use OCR to convert image to text description"""
@@ -481,17 +698,14 @@ class BaseOfficeLoader:
         if style_name:
             style_lower = style_name.lower()
 
-            # Check for title/heading styles
-            if 'title' in style_lower:
+            # Check for title/heading styles ('subtitle' first: it contains 'title')
+            if 'subtitle' in style_lower:
+                return "text:section"
+            elif 'title' in style_lower:
                 return "text:title"
             elif 'heading' in style_lower:
-                # Extract heading level if possible
-                if '1' in style_name:
-                    return "text:title"
-                else:
-                    return "text:section"
-            elif 'subtitle' in style_lower:
-                return "text:section"
+                level = re.search(r'\d+', style_lower)
+                return "text:title" if level and level.group(0) == '1' else "text:section"
             elif 'caption' in style_lower:
                 return "text:caption"
             elif any(x in style_lower for x in ['list', 'bullet']):
@@ -607,6 +821,7 @@ class DocxLoader(BaseOfficeLoader):
     def __init__(self, file_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None):
         super().__init__(file_path, ocr, table_style)
         self._open_document()
+        self._structure = _DocxStructure(self.doc)
 
     def _open_document(self):
         """Open DOCX document with error handling and configuration logging"""
@@ -747,7 +962,13 @@ class DocxLoader(BaseOfficeLoader):
                 for i in range(prev_len, len(result["content"])):
                     result["content"][i]["page"] = page_num
             elif isinstance(element, Table):
-                table_md = self._convert_table_to_markdown(element, extract_images, ocr_images, ocr_results_map)
+                try:
+                    table_md = self._convert_table_to_markdown(element, extract_images, ocr_images, ocr_results_map)
+                except Exception as e:
+                    # One malformed table must not send the whole document to the basic
+                    # converter (which reorders content): keep its text, lose its structure.
+                    logger.warning(f"DOCX table conversion failed ({e}); keeping the table text without merges")
+                    table_md = self._table_text_fallback(element._tbl)
                 if table_md:
                     result["content"].append({
                         "type": "table",
@@ -814,13 +1035,13 @@ class DocxLoader(BaseOfficeLoader):
         return result
 
     def _iter_block_items(self):
-        """Yield each paragraph and table in document order"""
-        parent = self.doc.element.body
-        for child in parent.iterchildren():
-            if isinstance(child, docx.oxml.text.paragraph.CT_P):
-                yield Paragraph(child, self.doc)
-            elif isinstance(child, docx.oxml.table.CT_Tbl):
-                yield Table(child, self.doc)
+        """Yield each paragraph and table in document order, including those inside
+        block-level content controls and custom XML."""
+        for block in _docx_blocks(self.doc.element.body):
+            if block.tag == _W_P:
+                yield Paragraph(block, self.doc)
+            else:
+                yield Table(block, self.doc)
 
     def _load_footnotes(self) -> Dict[str, str]:
         """Extract footnotes and endnotes from the DOCX ZIP.
@@ -875,10 +1096,14 @@ class DocxLoader(BaseOfficeLoader):
             ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
-            
+
+        runs = list(_docx_paragraph_content(paragraph._p))
+
         # Extract images from runs first
         if extract_images:
-            for run in paragraph.runs:
+            for run in runs:
+                if run.tag != _W_R:
+                    continue
                 image_result = self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes)
                 if image_result:
                     if isinstance(image_result, list):
@@ -886,13 +1111,16 @@ class DocxLoader(BaseOfficeLoader):
                     else:
                         content.append(image_result)
 
+        # List numbering advances for every list paragraph, empty ones included, as in Word.
+        numbering = self._structure.list_marker(paragraph._p)
+
         # Then extract text
-        text = paragraph.text.strip()
+        text = ''.join(_docx_run_text(run) for run in runs).strip()
         if text:
             # Detect footnote/endnote references in paragraph XML
             try:
                 refs = []
-                for run_el in paragraph._element.findall(qn('w:r')):
+                for run_el in runs:
                     fn_ref = run_el.find(qn('w:footnoteReference'))
                     if fn_ref is not None:
                         ref_id = fn_ref.get(qn('w:id'), '')
@@ -908,11 +1136,51 @@ class DocxLoader(BaseOfficeLoader):
             except (AttributeError, TypeError):
                 pass
 
-            text_type = self._classify_text_type(text, paragraph.style.name if paragraph.style else "")
-            content.append({
-                "type": text_type,
-                "content": text
-            })
+            content.append(self._paragraph_item(paragraph, text, numbering))
+
+    def _paragraph_item(self, paragraph: Paragraph, text: str,
+                        numbering: Optional[Tuple[str, int]]) -> Dict[str, Any]:
+        """Typed content item for a paragraph's text.
+
+        Headings (outline level, or the Title/Subtitle/Heading N styles) carry
+        ``level`` (1-6); list paragraphs carry ``marker`` (``"1."``, ``"-"``...) and
+        ``list_level``. The structure lives beside ``content`` so the text stays verbatim.
+        """
+        try:
+            style_name = paragraph.style.name if paragraph.style is not None else ""
+        except (AttributeError, KeyError, ValueError):
+            style_name = ""
+        outline = self._structure.outline_level(paragraph._p)
+        level = self._heading_level(outline, style_name)
+        if level:
+            item = {"type": "text:title" if level == 1 else "text:section", "content": text, "level": min(level, 6)}
+            if numbering and numbering[0] != '-':
+                item["marker"] = numbering[0]
+            return item
+        if numbering:
+            marker, depth = numbering
+            return {"type": "text:list", "content": text, "marker": marker,
+                    "list_level": max(depth, _style_list_depth(style_name))}
+        text_type = self._classify_text_type(text, style_name)
+        if outline == 9 and text_type in ("text:title", "text:section"):
+            text_type = "text:normal"  # explicitly body text, whatever the style is called
+        return {"type": text_type, "content": text}
+
+    @staticmethod
+    def _heading_level(outline: Optional[int], style_name: str) -> Optional[int]:
+        """1-9 for headings, None for body text. The outline level Word uses for its
+        navigation pane decides (9 is body text, even in a style named "Heading 2"); the
+        built-in Title (1) and Subtitle (2) styles, which have none, go by name, and so do
+        Heading N styles when no outline level is set anywhere."""
+        if outline is not None and outline <= 8:
+            return outline + 1
+        name = (style_name or "").strip().lower()
+        if name == "title":
+            return 1
+        if name == "subtitle":
+            return 2
+        match = re.fullmatch(r'heading\s*([1-9])', name)
+        return int(match.group(1)) if match and outline is None else None
 
     def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
                            processed_image_hashes: set = None) -> Optional[Union[Dict[str, str], List[Dict[str, str]]]]:
@@ -927,8 +1195,8 @@ class DocxLoader(BaseOfficeLoader):
             processed_image_hashes = set()
             
         try:
-            # Access the underlying XML element
-            r_element = run._element
+            # Access the underlying XML element (a python-docx Run or a w:r element)
+            r_element = getattr(run, '_element', run)
 
             # Look for drawing elements in the run
             found_items: List[Dict[str, str]] = []
@@ -1061,20 +1329,10 @@ class DocxLoader(BaseOfficeLoader):
                     # Use image content hash to find OCR result (already calculated above)
 
                     if img_hash in ocr_results_map:
-                        ocr_text = ocr_results_map[img_hash]
-                        return {
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>"
-                        }
-                    else:
-                        # Fallback to individual OCR if not in batch results
-                        logger.warning(f"OCR result not found for image with rid {rid}, using fallback OCR")
-                        ocr_text = self._ocr_image(image_bytes)
-                        if ocr_text:
-                            return {
-                                "type": "text:image_description",
-                                "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>"
-                            }
+                        return self._ocr_description(ocr_results_map[img_hash])
+                    # Fallback to individual OCR if not in batch results
+                    logger.warning(f"OCR result not found for image with rid {rid}, using fallback OCR")
+                    return self._ocr_description(self._ocr_image(image_bytes))
                 else:
                     # Return base64 encoded image
                     base64_image = base64.b64encode(image_bytes).decode('utf-8')
@@ -1125,22 +1383,17 @@ class DocxLoader(BaseOfficeLoader):
                         'location': location_info
                     })
 
-        # 1. Collect from paragraphs (inline images in runs)
-        for element in self._iter_block_items():
-            if isinstance(element, Paragraph):
-                for run in element.runs:
-                    # Check for images in runs
-                    r_element = run._element
-                    for child in r_element:
-                        if child.tag.endswith('}drawing'):
-                            for drawing_child in child:
-                                if drawing_child.tag.endswith('}inline'):
-                                    image_data = self._extract_image_data_from_inline(drawing_child)
-                                    add_unique_image(image_data, {'type': 'paragraph_inline'})
-                                elif drawing_child.tag.endswith('}anchor'):
-                                    # Handle floating/anchored images
-                                    image_data = self._extract_image_data_from_anchor(drawing_child)
-                                    add_unique_image(image_data, {'type': 'paragraph_anchor'})
+        # 1. Collect every drawing in the body in document order: paragraphs, tables at
+        #    any depth, content controls, text boxes (mc:Choice); deleted revisions and
+        #    mc:Fallback copies are skipped.
+        for element in _docx_rendered(self.doc.element.body):
+            if element.tag != _W_DRAWING:
+                continue
+            for drawing_child in element:
+                if drawing_child.tag.endswith('}inline'):
+                    add_unique_image(self._extract_image_data_from_inline(drawing_child), {'type': 'body_inline'})
+                elif drawing_child.tag.endswith('}anchor'):
+                    add_unique_image(self._extract_image_data_from_anchor(drawing_child), {'type': 'body_anchor'})
 
         # 2. Collect from document inline shapes
         if hasattr(self.doc, 'inline_shapes'):
@@ -1191,61 +1444,7 @@ class DocxLoader(BaseOfficeLoader):
         except Exception as e:
             logger.warning(f"Failed to extract images from headers/footers: {e}")
 
-        # 4. Check for images in shapes (text boxes, etc.)
-        try:
-            # Access the document's body element
-            body = self.doc.element.body
-
-            # Look for AlternateContent elements which often contain shapes
-            for elem in body.iter():
-                if elem.tag.endswith('}AlternateContent'):
-                    # Check Choice elements for modern format
-                    for choice in elem:
-                        if choice.tag.endswith('}Choice'):
-                            for child in choice:
-                                if child.tag.endswith('}drawing'):
-                                    for drawing_child in child:
-                                        if drawing_child.tag.endswith('}inline'):
-                                            image_data = self._extract_image_data_from_inline(drawing_child)
-                                            add_unique_image(image_data, {'type': 'shape_inline'})
-                                        elif drawing_child.tag.endswith('}anchor'):
-                                            image_data = self._extract_image_data_from_anchor(drawing_child)
-                                            add_unique_image(image_data, {'type': 'shape_anchor'})
-        except Exception as e:
-            logger.warning(f"Failed to extract images from shapes: {e}")
-
-        # 5. Check for images in tables
-        try:
-            for table_idx, element in enumerate(self._iter_block_items()):
-                if isinstance(element, Table):
-                    for row_idx, row in enumerate(element.rows):
-                        for cell_idx, cell in enumerate(row.cells):
-                            for para in cell.paragraphs:
-                                for run in para.runs:
-                                    r_element = run._element
-                                    for child in r_element:
-                                        if child.tag.endswith('}drawing'):
-                                            for drawing_child in child:
-                                                if drawing_child.tag.endswith('}inline'):
-                                                    image_data = self._extract_image_data_from_inline(drawing_child)
-                                                    add_unique_image(image_data, {
-                                                        'type': 'table_cell',
-                                                        'table': table_idx,
-                                                        'row': row_idx,
-                                                        'cell': cell_idx
-                                                    })
-                                                elif drawing_child.tag.endswith('}anchor'):
-                                                    image_data = self._extract_image_data_from_anchor(drawing_child)
-                                                    add_unique_image(image_data, {
-                                                        'type': 'table_cell_anchor',
-                                                        'table': table_idx,
-                                                        'row': row_idx,
-                                                        'cell': cell_idx
-                                                    })
-        except Exception as e:
-            logger.warning(f"Failed to extract images from tables: {e}")
-
-        # 6. Try to get all relationships and check for image parts
+        # 4. Try to get all relationships and check for image parts
         try:
             # Get all relationships from document part
             for rel_id, rel in self.doc.part.rels.items():
@@ -1337,72 +1536,151 @@ class DocxLoader(BaseOfficeLoader):
                 if image_content:
                     content.append(image_content)
 
-    def _extract_cell_content_with_images(self, cell, extract_images: bool = True,
-                                          ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None) -> str:
-        """Extract complete cell content including text and images (with OCR if enabled)
-        
-        Args:
-            cell: DOCX table cell object
-            extract_images: Whether to extract images
-            ocr_images: Whether to use OCR on images
-            ocr_results_map: Pre-computed OCR results map
-            
-        Returns:
-            Combined cell content as string
+    # ------------------------------------------------------------------ #
+    # Tables: read from the w:tbl XML                                     #
+    # ------------------------------------------------------------------ #
+    def _convert_table_to_markdown(self, table_data, extract_images: bool = True, ocr_images: bool = False,
+                                   ocr_results_map: Optional[Dict[str, str]] = None) -> str:
+        """Render a python-docx ``Table`` (merges from ``w:gridSpan``/``w:vMerge``, rows
+        offset by ``w:gridBefore``/``w:gridAfter``); other inputs go to the base class."""
+        tbl = getattr(table_data, '_tbl', None)
+        if tbl is None:
+            return super()._convert_table_to_markdown(table_data, extract_images, ocr_images, ocr_results_map)
+        ocr_results_map = ocr_results_map or {}
+        texts, spans = self._docx_table_grid(
+            tbl, lambda tc: "\n".join(self._tc_lines(tc, extract_images, ocr_images, ocr_results_map)))
+        if not texts:
+            return ""
+        logger.debug(f"DOCX Table: {len(texts)}x{len(texts[0])}, {len(spans)} merged cells")
+        table_obj = TableData.from_raw(texts, {'is_complex': bool(spans), 'cell_spans': spans})
+        return TableRenderer(self.table_style).render(table_obj)
+
+    @staticmethod
+    def _docx_table_grid(tbl, cell_text) -> Tuple[List[List[str]], Dict[Tuple[int, int], Tuple[int, int]]]:
+        """Lay a ``w:tbl`` out on its column grid.
+
+        Each row starts at its ``w:gridBefore`` column; a cell covers ``w:gridSpan``
+        columns; ``w:vMerge`` continuation cells extend the cell above that starts in
+        the same column with the same width (legacy ``w:hMerge`` continuations extend the
+        cell to their left). Text found in a continuation cell is appended to the merged
+        cell rather than dropped. Deleted (tracked) rows are skipped.
+
+        Returns ``(texts, spans)``: a rectangular grid of cell texts (``""`` for empty and
+        covered positions) and ``{(row, col): (rowspan, colspan)}`` for merged cells.
         """
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        cell_parts = []
+        grid_cols = tbl.find(_W_TBL_GRID)
+        width = len(grid_cols.findall(_W_GRID_COL)) if grid_cols is not None else 0
+        rows = []
+        for tr in _docx_children(tbl, _W_TR):
+            tr_pr = tr.find(_W_TR_PR)
+            if tr_pr is not None and tr_pr.find(_W_DEL) is not None:
+                continue
+            col = max(0, _docx_int(tr_pr.find(_W_GRID_BEFORE) if tr_pr is not None else None, 0))
+            cells = []
+            for tc in _docx_children(tr, _W_TC):
+                tc_pr = tc.find(_W_TC_PR)
+                span = max(1, _docx_int(tc_pr.find(_W_GRID_SPAN) if tc_pr is not None else None, 1))
+                v_merge = tc_pr.find(_W_V_MERGE) if tc_pr is not None else None
+                h_merge = tc_pr.find(_W_H_MERGE) if tc_pr is not None else None
+                continues_above = v_merge is not None and v_merge.get(_W_VAL, 'continue') != 'restart'
+                continues_left = h_merge is not None and h_merge.get(_W_VAL, 'continue') != 'restart'
+                if continues_left and cells:
+                    start, previous_span, above, _, texts_in = cells[-1]
+                    cells[-1] = (start, previous_span + span, above, tc, texts_in + [tc])
+                else:
+                    cells.append((col, span, continues_above, tc, [tc]))
+                col += span
+            col += max(0, _docx_int(tr_pr.find(_W_GRID_AFTER) if tr_pr is not None else None, 0))
+            width = max(width, col)
+            rows.append(cells)
 
-        # Process each paragraph in the cell
-        for para in cell.paragraphs:
-            para_parts = []
+        texts = [[""] * width for _ in rows]
+        spans: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        origin_of: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for r, cells in enumerate(rows):
+            for col, span, continues_above, _, tcs in cells:
+                span = min(span, width - col)
+                if span <= 0:
+                    continue
+                text = "\n".join(t for t in (cell_text(tc) for tc in tcs) if t)
+                origin = origin_of.get((r - 1, col)) if continues_above else None
+                if origin is not None and spans.get(origin, (1, 1))[1] == span:
+                    rowspan, colspan = spans.get(origin, (1, span))
+                    spans[origin] = (rowspan + 1, colspan)
+                    origin_of[(r, col)] = origin
+                    if text:
+                        texts[origin[0]][origin[1]] = "\n".join(t for t in (texts[origin[0]][origin[1]], text) if t)
+                    continue
+                texts[r][col] = text
+                origin_of[(r, col)] = (r, col)
+                if span > 1:
+                    spans[(r, col)] = (1, span)
+        return texts, spans
 
-            # Process each run in the paragraph
-            for run in para.runs:
-                # First check for images in the run
-                if extract_images:
-                    # Check for drawing elements
-                    r_element = run._element
-                    for child in r_element:
-                        if child.tag.endswith('}drawing'):
-                            for drawing_child in child:
-                                image_bytes = None
-                                if drawing_child.tag.endswith('}inline'):
-                                    image_bytes = self._extract_image_data_from_inline(drawing_child)
-                                elif drawing_child.tag.endswith('}anchor'):
-                                    image_bytes = self._extract_image_data_from_anchor(drawing_child)
+    def _tc_lines(self, container, extract_images: bool, ocr_images: bool,
+                  ocr_results_map: Dict[str, str]) -> List[str]:
+        """Lines of a cell in document order: one per non-empty paragraph and one per
+        row of a nested table (its cells joined with ``" | "``)."""
+        lines = []
+        for block in _docx_blocks(container):
+            if block.tag == _W_P:
+                text = self._cell_paragraph_text(block, extract_images, ocr_images, ocr_results_map)
+                if text:
+                    lines.append(text)
+            else:
+                texts, _ = self._docx_table_grid(
+                    block, lambda tc: " ".join(self._tc_lines(tc, extract_images, ocr_images, ocr_results_map)))
+                lines.extend(" | ".join(t for t in row if t) for row in texts if any(row))
+        return lines
 
-                                if image_bytes:
-                                    if ocr_images:
-                                        # Use OCR to get text
-                                        img_hash = _image_hash(image_bytes)
-                                        if img_hash in ocr_results_map:
-                                            ocr_text = ocr_results_map[img_hash]
-                                            para_parts.append(f"[Image: {ocr_text}]")
-                                        else:
-                                            # Fallback to individual OCR
-                                            ocr_text = self._ocr_image(image_bytes)
-                                            if ocr_text:
-                                                para_parts.append(f"[Image: {ocr_text}]")
-                                            else:
-                                                para_parts.append("[Image]")
-                                    else:
-                                        # Just mark as image placeholder
-                                        para_parts.append("[Image]")
+    def _cell_paragraph_text(self, p_el, extract_images: bool, ocr_images: bool,
+                             ocr_results_map: Dict[str, str]) -> str:
+        """Text of a paragraph in a table cell, image markers in place and its list
+        number or bullet in front."""
+        parts = []
+        for run in _docx_paragraph_content(p_el):
+            if extract_images and run.tag == _W_R:
+                parts.extend(self._cell_image_markers(run, ocr_images, ocr_results_map))
+            parts.append(_docx_run_text(run))
+        numbering = self._structure.list_marker(p_el)
+        text = "".join(parts).strip()
+        return f"{numbering[0]} {text}" if text and numbering else text
 
-                # Then add the text content
-                if run.text:
-                    para_parts.append(run.text)
+    def _cell_image_markers(self, run, ocr_images: bool, ocr_results_map: Dict[str, str]) -> List[str]:
+        """``[Image]`` (or ``[Image: <OCR text>]``) for each picture drawn in ``run``."""
+        markers = []
+        for child in run:
+            if not child.tag.endswith('}drawing'):
+                continue
+            for drawing_child in child:
+                image_bytes = None
+                if drawing_child.tag.endswith('}inline'):
+                    image_bytes = self._extract_image_data_from_inline(drawing_child)
+                elif drawing_child.tag.endswith('}anchor'):
+                    image_bytes = self._extract_image_data_from_anchor(drawing_child)
+                if not image_bytes:
+                    continue
+                if not ocr_images:
+                    markers.append("[Image]")
+                    continue
+                img_hash = _image_hash(image_bytes)
+                ocr_text = ocr_results_map[img_hash] if img_hash in ocr_results_map else self._ocr_image(image_bytes)
+                markers.append(f"[Image: {ocr_text}]" if ocr_text else "[Image]")
+        return markers
 
-            # Combine paragraph parts
-            if para_parts:
-                para_text = "".join(para_parts).strip()
-                if para_text:
-                    cell_parts.append(para_text)
-
-        # Join all paragraphs with newlines
-        return "\n".join(cell_parts)
+    def _table_text_fallback(self, tbl) -> str:
+        """Every cell's text on a plain grid (no merges), for a table whose structure
+        could not be read; the text itself is never dropped."""
+        try:
+            rows = [["".join(t.text or "" for t in tc.iter(_W_T)) for tc in _docx_children(tr, _W_TC)]
+                    for tr in _docx_children(tbl, _W_TR)]
+            width = max((len(row) for row in rows), default=0)
+            rows = [row + [""] * (width - len(row)) for row in rows if any(cell.strip() for cell in row)]
+            if rows:
+                return TableRenderer(self.table_style).render(TableData.from_raw(rows, {'is_complex': False}))
+        except Exception as e:
+            logger.warning(f"DOCX table text fallback failed ({e}); emitting the raw text")
+        return "\n".join(t.text for t in tbl.iter(_W_T) if t.text)
 
 
 class PptxLoader(BaseOfficeLoader):
@@ -1477,6 +1755,15 @@ class PptxLoader(BaseOfficeLoader):
         image_counter = 0
 
         for slide_idx, slide in enumerate(self.doc.slides):
+            background = self._slide_background_image(slide)
+            if background is not None:
+                image_counter += 1
+                images_info.append({
+                    'id': f'pptx_slide{slide_idx + 1}_background_{image_counter}',
+                    'data': background,
+                    'location': {'slide': slide_idx + 1, 'type': 'background'}
+                })
+
             # Check placeholders
             for placeholder in slide.placeholders:
                 if hasattr(placeholder, 'image'):
@@ -1551,6 +1838,17 @@ class PptxLoader(BaseOfficeLoader):
 
         logger.info(f"Processing slide {slide_num}...")
 
+        # A picture set as this slide's own background (Format Background > Picture fill)
+        # is slide content; layout/master backgrounds are shared decoration and skipped.
+        if extract_images:
+            background = self._slide_background_image(slide)
+            if background is not None:
+                item = self._image_item(background, slide_num, ocr_images, ocr_results_map)
+                if item:
+                    item["_top"] = -1
+                    item["_left"] = -1
+                    content_items.append(item)
+
         # First extract from placeholders (most structured content)
         placeholder_content = self._extract_from_placeholders(slide, slide_num, extract_images, ocr_images,
                                                               ocr_results_map)
@@ -1573,7 +1871,7 @@ class PptxLoader(BaseOfficeLoader):
                 # Look for footer/header text in layout
                 for shape in layout.shapes:
                     if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
-                        text = shape.text_frame.text.strip()
+                        text = _soft_breaks(shape.text_frame.text).strip()
                         if text and len(text) < 100:  # Usually footers/headers are short
                             # Check if this text is already captured
                             text_exists = any(item.get('content', '') == text for item in content_items)
@@ -1641,9 +1939,9 @@ class PptxLoader(BaseOfficeLoader):
                             content_items.append(table_content)
                             logger.debug(f"    Extracted table")
 
-                    # Handle picture placeholders
-                    if extract_images and ph_type == PP_PLACEHOLDER.PICTURE:
-                        # Picture placeholders might be populated
+                    # Pictures in placeholders: a picture placeholder, or a picture inserted
+                    # into a content (object/body) placeholder, which becomes a p:pic too
+                    if extract_images and (ph_type == PP_PLACEHOLDER.PICTURE or hasattr(placeholder, 'image')):
                         if hasattr(placeholder, 'image'):
                             image_content = self._extract_image_from_placeholder(placeholder, slide_num, ocr_images,
                                                                                  ocr_results_map)
@@ -1662,7 +1960,7 @@ class PptxLoader(BaseOfficeLoader):
             try:
                 for idx, placeholder in enumerate(slide.placeholders):
                     if placeholder.has_text_frame:
-                        text = placeholder.text_frame.text.strip()
+                        text = _soft_breaks(placeholder.text_frame.text).strip()
                         if text:
                             content_items.append({
                                 "type": self._classify_text_type(text, ""),
@@ -1683,7 +1981,7 @@ class PptxLoader(BaseOfficeLoader):
 
         for paragraph in placeholder.text_frame.paragraphs:
             # Don't strip yet - check raw text first
-            para_text = paragraph.text
+            para_text = _soft_breaks(paragraph.text)
             # Only skip if truly empty or just whitespace
             if para_text and not para_text.isspace():
                 # Now we can strip for storage
@@ -1794,7 +2092,7 @@ class PptxLoader(BaseOfficeLoader):
                         if hasattr(shape, 'text') and shape.text.strip():
                             content_items.append({
                                 "type": "text:normal",
-                                "content": shape.text.strip(),
+                                "content": _soft_breaks(shape.text).strip(),
                                 "page": slide_num,
                                 "_top": shape.top if hasattr(shape, 'top') else 0,
                                 "_left": shape.left if hasattr(shape, 'left') else 0
@@ -1859,7 +2157,7 @@ class PptxLoader(BaseOfficeLoader):
 
         for paragraph in shape.text_frame.paragraphs:
             # Don't strip yet - check raw text first
-            para_text = paragraph.text
+            para_text = _soft_breaks(paragraph.text)
             # Only skip if truly empty or just whitespace
             if para_text and not para_text.isspace():
                 # Now we can strip for storage
@@ -1899,7 +2197,7 @@ class PptxLoader(BaseOfficeLoader):
         try:
             if slide.has_notes_slide:
                 notes_slide = slide.notes_slide
-                notes_text = notes_slide.notes_text_frame.text.strip()
+                notes_text = _soft_breaks(notes_slide.notes_text_frame.text).strip()
 
                 if notes_text:
                     return {
@@ -1945,7 +2243,7 @@ class PptxLoader(BaseOfficeLoader):
                     vMerge = tc.vMerge  # Vertical merge (True for continuation cells)
 
                     # Get cell text
-                    cell_text = cell.text.strip() if hasattr(cell, 'text') else ''
+                    cell_text = _soft_breaks(cell.text).strip() if hasattr(cell, 'text') else ''
 
                     # Check if this is a vertically merged cell continuation
                     if vMerge:
@@ -2040,6 +2338,34 @@ class PptxLoader(BaseOfficeLoader):
 
         return None
 
+    @staticmethod
+    def _slide_background_image(slide) -> Optional[bytes]:
+        """Bytes of the picture fill of the slide's own background (``p:bg/p:bgPr/a:blipFill``), or None."""
+        p_ns = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+        blip = slide._element.find(f'{{{p_ns}}}cSld/{{{p_ns}}}bg/{{{p_ns}}}bgPr/'
+                                   '{http://schemas.openxmlformats.org/drawingml/2006/main}blipFill/'
+                                   '{http://schemas.openxmlformats.org/drawingml/2006/main}blip')
+        rid = blip.get(qn('r:embed')) if blip is not None else None
+        if not rid:
+            return None
+        try:
+            return slide.part.related_part(rid).blob
+        except (KeyError, AttributeError) as e:
+            logger.debug(f"Slide background picture unavailable: {e}")
+            return None
+
+    def _image_item(self, image_data: bytes, slide_num: int, ocr_images: bool,
+                    ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+        """Content item for one picture: its OCR text when OCR runs (None when OCR finds no
+        text), else the image as base64."""
+        if ocr_images and self.ocr:
+            img_hash = _image_hash(image_data)
+            ocr_text = (ocr_results_map or {}).get(img_hash)
+            if ocr_text is None:
+                ocr_text = self._ocr_image(image_data)
+            return self._ocr_description(ocr_text, page=slide_num)
+        return {"type": "image", "content": self._extract_image_as_base64(image_data), "page": slide_num}
+
     def _extract_image_from_placeholder(self, placeholder, slide_num: int, ocr_images: bool,
                                         ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[
         Dict[str, Any]]:
@@ -2055,22 +2381,11 @@ class PptxLoader(BaseOfficeLoader):
                 img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
-                    ocr_text = ocr_results_map[img_hash]
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
-                else:
-                    # Fallback to individual OCR
-                    logger.warning(
-                        f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
-                    ocr_text = self._ocr_image(image_data)
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
+                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
+                # Fallback to individual OCR
+                logger.warning(
+                    f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
+                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
             else:
                 base64_data = self._extract_image_as_base64(image_data)
                 return {
@@ -2096,21 +2411,10 @@ class PptxLoader(BaseOfficeLoader):
                 img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
-                    ocr_text = ocr_results_map[img_hash]
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
-                else:
-                    # Fallback to individual OCR
-                    logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
-                    ocr_text = self._ocr_image(image_data)
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
+                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
+                # Fallback to individual OCR
+                logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
+                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
             else:
                 # Return base64 encoded image
                 base64_data = self._extract_image_as_base64(image_data)
@@ -2142,7 +2446,7 @@ class PptxLoader(BaseOfficeLoader):
                 # Chart title
                 if hasattr(chart, 'has_title') and chart.has_title:
                     try:
-                        title_text = chart.chart_title.text_frame.text.strip()
+                        title_text = _soft_breaks(chart.chart_title.text_frame.text).strip()
                         if title_text:
                             text_items.append({
                                 "type": "text:caption",
@@ -2154,7 +2458,7 @@ class PptxLoader(BaseOfficeLoader):
                 # Axis titles
                 try:
                     if hasattr(chart, 'category_axis') and chart.category_axis.has_title:
-                        axis_text = chart.category_axis.axis_title.text_frame.text.strip()
+                        axis_text = _soft_breaks(chart.category_axis.axis_title.text_frame.text).strip()
                         if axis_text:
                             text_items.append({
                                 "type": "text:caption",
@@ -2165,7 +2469,7 @@ class PptxLoader(BaseOfficeLoader):
 
                 try:
                     if hasattr(chart, 'value_axis') and chart.value_axis.has_title:
-                        axis_text = chart.value_axis.axis_title.text_frame.text.strip()
+                        axis_text = _soft_breaks(chart.value_axis.axis_title.text_frame.text).strip()
                         if axis_text:
                             text_items.append({
                                 "type": "text:caption",
@@ -2192,7 +2496,7 @@ class PptxLoader(BaseOfficeLoader):
             # 5. Connector text (lines with labels)
             if hasattr(shape, 'connector_type'):
                 if hasattr(shape, 'text_frame') and shape.text_frame:
-                    connector_text = shape.text_frame.text.strip()
+                    connector_text = _soft_breaks(shape.text_frame.text).strip()
                     if connector_text:
                         text_items.append({
                             "type": "text:caption",
@@ -2210,7 +2514,16 @@ class PptxLoader(BaseOfficeLoader):
         return text_items
 
 class XlsxLoader(BaseOfficeLoader):
-    """Loader for XLSX (Excel) documents"""
+    """Loader for XLSX (Excel) documents
+
+    Every sheet is read cell by cell with openpyxl (cached values). Values are
+    rendered the way the spreadsheet displays them (number formats), merged cells
+    come only from ``merged_cells.ranges`` (never guessed from blank cells), fully
+    empty rows and columns are dropped, leading single-cell title rows become text
+    above the table, a formula saved without a cached value shows its formula text,
+    and pictures anchored inside the table (or placed in a cell) are marked in their
+    cell (``[Image]``, or ``[Image: <OCR text>]`` when OCR runs).
+    """
 
     def __init__(self, file_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None):
         super().__init__(file_path, ocr, table_style)
@@ -2220,12 +2533,14 @@ class XlsxLoader(BaseOfficeLoader):
         """Open XLSX document"""
         try:
             self.doc = openpyxl.load_workbook(self.file_path, data_only=True)
-            self.df_sheets = pd.read_excel(self.file_path, sheet_name=None)
             logger.info(f"Opened XLSX: {self.file_path.name}")
             logger.info(f"Total sheets: {len(self.doc.worksheets)}")
         except Exception as e:
             logger.error(f"Failed to open XLSX: {e}")
             raise
+        self._scans: Optional[Dict[str, Dict[str, Dict[Tuple[int, int], str]]]] = None
+        self._media_cache: Dict[str, bytes] = {}
+        self._fallback_media: Dict[int, str] = {}
 
     def convert_to_json(self,
                         extract_images: bool = True,
@@ -2238,475 +2553,310 @@ class XlsxLoader(BaseOfficeLoader):
             "content": []
         }
 
-        # Batch OCR processing if requested
+        # Image data is read once (openpyxl's Image._data() can only be read once) and
+        # OCR'd in one batch before the sheets are laid out, so a picture's OCR text can
+        # go into the cell it is anchored to.
         ocr_results_map = {}
-        # Store image data to avoid calling _data() twice
-        image_data_cache = {}  
-        
-        if extract_images and ocr_images:
+        image_data_cache = {}
+        if extract_images:
             if show_progress:
-                logger.info("Collecting all images for batch OCR processing...")
-
+                logger.info("Collecting all images...")
             all_images_info = self._collect_all_images()
-            
-            # Cache image data for reuse during sheet extraction
-            # Build cache using sheet_name and img_idx from the location info
             for info in all_images_info:
-                sheet_name = info['location']['sheet_name']
-                img_idx = info['location']['img_idx']
-                cache_key = (sheet_name, img_idx)
-                image_data_cache[cache_key] = info['data']
-                
-                # Also cache fallback images with a special key
-                if info['location'].get('source') == 'zip_fallback':
-                    fallback_key = ('_fallback', img_idx)
-                    image_data_cache[fallback_key] = info['data']
-
-            if all_images_info:
+                location = info['location']
+                image_data_cache[(location['sheet_name'], location['img_idx'])] = info['data']
+                if location.get('source') == 'zip_fallback':
+                    image_data_cache[('_fallback', location['img_idx'])] = info['data']
+                    self._fallback_media[location['img_idx']] = info.get('media_file', '')
+            if ocr_images and all_images_info:
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
-
                 try:
-                    # Use the configured OCR instance from BaseOfficeLoader
                     ocr_results_map = self._batch_ocr_images(all_images_info)
-
-                    if show_progress:
-                        logger.info(f"Successfully processed {len(ocr_results_map)} images with OCR")
-
                 except Exception as e:
                     logger.error(f"Batch OCR processing failed: {e}")
                     ocr_images = False  # Fall back to base64 extraction
-        elif extract_images:
-            # Even without OCR, collect and cache images to avoid double _data() calls
-            all_images_info = self._collect_all_images()
-            # Build cache using sheet_name and img_idx from the location info
-            for info in all_images_info:
-                sheet_name = info['location']['sheet_name']
-                img_idx = info['location']['img_idx']
-                cache_key = (sheet_name, img_idx)
-                image_data_cache[cache_key] = info['data']
-                
-                # Also cache fallback images with a special key
-                if info['location'].get('source') == 'zip_fallback':
-                    fallback_key = ('_fallback', img_idx)
-                    image_data_cache[fallback_key] = info['data']
 
-        # Track which images have been embedded in tables to avoid duplicates
-        embedded_image_hashes = set()
-        
-        # Process each worksheet
         for sheet_idx, sheet_name in enumerate(self.doc.sheetnames):
             if show_progress:
-                logger.info(f"Processing sheet {sheet_idx + 1}/{len(self.doc.worksheets)}: {sheet_name}")
-
+                logger.info(f"Processing sheet {sheet_idx + 1}/{len(self.doc.sheetnames)}: {sheet_name}")
             sheet = self.doc[sheet_name]
-
-            # Add sheet title
             document["content"].append({
                 "type": "text:title",
                 "content": f"Sheet: {sheet_name}",
                 "page": sheet_idx + 1
             })
-
-            # Extract table data with merged cell detection
-            table_content = self._extract_sheet_as_table(sheet, sheet_name)
-            
-            # If we have OCR results and the table contains #VALUE!, embed OCR in the table
-            if table_content and ocr_images and ocr_results_map and "#VALUE!" in table_content:
-                # Get the first available OCR result for #VALUE! replacement
-                for info in all_images_info:
-                    if info['location']['sheet_name'] == sheet_name:
-                        img_hash = _image_hash(info['data'])
-                        if img_hash in ocr_results_map:
-                            ocr_text = ocr_results_map[img_hash]
-                            
-                            # Convert OCR result to structured single-line text for AI agents
-                            import html
-                            import re
-                            
-                            # Remove markdown formatting to convert to pure text
-                            pure_text = ocr_text
-                            
-                            # Remove markdown bold/italic markers
-                            pure_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', pure_text)  # Remove bold **text**
-                            pure_text = re.sub(r'\*([^*]+)\*', r'\1', pure_text)      # Remove italic *text*
-                            pure_text = re.sub(r'__([^_]+)__', r'\1', pure_text)      # Remove bold __text__
-                            pure_text = re.sub(r'_([^_]+)_', r'\1', pure_text)        # Remove italic _text_
-                            
-                            # Convert headers to structured sections
-                            pure_text = re.sub(r'^#{1,6}\s+(.+)$', r'[\1]:', pure_text, flags=re.MULTILINE)
-                            
-                            # Remove code blocks markers but keep content
-                            pure_text = re.sub(r'```[^\n]*\n', '', pure_text)
-                            pure_text = re.sub(r'```', '', pure_text)
-                            pure_text = re.sub(r'`([^`]+)`', r'\1', pure_text)  # Remove inline code markers
-                            
-                            # Convert markdown lists to structured format
-                            pure_text = re.sub(r'^[\s]*[-*+]\s+(.+)$', r'• \1', pure_text, flags=re.MULTILINE)
-                            pure_text = re.sub(r'^[\s]*\d+\.\s+(.+)$', r'• \1', pure_text, flags=re.MULTILINE)
-                            
-                            # Structure the text for AI understanding
-                            # Split by common OCR sections
-                            sections = []
-                            
-                            # Check for common patterns in OCR results
-                            if "Extracted Text:" in pure_text or "[Extracted Text]:" in pure_text:
-                                # Split into logical sections
-                                lines = pure_text.split('\n')
-                                current_section = []
-                                for line in lines:
-                                    line = line.strip()
-                                    if line and (line.startswith('[') or 'Analysis:' in line or 'Summary:' in line or 'Text:' in line):
-                                        if current_section:
-                                            sections.append(' '.join(current_section))
-                                        current_section = [line]
-                                    elif line:
-                                        current_section.append(line)
-                                if current_section:
-                                    sections.append(' '.join(current_section))
-                                
-                                # Join sections with clear separators
-                                pure_text = ' || '.join(sections) if sections else pure_text
-                            else:
-                                # For simple text, just clean up line breaks
-                                pure_text = re.sub(r'\n+', ' ', pure_text)
-                            
-                            # Clean up multiple spaces and format
-                            pure_text = re.sub(r'\s+', ' ', pure_text)
-                            pure_text = re.sub(r'\|\|\s+\|\|', '||', pure_text)  # Clean up empty sections
-                            pure_text = pure_text.strip()
-                            
-                            # Escape HTML entities
-                            pure_text_escaped = html.escape(pure_text)
-                            
-                            # Create a formatted div with structured OCR result
-                            cell_content = f'''<div style="max-width: 100%; overflow-x: auto; background: #f9f9f9; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333;">
-<strong>📷 OCR Analysis:</strong> <span style="font-family: 'Consolas', monospace; color: #0066cc;">{pure_text_escaped}</span>
-</div>'''
-                            
-                            # Replace #VALUE! with the FULL OCR result
-                            # Replace only the first placeholder occurrence on this sheet
-                            table_content = table_content.replace(
-                                "#VALUE!</td>",
-                                f"{cell_content}</td>",
-                                1
-                            )
-                            
-                            # Mark that we've embedded this image's OCR
-                            embedded_image_hashes.add(img_hash)
-                            logger.info(f"Replaced #VALUE! with full OCR result in sheet {sheet_name}")
-                            break
-            
-            if table_content:
-                document["content"].append({
-                    "type": "table",
-                    "content": table_content,
-                    "page": sheet_idx + 1
-                })
-
-            # Only extract images that weren't already embedded in table cells
+            items, embedded = self._extract_sheet_content(
+                sheet, sheet_idx + 1, extract_images, ocr_images, ocr_results_map, image_data_cache)
+            document["content"].extend(items)
             if extract_images:
-                # Filter out images that were already embedded
-                filtered_images = []
-                images = self._extract_images_from_sheet(sheet, sheet_idx + 1, ocr_images, ocr_results_map, image_data_cache)
-                
-                for img in images:
-                    # Check if this image's OCR was already embedded
-                    img_content = img.get('content', '')
-                    skip_image = False
-                    
-                    # Check if any embedded hash matches this image's content
-                    for embedded_hash in embedded_image_hashes:
-                        if embedded_hash in ocr_results_map:
-                            embedded_text = ocr_results_map[embedded_hash]
-                            # If this image's content matches an embedded one, skip it
-                            if embedded_text in img_content:
-                                skip_image = True
-                                break
-                    
-                    if not skip_image:
-                        filtered_images.append(img)
-                
-                if filtered_images:
-                    document["content"].extend(filtered_images)
+                document["content"].extend(self._extract_images_from_sheet(
+                    sheet, sheet_idx + 1, ocr_images, ocr_results_map, image_data_cache, embedded))
 
         return document
 
-    def _extract_sheet_as_table(self, sheet, sheet_name: str) -> str:
-        """Extract sheet data as table with merged cell detection"""
-        # Get DataFrame for data
-        if sheet_name in self.df_sheets:
-            df = self.df_sheets[sheet_name]
-            if df.empty:
-                return ""
-            
-            # Drop completely empty columns from DataFrame
-            df = df.dropna(axis=1, how='all')
-        else:
-            return ""
+    # ------------------------------------------------------------------ #
+    # Sheet layout                                                         #
+    # ------------------------------------------------------------------ #
+    def _extract_sheet_content(self, sheet, sheet_num: int, extract_images: bool, ocr_images: bool,
+                               ocr_results_map: Dict[Any, str], image_data_cache: Dict[tuple, bytes]
+                               ) -> Tuple[List[Dict[str, Any]], set]:
+        """Content items of one sheet (title rows, then the table) and the pictures
+        embedded in its cells (``("anchor", index)`` / ``("media", part name)``)."""
+        embedded: set = set()
+        if not hasattr(sheet, 'merged_cells'):  # a chartsheet has no cells
+            return [], embedded
+        scan = self._sheet_scans().get(sheet.title, {})
+        formulas, pictures = scan.get('formulas', {}), scan.get('pictures', {})
 
-        # Check for merged cells in the worksheet
-        merged_cells_ranges = sheet.merged_cells.ranges if hasattr(sheet, 'merged_cells') else []
-        has_merged_cells = len(merged_cells_ranges) > 0
+        texts: Dict[Tuple[int, int], str] = {}
+        for (row, col), cell in self._sheet_cells(sheet):
+            if (row, col) in pictures and cell.data_type == 'e':
+                continue  # a picture placed in the cell; Excel stores #VALUE! as its fallback
+            text = self._cell_text(cell) if cell.value is not None else formulas.get((row, col), "")
+            if text:
+                texts[(row, col)] = text
 
-        if has_merged_cells:
-            # Extract with merged cell information
-            return self._extract_sheet_with_merged_cells(sheet, df)
-        else:
-            # Use standard DataFrame conversion
-            return self._dataframe_to_markdown(df)
+        merges = [(r.min_row, r.min_col, r.max_row, r.max_col) for r in sheet.merged_cells.ranges
+                  if texts.get((r.min_row, r.min_col))]
+        # Decided on the text alone: a logo beside a title must not make the title a table row.
+        table_start = self._table_start(texts, merges)
 
-    def _extract_sheet_with_merged_cells(self, sheet, df: pd.DataFrame) -> str:
-        """Extract sheet data handling merged cells"""
-        # Get the actual dimensions
-        max_row = sheet.max_row
-        
-        # Find actual max column with data across ALL rows (not Excel's 16384 limit)
-        # This handles sheets with multiple tables that have different column counts
-        actual_max_col = 1
-        
-        # Check ALL rows to find the true max column with data
-        for row in sheet.iter_rows(min_row=1, max_row=max_row):
-            for idx, cell in enumerate(row, 1):
-                if cell.value is not None:
-                    actual_max_col = max(actual_max_col, idx)
-        
-        # Also check merged cells, but exclude the buggy full-width merges (A:XFD)
-        for merge_range in sheet.merged_cells.ranges:
-            # Skip merged cells that span to Excel's max column (XFD = 16384)
-            # These are typically separator rows, not real data
-            if merge_range.max_col >= 16384:
-                logger.debug(f"Skipping full-width merged cell: {merge_range}")
+        cells = dict(texts)
+        if extract_images and (texts or pictures):
+            marks = self._picture_marks(sheet, texts, merges, pictures, ocr_images, ocr_results_map,
+                                        image_data_cache, embedded)
+            for position, labels in marks.items():
+                cells[position] = " ".join(([cells[position]] if cells.get(position) else []) + labels)
+        if not cells:
+            return [], embedded
+        if table_start is None:
+            table_start = min(row for row, _ in cells)
+
+        by_row: Dict[int, Dict[int, str]] = {}
+        for (row, col), text in cells.items():
+            by_row.setdefault(row, {})[col] = text
+        # Rows above the table (titles, and pictures placed between them and the table) are
+        # text, one paragraph per row with its cells in column order.
+        items = [{"type": "text:normal", "content": " ".join(text for _, text in sorted(by_row[row].items())),
+                  "page": sheet_num}
+                 for row in sorted(row for row in by_row if row < table_start)]
+        table_rows = sorted(row for row in by_row if row >= table_start)
+        cols = sorted({col for row in table_rows for col in by_row[row]})
+        row_pos = {row: i for i, row in enumerate(table_rows)}
+        col_pos = {col: j for j, col in enumerate(cols)}
+        grid = [[by_row[row].get(col, "") for col in cols] for row in table_rows]
+        # A merge spans the rows and columns it covers that are still in the table.
+        spans = {}
+        for r1, c1, r2, c2 in merges:
+            if r1 not in row_pos or c1 not in col_pos:
                 continue
-            
-            # For normal merged cells, include their extent
-            actual_max_col = max(actual_max_col, merge_range.max_col)
-        
-        max_col = actual_max_col
-        logger.debug(f"Sheet dimensions: {max_row} rows x {max_col} columns (actual used)")
-
-        # Build table data with merged cell info
-        table_data = []
-        merged_cells_info = []
-
-        # Map merged cell ranges
-        merge_map = {}
-        for merge_range in sheet.merged_cells.ranges:
-            # Get the top-left cell of the merge
-            min_row = merge_range.min_row
-            min_col = merge_range.min_col
-            max_row_merge = merge_range.max_row
-            # Limit merged cell columns to actual data bounds
-            # (Handles buggy Excel files with merges to column XFD)
-            max_col_merge = min(merge_range.max_col, max_col)
-
-            # Get the value from the top-left cell
-            cell_value = sheet.cell(row=min_row, column=min_col).value
-
-            # Store merge info - only mark the origin cell
-            merge_map[(min_row, min_col)] = {
-                'min_row': min_row,
-                'min_col': min_col,
-                'max_row': max_row_merge,
-                'max_col': max_col_merge,
-                'value': cell_value,
-                'rowspan': max_row_merge - min_row + 1,
-                'colspan': max_col_merge - min_col + 1
-            }
-
-            # Mark other cells in the merge as "merged" (not origin)
-            for r in range(min_row, max_row_merge + 1):
-                for c in range(min_col, max_col_merge + 1):
-                    if (r, c) != (min_row, min_col):
-                        # Keep a backlink to the origin so we can map image anchors correctly
-                        merge_map[(r, c)] = {'is_merged': True, 'origin': (min_row, min_col)}
-
-        # Detect cells containing images (based on anchor positions) so we can embed OCR in-place
-        image_origin_cells = set()
-        try:
-            from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
-        except Exception:
-            coordinate_from_string = None
-            column_index_from_string = None
-
-        for _img in getattr(sheet, "_images", []):
-            row = None
-            col = None
-            anchor = getattr(_img, "anchor", None)
-            try:
-                # Anchor can be a coordinate string like 'B3'
-                if isinstance(anchor, str) and coordinate_from_string is not None:
-                    col_letter, row_num = coordinate_from_string(anchor)
-                    row = int(row_num)
-                    col = int(column_index_from_string(col_letter))
-                # Or an anchor object (OneCellAnchor/TwoCellAnchor) with 0-based indices
-                elif hasattr(anchor, "_from") and hasattr(anchor._from, "row") and hasattr(anchor._from, "col"):
-                    row = int(anchor._from.row) + 1
-                    col = int(anchor._from.col) + 1
-            except Exception:
-                row = None
-                col = None
-
-            if row is None or col is None:
-                continue
-
-            # If the anchor falls inside a merged region, use that region's origin
-            origin_row, origin_col = row, col
-            mi = merge_map.get((row, col))
-            if isinstance(mi, dict) and mi.get('is_merged') and 'origin' in mi:
-                origin_row, origin_col = mi['origin']
-            else:
-                # Search origins in merge_map
-                for _pos, _info in merge_map.items():
-                    if 'min_row' in _info:
-                        if _info['min_row'] <= row <= _info['max_row'] and _info['min_col'] <= col <= _info['max_col']:
-                            origin_row, origin_col = _info['min_row'], _info['min_col']
-                            break
-
-            image_origin_cells.add((origin_row, origin_col))
-
-        # Extract data row by row
-        # Start from row 1 (Excel is 1-indexed)
-        for row_idx in range(1, max_row + 1):
-            row_data = []
-
-            for col_idx in range(1, max_col + 1):
-                # Check if this cell is part of a merge
-                if (row_idx, col_idx) in merge_map:
-                    merge_info = merge_map[(row_idx, col_idx)]
-
-                    if 'is_merged' in merge_info:
-                        # This cell is part of a merge but not the origin
-                        row_data.append("")
-                    else:
-                        # This is the origin cell of a merge
-                        value = str(merge_info['value']) if merge_info['value'] is not None else ""
-                        # If an image is anchored to this merged region's origin, mark placeholder for OCR embedding
-                        if (row_idx, col_idx) in image_origin_cells:
-                            value = "#VALUE!" if not value else f"{value} #VALUE!"
-                        row_data.append(value)
-
-                        # Record merge info (0-indexed for our table)
-                        if merge_info['rowspan'] > 1 or merge_info['colspan'] > 1:
-                            merged_cells_info.append({
-                                'row': len(table_data),  # Current row in table_data
-                                'col': col_idx - 1,  # Convert to 0-indexed
-                                'rowspan': merge_info['rowspan'],
-                                'colspan': merge_info['colspan']
-                            })
-                else:
-                    # Regular cell - get its value
-                    cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                    value = str(cell_value) if cell_value is not None else ""
-                    # If an image is anchored to this exact cell, mark placeholder for OCR embedding
-                    if (row_idx, col_idx) in image_origin_cells:
-                        value = "#VALUE!" if not value else f"{value} #VALUE!"
-                    row_data.append(value)
-
-            # Add all rows to table_data initially
-            table_data.append(row_data)
-
-        # Filter out columns that are completely empty across ALL rows
-        # This preserves columns that have data in ANY table within the sheet
-        if table_data and len(table_data) > 1:
-            # Check which columns have ANY data across all rows
-            cols_with_data = set()
-            for row_idx, row in enumerate(table_data):
-                for col_idx, cell in enumerate(row[:max_col]):
-                    if cell and str(cell).strip():
-                        cols_with_data.add(col_idx)
-            
-            # Keep all columns that have data somewhere
-            cols_to_keep = sorted(list(cols_with_data))
-            
-            # Only filter if we're actually removing empty columns
-            if cols_to_keep and len(cols_to_keep) < max_col:
-                filtered_table_data = []
-                for row in table_data:
-                    filtered_row = [row[i] if i < len(row) else '' for i in cols_to_keep]
-                    filtered_table_data.append(filtered_row)
-                
-                # Update merged cells info for new column indices
-                filtered_merged_cells_info = []
-                col_index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(cols_to_keep)}
-                
-                for merge_info in merged_cells_info:
-                    old_col = merge_info['col']
-                    if old_col in col_index_map:
-                        # Calculate new colspan based on how many columns in the span are kept
-                        old_col_end = old_col + merge_info['colspan']
-                        kept_cols_in_span = [c for c in range(old_col, old_col_end) if c in cols_to_keep]
-                        
-                        if kept_cols_in_span:
-                            filtered_merged_cells_info.append({
-                                'row': merge_info['row'],
-                                'col': col_index_map[old_col],
-                                'rowspan': merge_info['rowspan'],
-                                'colspan': len(kept_cols_in_span)
-                            })
-                
-                table_data = filtered_table_data
-                merged_cells_info = filtered_merged_cells_info
-                actual_col_count = len(cols_to_keep)
-                logger.debug(f"Filtered table from {max_col} to {actual_col_count} columns (removed completely empty columns)")
-            else:
-                actual_col_count = max_col
-        else:
-            actual_col_count = max_col
-        
-        # Debug logging
-        logger.debug(f"Extracted {len(table_data)} rows with {len(merged_cells_info)} merged cells")
-        if len(table_data) > 0:
-            logger.debug(f"First row: {table_data[0][:10] if len(table_data[0]) > 10 else table_data[0]}")
-
-        # Create table info for complex table handling
-        if merged_cells_info:
-            cell_spans = {}
-            for merge_info in merged_cells_info:
-                key = (merge_info['row'], merge_info['col'])
-                cell_spans[key] = (merge_info['rowspan'], merge_info['colspan'])
-
-            table_obj = TableData.from_raw(table_data, {
-                'is_complex': True,
-                'cell_spans': cell_spans,
+            rowspan = bisect.bisect_right(table_rows, r2) - row_pos[r1]
+            colspan = bisect.bisect_right(cols, c2) - col_pos[c1]
+            if rowspan > 1 or colspan > 1:
+                spans[(row_pos[r1], col_pos[c1])] = (rowspan, colspan)
+        if grid:
+            table_obj = TableData.from_raw(grid, {'is_complex': bool(spans), 'cell_spans': spans})
+            items.append({
+                "type": "table",
+                "content": TableRenderer(self.table_style).render(table_obj),
+                "page": sheet_num
             })
-            renderer = TableRenderer(self.table_style)
-            return renderer._render_html(table_obj)
+        return items, embedded
+
+    @staticmethod
+    def _table_start(texts: Dict[Tuple[int, int], str], merges) -> Optional[int]:
+        """First row of the sheet's table; the text rows above it are titles.
+
+        Only rows above the first row with two or more cells can be titles, and only on
+        strong evidence: the row's single cell is merged across the table's width, or a
+        blank row separates it from the table ("ACME Corp - Sales Report FY2025", blank row,
+        header row). A lone cell right above the table ("Customer" over two-column data) may
+        be a header and stays in the table. None when the sheet has no text.
+        """
+        rows = sorted({row for row, _ in texts})
+        if not rows:
+            return None
+        cols_by_row: Dict[int, List[int]] = {}
+        for row, col in texts:
+            cols_by_row.setdefault(row, []).append(col)
+        first_multi = next((row for row in rows if len(cols_by_row[row]) >= 2), None)
+        if first_multi is None:
+            return rows[0]
+        table_cols = [col for row, col in texts if row >= first_multi]
+        left, right = min(table_cols), max(table_cols)
+        start = first_multi
+        for row in reversed([row for row in rows if row < first_multi]):
+            col = cols_by_row[row][0]
+            across = any((r1, c1) == (row, col) and c1 <= left and c2 >= right and r2 < start
+                         for r1, c1, r2, c2 in merges)
+            if across or start - row > 1:
+                return start
+            start = row
+        return start
+
+    @staticmethod
+    def _sheet_cells(sheet):
+        """((row, col), cell) for every stored cell, in row-major order."""
+        cells = getattr(sheet, '_cells', None)
+        if isinstance(cells, dict):
+            return sorted(cells.items())
+        return (((cell.row, cell.column), cell) for row in sheet.iter_rows() for cell in row)
+
+    @staticmethod
+    def _cell_text(cell) -> str:
+        """The cell as displayed: number formats applied, line breaks normalised,
+        control characters removed."""
+        try:
+            text = format_cell_value(cell.value, cell.number_format)
+        except Exception:
+            text = str(cell.value)
+        text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\x0b', '\n').replace('\x0c', '\n')
+        return _CONTROL_CHARS.sub('', text).strip()
+
+    def _picture_marks(self, sheet, texts, merges, pictures, ocr_images: bool, ocr_results_map,
+                       image_data_cache, embedded: set) -> Dict[Tuple[int, int], List[str]]:
+        """``[Image]`` / ``[Image: <OCR text>]`` labels for pictures inside the sheet's
+        table: anchored pictures whose top-left cell lies within the used range (a cell
+        inside a merge maps to the merge's top-left cell) and pictures placed in cells."""
+        marks: Dict[Tuple[int, int], List[str]] = {}
+        if texts:
+            row_lo, row_hi = min(r for r, _ in texts), max(r for r, _ in texts)
+            col_lo, col_hi = min(c for _, c in texts), max(c for _, c in texts)
         else:
-            # Filter out completely empty rows before converting to markdown
-            filtered_data = []
-            for idx, row in enumerate(table_data):
-                if idx == 0 or any(cell.strip() for cell in row if cell):  # Keep headers or non-empty rows
-                    filtered_data.append(row)
-            
-            # Use standard markdown conversion
-            return self._convert_table_to_markdown(filtered_data) if filtered_data else ""
+            row_lo = row_hi = col_lo = col_hi = None
+        for index, image in enumerate(getattr(sheet, '_images', [])):
+            position = self._anchor_cell(image)
+            if position is None or row_lo is None:
+                continue
+            position = next(((r1, c1) for r1, c1, r2, c2 in merges
+                             if r1 <= position[0] <= r2 and c1 <= position[1] <= c2), position)
+            if not (row_lo <= position[0] <= row_hi and col_lo <= position[1] <= col_hi):
+                continue
+            label = self._picture_label(image_data_cache.get((sheet.title, index)), ocr_images, ocr_results_map)
+            marks.setdefault(position, []).append(label)
+            if label != "[Image]":
+                embedded.add(('anchor', index))
+        for position, media in pictures.items():
+            label = self._picture_label(self._media_bytes(media), ocr_images, ocr_results_map)
+            marks.setdefault(position, []).append(label)
+            if label != "[Image]":
+                embedded.add(('media', media))
+        return marks
 
-    def _dataframe_to_markdown(self, df: pd.DataFrame) -> str:
-        """Convert pandas DataFrame to markdown table"""
-        # Convert DataFrame to list of lists
-        table_data = [df.columns.tolist()]  # Header
-        table_data.extend(df.values.tolist())  # Data
+    def _picture_label(self, data: Optional[bytes], ocr_images: bool, ocr_results_map) -> str:
+        """``[Image: <OCR text>]`` when OCR read the picture, else ``[Image]``. Only a picture
+        whose OCR text went into its cell counts as embedded; any other picture is still
+        emitted after the table, so extracted image data is never dropped."""
+        if not (ocr_images and data):
+            return "[Image]"
+        img_hash = _image_hash(data)
+        text = ocr_results_map.get(img_hash)
+        if text is None:  # not in the batch: OCR it once, and remember it for the image item
+            text = ocr_results_map[img_hash] = self._ocr_image(data)
+        text = (text or "").strip()
+        return f"[Image: {text}]" if text else "[Image]"
 
-        # Handle NaN values
-        for i, row in enumerate(table_data):
-            table_data[i] = [str(cell) if pd.notna(cell) else "" for cell in row]
+    @staticmethod
+    def _anchor_cell(image) -> Optional[Tuple[int, int]]:
+        """1-based (row, col) of a picture's top-left anchor cell."""
+        anchor = getattr(image, 'anchor', None)
+        try:
+            if isinstance(anchor, str):
+                from openpyxl.utils.cell import coordinate_to_tuple
+                return coordinate_to_tuple(anchor)
+            start = getattr(anchor, '_from', None)
+            if start is not None:
+                return int(start.row) + 1, int(start.col) + 1
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return None
 
-        return self._convert_table_to_markdown(table_data)
+    def _media_bytes(self, part_name: str) -> Optional[bytes]:
+        if part_name not in self._media_cache:
+            try:
+                with zipfile.ZipFile(self.file_path) as archive:
+                    self._media_cache[part_name] = archive.read(part_name)
+            except (KeyError, zipfile.BadZipFile, OSError) as e:
+                logger.debug(f"XLSX picture {part_name} unavailable: {e}")
+                self._media_cache[part_name] = None
+        return self._media_cache[part_name]
+
+    # ------------------------------------------------------------------ #
+    # What openpyxl does not expose: uncached formulas, in-cell pictures   #
+    # ------------------------------------------------------------------ #
+    def _sheet_scans(self) -> Dict[str, Dict[str, Dict[Tuple[int, int], str]]]:
+        """Per sheet title: ``formulas`` {(row, col): "=formula"} for formulas saved
+        without a cached value (openpyxl reads them as empty), and ``pictures``
+        {(row, col): media part} for pictures placed in cells (Excel's rich values)."""
+        if self._scans is None:
+            try:
+                self._scans = self._scan_package()
+            except Exception as e:
+                logger.warning(f"XLSX formula/picture scan failed ({e}); uncached formulas stay empty")
+                self._scans = {}
+        return self._scans
+
+    def _scan_package(self) -> Dict[str, Dict[str, Dict[Tuple[int, int], str]]]:
+        from lxml import etree
+        from openpyxl.utils.cell import coordinate_to_tuple
+        scans: Dict[str, Dict[str, Dict[Tuple[int, int], str]]] = {}
+        unresolved: Dict[str, List[Tuple[int, int]]] = {}
+        value_metadata: Dict[str, Dict[Tuple[int, int], int]] = {}
+        with zipfile.ZipFile(self.file_path) as archive:
+            names = set(archive.namelist())
+            for title, part in _xlsx_sheet_parts(archive).items():
+                if part not in names or not _zip_member_matches(archive, part, _FORMULA_OR_RICH_VALUE):
+                    continue
+                formulas: Dict[Tuple[int, int], str] = {}
+                for _, element in etree.iterparse(archive.open(part), events=('end',), tag=_SML_C,
+                                                  resolve_entities=False, no_network=True, huge_tree=False):
+                    reference = element.get('r')
+                    if reference:
+                        position = coordinate_to_tuple(reference)
+                        formula = element.find(_SML_F)
+                        if formula is not None and _formula_uncached(element):
+                            if formula.text:
+                                formulas[position] = "=" + formula.text
+                            else:
+                                unresolved.setdefault(title, []).append(position)
+                        if element.get('vm'):
+                            value_metadata.setdefault(title, {})[position] = _attr_int(element, 'vm')
+                    element.clear(keep_tail=True)
+                scans[title] = {'formulas': formulas, 'pictures': {}}
+            if value_metadata:
+                images = _xlsx_rich_value_images(archive, names)
+                for title, cells in value_metadata.items():
+                    scans[title]['pictures'] = {position: images[vm] for position, vm in cells.items() if vm in images}
+        if unresolved:
+            # Shared formulas store their text once; openpyxl translates it for each cell.
+            formula_book = openpyxl.load_workbook(self.file_path, data_only=False)
+            for title, positions in unresolved.items():
+                for row, col in positions:
+                    value = formula_book[title].cell(row, col).value
+                    value = getattr(value, 'text', value)
+                    if isinstance(value, str) and value:
+                        scans[title]['formulas'][(row, col)] = value if value.startswith('=') else '=' + value
+        return scans
 
     def _extract_images_from_sheet(self, sheet, sheet_num: int, ocr_images: bool,
                                    ocr_results_map: Optional[Dict[str, str]] = None,
-                                   image_data_cache: Optional[Dict[tuple, bytes]] = None) -> List[Dict[str, Any]]:
-        """Extract images from an Excel sheet"""
+                                   image_data_cache: Optional[Dict[tuple, bytes]] = None,
+                                   embedded: Optional[set] = None) -> List[Dict[str, Any]]:
+        """Extract images from an Excel sheet, except those already shown in a table
+        cell (``embedded``: ``("anchor", index)`` / ``("media", part name)``)."""
         if ocr_results_map is None:
             ocr_results_map = {}
         if image_data_cache is None:
             image_data_cache = {}
+        embedded = embedded or set()
         images = []
         sheet_name = sheet.title
 
         # First try standard image extraction
-        for img_idx, image in enumerate(sheet._images):
+        for img_idx, image in enumerate(getattr(sheet, '_images', [])):
+            if ('anchor', img_idx) in embedded:
+                continue
             try:
                 # Try to get cached image data first to avoid double _data() call
                 cache_key = (sheet_name, img_idx)  # Use sheet_name for consistency
@@ -2725,23 +2875,15 @@ class XlsxLoader(BaseOfficeLoader):
                 if ocr_images:
                     # Use image content hash to find OCR result
                     img_hash = _image_hash(image_data)
-
                     if img_hash in ocr_results_map:
                         ocr_text = ocr_results_map[img_hash]
-                        images.append({
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                            "page": sheet_num
-                        })
                     else:
                         # Fallback to individual OCR
                         logger.warning(f"OCR result not found for image on sheet {sheet_name}, using fallback OCR")
                         ocr_text = self._ocr_image(image_data)
-                        images.append({
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                            "page": sheet_num
-                        })
+                    item = self._ocr_description(ocr_text, page=sheet_num)
+                    if item:
+                        images.append(item)
                 else:
                     # Return base64 encoded image
                     base64_data = self._extract_image_as_base64(image_data)
@@ -2760,40 +2902,28 @@ class XlsxLoader(BaseOfficeLoader):
             fallback_idx = 0
             while True:
                 fallback_key = ('_fallback', fallback_idx)
+                if fallback_key in image_data_cache and ('media', self._fallback_media.get(fallback_idx)) in embedded:
+                    fallback_idx += 1  # a picture placed in a cell, already shown there
+                    continue
                 if fallback_key in image_data_cache:
                     image_data = image_data_cache[fallback_key]
                     
                     if ocr_images:
-                        # First try the special fallback OCR key for this specific image
+                        # First try the special fallback OCR key for this specific image, then
+                        # the hash, then an individual OCR call
                         fallback_ocr_key = ('_fallback_ocr', fallback_idx)
-                        
+                        img_hash = _image_hash(image_data)
                         if fallback_ocr_key in ocr_results_map:
                             ocr_text = ocr_results_map[fallback_ocr_key]
-                            images.append({
-                                "type": "text:image_description",
-                                "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                "page": sheet_num
-                            })
                             logger.info(f"Using OCR result for fallback image {fallback_idx}")
+                        elif img_hash in ocr_results_map:
+                            ocr_text = ocr_results_map[img_hash]
                         else:
-                            # Try hash-based lookup as backup
-                            img_hash = _image_hash(image_data)
-                            if img_hash in ocr_results_map:
-                                ocr_text = ocr_results_map[img_hash]
-                                images.append({
-                                    "type": "text:image_description",
-                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                    "page": sheet_num
-                                })
-                            else:
-                                # Fallback to individual OCR
-                                logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
-                                ocr_text = self._ocr_image(image_data)
-                                images.append({
-                                    "type": "text:image_description",
-                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                    "page": sheet_num
-                                })
+                            logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
+                            ocr_text = self._ocr_image(image_data)
+                        item = self._ocr_description(ocr_text, page=sheet_num)
+                        if item:
+                            images.append(item)
                     else:
                         # Return base64 encoded image
                         base64_data = self._extract_image_as_base64(image_data)
@@ -2820,7 +2950,7 @@ class XlsxLoader(BaseOfficeLoader):
             sheet = self.doc[sheet_name]
 
             # Extract images from sheet using standard method
-            for img_idx, image in enumerate(sheet._images):
+            for img_idx, image in enumerate(getattr(sheet, '_images', [])):
                 try:
                     image_data = image._data()
                     image_counter += 1
@@ -3016,10 +3146,16 @@ def office_to_json(
     return json_data
 
 
+_MARKDOWN_LIST_MARKER = re.compile(r'[-+*]|\d{1,9}[.)]')
+
+
 def office_to_markdown(json_data: Dict[str, Any]) -> str:
     """Convert Office JSON data to markdown string"""
     markdown_parts = []
     current_page = None
+    # Depth of the deepest list item still open in the current run of list items
+    # (only markers Markdown recognises open one); -1 when none is.
+    list_depth, list_page = -1, None
 
     # Determine marker label from filename
     filename = json_data.get("filename", "")
@@ -3038,6 +3174,28 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             markdown_parts.append(f"<!-- {page_label} {item['page']} -->")
             markdown_parts.append("")
             current_page = item["page"]
+
+        # Structure read from the file (list marker, heading level) sits beside the
+        # verbatim ``content``; only the prefix is built here. A list item nests at
+        # most one level below a preceding item of the same run whose marker is a
+        # Markdown list marker ("-", "1.", "1)"), so an indented line always continues
+        # a list and never starts an indented code block.
+        if item["type"] == "text:list" and item.get("marker"):
+            if item.get("page") != list_page:
+                list_depth = -1
+            depth = min(item.get("list_level", 0), list_depth + 1)
+            markdown_parts.append(f"{'    ' * depth}{item['marker']} {item['content']}\n")
+            if _MARKDOWN_LIST_MARKER.fullmatch(item["marker"]):
+                list_depth = depth
+            else:  # a paragraph ("(a) ..."): it closes list items at its own depth and deeper
+                list_depth = min(list_depth, depth - 1)
+            list_page = item.get("page")
+            continue
+        list_depth = -1
+        if item["type"] in ("text:title", "text:section") and item.get("level"):
+            number = f"{item['marker']} " if item.get("marker") else ""
+            markdown_parts.append(f"{'#' * item['level']} {number}{item['content']}\n")
+            continue
 
         if item["type"] == "text:title":
             # Add titles with H1 formatting and extra spacing
