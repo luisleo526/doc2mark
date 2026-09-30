@@ -655,6 +655,17 @@ class BaseOfficeLoader:
         """Convert image bytes to base64 string"""
         return base64.b64encode(image_data).decode('utf-8')
 
+    @staticmethod
+    def _ocr_description(ocr_text: Optional[str], **fields) -> Optional[Dict[str, Any]]:
+        """The ``text:image_description`` item for a picture's OCR text (inside the internal
+        ``<image_ocr_result>`` provenance wrapper that the Markdown render strips), or None
+        when OCR found no text in the picture: an empty description is never emitted, as on
+        the PDF path, which skips images that OCR to nothing."""
+        text = (ocr_text or "").strip()
+        if not text:
+            return None
+        return {"type": "text:image_description", "content": f"<image_ocr_result>{text}</image_ocr_result>", **fields}
+
     def _ocr_image(self, image_bytes: bytes) -> str:
         """Use OCR to convert image to text description"""
         if not image_bytes:
@@ -1318,20 +1329,10 @@ class DocxLoader(BaseOfficeLoader):
                     # Use image content hash to find OCR result (already calculated above)
 
                     if img_hash in ocr_results_map:
-                        ocr_text = ocr_results_map[img_hash]
-                        return {
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>"
-                        }
-                    else:
-                        # Fallback to individual OCR if not in batch results
-                        logger.warning(f"OCR result not found for image with rid {rid}, using fallback OCR")
-                        ocr_text = self._ocr_image(image_bytes)
-                        if ocr_text:
-                            return {
-                                "type": "text:image_description",
-                                "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>"
-                            }
+                        return self._ocr_description(ocr_results_map[img_hash])
+                    # Fallback to individual OCR if not in batch results
+                    logger.warning(f"OCR result not found for image with rid {rid}, using fallback OCR")
+                    return self._ocr_description(self._ocr_image(image_bytes))
                 else:
                     # Return base64 encoded image
                     base64_image = base64.b64encode(image_bytes).decode('utf-8')
@@ -2355,15 +2356,14 @@ class PptxLoader(BaseOfficeLoader):
 
     def _image_item(self, image_data: bytes, slide_num: int, ocr_images: bool,
                     ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
-        """Content item for one picture: its OCR text when OCR runs, else the image as base64."""
+        """Content item for one picture: its OCR text when OCR runs (None when OCR finds no
+        text), else the image as base64."""
         if ocr_images and self.ocr:
             img_hash = _image_hash(image_data)
             ocr_text = (ocr_results_map or {}).get(img_hash)
             if ocr_text is None:
                 ocr_text = self._ocr_image(image_data)
-            return {"type": "text:image_description",
-                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                    "page": slide_num}
+            return self._ocr_description(ocr_text, page=slide_num)
         return {"type": "image", "content": self._extract_image_as_base64(image_data), "page": slide_num}
 
     def _extract_image_from_placeholder(self, placeholder, slide_num: int, ocr_images: bool,
@@ -2381,22 +2381,11 @@ class PptxLoader(BaseOfficeLoader):
                 img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
-                    ocr_text = ocr_results_map[img_hash]
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
-                else:
-                    # Fallback to individual OCR
-                    logger.warning(
-                        f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
-                    ocr_text = self._ocr_image(image_data)
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
+                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
+                # Fallback to individual OCR
+                logger.warning(
+                    f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
+                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
             else:
                 base64_data = self._extract_image_as_base64(image_data)
                 return {
@@ -2422,21 +2411,10 @@ class PptxLoader(BaseOfficeLoader):
                 img_hash = _image_hash(image_data)
 
                 if img_hash in ocr_results_map:
-                    ocr_text = ocr_results_map[img_hash]
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
-                else:
-                    # Fallback to individual OCR
-                    logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
-                    ocr_text = self._ocr_image(image_data)
-                    return {
-                        "type": "text:image_description",
-                        "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                        "page": slide_num
-                    }
+                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
+                # Fallback to individual OCR
+                logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
+                return self._ocr_description(self._ocr_image(image_data), page=slide_num)
             else:
                 # Return base64 encoded image
                 base64_data = self._extract_image_as_base64(image_data)
@@ -2897,23 +2875,15 @@ class XlsxLoader(BaseOfficeLoader):
                 if ocr_images:
                     # Use image content hash to find OCR result
                     img_hash = _image_hash(image_data)
-
                     if img_hash in ocr_results_map:
                         ocr_text = ocr_results_map[img_hash]
-                        images.append({
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                            "page": sheet_num
-                        })
                     else:
                         # Fallback to individual OCR
                         logger.warning(f"OCR result not found for image on sheet {sheet_name}, using fallback OCR")
                         ocr_text = self._ocr_image(image_data)
-                        images.append({
-                            "type": "text:image_description",
-                            "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                            "page": sheet_num
-                        })
+                    item = self._ocr_description(ocr_text, page=sheet_num)
+                    if item:
+                        images.append(item)
                 else:
                     # Return base64 encoded image
                     base64_data = self._extract_image_as_base64(image_data)
@@ -2939,36 +2909,21 @@ class XlsxLoader(BaseOfficeLoader):
                     image_data = image_data_cache[fallback_key]
                     
                     if ocr_images:
-                        # First try the special fallback OCR key for this specific image
+                        # First try the special fallback OCR key for this specific image, then
+                        # the hash, then an individual OCR call
                         fallback_ocr_key = ('_fallback_ocr', fallback_idx)
-                        
+                        img_hash = _image_hash(image_data)
                         if fallback_ocr_key in ocr_results_map:
                             ocr_text = ocr_results_map[fallback_ocr_key]
-                            images.append({
-                                "type": "text:image_description",
-                                "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                "page": sheet_num
-                            })
                             logger.info(f"Using OCR result for fallback image {fallback_idx}")
+                        elif img_hash in ocr_results_map:
+                            ocr_text = ocr_results_map[img_hash]
                         else:
-                            # Try hash-based lookup as backup
-                            img_hash = _image_hash(image_data)
-                            if img_hash in ocr_results_map:
-                                ocr_text = ocr_results_map[img_hash]
-                                images.append({
-                                    "type": "text:image_description",
-                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                    "page": sheet_num
-                                })
-                            else:
-                                # Fallback to individual OCR
-                                logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
-                                ocr_text = self._ocr_image(image_data)
-                                images.append({
-                                    "type": "text:image_description",
-                                    "content": f"<image_ocr_result>{ocr_text}</image_ocr_result>",
-                                    "page": sheet_num
-                                })
+                            logger.warning(f"OCR result not found for fallback image {fallback_idx}, using fallback OCR")
+                            ocr_text = self._ocr_image(image_data)
+                        item = self._ocr_description(ocr_text, page=sheet_num)
+                        if item:
+                            images.append(item)
                     else:
                         # Return base64 encoded image
                         base64_data = self._extract_image_as_base64(image_data)
