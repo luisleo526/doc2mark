@@ -4,6 +4,7 @@ the deterministic patterns over the labelled answers of the Jev spike (report se
 (the E2E image has no Gemini client and no Google credentials)."""
 
 import io
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -204,6 +205,16 @@ def test_canonical_refusals_and_bare_placeholders_count_as_no_content(answer):
 def test_patterns_ignore_long_answers_that_start_with_an_apology():
     answer = "I'm sorry, but I can't read the header. " + "Line item 12 costs 30 dollars. " * 20
     assert not matches_non_content_pattern(answer)
+
+
+@pytest.mark.parametrize("answer", [
+    "I'm sorry, but I can't assist with that" + "\n" * 350 + "x",
+    "I can't read the text in this image" + " \n" * 170 + "x",
+])
+def test_patterns_do_not_backtrack_over_runs_of_blank_lines(answer):
+    started = time.perf_counter()
+    assert not matches_non_content_pattern(answer)
+    assert time.perf_counter() - started < 0.05
 
 
 class TestJudgeContract:
