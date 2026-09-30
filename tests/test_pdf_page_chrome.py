@@ -316,7 +316,7 @@ class _CleanTextLoader(PDFLoader):
     title, as a lane that removes hidden text does."""
 
     @contextmanager
-    def _text_page(self, page):
+    def _text_page(self, page, *args, **kwargs):
         second = pymupdf.open(self.pdf_path)
         try:
             source = second[page.number]
@@ -363,7 +363,7 @@ class _SwitchingPage:
 
 class _SwitchingLoader(PDFLoader):
     @contextmanager
-    def _text_page(self, page):
+    def _text_page(self, page, *args, **kwargs):
         second = pymupdf.open(self.pdf_path)
         try:
             yield _SwitchingPage(page, second)
@@ -423,17 +423,18 @@ def test_page_state_follows_the_page_index_when_text_is_read_from_a_copy(tmp_pat
 
 
 class _SingleBlockLoader(PDFLoader):
-    """A text source that cannot be re-entered, like one discarding shared page copies when a block
-    ends (PR #18's PageCopies)."""
+    """The loader's own text source (PR #18's, which discards its shared page copies when a block
+    ends), refusing to be entered while another block is open."""
 
     _open = False
 
     @contextmanager
-    def _text_page(self, page):
+    def _text_page(self, page, *args, **kwargs):
         assert not self._open, "_text_page entered while another block is open"
         self._open = True
         try:
-            yield page
+            with super()._text_page(page, *args, **kwargs) as text_page:
+                yield text_page
         finally:
             self._open = False
 

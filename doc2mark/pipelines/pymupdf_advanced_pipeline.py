@@ -193,6 +193,8 @@ class PDFLoader:
         self._rendered_pages: set = set()  # pages whose content is the OCR of their render
         self._judged_pages: set = set()    # pages the legibility judge was asked about
         self._chrome_regions: Optional[Dict[int, List[Tuple[Tuple[float, float, float, float], str, bool]]]] = None
+        # OCR options of the conversion under way: the page text depends on them (see _text_page).
+        self._text_options: Tuple[bool, Optional[Dict[tuple, str]]] = (False, None)
 
         # Neighbor-page PDF context (off by default). Resolve the context tier
         # once from the OCR instance's config (NOT self.config, which does not
@@ -375,6 +377,11 @@ class PDFLoader:
 
         # If OCR is requested, collect all images first for batch processing
         ocr_results_map = {}
+        # The page text depends on this run's OCR (see _text_source): the document-wide passes
+        # that read every page through _text_page run afresh for it.
+        self._text_options = (ocr_images, ocr_results_map)
+        self._chrome_regions = None
+        self._first_text_page_num = None
         if extract_images and ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
@@ -1160,7 +1167,11 @@ class PDFLoader:
         find_tables() reports them in one uncropped frame (see ``_record_rotated_crop_boxes``);
         ``_restore_cropbox`` puts it back once the tables are extracted. ``page_num`` is the
         page's index in ``self.doc`` (default ``page.number``): the page object may be another
-        handle on the file (a cleaned copy), whose own document is the one written to."""
+        handle on the file (a cleaned copy), whose own document is the one written to.
+
+        While the CropBox is off, ``pdf_routing.PageCopies`` does not copy the page (the copy
+        would not show what the page shows), so the tables of such a page are read from the
+        page itself even when it has hidden text; the text path still leaves that text out."""
         number = page.number if page_num is None else page_num
         if number not in getattr(self, "_rotated_crop_boxes", {}) or number in self._rotated_cropped_pages:
             return
@@ -1197,16 +1208,26 @@ class PDFLoader:
                 self._rotated_cropped_pages.add(number)
 
     @contextmanager
-    def _text_page(self, page):
-        """The page object whose text is read for ``page``. Text and tables (``_process_page``),
+    def _text_page(self, page, ocr_images: Optional[bool] = None,
+                   ocr_results_map: Optional[Dict[tuple, str]] = None):
+        """The page object whose text is read for ``page`` (a page of ``self.doc``): the page as
+        ``_text_source`` gives it, without its hidden text. Text and tables (``_process_page``),
         running headers and footers (``_detect_page_chrome``, ``_middle_lines``) and the
-        first-text-page check all read a page through here, so they see the same text: a
-        pipeline that reads text from a cleaned copy of the page (hidden text removed) yields
-        that copy here and releases it when the block ends. Blocks never nest: ``_process_page``
-        runs the document-wide passes before opening its page's block, so an implementation may
-        share state between blocks (one set of copies, discarded at the end of each block).
-        This one reads the page itself."""
-        yield page
+        first-text-page check all read a page through here, so they see the same text.
+        ``ocr_images`` and ``ocr_results_map`` default to the conversion under way (see
+        ``convert_to_json``). The page copies the text source makes are discarded when the
+        block ends, so blocks never nest: ``_process_page`` runs the document-wide passes
+        before opening its page's block."""
+        copies = getattr(self, "_copies", None)
+        if copies is None:  # no routing state (a loader built without __init__): the page itself
+            yield page
+            return
+        if ocr_images is None:
+            ocr_images, ocr_results_map = getattr(self, "_text_options", (False, None))
+        try:
+            yield self._text_source(page, page.number, ocr_images, ocr_results_map)
+        finally:
+            copies.discard()
 
     def _get_first_text_page_num(self) -> int:
         """Return the first page index containing non-empty text, falling back to 0.
@@ -1605,12 +1626,11 @@ class PDFLoader:
 
         # --- TEXT-authoritative page: rule-based text/tables + per-image OCR. ---
         # The document-wide passes read every page through _text_page: run them (once) before
-        # this page's text is read, so blocks never nest.
+        # this page's block opens, so blocks never nest.
         self._page_chrome_regions(page_num)
         self._get_first_text_page_num()
-        text_page = self._text_source(page, page_num, ocr_images, ocr_results_map)
         content_items = []
-        try:
+        with self._text_page(page, ocr_images, ocr_results_map) as text_page:
             # A rotated page's tables are found and read uncropped, in one frame; its CropBox
             # is back before anything else reads the page (see _record_rotated_crop_boxes).
             self._uncrop_for_tables(text_page, page_num)
@@ -1621,8 +1641,6 @@ class PDFLoader:
             content_items.extend(table_items)
             text_items = self._extract_text_as_markdown(text_page, page_num, table_bboxes)
             content_items.extend(text_items)
-        finally:
-            self._copies.discard()
         if extract_images:
             content_items.extend(self._extract_images_simple(
                 page, page_num, ocr_images=ocr_images, ocr_results_map=ocr_results_map))
