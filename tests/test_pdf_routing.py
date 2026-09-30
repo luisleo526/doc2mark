@@ -255,6 +255,14 @@ TOTAL_REVENUE = "Total revenue from contracts with customers 1,200"
                  ["AI"], False, id="short-line-inside-a-misread-longer-copy"),
     pytest.param(["AI", "AI Agent for finance teams", "Quarterly review"],
                  "AI\nAI Agent for flnance teams\nQuarterly review", [], False, id="short-line-with-its-own-copy"),
+    pytest.param(["Revenue from contracts with customers 1,300", "Revenue from contracts with customers 1,100",
+                  "Revenue from contracts with customers 1,200"],
+                 "| Revenue from contracts with customers | 4 | 1,300 |\n\n| Revenue from contracts with customers | 5 | 1,200 |",
+                 ["Revenue from contracts with customers 1,100"], False, id="absent-row-between-two-rows"),
+    pytest.param(["Net sales", "before discount", "Net sales before discount"],
+                 "| Net sales | (a) | before discount |\n\nFigure 1: Net sales by quarter for the group and its segments in the "
+                 "year\n\nFigure 2: before discount margins", ["Net sales before discount"], False,
+                 id="header-cells-with-spare-copies"),
 ])
 def test_the_line_the_ocr_read_keeps_its_words_and_the_absent_one_stays_missing(tmp_path, lines, ocr, missing, cjk):
     """Review of #26: longer lines claimed OCR words first, so an absent line that nearly contains present lines
@@ -263,6 +271,18 @@ def test_the_line_the_ocr_read_keeps_its_words_and_the_absent_one_stays_missing(
     word may come between two characters of one CJK word; and when either of two lines could be the OCR text,
     both are kept."""
     assert _tail(tmp_path, lines, ocr, cjk=cjk) == missing
+
+
+def test_identical_rows_each_find_one_of_many_near_copies(tmp_path):
+    """Re-check of the review: a line's search compares the places that could hold it and keeps the best, but
+    stops at a fit of one inserted word and after a few places, so 100 identical rows read with an extra word
+    each among 500 such copies are all found, fast."""
+    lines = ["Net sales before discount 1,200"] * 100
+    ocr = "\n".join("Net sales before discount (a) 1,200" for _ in range(500))
+    page, measure = _page_of(tmp_path, lines)
+    started = time.perf_counter()
+    assert pdf_routing.missing_painted_lines(page, measure, ocr) == []
+    assert time.perf_counter() - started <= 2.0
 
 
 def test_many_near_misses_cost_about_the_positional_scan(tmp_path):
