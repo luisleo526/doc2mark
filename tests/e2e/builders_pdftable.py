@@ -393,6 +393,10 @@ BACKSLASH_ROWS = [["Key", "Value"], ["glob", "C:\\Users\\*.txt"], ["unc", "\\\\s
                   ["trailing", "ends with \\"], ["escaped", "a \\| b \\_c\\_"], ["two lines", "C:\\temp\\\nD:\\data"]]
 
 
+IDENTIFIER_ROWS = [["Column", "Type"], ["user_id", "int"], ["snake_case_name", "str"], ["MAX_RETRIES", "const"],
+                   ["_private", "x_y_z"]]
+
+
 def backslash_table_pdf(path: Path, *, merged: bool) -> Path:
     """A ruled table of Windows paths and escape-like text (``BACKSLASH_ROWS``): backslashes before
     ASCII punctuation, at the end of a cell and at the end of a cell's first line. ``merged`` adds a

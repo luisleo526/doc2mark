@@ -509,6 +509,18 @@ def test_r2_backslashes_in_cells_read_back_exactly(run_cli, e2e_dir, style):
     assert table.rows[1 if merged else 0:] == B.BACKSLASH_ROWS, result.markdown
 
 
+@pytest.mark.parametrize("row_h", [18, 12], ids=["normal_rows", "tight_rows"])
+def test_r2_underscores_stay_in_their_word_and_row(run_cli, e2e_dir, row_h):
+    """The text page find_tables() builds in PyMuPDF 1.28 measures glyphs by their ink, and an underscore's
+    box lands below its line: read by those boxes, ``user_id`` became ``user id`` plus a line holding
+    ``_``, and in tight rows the underscores moved into the next row. Identifiers read back whole."""
+    result = convert(run_cli, B.table_pdf(e2e_dir / "identifiers.pdf", B.IDENTIFIER_ROWS, col_w=[120, 80],
+                                          row_h=row_h))
+
+    [table] = tables(result)
+    assert table.rows == B.IDENTIFIER_ROWS, result.markdown
+
+
 # --- T1: a span never overwrites a value (safety net in TableData) ----------------------------------------
 
 @pytest.mark.parametrize("rows", [
