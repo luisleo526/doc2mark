@@ -208,9 +208,15 @@ class TestPipelines:
         assert '#VALUE!' not in result.content
 
         # The picture anchored at A4 ("Sample Image:", a title row) is marked on that line:
-        # "[Image: <text>]" when the model reads text in it, "[Image]" when it reads none.
+        # "[Image: <text>]" when the model reads text in it, "[Image]" when it reads none, and
+        # "[image: OCR unavailable]" when the provider could not read it (a rejected key, an
+        # outage), which is then counted as a failure, never shown as the picture's content.
         line = next((line for line in result.content.splitlines() if line.startswith("Sample Image:")), "")
-        assert "[Image" in line, result.content[:1500]
+        issues = (result.metadata.extra or {}).get("ocr_issues") or {}
+        if issues.get("failed"):
+            assert "[image: OCR unavailable]" in line, (issues, result.content[:1500])
+        else:
+            assert "[Image" in line, result.content[:1500]
 
         # The internal OCR wrapper never leaks, and an empty OCR result is not an item
         assert "image_ocr_result>" not in result.content
