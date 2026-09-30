@@ -536,21 +536,24 @@ def test_cjk_deck_with_a_complete_text_layer_keeps_it(run_cli, require_tool, e2e
             assert line in page_text, result.describe()
 
 
+DECK_LABELS = [
+    ["數辰企業簡報：智慧製造解決方案", "客戶數量持續成長 KPI 2026", "導入週期縮短至六週內完成部署上線",
+     "服務超過三百家企業客戶"],
+    ["產品藍圖與里程碑規劃概覽說明", "平台整合 ERP 與 CRM 系統", "全年營收目標四千八百萬元整體達成",
+     "新版行動應用程式正式上線"],
+    ["客戶案例：精密零件製造商導入", "良率提升百分之十二 Q3 2026", "交期縮短三成並降低庫存成本支出",
+     "年度節省成本超過一千萬元"],
+]
+DECK_ARTWORK = [["QUARTERLY KPI 2026", "REVENUE 48M"], ["ROADMAP PHASE 2", "LAUNCH MAY 2027"],
+                ["CASE STUDY 17", "YIELD PLUS 12"]]
+
+
 def test_sparse_cjk_slide_deck_still_routes_to_page_ocr(run_cli, require_tool, e2e_dir):
     """R-F9 guard for the real Traditional-Chinese deck (about 82 characters of slide labels per page over
     full-bleed artwork, which must stay on page-render OCR): here about 50 CJK and 15 Latin characters per slide
     of live text, with most words baked into the artwork, where only OCR can read them."""
     require_tool("tesseract")
-    labels = [
-        ["數辰企業簡報：智慧製造解決方案", "客戶數量持續成長 KPI 2026", "導入週期縮短至六週內完成部署上線",
-         "服務超過三百家企業客戶"],
-        ["產品藍圖與里程碑規劃概覽說明", "平台整合 ERP 與 CRM 系統", "全年營收目標四千八百萬元整體達成",
-         "新版行動應用程式正式上線"],
-        ["客戶案例：精密零件製造商導入", "良率提升百分之十二 Q3 2026", "交期縮短三成並降低庫存成本支出",
-         "年度節省成本超過一千萬元"],
-    ]
-    artwork = [["QUARTERLY KPI 2026", "REVENUE 48M"], ["ROADMAP PHASE 2", "LAUNCH MAY 2027"],
-               ["CASE STUDY 17", "YIELD PLUS 12"]]
+    labels, artwork = DECK_LABELS, DECK_ARTWORK
     pdf = builders_route.cjk_deck_pdf(e2e_dir / "sparse_deck.pdf", labels, baked=artwork)
 
     result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
@@ -751,6 +754,32 @@ def test_garbled_title_page_keeps_the_legible_body_the_ocr_cannot_read(run_cli, 
     assert "INVOICE SUMMARY" in text.upper(), result.describe()
     assert all(text.count(line) == 1 for line in INVOICE_BODY), result.describe()
     assert "\ufffd" not in result.markdown, result.describe()
+
+
+MORE_DECK_LABELS = [["整合生產排程與品質檢驗資料即時分析", "支援多廠區協同作業與權限分級管理"],
+                    ["第二季完成供應鏈模組與報表中心", "第四季推出預測維護與能源管理功能"],
+                    ["生產線停機時間減少四成以上", "品質追溯時間由數天縮短為數分鐘"]]
+
+
+def test_denser_cjk_deck_routes_text_and_still_reads_its_artwork(run_cli, require_tool, e2e_dir):
+    """m9, the margin of the CJK weight: the real Traditional-Chinese deck measures 161 against the limit of 200
+    (24 % headroom). A deck like the sparse one (about 155 per slide) with two more labels per slide (about 80
+    CJK characters, 238 to 254) crosses the limit and routes "text": its labels stay verbatim and every
+    full-bleed picture is still OCR'd on its own, so crossing the limit changes how the output is structured,
+    not what it contains."""
+    require_tool("tesseract")
+    labels = [lines + more for lines, more in zip(DECK_LABELS, MORE_DECK_LABELS)]
+    pdf = builders_route.cjk_deck_pdf(e2e_dir / "denser_deck.pdf", labels, baked=DECK_ARTWORK)
+
+    result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert extra(result)["ocr_routing"] == {"document_route": "text", "overrides": []}, extra(result)
+    text = words(result.markdown)
+    for page, (lines, artwork) in enumerate(zip(labels, DECK_ARTWORK), 1):
+        page_text = words(" ".join(item["content"] for item in text_layer_items(result, page)))
+        assert all(line in page_text for line in lines), result.describe()
+        assert all(line in text for line in artwork), result.describe()
 
 
 NO_OCR_JUDGE_SCRIPT = (

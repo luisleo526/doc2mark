@@ -113,8 +113,8 @@ def test_one_mojibake_like_match_among_clean_text_is_punctuation():
     # e-acute, ellipsis, right double quote are the cp1252 bytes E9 85 94: one valid UTF-8 sequence
     quote = "C'\xe9tait ferm\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK} disait-il"
     assert text_layer_stats([(quote, 12.0)]).garbage_glyphs == 0
-    assert text_layer_stats([(quote, 12.0), ("Il \xe9tait arriv\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK}",
-                                             12.0)]).garbage_glyphs == 0
+    again = "Il \xe9tait arriv\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK}"
+    assert text_layer_stats([(quote, 12.0), (again, 12.0)]).garbage_glyphs == 0
     # a typical sequence (a Latin-1 letter read back as two characters), or two distinct ones, is mojibake
     assert text_layer_stats([("R\xc3\xa9sum\xc3\xa9", 12.0)]).garbage_glyphs == 4
     assert text_layer_stats([("\xe6\N{EM DASH}\xa5\xe6\N{LATIN SMALL LIGATURE OE}\xac", 12.0)]).garbage_glyphs == 6
