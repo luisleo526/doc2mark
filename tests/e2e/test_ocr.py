@@ -11,7 +11,10 @@ pointed (``OPENAI_BASE_URL``) at a local fake OpenAI-compatible server started b
 CLI, LangChain and the ``openai`` SDK run unmodified. The Tesseract tests run real Tesseract.
 """
 
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -768,6 +771,43 @@ def test_refused_page_leaves_a_marker_and_its_location(run_cli, fake_llm, scan):
     issues = ocr_issues(result)
     assert issues.get("refused") == 1, result.json
     assert issues.get("locations") == [{"issue": "refused", "image": 1, "page": 1}], result.json
+
+
+def test_refused_recovery_of_an_empty_page_is_a_provider_refusal(run_cli, fake_llm, scan):
+    """Review of #25 (M1): the structured call answered an empty page and the API refused the free-form recovery
+    (``message.refusal``). The page was counted as refused but not as refused by the provider, so the OCR cache
+    replayed that refusal for its full TTL and ``cache_dir`` stored the document for ever."""
+    fake_llm.script(structured=[fake.page("")], free_form=[fake.refusal(REFUSAL)])
+
+    result = run_llm(run_cli, scan, fake_llm, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    issues = ocr_issues(result)
+    assert issues.get("refused") == 1 and issues.get("provider_refused") == 1, result.json
+    assert len(fake_llm.requests_of("free_form")) == 1, result.describe()
+
+
+CACHE_DIR_SCRIPT = (
+    "import sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "loader = UnifiedDocumentLoader(ocr_provider='openai', cache_dir=sys.argv[2])\n"
+    "for _ in range(2):\n"
+    "    loader.load(sys.argv[1], extract_images=True, ocr_images=True)\n"
+)
+
+
+def test_refused_recovery_keeps_the_document_out_of_cache_dir(e2e_dir, fake_llm, scan):
+    """M1 through the public API (``cache_dir`` has no CLI switch): a document whose page the provider refused on
+    the recovery call is not stored, so the next run asks again instead of serving the refusal for ever."""
+    fake_llm.script(structured=[fake.page("")], free_form=[fake.refusal(REFUSAL)])
+
+    proc = subprocess.run([sys.executable, "-c", CACHE_DIR_SCRIPT, str(scan), str(e2e_dir / "document-cache")],
+                          cwd=e2e_dir, capture_output=True, text=True, encoding="utf-8", timeout=600,
+                          env={**os.environ, **fake_llm.env})
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(fake_llm.requests_of("structured")) == 2, proc.stderr
+    assert len(fake_llm.requests_of("free_form")) == 2, proc.stderr
 
 
 def test_free_form_refusal_is_reported(run_cli, fake_llm, scan):

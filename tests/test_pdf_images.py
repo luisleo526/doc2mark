@@ -318,6 +318,28 @@ def test_without_text_clip_pictures_are_measured_unclipped_and_the_run_says_so(m
     assert len(warnings) == 1 and "TEXT_CLIP" in warnings[0] and "1.27.1" in warnings[0]
 
 
+def test_clip_extents_that_do_not_pair_with_the_pictures_are_reported_once_per_document(monkeypatch, caplog):
+    """Review of #25 (m5): when MuPDF's clipped image extents do not pair up one to one with a page's images, its
+    pictures are measured without their clip paths and a WARNING says so. It said so for every page, and twice per
+    page (the placements and the boxes both measure): now once per document."""
+    measured = pdf_images._clipped_image_boxes
+    monkeypatch.setattr(pdf_images, "_clipped_image_boxes",
+                        lambda page: (measured(page) or []) + [pymupdf.Rect(0, 0, 10, 10)])
+    docs = [pymupdf.open(), pymupdf.open()]
+    for doc in docs:
+        for _ in range(3):
+            _clipped_page(doc, (700, 300, 1900, 975), (700, 300, 950, 530))
+    with caplog.at_level(logging.WARNING, logger=pdf_images.__name__):
+        for doc in docs:
+            for page in doc:
+                [placement] = pdf_images.placements(page)
+                pdf_images.shown_boxes(page)
+                assert placement.visible == placement.bbox & pdf_images.page_area(page)
+    warnings = [record.getMessage() for record in caplog.records
+                if record.name == pdf_images.__name__ and "clip" in record.getMessage()]
+    assert len(warnings) == 2, warnings
+
+
 def test_a_picture_clipped_away_entirely_is_not_shown():
     doc = pymupdf.open()
     page = _clipped_page(doc, (100, 100, 500, 325), (10, 10, 30, 30))

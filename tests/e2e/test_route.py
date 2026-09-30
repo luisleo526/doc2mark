@@ -884,3 +884,63 @@ def test_running_header_and_page_number_of_an_ocrd_page_are_not_added_again(run_
     assert text.count(RUNNING_HEADER) == 1, result.describe()
     assert not re.search(r"Page \d of 4", text), result.describe()
     assert all(line in text for page in reports for line in page), result.describe()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Review of #25: the verbatim tail does not depend on line order, and one OCR word stands for one printed line
+
+NET_LOSS_ROW = "<table><tr><td>Net loss before tax</td><td>Note 4</td><td>1,200</td></tr></table>"
+
+
+def run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, printed, reply):
+    """The report whose second page is a scan with ``printed`` lines over it, its render OCR'd as ``reply``."""
+    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "report.pdf", REPORT, INVOICE_SCAN, printed=printed)
+    fake_llm.script(structured=[reply])
+    result = run_cli(pdf, "--ocr", "openai", "--ocr-images", env=fake_llm.env, fmt="both")
+    assert result.exit_code == 0, result.describe()
+    assert len(fake_llm.requests_of("structured")) == 1, result.describe()
+    return result
+
+
+@pytest.mark.parametrize("printed", [
+    ["Tax 1,200", "Net loss before tax 1,200"],
+    ["Net loss before tax 1,200", "Tax 1,200"],
+], ids=["short-line-first", "short-line-last"])
+def test_printed_short_line_the_ocr_missed_is_added_whatever_the_line_order(run_cli, e2e_dir, fake_llm, printed):
+    """M2: lines were matched with gaps in page order, so the printed "Tax 1,200", which the OCR left out, took the
+    words of "Net loss before tax 1,200" (read as a table row with a "Note 4" cell between them): the row came out
+    twice and "Tax 1,200" not at all. Longer lines claim their OCR words first, and a line of three words or fewer
+    must be found in one piece."""
+    result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, printed,
+                                         fake.page("", tables=[fake.table(NET_LOSS_ROW)]))
+
+    text = words(result.markdown)
+    assert "Tax 1,200" in text and text.count("Net loss before tax") == 1, result.describe()
+    assert all(line in text for page in REPORT for line in page), result.describe()
+
+
+def test_printed_line_whose_words_are_spread_over_a_chart_reading_is_added(run_cli, e2e_dir, fake_llm):
+    """M2: "Revenue 2024 up 12 percent" counted as reproduced by the OCR's reading of a chart, "Revenue by year 2024
+    up from 2023 12 percent growth", and was lost. With gaps a line may gain or miss only a few words."""
+    result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, ["Revenue 2024 up 12 percent"],
+                                         fake.page("Chart: Revenue by year 2024 up from 2023 12 percent growth"))
+
+    assert "Revenue 2024 up 12 percent" in words(result.markdown), result.describe()
+
+
+def test_a_word_the_ocr_read_once_stands_for_one_printed_line(run_cli, e2e_dir, fake_llm):
+    """m2: lines found in place did not claim their OCR words, so the one "Total" the OCR read stood for both printed
+    "Total" lines and the second was lost."""
+    result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, ["Total", "1", "Total", "2"],
+                                         fake.page("Total 1"))
+
+    assert words(result.markdown).split().count("Total") == 2, result.describe()
+
+
+def test_a_printed_latin_line_is_not_found_inside_cjk_words(run_cli, e2e_dir, fake_llm):
+    """m2: letters written between CJK characters count as words since #25, so the printed label "AI" matched the
+    "AI" inside the OCR's "財務AI使用介面" and was lost. A line without CJK characters is found only in words that
+    stand alone in the OCR text."""
+    result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, ["AI"], fake.page("財務AI使用介面"))
+
+    assert re.search(r"^AI$", result.markdown, re.M), result.describe()

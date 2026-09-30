@@ -9,6 +9,7 @@ Lane-specific builders belong in your own module (for example
 """
 
 import io
+import zlib
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -81,4 +82,21 @@ def image_pdf(path: Path, pages: Pages, *, font_size: int = 110, font_path: Opti
         page.insert_image(page.rect, stream=text_png(text, font_size=font_size, font_path=font_path))
     doc.save(str(path))
     doc.close()
+    return Path(path)
+
+
+def damaged_stream_pdf(path: Path, pages: Pages, damaged: Sequence[int]) -> Path:
+    """``text_pdf`` of ``pages`` whose pages ``damaged`` (0-based) keep a content stream that no longer inflates: its
+    compressed bytes are scrambled under its ``/FlateDecode`` filter, as in a file damaged in transit. MuPDF
+    reports a zlib error for such a page each time it reads it; the other pages read as usual."""
+    text_pdf(path, pages)
+    doc = pymupdf.open(str(path))
+    for number in damaged:
+        xref = doc[number].get_contents()[0]
+        deflated = zlib.compress(doc.xref_stream(xref))
+        doc.update_stream(xref, deflated[:2] + bytes(byte ^ 0x5A for byte in deflated[2:]), compress=False)
+        doc.xref_set_key(xref, "Filter", "/FlateDecode")
+    doc.save(str(path) + ".tmp")
+    doc.close()
+    Path(str(path) + ".tmp").replace(path)
     return Path(path)

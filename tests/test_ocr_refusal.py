@@ -620,3 +620,23 @@ def test_firewall_redo_failure_keeps_the_flagged_result_by_default():
     [kept] = ocr._enforce_router_firewall([withheld], redo)
 
     assert kept.text == "t" and kept.metadata["router_fallback"] == "unresolved"
+
+
+def test_gemini_blocked_recovery_of_an_empty_page_is_a_provider_refusal():
+    """Review of #25 (M1): Gemini answered the structured call with an empty page and blocked the free-form
+    recovery (SAFETY). The empty result is the provider's own block: flagged ``non_content="provider_refusal"``
+    with the block's reason, so the OCR cache keeps it briefly and ``cache_dir`` not at all."""
+    empty = SimpleNamespace(content="", usage_metadata={}, response_metadata={"finish_reason": "STOP"})
+    agent = _ScriptedGeminiAgent(
+        structured=[{"parsed": OCRPage(), "raw": empty, "parsing_error": None}],
+        free_form=[("", {REFUSAL_USAGE_KEY: "finish_reason=SAFETY"})],
+    )
+    ocr = VertexAIOCR(api_key="test-key", config=OCRConfig())
+    ocr._vision_agent = agent
+
+    [result] = ocr.batch_process_images([_png()])
+
+    assert result.text == "" and result.metadata["ocr_refusal"] is True
+    assert result.metadata["non_content"] == "provider_refusal"
+    assert result.metadata["refusal"] == "finish_reason=SAFETY"
+    assert agent.calls == ["structured", "free_form"]
