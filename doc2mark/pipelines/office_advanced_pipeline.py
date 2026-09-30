@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Any, Union, Optional, Tuple
@@ -33,7 +34,15 @@ def _safe_lxml_parser():
 
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
 from doc2mark.ocr.schema import plain_ocr_text  # noqa: E402
+from doc2mark.utils.markdown import (  # noqa: E402
+    emphasis_fits, escape_inline_pieces, escape_line_start, escape_markdown_text, normalize_control_chars,
+    wrap_inline,
+)
 from doc2mark.utils.number_format import format_cell_value  # noqa: E402
+
+# What a picture whose OCR failed shows, as on the PDF path: it was not read (no API key, an outage, an
+# answer the provider flags failed). The failure itself is in metadata.extra["ocr_issues"].
+OCR_UNAVAILABLE = "[image: OCR unavailable]"
 
 # Office document libraries
 try:
@@ -97,16 +106,24 @@ _M_OMATH, _M_OMATH_PARA, _M_T = f'{{{_M_NS}}}oMath', f'{{{_M_NS}}}oMathPara', f'
 _MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
 _MC_ALTERNATE_CONTENT = f'{{{_MC_NS}}}AlternateContent'
 _MC_CHOICE, _MC_FALLBACK = f'{{{_MC_NS}}}Choice', f'{{{_MC_NS}}}Fallback'
+_W_RPR, _W_R_STYLE, _W_B, _W_I = qn('w:rPr'), qn('w:rStyle'), qn('w:b'), qn('w:i')
+_W_HYPERLINK, _W_ANCHOR, _R_ID = qn('w:hyperlink'), qn('w:anchor'), qn('r:id')
+_W_FLD_SIMPLE, _W_INSTR = qn('w:fldSimple'), qn('w:instr')
+_W_FLD_CHAR, _W_FLD_CHAR_TYPE, _W_INSTR_TEXT = qn('w:fldChar'), qn('w:fldCharType'), qn('w:instrText')
+_W_TXBX_CONTENT, _W_LAST_RENDERED_BREAK = qn('w:txbxContent'), qn('w:lastRenderedPageBreak')
+_W_SECT_PR, _W_TITLE_PG, _W_EVEN_AND_ODD = qn('w:sectPr'), qn('w:titlePg'), qn('w:evenAndOddHeaders')
+_W_HEADER_REF, _W_FOOTER_REF = qn('w:headerReference'), qn('w:footerReference')
 
 # Paragraph-level elements whose content the reader does not see: properties,
 # deleted revisions and the moved-from copy of moved text.
 _DOCX_UNSEEN = frozenset({
-    _W_PPR, qn('w:rPr'), _W_DEL, _W_MOVE_FROM, qn('w:sdtPr'), qn('w:sdtEndPr'),
+    _W_PPR, _W_RPR, _W_DEL, _W_MOVE_FROM, qn('w:sdtPr'), qn('w:sdtEndPr'),
 })
 
 
-def _docx_paragraph_content(element):
-    """Yield the runs (``w:r``) and math zones of a paragraph in reading order.
+def _docx_paragraph_items(element, link=None):
+    """Yield ``(run, link)`` for the runs (``w:r``) and math zones of a paragraph in reading
+    order; ``link`` is the innermost ``w:hyperlink`` or ``w:fldSimple`` holding the run, or None.
 
     Descends into hyperlinks, content controls (``w:sdt``), tracked insertions
     (``w:ins``) and moves (``w:moveTo``), simple fields (``w:fldSimple``), smart
@@ -117,15 +134,208 @@ def _docx_paragraph_content(element):
         if not isinstance(tag, str) or tag in _DOCX_UNSEEN:
             continue
         if tag == _W_R or tag in (_M_OMATH, _M_OMATH_PARA):
+            yield child, link
+        elif tag == _MC_ALTERNATE_CONTENT:
+            branch = child.find(_MC_CHOICE)
+            if branch is None:
+                branch = child.find(_MC_FALLBACK)
+            if branch is not None:
+                yield from _docx_paragraph_items(branch, link)
+        else:
+            yield from _docx_paragraph_items(child, child if tag in (_W_HYPERLINK, _W_FLD_SIMPLE) else link)
+
+
+def _docx_paragraph_content(element):
+    """Yield the runs (``w:r``) and math zones of a paragraph in reading order (see
+    ``_docx_paragraph_items``)."""
+    for run, _ in _docx_paragraph_items(element):
+        yield run
+
+
+def _docx_text_boxes(element):
+    """Yield the contents (``w:txbxContent``) of the text boxes and shapes with text drawn in
+    ``element`` (a run), outermost first, in document order: DrawingML text boxes and shapes
+    (``wps:txbx``, also inside groups) and the VML text boxes of older files (``v:textbox``). Of an
+    ``mc:AlternateContent`` only the branch a reader shows is read (``mc:Choice``, else
+    ``mc:Fallback``), so a box saved both ways, as Word saves it, counts once. Boxes nested in a
+    box are read with that box's paragraphs."""
+    for child in element:
+        tag = child.tag
+        if not isinstance(tag, str) or tag in (_W_DEL, _W_MOVE_FROM):
+            continue
+        if tag == _W_TXBX_CONTENT:
             yield child
         elif tag == _MC_ALTERNATE_CONTENT:
             branch = child.find(_MC_CHOICE)
             if branch is None:
                 branch = child.find(_MC_FALLBACK)
             if branch is not None:
-                yield from _docx_paragraph_content(branch)
+                yield from _docx_text_boxes(branch)
         else:
-            yield from _docx_paragraph_content(child)
+            yield from _docx_text_boxes(child)
+
+
+def _docx_paragraph_text_boxes(p_el):
+    """The text boxes anchored in a paragraph's runs (see ``_docx_text_boxes``)."""
+    for run in _docx_paragraph_content(p_el):
+        if run.tag == _W_R:
+            yield from _docx_text_boxes(run)
+
+
+def _docx_flag(element) -> bool:
+    """An on/off property element (``w:titlePg``, ``w:evenAndOddHeaders``): on when present,
+    unless its ``w:val`` says off."""
+    return element is not None and element.get(_W_VAL, 'true').lower() not in ('0', 'false', 'off')
+
+
+def _docx_toggle(props, tag) -> Optional[bool]:
+    """A toggle property (``w:b``, ``w:i``) of run properties: True / False when set, None when not."""
+    element = props.find(tag) if props is not None else None
+    return None if element is None else _docx_flag(element)
+
+
+_HYPERLINK_FIELD = re.compile(r'\s*HYPERLINK\b(.*)', re.IGNORECASE | re.DOTALL)
+_FIELD_TOKEN = re.compile(r'"([^"]*)"|(\\\S+)|(\S+)')
+
+
+def _hyperlink_field_target(instruction: str) -> Optional[str]:
+    """The address a ``HYPERLINK`` field instruction points to (``HYPERLINK "https://…" \\o "tip"``),
+    with its ``\\l`` bookmark as a fragment; None for a bookmark in the document alone
+    (``HYPERLINK \\l "_Toc1"``) or another field."""
+    match = _HYPERLINK_FIELD.match(instruction or '')
+    if not match:
+        return None
+    address = anchor = None
+    switch = None
+    for token in _FIELD_TOKEN.finditer(match.group(1)):
+        quoted, flag, bare = token.groups()
+        if flag is not None:
+            switch = flag.lower() if flag.lower() in ('\\l', '\\o', '\\t') else None
+            continue
+        value = quoted if quoted is not None else bare
+        if switch == '\\l':
+            anchor = value
+        elif switch is None and address is None:
+            address = value
+        switch = None
+    if not address:
+        return None
+    return f"{address}#{anchor}" if anchor else address
+
+
+_LINK_SCHEMES = ('http://', 'https://', 'mailto:')
+_LINK_UNSAFE = frozenset(' "<>()\\`')
+
+
+def _link_destination(target: Optional[str]) -> Optional[str]:
+    """``target`` written as a Markdown link destination, or None when it is not a web or mail
+    address (``javascript:``, ``file:``, a relative path): such a link keeps only its text.
+    Spaces, parentheses, angle brackets, quotes and backslashes are percent-encoded so the
+    destination cannot end early or change the link."""
+    target = (target or '').strip()
+    if not target.lower().startswith(_LINK_SCHEMES):
+        return None
+    return ''.join(f'%{ord(char):02X}' if char in _LINK_UNSAFE or ord(char) < 0x20 or ord(char) == 0x7f
+                   else char for char in target)
+
+
+def _strip_pieces(pieces):
+    """``pieces`` (``(text, ...)`` tuples) without the whitespace at the start and end of their
+    joined text, as ``str.strip`` removes it."""
+    text = ''.join(piece[0] for piece in pieces)
+    start, end = len(text) - len(text.lstrip()), len(text.rstrip())
+    stripped, offset = [], 0
+    for piece in pieces:
+        low, high = max(offset, start), min(offset + len(piece[0]), end)
+        if low < high:
+            stripped.append((text[low:high],) + tuple(piece[1:]))
+        offset += len(piece[0])
+    return stripped
+
+
+# Characters that may stand right next to a link's brackets: brackets, quotes and sentence
+# punctuation. Anything else glued to a link's text (``https://`` before a link on ``www.``...) would
+# split the text around it for lexical retrieval.
+_LINK_NEIGHBOURS = frozenset('([{<"\'\u00ab\u201c\u2018)]}>\u00bb\u201d\u2019.,;:!?')
+_PAGE_NUMBER_FIELDS = frozenset({'PAGE', 'NUMPAGES', 'SECTIONPAGES'})
+
+
+def _sets_off_link(char: str) -> bool:
+    """Whether ``char`` (next to a link's text; "" at a line edge) leaves the link's brackets
+    between words: the line edge, a space, a bracket, quote or sentence punctuation, or a CJK
+    character or CJK punctuation (CJK text has no spaces between words)."""
+    if not char or char.isspace() or char in _LINK_NEIGHBOURS:
+        return True
+    if ord(char) < 0x2E80:  # a letter, digit or mark of a script that separates words with spaces
+        return False
+    return char.isalnum() or unicodedata.category(char).startswith('P')
+
+
+def _markdown_line(pieces) -> str:
+    """Inline Markdown for one line of styled runs (``(text, bold, italic, link target)``, no line
+    breaks): the line is escaped at once (``escape_inline_pieces``, so a ``<`` in one run sees the
+    letter in the next), runs are written ``**bold**`` / ``*italic*`` where the markers keep words
+    whole and CommonMark can close them (``emphasis_fits``), and the runs of a web or mail link
+    ``[text](address)`` where the brackets keep words whole. Otherwise the text is kept as it is."""
+    escaped = escape_inline_pieces(''.join(piece[0] for piece in pieces))
+    groups: List[List[Any]] = []   # [markdown, plain text, (bold, italic), link target]
+    offset = 0
+    for text, bold, italic, target, *_ in pieces:
+        markdown = ''.join(escaped[offset:offset + len(text)])
+        offset += len(text)
+        if groups and groups[-1][3] == target and (groups[-1][2] == (bold, italic) or not text.strip()):
+            groups[-1][0] += markdown
+            groups[-1][1] += text
+        else:
+            groups.append([markdown, text, (bold, italic), target])
+
+    def neighbours(first: int, last: int) -> Tuple[str, str]:
+        """The characters just outside groups ``first``..``last`` ("" at the line edge)."""
+        head, tail = groups[first][1][:1], groups[last][1][-1:]
+        before = head if head.isspace() else (groups[first - 1][1][-1:] if first else '')
+        after = tail if tail.isspace() else (groups[last + 1][1][:1] if last + 1 < len(groups) else '')
+        return before, after
+
+    out: List[str] = []
+    first = 0
+    while first < len(groups):
+        target = groups[first][3]
+        last = first
+        while last + 1 < len(groups) and groups[last + 1][3] == target:
+            last += 1
+        destination = _link_destination(target)
+        before, after = neighbours(first, last)
+        linked = bool(destination) and any(group[1].strip() for group in groups[first:last + 1]) and all(
+            _sets_off_link(char) for char in (before, after))
+        span = []
+        for position in range(first, last + 1):
+            markdown, text, (bold, italic), _ = groups[position]
+            if linked:
+                markdown = markdown.replace('[', '\\[').replace(']', '\\]')
+            marker = '***' if bold and italic else '**' if bold else '*' if italic else ''
+            core = text.strip()
+            if marker and any(char.isalnum() for char in core):
+                left, right = neighbours(position, position)
+                if emphasis_fits(left, core, right):
+                    markdown = wrap_inline(markdown, marker)
+            span.append(markdown)
+        joined = ''.join(span)
+        out.append(wrap_inline(joined, '[', f']({destination})') if linked else joined)
+        first = last + 1
+    return ''.join(out)
+
+
+def _docx_inline_markdown(pieces) -> str:
+    """Markdown for a paragraph's text from its styled runs (see ``_markdown_line``): one line per
+    line break, block syntax at a line start escaped as for body text."""
+    lines: List[List[Tuple[str, bool, bool, Optional[str]]]] = [[]]
+    for text, bold, italic, target, *_ in pieces:
+        for number, part in enumerate(normalize_control_chars(text).split('\n')):
+            if number:
+                lines.append([])
+            if part:
+                lines[-1].append((part, bold, italic, target))
+    return '\n'.join(escape_line_start(_markdown_line(line)) for line in lines)
 
 
 def _docx_run_text(run) -> str:
@@ -360,6 +570,28 @@ class _DocxStructure:
             based_on = style.find(qn('w:basedOn'))
             style_id = based_on.get(_W_VAL) if based_on is not None else None
 
+    def run_emphasis(self, run) -> Tuple[bool, bool]:
+        """(bold, italic) of a run: its own ``w:b`` / ``w:i``, else those of its character style
+        (``w:rStyle`` and the styles it is based on, e.g. Strong, Emphasis). Paragraph styles are not
+        consulted: a heading or a quote styled bold as a whole is its style, not emphasis in its text."""
+        props = run.find(_W_RPR)
+        bold, italic = _docx_toggle(props, _W_B), _docx_toggle(props, _W_I)
+        style_ref = props.find(_W_R_STYLE) if props is not None else None
+        style_id = style_ref.get(_W_VAL) if style_ref is not None else None
+        seen = set()
+        while (bold is None or italic is None) and style_id and style_id not in seen \
+                and len(seen) < self._MAX_STYLE_DEPTH:
+            seen.add(style_id)
+            style = self._styles.get(style_id)
+            if style is None:
+                break
+            style_props = style.find(_W_RPR)
+            bold = _docx_toggle(style_props, _W_B) if bold is None else bold
+            italic = _docx_toggle(style_props, _W_I) if italic is None else italic
+            based_on = style.find(qn('w:basedOn'))
+            style_id = based_on.get(_W_VAL) if based_on is not None else None
+        return bool(bold), bool(italic)
+
     def outline_level(self, p_el) -> Optional[int]:
         """The outline level set on the paragraph or, failing that, the nearest style of its
         chain: 0-8 for heading levels 1-9, 9 for body text; None when none is set."""
@@ -448,6 +680,14 @@ class _DocxStructure:
 
         marker = re.sub(r'%([1-9])', counter, text).strip()
         return (marker, ilvl) if marker else None
+
+
+# A caption by its shape: a caption word, then a number (3, 2.1, 4-2, A1, 3a, IV, A) and a separator
+# (":", ".", ")", a dash) or the end of the text.
+_CAPTION_TEXT = re.compile(
+    r'(?i:figure|fig\.?|table|tbl\.?|chart|graph|image|plate|scheme|exhibit)\s+'
+    r'(?:[A-Z]?\d+(?:[.\-–]\d+)*[a-z]?|[IVXLC]{1,7}|[A-Z])'
+    r'(?:\s*[:.)\-–—]|\s*$)')
 
 
 def _style_list_depth(style_name: str) -> int:
@@ -601,14 +841,86 @@ def _xlsx_rich_value_images(archive, names) -> Dict[int, str]:
     return images
 
 
+def _drawing_blip_rid(drawing) -> Optional[str]:
+    """``r:embed`` of the picture a ``wp:inline`` / ``wp:anchor`` shows (a ``pic:pic`` directly in
+    its graphic data), or None."""
+    for graphic in drawing:
+        if not graphic.tag.endswith('}graphic'):
+            continue
+        for data in graphic:
+            if not data.tag.endswith('}graphicData'):
+                continue
+            for pic in data:
+                if not pic.tag.endswith('}pic'):
+                    continue
+                for fill in pic:
+                    if not fill.tag.endswith('}blipFill'):
+                        continue
+                    for blip in fill:
+                        if blip.tag.endswith('}blip'):
+                            for name, value in blip.attrib.items():
+                                if name.endswith('}embed'):
+                                    return value
+    return None
+
+
 def _issue_location(location: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Where a picture sits, for the loader's OCR issue record: its slide or sheet."""
+    """Where a picture sits, for the loader's OCR issue record: its slide, sheet or (Word) page."""
     location = location or {}
     if 'slide' in location:
         return {"slide": location['slide']}
     if 'sheet' in location:
         return {"sheet": location.get('sheet_name') or location['sheet']}
+    if 'page' in location:
+        return {"page": location['page']}
     return {}
+
+
+_P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+
+def _pptx_hidden(shape) -> bool:
+    """A shape hidden on its slide (``p:cNvPr hidden="1"``)."""
+    c_nv_pr = shape._element.find(f'./*/{{{_P_NS}}}cNvPr')
+    return c_nv_pr is not None and c_nv_pr.get('hidden') in ('1', 'true')
+
+
+def _pptx_drawn_masters(slide) -> list:
+    """The slide layout and slide master whose shapes are drawn on ``slide`` (``showMasterSp``)."""
+    if slide._element.get('showMasterSp') in ('0', 'false'):
+        return []
+    layout = slide.slide_layout
+    owners = [layout]
+    if layout._element.get('showMasterSp') not in ('0', 'false'):
+        owners.append(layout.slide_master)
+    return owners
+
+
+def _pptx_visible_shapes(shapes):
+    """Every visible shape of a shape tree, groups opened (a hidden group hides its shapes)."""
+    for shape in shapes:
+        if _pptx_hidden(shape):
+            continue
+        yield shape
+        try:
+            is_group = shape.shape_type == MSO_SHAPE_TYPE.GROUP
+        except (AttributeError, NotImplementedError):
+            is_group = False
+        if is_group:
+            yield from _pptx_visible_shapes(shape.shapes)
+
+
+def _pptx_typed_text(paragraph) -> str:
+    """A paragraph's text without its fields (``a:fld``: the slide number, the date), whose cached
+    text is not text the slide sets."""
+    parts = []
+    for child in paragraph._p:
+        if child.tag == f'{{{_A_NS}}}r':
+            parts.append(''.join(t.text or '' for t in child.iter(f'{{{_A_NS}}}t')))
+        elif child.tag == f'{{{_A_NS}}}br':
+            parts.append('\n')
+    return ''.join(parts)
 
 
 class BaseOfficeLoader:
@@ -674,41 +986,51 @@ class BaseOfficeLoader:
         """The ``text:image_description`` item for a picture's OCR text (inside the internal
         ``<image_ocr_result>`` provenance wrapper that the Markdown render strips), or None
         when OCR found no text in the picture: an empty description is never emitted, as on
-        the PDF path, which skips images that OCR to nothing."""
-        text = (ocr_text or "").strip()
+        the PDF path, which skips images that OCR to nothing. ``ocr_text`` None means the OCR
+        failed: the picture gets the PDF path's marker, ``[image: OCR unavailable]``."""
+        text = OCR_UNAVAILABLE if ocr_text is None else ocr_text.strip()
         if not text:
             return None
         return {"type": "text:image_description", "content": f"<image_ocr_result>{text}</image_ocr_result>", **fields}
 
-    def _ocr_image(self, image_bytes: bytes, location: Optional[Dict[str, Any]] = None) -> str:
-        """Use OCR to convert image to text description. ``location`` is where the picture
-        sits (``{'slide': n}``, ``{'sheet': n, 'sheet_name': name}``), for the loader's OCR
-        issue record (see ``_issue_location``)."""
-        if not image_bytes:
-            return "No image data"
+    @staticmethod
+    def _ocr_failed(result) -> bool:
+        """No answer, or an answer the provider flags ``failed`` (a timeout, an error): the picture
+        was not read, which is not the same as a picture without text."""
+        return result is None or bool((getattr(result, 'metadata', None) or {}).get('failed'))
 
-        if not self.ocr:
-            return "OCR not available"
+    def _label_ocr_issues(self, locations: List[Optional[Dict[str, Any]]]) -> None:
+        """Tell the loader's OCR issue record where the pictures of the last OCR call sit."""
+        label_issues = getattr(self.ocr, "label_last_batch", None)
+        if callable(label_issues) and any(locations):
+            label_issues([_issue_location(location) for location in locations])
 
+    def _ocr_image(self, image_bytes: bytes, location: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """OCR one picture on its own (one the document's batch did not cover): its text ("" when
+        OCR found none), or None when it could not be read (no image data or OCR, a request that
+        raised, an answer the provider flags ``failed``). ``location`` is where the picture sits
+        (``{'slide': n}``, ``{'sheet': n, 'sheet_name': name}``, ``{'page': n}``), for the loader's
+        OCR issue record (see ``_issue_location``)."""
+        if not image_bytes or not self.ocr:
+            return None
+        # Use the configured OCR instance with language configuration if available
+        kwargs = {}
+        if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
+            kwargs['language'] = self.ocr.config.language
         try:
-            # Use the configured OCR instance with language configuration if available
-            kwargs = {}
-            if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
-                kwargs['language'] = self.ocr.config.language
-
             result = self.ocr.process_image(image_bytes, **kwargs)
-            label_issues = getattr(self.ocr, "label_last_batch", None)
-            if callable(label_issues) and location:
-                label_issues([_issue_location(location)])
-            if hasattr(result, 'text'):
-                self._ocr_cell_texts[_image_hash(image_bytes)] = plain_ocr_text(
-                    result.text, getattr(result, 'document', None))
-                return result.text
-            else:
-                return str(result)
         except Exception as e:
-            logger.error(f"OCR failed: {e}")
-            return "OCR failed"
+            logger.error(f"OCR failed: {e}; the picture is marked {OCR_UNAVAILABLE}")
+            self._label_ocr_issues([location])
+            return None
+        self._label_ocr_issues([location])
+        if self._ocr_failed(result):
+            return None
+        if hasattr(result, 'text'):
+            self._ocr_cell_texts[_image_hash(image_bytes)] = plain_ocr_text(
+                result.text, getattr(result, 'document', None))
+            return result.text
+        return str(result)
 
     def _classify_text_type(self, text: str, style_name: str) -> str:
         """Classify text type based on style and content"""
@@ -733,100 +1055,79 @@ class BaseOfficeLoader:
                 return "text:list"
 
         # Content-based classification as fallback
-        text_lower = text.lower()
-
         # Check for list patterns
         if re.match(r'^[\u2022•\-\*\d]+[\.\)]\s+', text):
             return "text:list"
 
-        # Check for caption patterns
-        caption_patterns = [
-            r'^(Figure|Fig\.?|Table|Tbl\.?|Chart|Graph|Image|Plate|Scheme)\s*\d*[\.:)]?',
-            r'^(Source|Note|Notes)[\.:)]',
-        ]
-
-        for pattern in caption_patterns:
-            if re.match(pattern, text, re.IGNORECASE):
-                return "text:caption"
+        # Caption-shaped text: a caption word, a number and a separator ("Figure 2: ...",
+        # "Table 3. ..."), or a source / note line. "Tablets are ...", "Table of contents" and
+        # "Figure 1 shows ..." are sentences.
+        if _CAPTION_TEXT.match(text) or re.match(r'(Source|Note|Notes)[\.:)]', text, re.IGNORECASE):
+            return "text:caption"
 
         # Default to normal text
         return "text:normal"
 
-    def _batch_ocr_images(self, images_info: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Process multiple images with OCR in a single batch call
-        
+    def _batch_ocr_images(self, images_info: List[Dict[str, Any]]) -> Dict[Any, Optional[str]]:
+        """OCR the document's pictures in one batch call.
+
         Args:
             images_info: List of dictionaries containing:
                 - 'id': Unique identifier for the image
                 - 'data': Image bytes
-                
+                - 'location': where the picture sits (slide, sheet or page), for the loader's
+                  OCR issue record
+
         Returns:
-            Dictionary mapping image IDs to OCR text results
+            ``{image hash: OCR text}`` (and ``{('_fallback_ocr', index): text}`` for XLSX pictures
+            read from the package); the text is None for a picture that was not read: an answer
+            the provider flags ``failed``, or every picture of a call that raised (no API key, an
+            outage). Those are not sent again one by one: a provider that raised fails them again,
+            and the next run asks again (such a document is not cached). A picture missing from
+            the map is OCR'd on its own where it is used.
         """
-        if not images_info:
+        if not images_info or not self.ocr:
             return {}
 
-        if not self.ocr:
-            logger.warning("No OCR instance available for batch processing")
-            return {}
+        image_data_list = [info['data'] for info in images_info]
+        language_info = getattr(self.ocr.config, 'language', 'auto') if hasattr(self.ocr,
+                                                                                'config') and self.ocr.config else 'auto'
+        logger.info(f"Processing {len(image_data_list)} images with configured OCR (language: {language_info})...")
+
+        # Pass language configuration if available
+        kwargs = {}
+        if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
+            kwargs['language'] = self.ocr.config.language
+            logger.info(f"🌍 Passing language configuration to OCR: {self.ocr.config.language}")
 
         try:
-            # Prepare image data for batch processing
-            image_data_list = [info['data'] for info in images_info]
-            image_ids = [info['id'] for info in images_info]
-
-            language_info = getattr(self.ocr.config, 'language', 'auto') if hasattr(self.ocr,
-                                                                                    'config') and self.ocr.config else 'auto'
-            logger.info(f"Processing {len(image_data_list)} images with configured OCR (language: {language_info})...")
-
-            # Use the configured OCR instance for batch processing
-            # Pass language configuration if available
-            kwargs = {}
-            if hasattr(self.ocr, 'config') and self.ocr.config and self.ocr.config.language:
-                kwargs['language'] = self.ocr.config.language
-                logger.info(f"🌍 Passing language configuration to OCR: {self.ocr.config.language}")
-
-            # Always use batch processing
             ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
-            # Tell the loader's OCR issue record which slide or sheet each picture is on.
-            label_issues = getattr(self.ocr, "label_last_batch", None)
-            if callable(label_issues):
-                label_issues([_issue_location(info.get('location')) for info in images_info])
+        except Exception as e:
+            logger.error(f"Batch OCR processing failed: {e}; {len(images_info)} picture(s) marked {OCR_UNAVAILABLE}")
+            ocr_results = [None] * len(images_info)
+        # Tell the loader's OCR issue record where each picture is (slide, sheet or page).
+        self._label_ocr_issues([info.get('location') for info in images_info])
 
-            # Map results back using both hash and ID for duplicate handling
-            # This ensures compatibility with individual lookup methods while preserving duplicates
-            results_map = {}
-            id_to_result = {}  # Additional map for ID-based lookup
-            
-            for image_info, ocr_result in zip(images_info, ocr_results):
-                # Use hash of image data as primary key - this matches individual lookup
-                img_hash = _image_hash(image_info['data'])
-                
-                # Store the OCR result
+        results_map: Dict[Any, Optional[str]] = {}
+        failed = 0
+        for image_info, ocr_result in zip(images_info, ocr_results):
+            img_hash = _image_hash(image_info['data'])
+            if self._ocr_failed(ocr_result):
+                ocr_text = None
+                failed += 1
+            else:
                 ocr_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
-                
-                # Store by hash (for compatibility)
-                results_map[img_hash] = ocr_text
                 if hasattr(ocr_result, 'text'):
                     self._ocr_cell_texts[img_hash] = plain_ocr_text(ocr_text, getattr(ocr_result, 'document', None))
-                
-                # Also store by ID (for handling duplicates)
-                id_to_result[image_info['id']] = ocr_text
+            # The same picture sent twice keeps an answer over a failure.
+            if ocr_text is not None or img_hash not in results_map:
+                results_map[img_hash] = ocr_text
+            # XLSX pictures read from the package are also found by their index
+            if image_info.get('location', {}).get('source') == 'zip_fallback':
+                results_map[('_fallback_ocr', image_info['location']['img_idx'])] = ocr_text
 
-            # For XLSX fallback images, also store with special keys for duplicate handling
-            for image_info, ocr_result in zip(images_info, ocr_results):
-                if image_info.get('location', {}).get('source') == 'zip_fallback':
-                    img_idx = image_info['location']['img_idx']
-                    fallback_key = ('_fallback_ocr', img_idx)
-                    ocr_text = ocr_result.text if hasattr(ocr_result, 'text') else str(ocr_result)
-                    results_map[fallback_key] = ocr_text
-
-            logger.info(f"Successfully processed {len(ocr_results)} images with OCR")
-            return results_map
-
-        except Exception as e:
-            logger.error(f"Batch OCR processing failed: {e}")
-            return {}
+        logger.info(f"OCR answered {len(ocr_results) - failed} of {len(images_info)} picture(s)")
+        return results_map
 
     def _collect_all_images(self) -> List[Dict[str, Any]]:
         """Collect all images from the document for batch processing
@@ -849,6 +1150,12 @@ class DocxLoader(BaseOfficeLoader):
         super().__init__(file_path, ocr, table_style)
         self._open_document()
         self._structure = _DocxStructure(self.doc)
+        # The part whose relationships resolve the r:id of pictures and links: the document, or the
+        # header or footer being read (a header's r:id means nothing in the document's relationships).
+        self._part = self.doc.part
+        # Where the picture being read sits ({'page': n}), for the loader's OCR issue record.
+        self._location: Optional[Dict[str, Any]] = None
+        self._layout_cache = None
 
     def _open_document(self):
         """Open DOCX document with error handling and configuration logging"""
@@ -903,7 +1210,14 @@ class DocxLoader(BaseOfficeLoader):
                         extract_images: bool = True,
                         ocr_images: bool = False,
                         show_progress: bool = True) -> Dict[str, Any]:
-        """Convert DOCX to JSON format"""
+        """Convert DOCX to JSON format.
+
+        Body paragraphs and tables come in document order, each tagged with the page it starts on
+        (counted from page and section breaks, see ``_layout``), the text boxes anchored in a
+        paragraph right after its text. The headers and footers a section shows are added once
+        each (a part shared with an earlier section is not repeated): headers before the section's
+        first block, footers after its last, their items marked ``"region": "header"`` /
+        ``"footer"``. Footnotes and endnotes come last."""
         result = {
             "filename": self.file_path.name,
             "pages": 1,  # DOCX doesn't have fixed pages
@@ -913,153 +1227,188 @@ class DocxLoader(BaseOfficeLoader):
         if show_progress:
             logging.info(f"Processing DOCX: {self.file_path.name}")
 
-        # Batch OCR processing if requested
+        # One OCR batch for every picture the document shows, before the text is laid out
+        ocr_images = bool(extract_images and ocr_images and self.ocr)
         ocr_results_map = {}
-        processed_image_hashes = set()  # Track processed images to avoid duplicates
-        if extract_images and ocr_images:
+        if ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
-
             all_images_info = self._collect_all_images()
-
             if all_images_info:
                 if show_progress:
                     logger.info(f"Processing {len(all_images_info)} images with batch OCR...")
+                ocr_results_map = self._batch_ocr_images(all_images_info)
 
-                try:
-                    # Use the configured OCR instance from BaseOfficeLoader
-                    ocr_results_map = self._batch_ocr_images(all_images_info)
-
-                    if show_progress:
-                        logger.info(f"Successfully processed {len(ocr_results_map)} images with OCR")
-
-                except Exception as e:
-                    logger.error(f"Batch OCR processing failed: {e}")
-                    ocr_images = False  # Fall back to base64 extraction
-
-        # Process document body with page break tracking
-        page_num = 1
-        _skip_next_rendered_break = False  # after a section break, skip the next lastRenderedPageBreak
-        for element in self._iter_block_items():
-            if isinstance(element, Paragraph):
-                # Detect page breaks before this paragraph (at most one increment)
-                try:
-                    has_break = False
-                    for run_el in element._element.findall(qn('w:r')):
-                        # Explicit page break: <w:br w:type="page"/>
-                        br = run_el.find(qn('w:br'))
-                        if br is not None and br.get(qn('w:type')) == 'page':
-                            has_break = True
-                            break
-                        # Rendered page break: <w:lastRenderedPageBreak/>
-                        if run_el.find(qn('w:lastRenderedPageBreak')) is not None:
-                            if _skip_next_rendered_break:
-                                _skip_next_rendered_break = False
-                            else:
-                                has_break = True
-                            break
-                    # Section break in paragraph properties: <w:pPr><w:sectPr>
-                    # sectPr means this paragraph ENDS the section; the NEXT
-                    # paragraph starts a new page.
-                    if not has_break:
-                        ppr = element._element.find(qn('w:pPr'))
-                        if ppr is not None:
-                            sect_pr = ppr.find(qn('w:sectPr'))
-                            if sect_pr is not None:
-                                sect_type_el = sect_pr.find(qn('w:type'))
-                                sect_type = sect_type_el.get(qn('w:val'), 'nextPage') if sect_type_el is not None else 'nextPage'
-                                if sect_type in ('nextPage', 'oddPage', 'evenPage'):
-                                    # Process current paragraph on current page,
-                                    # then increment for the next paragraph.
-                                    prev_len = len(result["content"])
-                                    self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map, processed_image_hashes)
-                                    for i in range(prev_len, len(result["content"])):
-                                        result["content"][i]["page"] = page_num
-                                    page_num += 1
-                                    _skip_next_rendered_break = True
-                                    continue  # skip the normal processing below
-                    if has_break:
-                        page_num += 1
-                except (AttributeError, TypeError):
-                    pass
-
-                prev_len = len(result["content"])
-                self._process_paragraph(element, result["content"], extract_images, ocr_images, ocr_results_map, processed_image_hashes)
-                # Tag newly added items with page number
-                for i in range(prev_len, len(result["content"])):
-                    result["content"][i]["page"] = page_num
-            elif isinstance(element, Table):
-                try:
-                    table_md = self._convert_table_to_markdown(element, extract_images, ocr_images, ocr_results_map)
-                except Exception as e:
-                    # One malformed table must not send the whole document to the basic
-                    # converter (which reorders content): keep its text, lose its structure.
-                    logger.warning(f"DOCX table conversion failed ({e}); keeping the table text without merges")
-                    table_md = self._table_text_fallback(element._tbl)
-                if table_md:
-                    result["content"].append({
-                        "type": "table",
-                        "content": table_md,
-                        "page": page_num
-                    })
-
-                # Note: Images are now handled within the table cells, no need to extract separately
-
-        result["pages"] = page_num
-
-        # Also check for inline shapes at document level
-        # NOTE: This is now disabled to avoid duplicate OCR results
-        # Images are already processed via paragraphs and tables
-        # if extract_images and hasattr(self.doc, 'inline_shapes'):
-        #     for inline_shape in self.doc.inline_shapes:
-        #         if hasattr(inline_shape, '_inline'):
-        #             image_content = self._extract_inline_shape_image(inline_shape, ocr_images, ocr_results_map)
-        #             if image_content:
-        #                 result["content"].append(image_content)
-
-        # Extract headers and footers (tagged separately so they can be excluded from main content)
-        try:
-            for section_idx, section in enumerate(self.doc.sections):
-                # Process header
-                if hasattr(section, 'header'):
-                    header = section.header
-                    header_items = []
-                    for para in header.paragraphs:
-                        self._process_paragraph(para, header_items, extract_images, ocr_images,
-                                                ocr_results_map, processed_image_hashes)
-                    for item in header_items:
-                        if item.get("type", "").startswith("text:"):
-                            item["type"] = "text:header"
-                        result["content"].append(item)
-
-                # Process footer
-                if hasattr(section, 'footer'):
-                    footer = section.footer
-                    footer_items = []
-                    for para in footer.paragraphs:
-                        self._process_paragraph(para, footer_items, extract_images, ocr_images,
-                                                ocr_results_map, processed_image_hashes)
-                    for item in footer_items:
-                        if item.get("type", "").startswith("text:"):
-                            item["type"] = "text:footer"
-                        result["content"].append(item)
-
-        except Exception as e:
-            logger.warning(f"Failed to process headers/footers: {e}")
+        blocks, pages, stories, _ = self._layout()
+        content = result["content"]
+        options = (extract_images, ocr_images, ocr_results_map, set())  # the set: pictures already emitted
+        section, last_page = -1, 1
+        for block, page, block_section in blocks:
+            while section < block_section:
+                if section >= 0:
+                    self._add_story_items(stories[section], "footer", last_page, content, *options)
+                section += 1
+                self._add_story_items(stories[section], "header", page, content, *options)
+            start = len(content)
+            self._location = {'page': page}
+            self._add_block(block, content, *options)
+            for item in content[start:]:
+                item["page"] = page
+            last_page = page
+        # The last section's footers; a section without blocks (after a trailing section break)
+        # still shows its headers and footers.
+        while section < len(stories) - 1:
+            if section >= 0:
+                self._add_story_items(stories[section], "footer", last_page, content, *options)
+            section += 1
+            self._add_story_items(stories[section], "header", last_page, content, *options)
+        if section >= 0:
+            self._add_story_items(stories[section], "footer", last_page, content, *options)
+        result["pages"] = pages
 
         # Extract footnotes and endnotes
         try:
             footnotes = self._load_footnotes()
             for note_id, note_text in sorted(footnotes.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
-                result["content"].append({
+                content.append({
                     "type": "text:footnote",
                     "content": f"[^{note_id}]: {note_text}",
-                    "page": page_num,  # footnotes at end of doc
+                    "page": pages,  # footnotes at end of doc
                 })
         except Exception as e:
             logger.debug(f"Failed to extract footnotes: {e}")
 
         return result
+
+    def _layout(self):
+        """``(blocks, pages, stories, section_pages)``: the body's top-level paragraphs and tables in
+        document order as ``(element, page, section)``, the page count, for each section the header
+        and footer parts it shows (``_section_stories``) and ``{section: (first page, last page)}``.
+
+        Pages follow Word's pagination only approximately: an explicit page break or Word's last
+        rendered page break in a paragraph puts it on the next page, and a paragraph ending a
+        next/odd/even-page section puts the following ones on the next page (the first rendered
+        break after it is that same break). A paragraph carrying ``w:sectPr`` ends its section."""
+        if self._layout_cache is not None:
+            return self._layout_cache
+        body = self.doc.element.body
+        blocks: List[Tuple[Any, int, int]] = []
+        section_breaks = []
+        page, section, skip_rendered = 1, 0, False
+        for block in _docx_blocks(body):
+            if block.tag != _W_P:
+                blocks.append((block, page, section))
+                continue
+            # Detect page breaks before this paragraph (at most one increment)
+            has_break = False
+            for run_el in block.findall(_W_R):
+                br = run_el.find(_W_BR)
+                if br is not None and br.get(_W_TYPE) == 'page':
+                    has_break = True
+                    break
+                if run_el.find(_W_LAST_RENDERED_BREAK) is not None:
+                    if skip_rendered:
+                        skip_rendered = False
+                    else:
+                        has_break = True
+                    break
+            ppr = block.find(_W_PPR)
+            sect_pr = ppr.find(_W_SECT_PR) if ppr is not None else None
+            if sect_pr is not None:
+                section_breaks.append(sect_pr)
+            if not has_break and sect_pr is not None:
+                sect_type = sect_pr.find(_W_TYPE)
+                if (sect_type.get(_W_VAL, 'nextPage') if sect_type is not None else 'nextPage') in (
+                        'nextPage', 'oddPage', 'evenPage'):
+                    # This paragraph ENDS the section: it stays on this page, the next one starts a new page.
+                    blocks.append((block, page, section))
+                    page += 1
+                    skip_rendered = True
+                    section += 1
+                    continue
+            if has_break:
+                page += 1
+            blocks.append((block, page, section))
+            if sect_pr is not None:
+                section += 1
+        stories = self._section_stories(section_breaks + [body.find(_W_SECT_PR)])
+        section_pages: Dict[int, Tuple[int, int]] = {}
+        for _, block_page, block_section in blocks:
+            section_pages[block_section] = (section_pages.get(block_section, (block_page,))[0], block_page)
+        self._layout_cache = (blocks, page, stories, section_pages)
+        return self._layout_cache
+
+    def _section_stories(self, sect_prs) -> List[Dict[str, list]]:
+        """For each section (its ``w:sectPr``; None when missing), the header and footer parts Word
+        shows in it: ``{"header": [parts], "footer": [parts]}``, in the order first page (with
+        ``w:titlePg``), default, even pages (with ``w:evenAndOddHeaders`` in the settings). A section
+        without a reference of a kind inherits the previous section's. A part is listed only for the
+        first section that shows it, so a header or footer shared by several sections is written
+        once."""
+        try:
+            even_and_odd = _docx_flag(self.doc.settings.element.find(_W_EVEN_AND_ODD))
+        except Exception:
+            even_and_odd = False
+        related = self.doc.part.related_parts
+        references: Dict[Tuple[str, str], Optional[str]] = {}
+        seen = set()
+        stories = []
+        for sect_pr in sect_prs:
+            shown: Dict[str, list] = {"header": [], "footer": []}
+            if sect_pr is not None:
+                for region, tag in (("header", _W_HEADER_REF), ("footer", _W_FOOTER_REF)):
+                    for reference in sect_pr.findall(tag):
+                        references[(region, reference.get(_W_TYPE, 'default'))] = reference.get(_R_ID)
+                kinds = (['first'] if _docx_flag(sect_pr.find(_W_TITLE_PG)) else []) + ['default'] + (
+                    ['even'] if even_and_odd else [])
+                for region in ("header", "footer"):
+                    for kind in kinds:
+                        rid = references.get((region, kind))
+                        part = related.get(rid) if rid else None
+                        if part is not None and part.partname not in seen:
+                            seen.add(part.partname)
+                            shown[region].append(part)
+            stories.append(shown)
+        return stories
+
+    def _add_story_items(self, stories: Dict[str, list], region: str, page: int, content: List[Dict],
+                         extract_images: bool, ocr_images: bool, ocr_results_map: Dict[Any, Optional[str]],
+                         processed_image_hashes: set) -> None:
+        """Add the paragraphs and tables of one section's ``region`` ("header" or "footer") parts,
+        tagged with ``page`` and ``region``."""
+        for part in stories[region]:
+            start = len(content)
+            previous, self._part = self._part, part
+            self._location = {'page': page}
+            try:
+                for block in _docx_blocks(part.element):
+                    self._add_block(block, content, extract_images, ocr_images, ocr_results_map,
+                                    processed_image_hashes)
+            except Exception as e:
+                logger.warning(f"Failed to read a {region} ({part.partname}): {e}")
+            finally:
+                self._part = previous
+            for item in content[start:]:
+                item["page"] = page
+                item["region"] = region
+
+    def _add_block(self, block, content: List[Dict], extract_images: bool, ocr_images: bool,
+                   ocr_results_map: Dict[Any, Optional[str]], processed_image_hashes: set) -> None:
+        """Add the items of a paragraph (with the text boxes anchored in it) or of a table."""
+        if block.tag == _W_P:
+            self._process_paragraph(Paragraph(block, self.doc), content, extract_images, ocr_images,
+                                    ocr_results_map, processed_image_hashes)
+            return
+        try:
+            table_md = self._convert_table_to_markdown(Table(block, self.doc), extract_images, ocr_images,
+                                                       ocr_results_map)
+        except Exception as e:
+            # One malformed table must not send the whole document to the basic
+            # converter (which reorders content): keep its text, lose its structure.
+            logger.warning(f"DOCX table conversion failed ({e}); keeping the table text without merges")
+            table_md = self._table_text_fallback(block)
+        if table_md:
+            content.append({"type": "table", "content": table_md})
 
     def _iter_block_items(self):
         """Yield each paragraph and table in document order, including those inside
@@ -1116,54 +1465,116 @@ class DocxLoader(BaseOfficeLoader):
         return notes
 
     def _process_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
-                           ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
+                           ocr_images: bool = False, ocr_results_map: Optional[Dict[Any, Optional[str]]] = None,
                            processed_image_hashes: set = None):
-        """Process a paragraph and extract text and images"""
+        """Add a paragraph's pictures, its text item and the items of the text boxes anchored in it.
+
+        The text item's ``content`` is the paragraph's text as written; when its runs carry bold,
+        italics or web / mail links, a normal paragraph or a list item also gets ``markdown``: the
+        same text as inline Markdown (``**bold**``, ``*italic*``, ``[text](address)``, escaped like
+        body text), which the Markdown output uses."""
         if ocr_results_map is None:
             ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
-
-        runs = list(_docx_paragraph_content(paragraph._p))
+        p_el = paragraph._p
 
         # Extract images from runs first
         if extract_images:
-            for run in runs:
-                if run.tag != _W_R:
-                    continue
-                image_result = self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes)
-                if image_result:
-                    if isinstance(image_result, list):
-                        content.extend(image_result)
-                    else:
-                        content.append(image_result)
+            for run in _docx_paragraph_content(p_el):
+                if run.tag == _W_R:
+                    content.extend(self._extract_run_images(run, ocr_images, ocr_results_map, processed_image_hashes))
 
         # List numbering advances for every list paragraph, empty ones included, as in Word.
-        numbering = self._structure.list_marker(paragraph._p)
+        numbering = self._structure.list_marker(p_el)
 
-        # Then extract text
-        text = ''.join(_docx_run_text(run) for run in runs).strip()
+        # Then extract text. In a header or footer, a paragraph that only shows a page number
+        # (PAGE, NUMPAGES, SECTIONPAGES fields) is not text of the document: its number is whatever
+        # page Word last showed it on, as the slide number of a PowerPoint footer.
+        pieces = _strip_pieces(self._paragraph_pieces(p_el))
+        text = ''.join(piece[0] for piece in pieces)
+        if text and self._part is not self.doc.part and all(
+                field in _PAGE_NUMBER_FIELDS for text_part, *_, field in pieces
+                if any(char.isalnum() for char in text_part)):
+            text = ''
         if text:
-            # Detect footnote/endnote references in paragraph XML
-            try:
-                refs = []
-                for run_el in runs:
-                    fn_ref = run_el.find(qn('w:footnoteReference'))
-                    if fn_ref is not None:
-                        ref_id = fn_ref.get(qn('w:id'), '')
-                        if ref_id and ref_id not in ('0', '-1'):
-                            refs.append(ref_id)
-                    en_ref = run_el.find(qn('w:endnoteReference'))
-                    if en_ref is not None:
-                        ref_id = en_ref.get(qn('w:id'), '')
-                        if ref_id and ref_id not in ('0', '-1'):
-                            refs.append(f"en{ref_id}")
-                if refs:
-                    text = text + " " + " ".join(f"[^{r}]" for r in refs)
-            except (AttributeError, TypeError):
-                pass
+            # Footnote/endnote references in the paragraph
+            refs = self._note_references(p_el)
+            suffix = " " + " ".join(f"[^{ref}]" for ref in refs) if refs else ""
+            item = self._paragraph_item(paragraph, text + suffix, numbering)
+            if item["type"] == "text:normal" or (item["type"] == "text:list" and item.get("marker")):
+                markdown = _docx_inline_markdown(pieces) + suffix
+                if markdown != escape_markdown_text(item["content"]):
+                    item["markdown"] = markdown
+            content.append(item)
 
-            content.append(self._paragraph_item(paragraph, text, numbering))
+        # Text boxes and shapes anchored in the paragraph, after its own text, in document order.
+        for box in _docx_paragraph_text_boxes(p_el):
+            for block in _docx_blocks(box):
+                self._add_block(block, content, extract_images, ocr_images, ocr_results_map, processed_image_hashes)
+
+    @staticmethod
+    def _note_references(p_el) -> List[str]:
+        """Ids of the footnotes (``3``) and endnotes (``en3``) referenced in a paragraph, in order."""
+        refs = []
+        for run in _docx_paragraph_content(p_el):
+            for tag, prefix in ((qn('w:footnoteReference'), ''), (qn('w:endnoteReference'), 'en')):
+                reference = run.find(tag)
+                if reference is not None:
+                    ref_id = reference.get(qn('w:id'), '')
+                    if ref_id and ref_id not in ('0', '-1'):
+                        refs.append(f"{prefix}{ref_id}")
+        return refs
+
+    def _paragraph_pieces(self, p_el) -> List[Tuple[str, bool, bool, Optional[str], Optional[str]]]:
+        """``(text, bold, italic, link target, field)`` for the runs of a paragraph in reading order;
+        their texts joined are the paragraph's text. A run's link target comes from its
+        ``w:hyperlink``, its ``w:fldSimple`` HYPERLINK field, or the HYPERLINK field whose result it
+        shows (``w:fldChar`` begin, ``w:instrText``, separate, result runs, end); ``field`` names the
+        field whose result the run shows (``PAGE``, ``HYPERLINK``...), or is None."""
+        pieces = []
+        fields: List[List[Any]] = []   # open fields: [instruction parts, showing its result]
+        for run, link in _docx_paragraph_items(p_el):
+            if run.tag == _W_R:
+                for child in run:
+                    if child.tag == _W_FLD_CHAR:
+                        kind = child.get(_W_FLD_CHAR_TYPE)
+                        if kind == 'begin':
+                            fields.append([[], False])
+                        elif kind == 'separate' and fields:
+                            fields[-1][1] = True
+                        elif kind == 'end' and fields:
+                            fields.pop()
+                    elif child.tag == _W_INSTR_TEXT and fields and not fields[-1][1]:
+                        fields[-1][0].append(child.text or '')
+            text = _docx_run_text(run)
+            if not text:
+                continue
+            target = self._link_target(link)
+            instruction = ''.join(fields[-1][0]) if fields and fields[-1][1] else None
+            if instruction is None and link is not None and link.tag == _W_FLD_SIMPLE:
+                instruction = link.get(_W_INSTR) or ''
+            if target is None and instruction:
+                target = _hyperlink_field_target(instruction)
+            field = (instruction.split() or [None])[0].upper() if instruction else None
+            bold, italic = self._structure.run_emphasis(run) if run.tag == _W_R else (False, False)
+            pieces.append((text, bold, italic, target, field))
+        return pieces
+
+    def _link_target(self, link) -> Optional[str]:
+        """The address a ``w:hyperlink`` (its external relationship, plus its ``w:anchor`` bookmark as
+        a fragment) or a ``w:fldSimple`` HYPERLINK field points to; None for a bookmark in the
+        document alone, another field, or no link."""
+        if link is None:
+            return None
+        if link.tag == _W_FLD_SIMPLE:
+            return _hyperlink_field_target(link.get(_W_INSTR))
+        rid = link.get(_R_ID)
+        relationship = self._part.rels.get(rid) if rid else None
+        if relationship is None or not relationship.is_external:
+            return None
+        anchor = link.get(_W_ANCHOR)
+        return f"{relationship.target_ref}#{anchor}" if anchor else relationship.target_ref
 
     def _paragraph_item(self, paragraph: Paragraph, text: str,
                         numbering: Optional[Tuple[str, int]]) -> Dict[str, Any]:
@@ -1209,359 +1620,100 @@ class DocxLoader(BaseOfficeLoader):
         match = re.fullmatch(r'heading\s*([1-9])', name)
         return int(match.group(1)) if match and outline is None else None
 
-    def _extract_run_images(self, run, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
-                           processed_image_hashes: set = None) -> Optional[Union[Dict[str, str], List[Dict[str, str]]]]:
-        """Extract all images from a run.
-
-        Returns a single dict if exactly one image is found, a list of dicts if multiple
-        images are found in the run, or None if no images are present.
-        """
+    def _extract_run_images(self, run, ocr_images: bool = False,
+                            ocr_results_map: Optional[Dict[Any, Optional[str]]] = None,
+                            processed_image_hashes: set = None) -> List[Dict[str, Any]]:
+        """Items for the pictures drawn in a run (``w:drawing`` inline or anchored), see
+        ``_drawing_item``."""
         if ocr_results_map is None:
             ocr_results_map = {}
         if processed_image_hashes is None:
             processed_image_hashes = set()
-            
+        items = []
         try:
-            # Access the underlying XML element (a python-docx Run or a w:r element)
-            r_element = getattr(run, '_element', run)
-
-            # Look for drawing elements in the run
-            found_items: List[Dict[str, str]] = []
-            for child in r_element:
-                # Check if this is a w:drawing element
-                if child.tag.endswith('}drawing'):
-                    # Look for inline or anchored shapes within the drawing
-                    for drawing_child in child:
-                        if drawing_child.tag.endswith('}inline'):
-                            # Found an inline shape, extract the image
-                            image_data = self._extract_image_from_inline(
-                                drawing_child, ocr_images, ocr_results_map, processed_image_hashes
-                            )
-                            if image_data:
-                                found_items.append(image_data)
-                        elif drawing_child.tag.endswith('}anchor'):
-                            # Found an anchored/floating shape, extract the image
-                            image_data = self._extract_image_from_anchor(
-                                drawing_child, ocr_images, ocr_results_map, processed_image_hashes
-                            )
-                            if image_data:
-                                found_items.append(image_data)
-            if found_items:
-                return found_items if len(found_items) > 1 else found_items[0]
-
+            for child in getattr(run, '_element', run):
+                if child.tag != _W_DRAWING:
+                    continue
+                for drawing in child:
+                    if drawing.tag.endswith(('}inline', '}anchor')):
+                        item = self._drawing_item(drawing, ocr_images, ocr_results_map, processed_image_hashes)
+                        if item:
+                            items.append(item)
         except Exception as e:
-            logging.warning(f"Failed to extract images from run: {e}")
+            logger.warning(f"Failed to extract images from run: {e}")
+        return items
 
-        return None
+    def _drawing_item(self, drawing, ocr_images: bool, ocr_results_map: Dict[Any, Optional[str]],
+                      processed_image_hashes: set) -> Optional[Dict[str, Any]]:
+        """The item for the picture a drawing shows: its OCR text (the ``[image: OCR unavailable]``
+        marker when its OCR failed; nothing when OCR found no text in it) or, without OCR, the image
+        as base64. A picture already emitted in this document (the same bytes) gives nothing."""
+        image_bytes = self._drawing_image_bytes(drawing)
+        if not image_bytes:
+            return None
+        img_hash = _image_hash(image_bytes)
+        if img_hash in processed_image_hashes:
+            return None
+        processed_image_hashes.add(img_hash)
+        if not ocr_images:
+            return {"type": "image", "content": base64.b64encode(image_bytes).decode('utf-8')}
+        if img_hash in ocr_results_map:
+            return self._ocr_description(ocr_results_map[img_hash])
+        logger.warning("A picture was not in the OCR batch; OCR'ing it on its own")
+        return self._ocr_description(self._ocr_image(image_bytes, self._location))
 
-    def _extract_image_from_inline(self, inline_element, ocr_images: bool = False,
-                                   ocr_results_map: Optional[Dict[str, str]] = None,
-                                   processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
-        """Extract image from an inline element"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        if processed_image_hashes is None:
-            processed_image_hashes = set()
-            
+    def _drawing_image_bytes(self, drawing) -> Optional[bytes]:
+        """Bytes of the picture a ``wp:inline`` / ``wp:anchor`` shows, resolved through the
+        relationships of the part being read (the document, or a header or footer)."""
+        rid = _drawing_blip_rid(drawing)
         try:
-            # Navigate through the inline shape structure to find the blip
-            for child in inline_element:
-                if child.tag.endswith('}graphic'):
-                    for graphic_child in child:
-                        if graphic_child.tag.endswith('}graphicData'):
-                            for data_child in graphic_child:
-                                if data_child.tag.endswith('}pic'):
-                                    # Found picture element
-                                    for pic_child in data_child:
-                                        if pic_child.tag.endswith('}blipFill'):
-                                            for blip_child in pic_child:
-                                                if blip_child.tag.endswith('}blip'):
-                                                    # Get the embed relationship ID
-                                                    embed_attr = None
-                                                    for attr_name, attr_value in blip_child.attrib.items():
-                                                        if attr_name.endswith('}embed'):
-                                                            embed_attr = attr_value
-                                                            break
-
-                                                    if embed_attr:
-                                                        # Get image using relationship ID
-                                                        return self._get_image_by_rid(embed_attr, ocr_images,
-                                                                                      ocr_results_map, processed_image_hashes)
+            part = self._part.related_parts.get(rid) if rid else None
         except Exception as e:
-            logging.warning(f"Failed to extract image from inline element: {e}")
-
-        return None
-
-    def _extract_image_from_anchor(self, anchor_element, ocr_images: bool = False,
-                                   ocr_results_map: Optional[Dict[str, str]] = None,
-                                   processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
-        """Extract image from an anchor element and return formatted result"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        if processed_image_hashes is None:
-            processed_image_hashes = set()
-            
-        try:
-            # Navigate through the anchor element structure to find the blip
-            for child in anchor_element:
-                if child.tag.endswith('}graphic'):
-                    for graphic_child in child:
-                        if graphic_child.tag.endswith('}graphicData'):
-                            for data_child in graphic_child:
-                                if data_child.tag.endswith('}pic'):
-                                    # Found picture element
-                                    for pic_child in data_child:
-                                        if pic_child.tag.endswith('}blipFill'):
-                                            for blip_child in pic_child:
-                                                if blip_child.tag.endswith('}blip'):
-                                                    # Get the embed relationship ID
-                                                    embed_attr = None
-                                                    for attr_name, attr_value in blip_child.attrib.items():
-                                                        if attr_name.endswith('}embed'):
-                                                            embed_attr = attr_value
-                                                            break
-
-                                                    if embed_attr:
-                                                        # Get image using relationship ID
-                                                        return self._get_image_by_rid(embed_attr, ocr_images,
-                                                                                      ocr_results_map, processed_image_hashes)
-        except Exception as e:
-            logging.warning(f"Failed to extract image from anchor element: {e}")
-
-        return None
-
-    def _get_image_by_rid(self, rid: str, ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None,
-                          processed_image_hashes: set = None) -> Optional[Dict[str, str]]:
-        """Get image data using relationship ID"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        if processed_image_hashes is None:
-            processed_image_hashes = set()
-            
-        try:
-            # Get the image part using the relationship ID
-            image_part = self.doc.part.related_parts.get(rid)
-            if image_part:
-                image_bytes = image_part.blob
-                
-                # Check if this image has already been processed
-                img_hash = _image_hash(image_bytes)
-                if img_hash in processed_image_hashes:
-                    return None  # Skip already processed images
-                
-                # Mark this image as processed
-                processed_image_hashes.add(img_hash)
-
-                if ocr_images:
-                    # Use image content hash to find OCR result (already calculated above)
-
-                    if img_hash in ocr_results_map:
-                        return self._ocr_description(ocr_results_map[img_hash])
-                    # Fallback to individual OCR if not in batch results
-                    logger.warning(f"OCR result not found for image with rid {rid}, using fallback OCR")
-                    return self._ocr_description(self._ocr_image(image_bytes))
-                else:
-                    # Return base64 encoded image
-                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                    return {
-                        "type": "image",
-                        "content": base64_image
-                    }
-        except Exception as e:
-            logging.warning(f"Failed to get image by rId {rid}: {e}")
-
-        return None
-
-    def _extract_inline_shape_image(self, inline_shape, ocr_images: bool = False,
-                                    ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
-        """Extract image from an InlineShape object"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        try:
-            # Get the inline element
-            inline = inline_shape._inline
-
-            # Use the same extraction method
-            return self._extract_image_from_inline(inline, ocr_images, ocr_results_map)
-
-        except Exception as e:
-            logging.warning(f"Failed to extract image from inline shape: {e}")
-
-        return None
+            logger.warning(f"Failed to get image by rId {rid}: {e}")
+            return None
+        return getattr(part, 'blob', None) if part is not None else None
 
     def _collect_all_images(self) -> List[Dict[str, Any]]:
-        """Collect all images from DOCX document for batch processing"""
-        images_info = []
-        image_counter = 0
-        seen_images = set()  # Track unique images to avoid duplicates
+        """Every picture the document shows, once per distinct image, in document order: in body
+        paragraphs and tables at any depth, content controls and text boxes (the ``mc:Choice``
+        branch), then in the headers and footers; deleted revisions and ``mc:Fallback`` copies are
+        skipped. Each carries the page it is on (a header or footer picture: the page its block is
+        written at)."""
+        blocks, _, stories, section_pages = self._layout()
+        last_page = blocks[-1][1] if blocks else 1
+        images_info: List[Dict[str, Any]] = []
+        seen = set()
 
-        # Helper function to add unique images
-        def add_unique_image(image_data: bytes, location_info: Dict) -> None:
-            nonlocal image_counter
-            if image_data:
-                # Use hash to identify unique images
-                img_hash = _image_hash(image_data)
-                if img_hash not in seen_images:
-                    seen_images.add(img_hash)
-                    image_counter += 1
-                    images_info.append({
-                        'id': f'docx_image_{image_counter}',
-                        'data': image_data,
-                        'location': location_info
-                    })
+        def add_drawings(root, location: Dict[str, Any]) -> None:
+            for element in _docx_rendered(root):
+                if element.tag != _W_DRAWING:
+                    continue
+                for drawing in element:
+                    if not drawing.tag.endswith(('}inline', '}anchor')):
+                        continue
+                    data = self._drawing_image_bytes(drawing)
+                    if not data or _image_hash(data) in seen:
+                        continue
+                    seen.add(_image_hash(data))
+                    images_info.append({'id': f'docx_image_{len(images_info) + 1}', 'data': data,
+                                        'location': dict(location)})
 
-        # 1. Collect every drawing in the body in document order: paragraphs, tables at
-        #    any depth, content controls, text boxes (mc:Choice); deleted revisions and
-        #    mc:Fallback copies are skipped.
-        for element in _docx_rendered(self.doc.element.body):
-            if element.tag != _W_DRAWING:
-                continue
-            for drawing_child in element:
-                if drawing_child.tag.endswith('}inline'):
-                    add_unique_image(self._extract_image_data_from_inline(drawing_child), {'type': 'body_inline'})
-                elif drawing_child.tag.endswith('}anchor'):
-                    add_unique_image(self._extract_image_data_from_anchor(drawing_child), {'type': 'body_anchor'})
-
-        # 2. Collect from document inline shapes
-        if hasattr(self.doc, 'inline_shapes'):
-            for idx, inline_shape in enumerate(self.doc.inline_shapes):
-                if hasattr(inline_shape, '_inline'):
-                    image_data = self._extract_image_data_from_inline(inline_shape._inline)
-                    add_unique_image(image_data, {'type': 'document_inline_shape', 'index': idx})
-
-        # 3. Collect from headers and footers
-        try:
-            # Check all sections
-            for section_idx, section in enumerate(self.doc.sections):
-                # Headers
-                if hasattr(section, 'header'):
-                    header = section.header
-                    # Check paragraphs in header
-                    for para in header.paragraphs:
-                        for run in para.runs:
-                            r_element = run._element
-                            for child in r_element:
-                                if child.tag.endswith('}drawing'):
-                                    for drawing_child in child:
-                                        if drawing_child.tag.endswith('}inline'):
-                                            image_data = self._extract_image_data_from_inline(drawing_child)
-                                            add_unique_image(image_data, {'type': 'header', 'section': section_idx})
-                                        elif drawing_child.tag.endswith('}anchor'):
-                                            image_data = self._extract_image_data_from_anchor(drawing_child)
-                                            add_unique_image(image_data,
-                                                             {'type': 'header_anchor', 'section': section_idx})
-
-                # Footers
-                if hasattr(section, 'footer'):
-                    footer = section.footer
-                    # Check paragraphs in footer
-                    for para in footer.paragraphs:
-                        for run in para.runs:
-                            r_element = run._element
-                            for child in r_element:
-                                if child.tag.endswith('}drawing'):
-                                    for drawing_child in child:
-                                        if drawing_child.tag.endswith('}inline'):
-                                            image_data = self._extract_image_data_from_inline(drawing_child)
-                                            add_unique_image(image_data, {'type': 'footer', 'section': section_idx})
-                                        elif drawing_child.tag.endswith('}anchor'):
-                                            image_data = self._extract_image_data_from_anchor(drawing_child)
-                                            add_unique_image(image_data,
-                                                             {'type': 'footer_anchor', 'section': section_idx})
-        except Exception as e:
-            logger.warning(f"Failed to extract images from headers/footers: {e}")
-
-        # 4. Try to get all relationships and check for image parts
-        try:
-            # Get all relationships from document part
-            for rel_id, rel in self.doc.part.rels.items():
-                if "image" in rel.reltype:
+        for block, page, _ in blocks:
+            add_drawings(block, {'type': 'body', 'page': page})
+        for section, shown in enumerate(stories):
+            first, last = section_pages.get(section, (last_page, last_page))
+            for region, page in (("header", first), ("footer", last)):
+                for part in shown[region]:
+                    previous, self._part = self._part, part
                     try:
-                        image_part = rel.target_part
-                        if hasattr(image_part, 'blob'):
-                            add_unique_image(image_part.blob, {'type': 'relationship', 'rel_id': rel_id})
-                    except (AttributeError, KeyError) as e:
-                        logger.debug(f"Failed to extract image from relationship: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to extract images from relationships: {e}")
+                        add_drawings(part.element, {'type': region, 'page': page})
+                    except Exception as e:
+                        logger.warning(f"Failed to collect the pictures of a {region}: {e}")
+                    finally:
+                        self._part = previous
 
         logger.info(f"Collected {len(images_info)} unique images from DOCX")
         return images_info
-
-    def _extract_image_data_from_inline(self, inline_element) -> Optional[bytes]:
-        """Extract raw image data from an inline element"""
-        try:
-            # Navigate through the inline shape structure to find the blip
-            for child in inline_element:
-                if child.tag.endswith('}graphic'):
-                    for graphic_child in child:
-                        if graphic_child.tag.endswith('}graphicData'):
-                            for data_child in graphic_child:
-                                if data_child.tag.endswith('}pic'):
-                                    # Found picture element
-                                    for pic_child in data_child:
-                                        if pic_child.tag.endswith('}blipFill'):
-                                            for blip_child in pic_child:
-                                                if blip_child.tag.endswith('}blip'):
-                                                    # Get the embed relationship ID
-                                                    embed_attr = None
-                                                    for attr_name, attr_value in blip_child.attrib.items():
-                                                        if attr_name.endswith('}embed'):
-                                                            embed_attr = attr_value
-                                                            break
-
-                                                    if embed_attr:
-                                                        # Get image data using relationship ID
-                                                        image_part = self.doc.part.related_parts.get(embed_attr)
-                                                        if image_part:
-                                                            return image_part.blob
-        except Exception as e:
-            logging.warning(f"Failed to extract image data from inline element: {e}")
-
-        return None
-
-    def _extract_image_data_from_anchor(self, anchor_element) -> Optional[bytes]:
-        """Extract raw image data from an anchor element"""
-        try:
-            # Navigate through the anchor element structure to find the blip
-            for child in anchor_element:
-                if child.tag.endswith('}graphic'):
-                    for graphic_child in child:
-                        if graphic_child.tag.endswith('}graphicData'):
-                            for data_child in graphic_child:
-                                if data_child.tag.endswith('}pic'):
-                                    # Found picture element
-                                    for pic_child in data_child:
-                                        if pic_child.tag.endswith('}blipFill'):
-                                            for blip_child in pic_child:
-                                                if blip_child.tag.endswith('}blip'):
-                                                    # Get the embed relationship ID
-                                                    embed_attr = None
-                                                    for attr_name, attr_value in blip_child.attrib.items():
-                                                        if attr_name.endswith('}embed'):
-                                                            embed_attr = attr_value
-                                                            break
-
-                                                    if embed_attr:
-                                                        # Get image data using relationship ID
-                                                        image_part = self.doc.part.related_parts.get(embed_attr)
-                                                        if image_part:
-                                                            return image_part.blob
-        except Exception as e:
-            logging.warning(f"Failed to extract image data from anchor element: {e}")
-
-        return None
-
-    def _extract_images_from_paragraph(self, paragraph: Paragraph, content: List[Dict], extract_images: bool,
-                                       ocr_images: bool = False, ocr_results_map: Optional[Dict[str, str]] = None):
-        """Extract only images from a paragraph (used for table cells to avoid duplicate text)"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
-        if extract_images:
-            for run in paragraph.runs:
-                image_content = self._extract_run_images(run, ocr_images, ocr_results_map)
-                if image_content:
-                    content.append(image_content)
 
     # ------------------------------------------------------------------ #
     # Tables: read from the w:tbl XML                                     #
@@ -1645,15 +1797,18 @@ class DocxLoader(BaseOfficeLoader):
         return texts, spans
 
     def _tc_lines(self, container, extract_images: bool, ocr_images: bool,
-                  ocr_results_map: Dict[str, str]) -> List[str]:
-        """Lines of a cell in document order: one per non-empty paragraph and one per
-        row of a nested table (its cells joined with ``" | "``)."""
+                  ocr_results_map: Dict[Any, Optional[str]]) -> List[str]:
+        """Lines of a cell in document order: one per non-empty paragraph, then the lines of
+        the text boxes anchored in it, and one per row of a nested table (its cells joined
+        with ``" | "``)."""
         lines = []
         for block in _docx_blocks(container):
             if block.tag == _W_P:
                 text = self._cell_paragraph_text(block, extract_images, ocr_images, ocr_results_map)
                 if text:
                     lines.append(text)
+                for box in _docx_paragraph_text_boxes(block):
+                    lines.extend(self._tc_lines(box, extract_images, ocr_images, ocr_results_map))
             else:
                 texts, _ = self._docx_table_grid(
                     block, lambda tc: " ".join(self._tc_lines(tc, extract_images, ocr_images, ocr_results_map)))
@@ -1661,7 +1816,7 @@ class DocxLoader(BaseOfficeLoader):
         return lines
 
     def _cell_paragraph_text(self, p_el, extract_images: bool, ocr_images: bool,
-                             ocr_results_map: Dict[str, str]) -> str:
+                             ocr_results_map: Dict[Any, Optional[str]]) -> str:
         """Text of a paragraph in a table cell, image markers in place and its list
         number or bullet in front."""
         parts = []
@@ -1673,25 +1828,28 @@ class DocxLoader(BaseOfficeLoader):
         text = "".join(parts).strip()
         return f"{numbering[0]} {text}" if text and numbering else text
 
-    def _cell_image_markers(self, run, ocr_images: bool, ocr_results_map: Dict[str, str]) -> List[str]:
-        """``[Image]`` (or ``[Image: <OCR text>]``) for each picture drawn in ``run``."""
+    def _cell_image_markers(self, run, ocr_images: bool, ocr_results_map: Dict[Any, Optional[str]]) -> List[str]:
+        """``[Image]`` (or ``[Image: <OCR text>]``, ``[image: OCR unavailable]`` when its OCR failed)
+        for each picture drawn in ``run``."""
         markers = []
         for child in run:
-            if not child.tag.endswith('}drawing'):
+            if child.tag != _W_DRAWING:
                 continue
-            for drawing_child in child:
-                image_bytes = None
-                if drawing_child.tag.endswith('}inline'):
-                    image_bytes = self._extract_image_data_from_inline(drawing_child)
-                elif drawing_child.tag.endswith('}anchor'):
-                    image_bytes = self._extract_image_data_from_anchor(drawing_child)
+            for drawing in child:
+                if not drawing.tag.endswith(('}inline', '}anchor')):
+                    continue
+                image_bytes = self._drawing_image_bytes(drawing)
                 if not image_bytes:
                     continue
                 if not ocr_images:
                     markers.append("[Image]")
                     continue
                 img_hash = _image_hash(image_bytes)
-                ocr_text = ocr_results_map[img_hash] if img_hash in ocr_results_map else self._ocr_image(image_bytes)
+                ocr_text = ocr_results_map[img_hash] if img_hash in ocr_results_map else self._ocr_image(
+                    image_bytes, self._location)
+                if ocr_text is None:
+                    markers.append(OCR_UNAVAILABLE)
+                    continue
                 # The cell's text is escaped by the table renderer: give it the plain OCR text.
                 ocr_text = self._ocr_cell_texts.get(img_hash, ocr_text).strip()
                 markers.append(f"[Image: {ocr_text}]" if ocr_text else "[Image]")
@@ -1699,17 +1857,20 @@ class DocxLoader(BaseOfficeLoader):
 
     def _table_text_fallback(self, tbl) -> str:
         """Every cell's text on a plain grid (no merges), for a table whose structure
-        could not be read; the text itself is never dropped."""
+        could not be read; the text itself is never dropped (and text a reader does not
+        see, such as the ``mc:Fallback`` copy of a text box, is not added)."""
+        def shown_text(element) -> str:
+            return "".join(t.text or "" for t in _docx_rendered(element) if t.tag == _W_T)
+
         try:
-            rows = [["".join(t.text or "" for t in tc.iter(_W_T)) for tc in _docx_children(tr, _W_TC)]
-                    for tr in _docx_children(tbl, _W_TR)]
+            rows = [[shown_text(tc) for tc in _docx_children(tr, _W_TC)] for tr in _docx_children(tbl, _W_TR)]
             width = max((len(row) for row in rows), default=0)
             rows = [row + [""] * (width - len(row)) for row in rows if any(cell.strip() for cell in row)]
             if rows:
                 return TableRenderer(self.table_style).render(TableData.from_raw(rows, {'is_complex': False}))
         except Exception as e:
             logger.warning(f"DOCX table text fallback failed ({e}); emitting the raw text")
-        return "\n".join(t.text for t in tbl.iter(_W_T) if t.text)
+        return "\n".join(t.text for t in _docx_rendered(tbl) if t.tag == _W_T and t.text)
 
 
 class PptxLoader(BaseOfficeLoader):
@@ -1718,6 +1879,7 @@ class PptxLoader(BaseOfficeLoader):
     def __init__(self, file_path: Union[str, Path], ocr=None, table_style: Union[str, TableStyle] = None):
         super().__init__(file_path, ocr, table_style)
         self._open_document()
+        self._inherited_seen: set = set()
 
     def _open_document(self):
         """Open PPTX document"""
@@ -1739,10 +1901,13 @@ class PptxLoader(BaseOfficeLoader):
             "pages": len(self.doc.slides),
             "content": []
         }
+        # Shapes of layouts and masters whose text a slide already showed (see _inherited_text).
+        self._inherited_seen = set()
 
         # Batch OCR processing if requested
+        ocr_images = bool(extract_images and ocr_images and self.ocr)
         ocr_results_map = {}
-        if extract_images and ocr_images:
+        if ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
 
@@ -1889,35 +2054,15 @@ class PptxLoader(BaseOfficeLoader):
         content_items.extend(shape_content)
         logger.info(f"  Extracted {len(shape_content)} items from shapes")
 
-        # Extract text from slide master/layout (headers, footers, page numbers)
+        # Text the slide's layout and master draw on it (their placeholders are prompts, shown only
+        # through the slide's own placeholders)
         try:
-            # Check for text in slide layout that might not be in placeholders
-            if hasattr(slide, 'slide_layout'):
-                layout = slide.slide_layout
-                layout_shape_count = len(layout.shapes) if hasattr(layout, 'shapes') else 0
-                logger.debug(f"  Checking {layout_shape_count} shapes in slide layout")
-
-                # Look for footer/header text in layout
-                for shape in layout.shapes:
-                    if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
-                        text = _soft_breaks(shape.text_frame.text).strip()
-                        if text and len(text) < 100:  # Usually footers/headers are short
-                            # Check if this text is already captured
-                            text_exists = any(item.get('content', '') == text for item in content_items)
-                            if not text_exists:
-                                content_items.append({
-                                    "type": "text:caption",
-                                    "content": text,
-                                    "page": slide_num,
-                                    "_top": 1000,  # Put at bottom
-                                    "_left": 0
-                                })
-                                logger.debug(f"    Added layout text: '{text}'")
+            content_items.extend(self._inherited_text(slide, slide_num))
         except Exception as e:
             logger.warning(f"Error extracting layout text: {e}")
 
         # Sort by position to maintain reading order
-        content_items.sort(key=lambda x: (x.get("_top", 0), x.get("_left", 0)))
+        content_items.sort(key=lambda x: (x.get("_top") or 0, x.get("_left") or 0))
 
         # Remove internal position markers
         for item in content_items:
@@ -1926,6 +2071,27 @@ class PptxLoader(BaseOfficeLoader):
 
         logger.info(f"  Total items extracted from slide {slide_num}: {len(content_items)}")
         return content_items
+
+    def _inherited_text(self, slide, slide_num: int) -> List[Dict[str, Any]]:
+        """Text the slide's layout and master draw on it: their visible non-placeholder shapes (a
+        tagline, a company line), each kept once per presentation, on the first slide that shows
+        it, as a PDF keeps the first copy of a running header. Their placeholders are prompts
+        ("Click to edit Master title style") and date / footer / slide-number fields, which a slide
+        shows only through its own placeholders."""
+        items = []
+        for owner in _pptx_drawn_masters(slide):
+            for shape in _pptx_visible_shapes(owner.shapes):
+                if shape.is_placeholder or not getattr(shape, 'has_text_frame', False):
+                    continue
+                key = (str(owner.part.partname), shape.shape_id)
+                if key in self._inherited_seen:
+                    continue
+                self._inherited_seen.add(key)
+                text_item = self._extract_text_from_shape(shape)
+                if text_item:
+                    items.append({"type": "text:normal", "content": text_item["content"], "page": slide_num,
+                                  "_top": shape.top or 0, "_left": shape.left or 0})
+        return items
 
     def _extract_from_placeholders(self, slide, slide_num: int, extract_images: bool, ocr_images: bool,
                                    ocr_results_map: Optional[Dict[str, str]] = None) -> List[
@@ -2005,12 +2171,20 @@ class PptxLoader(BaseOfficeLoader):
         return content_items
 
     def _extract_text_from_placeholder(self, placeholder, ph_type) -> Optional[Dict[str, Any]]:
-        """Extract text from a placeholder with proper type classification"""
+        """Extract text from a placeholder with proper type classification. A date, footer, header
+        or slide-number placeholder gives only the text the slide sets in it: its fields (the slide
+        number, an automatic date) are not text of the slide."""
         text_parts = []
+        try:
+            from pptx.enum.shapes import PP_PLACEHOLDER
+            marginal = ph_type in (PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.HEADER,
+                                   PP_PLACEHOLDER.SLIDE_NUMBER)
+        except ImportError:
+            marginal = False
 
         for paragraph in placeholder.text_frame.paragraphs:
             # Don't strip yet - check raw text first
-            para_text = _soft_breaks(paragraph.text)
+            para_text = _soft_breaks(_pptx_typed_text(paragraph) if marginal else paragraph.text)
             # Only skip if truly empty or just whitespace
             if para_text and not para_text.isspace():
                 # Now we can strip for storage
@@ -2117,8 +2291,9 @@ class PptxLoader(BaseOfficeLoader):
                         logger.debug(
                             f"  Shape {idx}: Type={shape_type_name}, Name={shape.name if hasattr(shape, 'name') else 'unnamed'}")
 
-                        # Try to extract text from any shape as a last resort
-                        if hasattr(shape, 'text') and shape.text.strip():
+                        # Try to extract text from any shape as a last resort (a shape with a text
+                        # frame, such as an AutoShape, was read above)
+                        if not getattr(shape, 'has_text_frame', False) and getattr(shape, 'text', '').strip():
                             content_items.append({
                                 "type": "text:normal",
                                 "content": _soft_breaks(shape.text).strip(),
@@ -2384,75 +2559,35 @@ class PptxLoader(BaseOfficeLoader):
             return None
 
     def _image_item(self, image_data: bytes, slide_num: int, ocr_images: bool,
-                    ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+                    ocr_results_map: Optional[Dict[Any, Optional[str]]] = None) -> Optional[Dict[str, Any]]:
         """Content item for one picture: its OCR text when OCR runs (None when OCR finds no
-        text), else the image as base64."""
+        text; the ``[image: OCR unavailable]`` marker when its OCR failed), else the image as
+        base64."""
         if ocr_images and self.ocr:
             img_hash = _image_hash(image_data)
-            ocr_text = (ocr_results_map or {}).get(img_hash)
-            if ocr_text is None:
+            if img_hash in (ocr_results_map or {}):
+                ocr_text = ocr_results_map[img_hash]
+            else:
+                logger.warning(f"OCR result not found for a picture on slide {slide_num}, using fallback OCR")
                 ocr_text = self._ocr_image(image_data, {'slide': slide_num})
             return self._ocr_description(ocr_text, page=slide_num)
         return {"type": "image", "content": self._extract_image_as_base64(image_data), "page": slide_num}
 
     def _extract_image_from_placeholder(self, placeholder, slide_num: int, ocr_images: bool,
-                                        ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[
+                                        ocr_results_map: Optional[Dict[Any, Optional[str]]] = None) -> Optional[
         Dict[str, Any]]:
         """Extract image from a picture placeholder"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
         try:
-            image = placeholder.image
-            image_data = image.blob
-
-            if ocr_images and self.ocr:
-                # Use image content hash to find OCR result
-                img_hash = _image_hash(image_data)
-
-                if img_hash in ocr_results_map:
-                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
-                # Fallback to individual OCR
-                logger.warning(
-                    f"OCR result not found for placeholder image on slide {slide_num}, using fallback OCR")
-                return self._ocr_description(self._ocr_image(image_data, {'slide': slide_num}), page=slide_num)
-            else:
-                base64_data = self._extract_image_as_base64(image_data)
-                return {
-                    "type": "image",
-                    "content": base64_data,
-                    "page": slide_num
-                }
+            return self._image_item(placeholder.image.blob, slide_num, ocr_images, ocr_results_map)
         except Exception as e:
             logger.warning(f"Failed to extract image from placeholder: {e}")
             return None
 
     def _extract_image_from_shape(self, shape, slide_num: int, ocr_images: bool,
-                                  ocr_results_map: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+                                  ocr_results_map: Optional[Dict[Any, Optional[str]]] = None) -> Optional[Dict[str, Any]]:
         """Extract image from a shape"""
-        if ocr_results_map is None:
-            ocr_results_map = {}
         try:
-            image = shape.image
-            image_data = image.blob
-
-            if ocr_images and self.ocr:
-                # Use image content hash to find OCR result
-                img_hash = _image_hash(image_data)
-
-                if img_hash in ocr_results_map:
-                    return self._ocr_description(ocr_results_map[img_hash], page=slide_num)
-                # Fallback to individual OCR
-                logger.warning(f"OCR result not found for shape image on slide {slide_num}, using fallback OCR")
-                return self._ocr_description(self._ocr_image(image_data, {'slide': slide_num}), page=slide_num)
-            else:
-                # Return base64 encoded image
-                base64_data = self._extract_image_as_base64(image_data)
-                return {
-                    "type": "image",
-                    "content": base64_data,
-                    "page": slide_num
-                }
-
+            return self._image_item(shape.image.blob, slide_num, ocr_images, ocr_results_map)
         except Exception as e:
             logger.warning(f"Failed to extract image: {e}")
             return None
@@ -2575,12 +2710,17 @@ class XlsxLoader(BaseOfficeLoader):
                         extract_images: bool = True,
                         ocr_images: bool = False,
                         show_progress: bool = True) -> Dict[str, Any]:
-        """Convert XLSX to JSON format"""
+        """Convert XLSX to JSON format. Besides ``content``, the result carries ``sheet_names``
+        (every sheet, in workbook order) and ``total_cells`` (the cells that show a value, over
+        all sheets)."""
         document = {
             "filename": self.file_path.name,
             "pages": len(self.doc.worksheets),
-            "content": []
+            "content": [],
+            "sheet_names": list(self.doc.sheetnames),
+            "total_cells": 0,
         }
+        ocr_images = bool(ocr_images and self.ocr)
 
         # Image data is read once (openpyxl's Image._data() can only be read once) and
         # OCR'd in one batch before the sheets are laid out, so a picture's OCR text can
@@ -2618,6 +2758,7 @@ class XlsxLoader(BaseOfficeLoader):
             items, embedded = self._extract_sheet_content(
                 sheet, sheet_idx + 1, extract_images, ocr_images, ocr_results_map, image_data_cache)
             document["content"].extend(items)
+            document["total_cells"] += self._filled_cells
             if extract_images:
                 document["content"].extend(self._extract_images_from_sheet(
                     sheet, sheet_idx + 1, ocr_images, ocr_results_map, image_data_cache, embedded))
@@ -2631,8 +2772,10 @@ class XlsxLoader(BaseOfficeLoader):
                                ocr_results_map: Dict[Any, str], image_data_cache: Dict[tuple, bytes]
                                ) -> Tuple[List[Dict[str, Any]], set]:
         """Content items of one sheet (title rows, then the table) and the pictures
-        embedded in its cells (``("anchor", index)`` / ``("media", part name)``)."""
+        embedded in its cells (``("anchor", index)`` / ``("media", part name)``). Sets
+        ``self._filled_cells``: how many of its cells show a value."""
         embedded: set = set()
+        self._filled_cells = 0
         if not hasattr(sheet, 'merged_cells'):  # a chartsheet has no cells
             return [], embedded
         scan = self._sheet_scans().get(sheet.title, {})
@@ -2645,6 +2788,7 @@ class XlsxLoader(BaseOfficeLoader):
             text = self._cell_text(cell) if cell.value is not None else formulas.get((row, col), "")
             if text:
                 texts[(row, col)] = text
+        self._filled_cells = len(texts)
 
         merges = [(r.min_row, r.min_col, r.max_row, r.max_col) for r in sheet.merged_cells.ranges
                   if texts.get((r.min_row, r.min_col))]
@@ -2776,16 +2920,19 @@ class XlsxLoader(BaseOfficeLoader):
 
     def _picture_label(self, data: Optional[bytes], ocr_images: bool, ocr_results_map,
                        sheet_name: Optional[str] = None) -> str:
-        """``[Image: <OCR text>]`` when OCR read the picture, else ``[Image]``. Only a picture
-        whose OCR text went into its cell counts as embedded; any other picture is still
-        emitted after the table, so extracted image data is never dropped. ``sheet_name``: the
-        picture's sheet, for the loader's OCR issue record."""
-        if not (ocr_images and data):
+        """``[Image: <OCR text>]`` when OCR read the picture, ``[image: OCR unavailable]`` when its
+        OCR failed, else ``[Image]``. Only a picture whose OCR result went into its cell counts as
+        embedded; any other picture is still emitted after the table, so extracted image data is
+        never dropped. ``sheet_name``: the picture's sheet, for the loader's OCR issue record."""
+        if not (ocr_images and self.ocr and data):
             return "[Image]"
         img_hash = _image_hash(data)
-        text = ocr_results_map.get(img_hash)
-        if text is None:  # not in the batch: OCR it once, and remember it for the image item
+        if img_hash in ocr_results_map:
+            text = ocr_results_map[img_hash]
+        else:  # not in the batch: OCR it once, and remember it for the image item
             text = ocr_results_map[img_hash] = self._ocr_image(data, {'sheet': sheet_name} if sheet_name else None)
+        if text is None:
+            return OCR_UNAVAILABLE
         # The cell's text is escaped by the table renderer: give it the plain OCR text.
         text = (self._ocr_cell_texts.get(img_hash, text) or "").strip()
         return f"[Image: {text}]" if text else "[Image]"
@@ -3187,8 +3334,11 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
 
     Document text is escaped so it cannot turn into Markdown/HTML structure (a paragraph
     ``# of units`` stays a paragraph, ``<img …>`` stays text); see ``doc2mark.utils.markdown``.
+    A paragraph or list item with a ``markdown`` key (Word bold, italics and links) is written
+    from it. Items of a Word header or footer (``"region": "header"`` / ``"footer"``) are written
+    between ``<!-- header -->`` and ``<!-- /header -->`` (``footer``) lines.
     """
-    from doc2mark.utils.markdown import escape_heading_text, escape_list_item, escape_markdown_text
+    from doc2mark.utils.markdown import escape_heading_text, escape_list_item
 
     def escape_footnote(text: str) -> str:
         # "[^3]: note text" -> keep the definition label, escape the note
@@ -3210,7 +3360,12 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
     else:
         page_label = "page"
 
+    region = None
     for item in json_data["content"]:
+        # Close a header / footer block before a page marker, open one after it
+        if item.get("region") != region and region:
+            markdown_parts.append(f"<!-- /{region} -->\n")
+            region = None
         # Add page/slide/sheet separator if needed
         if "page" in item and item["page"] != current_page:
             if markdown_parts:
@@ -3218,6 +3373,10 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             markdown_parts.append(f"<!-- {page_label} {item['page']} -->")
             markdown_parts.append("")
             current_page = item["page"]
+        if item.get("region") != region:
+            region = item["region"]
+            markdown_parts.append(f"<!-- {region} -->\n")
+            list_depth = -1
 
         # Structure read from the file (list marker, heading level) sits beside the
         # verbatim ``content``; only the prefix is built here. A list item nests at
@@ -3228,7 +3387,8 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             if item.get("page") != list_page:
                 list_depth = -1
             depth = min(item.get("list_level", 0), list_depth + 1)
-            markdown_parts.append(f"{'    ' * depth}{item['marker']} {escape_markdown_text(item['content'])}\n")
+            text = item.get("markdown") or escape_markdown_text(item["content"])
+            markdown_parts.append(f"{'    ' * depth}{item['marker']} {text}\n")
             if _MARKDOWN_LIST_MARKER.fullmatch(item["marker"]):
                 list_depth = depth
             else:  # a paragraph ("(a) ..."): it closes list items at its own depth and deeper
@@ -3256,7 +3416,7 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
             markdown_parts.append("\n".join(f"*{line.strip()}*" for line in caption_lines if line.strip()) + "\n")
         elif item["type"] == "text:normal":
             # Add normal text with paragraph spacing
-            markdown_parts.append(f"{escape_markdown_text(item['content'])}\n")
+            markdown_parts.append(f"{item.get('markdown') or escape_markdown_text(item['content'])}\n")
         elif item["type"] == "text:image_description":
             # OCR'd-image text — strip the internal provenance wrapper and emit
             # clean text (no code-fence / <ocr_result> noise).
@@ -3273,4 +3433,6 @@ def office_to_markdown(json_data: Dict[str, Any]) -> str:
         elif item["type"] == "text:footnote":
             markdown_parts.append(f"{escape_footnote(item['content'])}\n")
 
+    if region:
+        markdown_parts.append(f"<!-- /{region} -->\n")
     return "\n".join(markdown_parts)

@@ -18,6 +18,9 @@ from doc2mark.core.base import (
 from doc2mark.ocr.base import BaseOCR
 logger = logging.getLogger(__name__)
 
+# What a picture whose OCR failed shows, as on the PDF and Office paths.
+OCR_UNAVAILABLE = "[image: OCR unavailable]"
+
 _heif_registered = False
 
 
@@ -128,44 +131,54 @@ class ImageProcessor(BaseProcessor):
                 logger.debug(f"OCR requested: {ocr_images}, OCR available: {self.ocr is not None}")
                 
                 # Perform OCR if requested
+                ocr_failed = False
                 if ocr_images:
                     if self.ocr:
                         logger.info(f"🔍 Performing OCR on image: {file_path.name}")
                         try:
                             # Read image bytes
                             image_bytes = file_path.read_bytes()
-                            
+
                             # Log OCR request
                             logger.debug(f"OCR Provider: {type(self.ocr).__name__}")
                             logger.debug(f"Image size: {len(image_bytes)} bytes")
-                            
+
                             # Use batch processing with single image (OpenAI OCR requires this)
                             ocr_results = self.ocr.batch_process_images([image_bytes])
                             ocr_result = ocr_results[0] if ocr_results else None
-                            
+                            # No answer, or one the provider flags failed (a timeout, an error): the
+                            # picture was not read, which is not the same as a picture without text.
+                            ocr_failed = ocr_result is None or bool(
+                                (getattr(ocr_result, 'metadata', None) or {}).get('failed'))
+
                             # Extract text from result
-                            if ocr_result and hasattr(ocr_result, 'text'):
-                                ocr_text = ocr_result.text
-                            elif ocr_result:
-                                ocr_text = str(ocr_result)
-                            else:
+                            if ocr_failed:
                                 ocr_text = None
-                            
-                            logger.info(f"✓ OCR completed, extracted {len(ocr_text) if ocr_text else 0} characters")
-                            
-                            if ocr_text and ocr_text.strip():
-                                content_parts.append("## OCR Extracted Text\n")
-                                content_parts.append(ocr_text.strip())
-                                content_parts.append("")
+                            elif hasattr(ocr_result, 'text'):
+                                ocr_text = ocr_result.text
                             else:
-                                content_parts.append("## OCR Extraction\n")
-                                content_parts.append("*No text detected in image*\n")
-                                ocr_text = ""  # Set to empty string to indicate OCR was performed
+                                ocr_text = str(ocr_result)
+
+                            logger.info(f"✓ OCR completed, extracted {len(ocr_text) if ocr_text else 0} characters")
                         except Exception as e:
+                            # The error goes to the log and to metadata.extra["ocr_issues"]; the
+                            # document shows only that the picture could not be read.
                             logger.error(f"❌ OCR failed for {file_path.name}: {e}")
+                            ocr_failed = True
+                            ocr_text = None
+
+                        if ocr_failed:
+                            logger.warning(f"OCR could not read {file_path.name}; marking it {OCR_UNAVAILABLE}")
                             content_parts.append("## OCR Extraction\n")
-                            content_parts.append(f"*OCR extraction failed: {str(e)}*\n")
-                            ocr_text = None  # Keep as None to indicate OCR failed
+                            content_parts.append(f"{OCR_UNAVAILABLE}\n")
+                        elif ocr_text and ocr_text.strip():
+                            content_parts.append("## OCR Extracted Text\n")
+                            content_parts.append(ocr_text.strip())
+                            content_parts.append("")
+                        else:
+                            content_parts.append("## OCR Extraction\n")
+                            content_parts.append("*No text detected in image*\n")
+                            ocr_text = ""  # Set to empty string to indicate OCR was performed
                     else:
                         logger.warning(f"⚠️ OCR requested but no OCR provider available")
                         content_parts.append("## OCR Extraction\n")
@@ -250,7 +263,12 @@ class ImageProcessor(BaseProcessor):
             ]
             
             # Add OCR result if available (similar to PDF processor)
-            if ocr_text is not None and ocr_text != "":
+            if ocr_failed:
+                json_content.append({
+                    'type': 'text:image_description',
+                    'content': f'<image_ocr_result>{OCR_UNAVAILABLE}</image_ocr_result>'
+                })
+            elif ocr_text is not None and ocr_text != "":
                 if ocr_text.strip():
                     json_content.append({
                         'type': 'text:image_description',

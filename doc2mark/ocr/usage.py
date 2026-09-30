@@ -177,7 +177,8 @@ class UsageAggregatingOCR(BaseOCR):
         The dict counts images whose answer was only a refusal / "no readable text"
         statement (``refused``, emitted as empty text; ``provider_refused`` of them the
         provider's own refusal or safety block, which may not last: see
-        ``doc2mark.ocr.cache.REFUSAL_TTL_SECONDS``), images that failed (``failed``),
+        ``doc2mark.ocr.cache.REFUSAL_TTL_SECONDS``), images that failed (``failed``: the
+        provider flagged the answer, or the call carrying the image raised),
         images that still withhold values after the router firewall's verbatim redo
         (``withheld``) and answers kept as text although the optional non-content judge
         rated them close to no content (``suspected``, ``metadata["non_content_suspected"]``),
@@ -221,7 +222,9 @@ class UsageAggregatingOCR(BaseOCR):
             if 0 <= position < min(count, len(labels)) and isinstance(labels[position], dict):
                 location.update(labels[position])
 
-    def _note_error(self, exc: BaseException) -> None:
+    def _note_error(self, exc: BaseException, images: int) -> None:
+        """Record an OCR call that raised. It answered none of its ``images``: each is a failed image,
+        with a location the calling pipeline can place through :meth:`label_last_batch`."""
         issues = getattr(self._usage_local, "issues", None)
         if issues is None:
             return
@@ -232,6 +235,13 @@ class UsageAggregatingOCR(BaseOCR):
         message = f"{type(exc).__name__}: {exc}"
         if message not in issues["errors"] and len(issues["errors"]) < _MAX_ISSUE_ERRORS:
             issues["errors"].append(message)
+        first = getattr(self._usage_local, "images_seen", 0)
+        self._usage_local.images_seen = first + images
+        self._usage_local.last_batch = (first, images)
+        issues["failed"] += images
+        for position in range(images):
+            if len(issues["locations"]) < _MAX_ISSUE_LOCATIONS:
+                issues["locations"].append({"issue": "failed", "image": first + position + 1})
 
     def pop_document_usage(self) -> Optional[Dict[str, int]]:
         """Return the accumulated usage and clear it, or ``None`` when no OCR
@@ -299,7 +309,7 @@ class UsageAggregatingOCR(BaseOCR):
         try:
             results = self.wrapped.batch_process_images(images, **kwargs)
         except Exception as exc:
-            self._note_error(exc)
+            self._note_error(exc, len(images))
             raise
         self._record(results)
         return results
@@ -316,7 +326,7 @@ class UsageAggregatingOCR(BaseOCR):
                 return result
             results = self.wrapped.batch_process_images([image], **kwargs)
         except Exception as exc:
-            self._note_error(exc)
+            self._note_error(exc, 1)
             raise
         self._record(results)
         return results[0] if results else OCRResult(text="")
