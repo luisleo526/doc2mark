@@ -170,7 +170,10 @@ def test_invisible_text_is_kept_when_the_page_cannot_be_checked(tmp_path, monkey
     counts = len(measure.layer_rects), len(measure.hidden_rects), len(measure.duplicate_rects)
     assert counts == (len(LEDGER) + 1, 0, 1)
     assert "keeping it as the page's text" in caplog.text
-    assert pdf_routing.text_source(page, measure, copies) is page
+    source = pdf_routing.text_source(page, measure, copies)
+    spans = [span["text"] for block in source.get_text("dict")["blocks"] for line in block.get("lines", [])
+             for span in line["spans"]]
+    assert all(line in spans for line in LEDGER) and HIDDEN in spans and spans.count("CONFIDENTIAL") == 1
     copies.close()
 
 
