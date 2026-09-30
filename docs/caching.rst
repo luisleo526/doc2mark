@@ -24,7 +24,11 @@ run; an entry of either kind already in a cache is a miss, and each skipped writ
 is logged at INFO. The provider's own refusal or safety block (OpenAI's refusal
 field, a Gemini SAFETY or RECITATION block: ``metadata["non_content"] ==
 "provider_refusal"``) may not last, so it is cached for ``refusal_ttl_seconds``
-only (default 600, ten minutes), which a hit does not extend. Likewise
+only (default 600, ten minutes), which a hit does not extend; so is an empty
+structured answer whose free-form recovery the provider refused or blocked.
+Refusals cached before this TTL existed had none of their own, so the cache key
+version moved to ``ocr-cache-v6``: entries written under an earlier version are
+never read (a one-time miss for every image cached before). Likewise
 ``cache_dir`` (the loader's cache of converted documents, which never expires)
 does not store a document whose OCR failed somewhere, left a page showing content
 unread, or holds a provider's own refusal or block (see
@@ -71,7 +75,7 @@ fallback when Redis is unavailable:
        ttl_seconds=3600,
        max_age_seconds=43200,
        max_refreshes=10,
-       key_prefix="doc2mark:ocr:ocr-cache-v3",  # default prefix
+       key_prefix="doc2mark:ocr:ocr-cache-v6",  # default prefix
        fallback="memory",                        # "memory", "none", or "raise"
    )
 
@@ -154,7 +158,7 @@ Requires the ``redis`` extra:
        ttl_seconds=3600,
        max_age_seconds=43200,
        max_refreshes=10,
-       key_prefix="doc2mark:ocr:ocr-cache-v3",
+       key_prefix="doc2mark:ocr:ocr-cache-v6",
    )
 
 The constructor verifies the connection with ``ping()`` and raises on failure.
@@ -178,7 +182,7 @@ Constructor parameters:
 ``refusal_ttl_seconds`` (float, default ``600``)
     Same semantics as ``MemoryOCRCache``.
 
-``key_prefix`` (str, default ``"doc2mark:ocr:ocr-cache-v3"``)
+``key_prefix`` (str, default ``"doc2mark:ocr:ocr-cache-v6"``)
     Prefix for all Redis keys. Useful for namespacing when multiple
     applications share a Redis instance.
 

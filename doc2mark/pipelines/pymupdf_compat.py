@@ -35,8 +35,20 @@ def missing(capability: str, consequence: str, level: int = logging.WARNING) -> 
 
 def quiet_layout_recommendation() -> None:
     """PyMuPDF 1.26.7+ prints a recommendation of its ``pymupdf_layout`` package to stdout the first time
-    ``find_tables()`` runs in a process; stdout is where ``doc2mark`` writes a document (Markdown or
-    JSON) when no output file is given. Switch that print off."""
+    ``find_tables()`` runs in a process; stdout is where the ``doc2mark`` CLI writes a document (Markdown
+    or JSON) when no output file is given. Switch that print off, for the whole process: only the CLI
+    calls this, a library user's PyMuPDF is left as PyMuPDF sets it."""
     no_recommend_layout = getattr(pymupdf, "no_recommend_layout", None)
     if callable(no_recommend_layout):
         no_recommend_layout()
+
+
+def messages_to_log() -> None:
+    """PyMuPDF prints its messages to stdout, among them MuPDF's errors about a damaged file (``MuPDF error:
+    library error: zlib error: ...``). Send them to the ``pymupdf`` logger as warnings instead, and PyMuPDF's
+    debugging log there at DEBUG, for the whole process: only the CLI calls this (see
+    :func:`quiet_layout_recommendation`)."""
+    for setter, level in (("set_messages", logging.WARNING), ("set_log", logging.DEBUG)):
+        route = getattr(pymupdf, setter, None)
+        if callable(route):
+            route(pylogging_logger=logging.getLogger("pymupdf"), pylogging_level=level)

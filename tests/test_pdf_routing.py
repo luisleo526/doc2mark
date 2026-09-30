@@ -3,7 +3,12 @@ text is classified when the page cannot be checked or PyMuPDF lacks a capability
 import functools
 import io
 import logging
+import os
+import random
 import string
+import subprocess
+import sys
+import time
 from dataclasses import replace
 
 import pymupdf
@@ -106,6 +111,204 @@ def test_page_chrome_lines_are_not_added_to_the_ocr_text(tmp_path):
 
     assert pdf_routing.missing_painted_lines(page, measure, "Invoice", chrome=[header]) == [
         "Station 12 passed its test"]
+
+
+# --- Review of #25: line order, shared OCR words, words inside CJK text, the cost of the gapped match -------------
+
+NET_LOSS_ROW = "<table><tr><td>Net loss before tax</td><td>Note 4</td><td>1,200</td></tr></table>"
+ZIPF_CHARS = ("的一是在不了有和人這中大為上個國我以要他時來用們生到作地於出就分對成會可主發年動同工也能下過子說產種面而方後多"
+              "定行學法所民得經十三之進著等部度家電力裡如水化高自二理起小物現實加量都兩體制機當使點從業本去把性好應開它合還因"
+              "由其些然前外天政四日那社義事平形相全表間樣與關各重新線內數正心反你明看原又麼利比或但質氣第向道命此變條只沒結解"
+              "問意建月公無系軍很情者最立代想已通並提直題黨程展五果料象員革位入常文總次品式活設及管特件長求老頭基資邊流路級少"
+              "圖山統接知較將組見計別她手角期根論運農指幾九區強放決西被幹做必戰先回則任取據處府研")
+
+
+def _page_of(tmp_path, lines, *, cjk=False):
+    """A page holding ``lines`` (in a CJK font when ``cjk``), and its measure."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=2400, height=1400)
+    for n, line in enumerate(lines):
+        page.insert_text((20, 30 + 13 * n), line, fontsize=10, fontname="china-t" if cjk else "helv")
+    path = tmp_path / f"tail-{random.random()}.pdf"
+    doc.save(str(path))
+    doc.close()
+    page = pymupdf.open(str(path))[0]
+    return page, pdf_routing.measure_page(page)
+
+
+def _tail(tmp_path, lines, ocr, *, cjk=False):
+    """``missing_painted_lines`` of a page holding ``lines`` for the OCR answer ``ocr``."""
+    return pdf_routing.missing_painted_lines(*_page_of(tmp_path, lines, cjk=cjk), ocr)
+
+
+def _zipf_lines(seed, count, width):
+    """``count`` lines of ``width`` CJK characters drawn with Zipf frequencies (as in running text), and the
+    random generator that drew them."""
+    rng = random.Random(seed)
+    weights = [1 / (rank + 1) for rank in range(len(ZIPF_CHARS))]
+    return ["".join(rng.choices(ZIPF_CHARS, weights=weights, k=width)) for _ in range(count)], rng
+
+
+@pytest.mark.parametrize("lines", [
+    ["Tax 1,200", "Net loss before tax 1,200"],
+    ["Net loss before tax 1,200", "Tax 1,200"],
+], ids=["short-line-first", "short-line-last"])
+def test_a_short_line_the_ocr_left_out_is_kept_whatever_the_line_order(tmp_path, lines):
+    """Review of #25 (M2): lines were matched with gaps in page order, so the short line "Tax 1,200", which the OCR
+    left out, took the words of the row "Net loss before tax 1,200" that the OCR read with a cell between them; the
+    row was then appended again and the short line was lost. Longer lines claim their OCR words first, and a line of
+    three words or fewer is found only in one piece."""
+    assert _tail(tmp_path, lines, NET_LOSS_ROW) == ["Tax 1,200"]
+
+
+def test_a_line_whose_words_are_spread_over_another_sentence_is_kept(tmp_path):
+    """M2: "Revenue 2024 up 12 percent" counted as reproduced by a chart's "Revenue by year 2024 up from 2023 12
+    percent growth". With gaps a line may gain or miss only a few words: at most max(2, a fifth of its words)
+    together."""
+    line = "Revenue 2024 up 12 percent"
+    assert _tail(tmp_path, [line], "Chart: Revenue by year 2024 up from 2023 12 percent growth") == [line]
+    assert _tail(tmp_path, [line], "Chart: Revenue 2024 (est.) up 12 percent") == []
+
+
+def test_two_lines_never_share_one_ocr_word(tmp_path):
+    """m2: lines found in place did not claim their OCR words, so the one "Total" of the OCR answer stood for both
+    "Total" lines of the page."""
+    assert _tail(tmp_path, ["Total", "1", "Total", "2"], "Total 1") == ["Total", "2"]
+
+
+def test_a_line_without_cjk_is_not_found_inside_cjk_words(tmp_path):
+    """m2: since #25 the letters and digits between CJK characters are words (dates, amounts), so the line "AI"
+    matched the "AI" of "財務AI使用介面" and was lost. A line without CJK characters is found only in words that stand
+    alone in the OCR text; a CJK line still matches however the OCR spaced it."""
+    lines = ["AI", "Quarterly review of the pilot"]
+    assert _tail(tmp_path, lines, "財務AI使用介面\nQuarterly review of the pilot") == ["AI"]
+    assert _tail(tmp_path, lines, "財務 AI 使用介面\nQuarterly review of the pilot") == []
+    assert _tail(tmp_path, ["財務 AI 使用介面"], "財務AI使用介面", cjk=True) == []
+
+
+def _positional_scan_seconds(lines, ocr):
+    """The cost of the verbatim tail before #25 on a page of CJK ``lines``: for each line, the first stretch of OCR
+    characters holding 80 % of the line's characters at the same places."""
+    ocr_chars = [char for char in ocr if not char.isspace()]
+    started = time.perf_counter()
+    for line in lines:
+        size = len(line)
+        for start in range(max(1, len(ocr_chars) - size + 1)):
+            if sum(1 for a, b in zip(ocr_chars[start:start + size], line) if a == b) >= 0.8 * size:
+                break
+    return time.perf_counter() - started
+
+
+@pytest.mark.parametrize("width, count", [(100, 50), (200, 25)])
+def test_an_ocr_answer_with_the_layers_characters_in_another_order_costs_about_the_positional_scan(
+        tmp_path, width, count):
+    """m1: the gapped match ran its in-order search on every stretch of OCR characters holding enough of a line's
+    characters. An answer holding a CJK page's characters in another order took 6 s for 50 lines of 100 characters
+    and 87 s for 25 lines of 200, where the positional scan alone takes 0.4 s. It now costs about that scan."""
+    lines, rng = _zipf_lines(7, count, width)
+    ocr = "\n".join("".join(rng.sample(line, len(line))) for line in lines)
+    page, measure = _page_of(tmp_path, lines, cjk=True)
+    started = time.perf_counter()
+    missing = pdf_routing.missing_painted_lines(page, measure, ocr)
+    spent = time.perf_counter() - started
+    assert missing == lines
+    assert spent <= 4 * _positional_scan_seconds(lines, ocr) + 1.0   # slack for coverage tracing in CI
+
+
+REVENUE_ROW = "<table><tr><td>Revenue from contracts with customers</td><td>4</td><td>1,200</td></tr></table>"
+REVENUE = "Revenue from contracts with customers 1,200"
+TOTAL_REVENUE = "Total revenue from contracts with customers 1,200"
+
+
+@pytest.mark.parametrize("lines, ocr, missing, cjk", [
+    pytest.param([REVENUE, TOTAL_REVENUE], REVENUE_ROW, [TOTAL_REVENUE], False, id="absent-total-row"),
+    pytest.param([REVENUE, "4", TOTAL_REVENUE], REVENUE_ROW, [TOTAL_REVENUE], False, id="absent-total-row-note-line"),
+    pytest.param(["Income statement", REVENUE, TOTAL_REVENUE], "Income statement\n\n" + REVENUE_ROW, [TOTAL_REVENUE],
+                 False, id="absent-total-row-heading-before"),
+    pytest.param(["Revenue from contracts with customers 1,300", REVENUE], "| Revenue from contracts with customers | 4 | 1,200 |",
+                 ["Revenue from contracts with customers 1,300"], False, id="absent-row-first"),
+    pytest.param([REVENUE, "Revenue from contracts with customers 1,300"], "| Revenue from contracts with customers | 4 | 1,200 |",
+                 ["Revenue from contracts with customers 1,300"], False, id="absent-row-second"),
+    pytest.param(["Note 12", "Cash and cash equivalents at the end of the year 5,400",
+                  "Cash and cash equivalents at the end of the year 5,400 restated"],
+                 "Note 12\n\n| Cash and cash equivalents at the end of the year | (a) | 5,400 |",
+                 ["Cash and cash equivalents at the end of the year 5,400 restated"], False, id="absent-longer-by-one-word"),
+    pytest.param(["Net sales before discount 1,200", "Other text here", "Net sales before discount 1,200"],
+                 "Net sales before discount 1,200\n\nOther text here", ["Net sales before discount 1,200"], False,
+                 id="printed-twice-read-once"),
+    pytest.param(["Net sales", "(note 3)", "before discount", "Net sales before discount"],
+                 "| Net sales | (note 3) | before discount |", ["Net sales before discount"], False,
+                 id="absent-line-made-of-header-cells"),
+    pytest.param(["營業收入", "營業外", "收入"], "<table><tr><td>營業外<br>收入</td><td>1,200</td></tr></table>", ["營業收入"],
+                 True, id="cjk-absent-line-made-of-wrapped-cells"),
+    pytest.param(["營業收入"], "圖表：營業外收入趨勢", ["營業收入"], True, id="cjk-no-word-inserted-inside-a-word"),
+    pytest.param(["Assets", "a) Revenue from contracts with customers 1,200"], "Assets\n\n| Revenue from contracts with customers | 4 | 1,200 |",
+                 [], False, id="misread-edge-word-is-not-taken"),
+    pytest.param(["1. " + REVENUE], REVENUE_ROW, [], False, id="first-word-missing-at-the-start"),
+    pytest.param(["Heading", "1. " + REVENUE], "Heading\n\n" + REVENUE_ROW, [], False, id="first-word-missing-after-a-line"),
+    pytest.param(["本系統採用", "SAP ERP", "進行管理"], "本系統採用SAP ERP進行管理", [], True, id="latin-words-inside-cjk-text"),
+    pytest.param(["金額", "1,234,567", "元"], "金額1,234,567元", [], True, id="amount-inside-cjk-text"),
+    pytest.param(["Tax 1,200", "Net loss before tax 1,200"],
+                 "<table><tr><td>Net loss before</td><td>Note 4</td><td>tax 1,200</td></tr></table>",
+                 ["Tax 1,200", "Net loss before tax 1,200"], False, id="either-line-could-be-the-row"),
+    pytest.param(["AI", "AI Agent for finance teams", "Quarterly review"], "AI Agent for flnance teams\nQuarterly review",
+                 ["AI"], False, id="short-line-inside-a-misread-longer-copy"),
+    pytest.param(["AI", "AI Agent for finance teams", "Quarterly review"],
+                 "AI\nAI Agent for flnance teams\nQuarterly review", [], False, id="short-line-with-its-own-copy"),
+    pytest.param(["Revenue from contracts with customers 1,300", "Revenue from contracts with customers 1,100",
+                  "Revenue from contracts with customers 1,200"],
+                 "| Revenue from contracts with customers | 4 | 1,300 |\n\n| Revenue from contracts with customers | 5 | 1,200 |",
+                 ["Revenue from contracts with customers 1,100"], False, id="absent-row-between-two-rows"),
+    pytest.param(["Net sales", "before discount", "Net sales before discount"],
+                 "| Net sales | (a) | before discount |\n\nFigure 1: Net sales by quarter for the group and its segments in the "
+                 "year\n\nFigure 2: before discount margins", ["Net sales before discount"], False,
+                 id="header-cells-with-spare-copies"),
+])
+def test_the_line_the_ocr_read_keeps_its_words_and_the_absent_one_stays_missing(tmp_path, lines, ocr, missing, cjk):
+    """Review of #26: longer lines claimed OCR words first, so an absent line that nearly contains present lines
+    took their words (a total row the OCR left out took its revenue row, a CJK row took the wrapped cells it is
+    made of) and the absent line was lost. Whole copies claim first, then the best fitting alignments; no OCR
+    word may come between two characters of one CJK word; and when either of two lines could be the OCR text,
+    both are kept."""
+    assert _tail(tmp_path, lines, ocr, cjk=cjk) == missing
+
+
+def test_identical_rows_each_find_one_of_many_near_copies(tmp_path):
+    """Re-check of the review: a line's search compares the places that could hold it and keeps the best, but
+    stops at a fit of one inserted word and after a few places, so 100 identical rows read with an extra word
+    each among 500 such copies are all found, fast."""
+    lines = ["Net sales before discount 1,200"] * 100
+    ocr = "\n".join("Net sales before discount (a) 1,200" for _ in range(500))
+    page, measure = _page_of(tmp_path, lines)
+    started = time.perf_counter()
+    assert pdf_routing.missing_painted_lines(page, measure, ocr) == []
+    assert time.perf_counter() - started <= 2.0
+
+
+def test_many_near_misses_cost_about_the_positional_scan(tmp_path):
+    """Review of #26: each alignment converted the whole page's free-word mask to a list, so an OCR answer made
+    of many near copies of the page's lines (10,000 characters) took seconds. It costs about the positional scan."""
+    lines = ["營業收入"] * 100
+    ocr = "\n".join("營業的入收" for _ in range(2000))
+    page, measure = _page_of(tmp_path, lines, cjk=True)
+    started = time.perf_counter()
+    missing = pdf_routing.missing_painted_lines(page, measure, ocr)
+    spent = time.perf_counter() - started
+    assert missing == lines
+    assert spent <= 4 * _positional_scan_seconds(lines, ocr) + 1.0   # slack for coverage tracing in CI
+
+
+@pytest.mark.parametrize("change", ["one-character-in-thirty-left-out", "one-character-added-early"])
+def test_cjk_lines_the_ocr_read_with_a_few_characters_changed_are_found(tmp_path, change):
+    """What #25 gained stays: an OCR answer that leaves out one character in thirty of a CJK line still reproduces
+    the line (the positional scan appended every such line again), and so does one that adds a character near
+    its start."""
+    lines, _ = _zipf_lines(45, 40, 45)
+    if change == "one-character-in-thirty-left-out":
+        ocr = "\n".join("".join(char for n, char in enumerate(line) if n % 30 != 5) for line in lines)
+    else:
+        ocr = "\n".join(line[:2] + "口" + line[2:] for line in lines)
+    assert _tail(tmp_path, lines, ocr, cjk=True) == []
 
 
 BODY = ["Invoice total EUR 2340 due on 14 March 2026", "Delivery of 1200 units to the Rotterdam depot",
@@ -354,6 +557,28 @@ def test_without_the_table_finders_text_page_tables_come_out_the_same(tmp_path, 
     assert content == expected and "Pumps" in content
     notes = [record for record in caplog.records if "TableFinder.textpage" in record.getMessage()]
     assert len(notes) == 1 and notes[0].levelno == logging.INFO and notes[0].name == pymupdf_compat.__name__
+
+
+USER_FIND_TABLES = (
+    "import sys\n"
+    "if sys.argv[1] == 'with-doc2mark':\n"
+    "    import doc2mark.pipelines.pymupdf_advanced_pipeline\n"
+    "import pymupdf\n"
+    "page = pymupdf.open().new_page()\n"
+    "page.insert_text((72, 72), 'Pump station 12 passed its test.')\n"
+    "page.find_tables()\n"
+)
+
+
+def test_importing_doc2mark_leaves_what_pymupdf_prints_alone():
+    """Review of #25 (m4): importing the PDF pipeline switched PyMuPDF's pymupdf_layout recommendation off for the
+    whole process, so code using PyMuPDF next to doc2mark behaved differently. Only the CLI, whose stdout is the
+    document, switches it off (tests/e2e/test_smoke.py)."""
+    env = {key: value for key, value in os.environ.items() if key != "PYMUPDF_SUGGEST_LAYOUT_ANALYZER"}
+    alone, with_doc2mark = (subprocess.run([sys.executable, "-c", USER_FIND_TABLES, which], capture_output=True,
+                                           text=True, env=env, timeout=300) for which in ("alone", "with-doc2mark"))
+    assert alone.returncode == 0 and with_doc2mark.returncode == 0, alone.stderr + with_doc2mark.stderr
+    assert with_doc2mark.stdout == alone.stdout
 
 
 @pytest.mark.parametrize("inherited", ["Resources", "MediaBox"])

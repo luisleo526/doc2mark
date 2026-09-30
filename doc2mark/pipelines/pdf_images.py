@@ -142,6 +142,19 @@ def _clipped_image_boxes(page) -> Optional[List[pymupdf.Rect]]:
             for block in blocks]
 
 
+def _unpaired_clips(page, clipped: int, images: int) -> None:
+    """Say that a page's clipped image extents do not pair up with its images, so its pictures are measured
+    without their clip paths: a warning for the first such page of a document, DEBUG for the others (both
+    :func:`placements` and :func:`shown_boxes` measure every page)."""
+    doc = page.parent
+    first = not getattr(doc, "_doc2mark_unpaired_clips", False)
+    if first:
+        doc._doc2mark_unpaired_clips = True
+    logger.log(logging.WARNING if first else logging.DEBUG,
+               f"Page {page.number + 1}: {clipped} clipped image boxes for {images} images; measuring its pictures "
+               f"without their clip paths" + (" (said once per document)" if first else ""))
+
+
 def _shown_parts(page, infos: Sequence[dict]) -> List[pymupdf.Rect]:
     """The part the page shows of each image of ``infos`` (``get_image_info()``, in its order): its box on
     the visible page, cut by its clip paths (see :func:`_clipped_image_boxes`) when the clipped extents
@@ -149,8 +162,7 @@ def _shown_parts(page, infos: Sequence[dict]) -> List[pymupdf.Rect]:
     area = page_area(page)
     clipped = _clipped_image_boxes(page)
     if clipped is not None and len(clipped) != len(infos):
-        logger.warning(f"Page {page.number + 1}: {len(clipped)} clipped image boxes for {len(infos)} images; "
-                       f"measuring its pictures without their clip paths")
+        _unpaired_clips(page, len(clipped), len(infos))
         clipped = None
     parts = []
     for index, info in enumerate(infos):

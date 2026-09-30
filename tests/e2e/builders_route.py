@@ -642,18 +642,19 @@ def paper_scan_png(lines: Sequence[str], *, font_px: int = 26, top_share: float 
 
 def report_with_scanned_page_pdf(path: Path, reports: Sequence[Sequence[str]], scan_lines: Sequence[str], *,
                                  printed: Sequence[str] = (), running_header: str = "",
-                                 page_numbers: bool = False) -> Path:
+                                 page_numbers: bool = False, printed_font: str = "helv") -> Path:
     """A text report whose second page is a full-page scan (``paper_scan_png`` of ``scan_lines``) with real text
-    printed over the blank paper above the scanned lines: ``printed`` lines. ``reports`` are the text pages
-    around it (the first before, the others after). Every page carries ``running_header`` at the top and
-    ``Page N of M`` at the bottom when asked, the scan too: printed over its blank margins."""
+    printed over the blank paper above the scanned lines: ``printed`` lines, in ``printed_font`` (``china-t`` for
+    CJK). ``reports`` are the text pages around it (the first before, the others after). Every page carries
+    ``running_header`` at the top and ``Page N of M`` at the bottom when asked, the scan too: printed over its
+    blank margins."""
     doc = pymupdf.open()
     pages = [reports[0], None, *reports[1:]]
     for number, lines in enumerate(pages, 1):
         page = doc.new_page(width=A4[0], height=A4[1])
         if lines is None:
             page.insert_image(page.rect, stream=paper_scan_png(scan_lines))
-            insert_lines(page, printed, top=110, fontsize=12)
+            insert_lines(page, printed, top=110, fontsize=12, fontname=printed_font)
         else:
             insert_lines(page, lines, top=120, fontsize=11)
         if running_header:

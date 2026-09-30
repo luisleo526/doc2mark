@@ -40,3 +40,19 @@ def test_a_pdf_written_to_stdout_is_only_the_document(run_cli, e2e_dir):
     assert "pymupdf_layout" not in markdown.stdout + as_json.stdout, markdown.describe()
     assert "Quarterly memo" in markdown.stdout.strip().splitlines()[0], markdown.describe()
     assert "Pump station 12 passed its test." in json.loads(as_json.stdout)["content"], as_json.describe()
+
+
+def test_a_damaged_pdf_written_to_stdout_is_only_the_document(run_cli, e2e_dir):
+    """Review of #25 (m3): MuPDF writes its errors about a damaged file (here a content stream that does not
+    inflate) to stdout, where the CLI writes the document: the Markdown carried "MuPDF error" lines and
+    ``--format json`` was not JSON. The CLI sends them to its log on stderr (warnings, shown with -v too)."""
+    memo = "Quarterly memo: pump station 12 passed its test."
+    pdf = pdfgen.damaged_stream_pdf(e2e_dir / "damaged.pdf", [memo, "Survey notes for station 14."], damaged=[1])
+
+    as_json = run_cli(pdf, "--ocr", "none", "--format", "json", raw=True)
+    verbose = run_cli(pdf, "--ocr", "none", "-v", raw=True)
+
+    assert as_json.exit_code == 0 and verbose.exit_code == 0, as_json.describe() + verbose.describe()
+    assert memo in json.loads(as_json.stdout)["content"], as_json.describe()
+    assert memo in verbose.stdout and "MuPDF" not in as_json.stdout + verbose.stdout, verbose.describe()
+    assert "MuPDF error" in as_json.stderr and "MuPDF error" in verbose.stderr, as_json.describe()

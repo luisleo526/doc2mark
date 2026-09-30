@@ -1,6 +1,7 @@
 """Tests for OCR cache behavior."""
 
 import fnmatch
+import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,8 @@ from doc2mark import RedisOCRCache as ExportedRedisOCRCache
 from doc2mark import create_ocr_cache as exported_create_ocr_cache
 from doc2mark.ocr import RedisOCRCache as OCRPackageRedisOCRCache
 from doc2mark.ocr import create_ocr_cache as ocr_package_create_ocr_cache
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.base import REFUSAL_USAGE_KEY, BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.openai import OpenAIOCR
 from doc2mark.ocr.schema import Interpretation, OCRPage, RawExtraction, Table
 from doc2mark.ocr.cache import (
     CACHE_SCHEMA_VERSION,
@@ -505,7 +507,7 @@ def test_cache_key_schema_and_api_key_identity_are_credential_scoped():
     provider.api_key = "tenant-b-secret"
     tenant_b_key = build_ocr_cache_key(provider, image)
 
-    assert CACHE_SCHEMA_VERSION == "ocr-cache-v5"
+    assert CACHE_SCHEMA_VERSION == "ocr-cache-v6"
     assert tenant_a_key != tenant_b_key
     assert "tenant-a-secret" not in tenant_a_key
     assert "tenant-b-secret" not in tenant_b_key
@@ -1065,3 +1067,66 @@ def test_redis_keeps_a_refusal_for_its_own_short_ttl(monkeypatch):
     ocr.batch_process_images([b"page"])
 
     assert len(provider.calls) == 2
+
+
+# --- Review of #25: a refused recovery is a provider refusal; entries of the previous key version -----------------
+
+def _png() -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _EmptyPageThenRefusalAgent:
+    """Stands in for the LangChain VisionAgent: the structured call answers an empty page, the free-form recovery
+    is the API's own refusal (``message.refusal``); records the calls it serves."""
+
+    def __init__(self, structured, calls):
+        self.structured, self.calls = structured, calls
+
+    def batch_invoke(self, input_dicts):
+        self.calls.append("structured" if self.structured else "free_form")
+        if self.structured:
+            return [{"parsed": OCRPage(), "raw": None, "parsing_error": None, "usage": {}} for _ in input_dicts]
+        return [("", {REFUSAL_USAGE_KEY: "I can't help with that."}) for _ in input_dicts]
+
+
+def test_a_refused_recovery_is_cached_like_any_provider_refusal(monkeypatch):
+    """Review of #25 (M1): the structured call answered an empty page and the provider refused the free-form
+    recovery. The result was flagged as a refusal but not as the provider's, so the OCR cache kept it for its
+    full TTL (and cache_dir kept the document for ever). It is the provider's refusal: kept for
+    refusal_ttl_seconds, then asked again."""
+    calls = []
+    monkeypatch.setattr("doc2mark.ocr.openai.VisionAgent",
+                        lambda **kwargs: _EmptyPageThenRefusalAgent(kwargs["structured"], calls))
+    clock = _Clock()
+    ocr = CachedOCR(OpenAIOCR(api_key="test-key", config=OCRConfig()),
+                    MemoryOCRCache(ttl_seconds=3600, time_func=clock))
+
+    [first] = ocr.batch_process_images([_png()])
+    clock.now += 300
+    ocr.batch_process_images([_png()])
+    assert calls == ["structured", "free_form"]
+    clock.now += 360
+    ocr.batch_process_images([_png()])
+
+    assert first.text == "" and first.metadata["ocr_refusal"] is True
+    assert first.metadata["non_content"] == "provider_refusal"
+    assert first.metadata["refusal"] == "I can't help with that."
+    assert calls == ["structured", "free_form"] * 2
+
+
+def test_answers_cached_before_refusals_had_a_short_ttl_are_not_replayed():
+    """Review of #25 (m6): a refusal cached by an earlier release has no TTL of its own and was replayed for the
+    cache's full sliding TTL. The OCR cache key has a new version, so entries written under the previous one are
+    never read (a one-time miss for every image cached before)."""
+    provider = _AnswerOCR(EMPTY_ANSWER)
+    cache = MemoryOCRCache(ttl_seconds=3600)
+    cache.set(build_ocr_cache_key(provider, b"page", kwargs={}, cache_version="ocr-cache-v5"),
+              OCRResult(text="", metadata=dict(OPENAI_REFUSAL)))
+
+    [result] = CachedOCR(provider, cache).batch_process_images([b"page"])
+
+    assert len(provider.calls) == 1 and not result.metadata.get("non_content")

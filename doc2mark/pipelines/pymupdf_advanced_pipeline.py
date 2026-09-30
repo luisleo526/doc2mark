@@ -96,9 +96,6 @@ BoilerplateJudge = Callable[[str, Dict[str, Any]], Optional[float]]
 
 logger = logging.getLogger(__name__)
 
-# The Markdown or JSON goes to stdout when no output file is given: no PyMuPDF advertisement there.
-pymupdf_compat.quiet_layout_recommendation()
-
 
 def _digest(data: Union[bytes, str, None]) -> Optional[str]:
     """sha256 of image bytes (or of a base64 context PDF); None for None."""

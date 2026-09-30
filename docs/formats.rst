@@ -137,10 +137,16 @@ per process: without ``TEXT_CLIP`` a picture is measured without its clip paths 
 warning: a picture a clip path hides or crops is taken whole); without invisible-only
 redaction hidden text that touches visible text can stay in a table cell (a warning);
 without ``TableFinder.textpage`` the text of a page with tables is read once more
-(INFO, same result). PyMuPDF 1.26.7
-and later print a recommendation of their ``pymupdf_layout`` package to stdout; the
-pipeline switches that off, because stdout is where the CLI writes a document when no
-output file is given.
+(INFO, same result).
+
+PyMuPDF prints to stdout: MuPDF's errors about a damaged file (``MuPDF error: library
+error: zlib error: ...``) and, from 1.26.7, a recommendation of its ``pymupdf_layout``
+package the first time the table finder runs. The ``doc2mark`` CLI writes the document
+to stdout when no output file is given, so it switches the recommendation off and sends
+MuPDF's messages to its log on stderr (warnings: shown by default and with ``-v``, not
+with ``-q``). The library leaves both as PyMuPDF sets them: an application that writes
+to stdout itself can call ``pymupdf.no_recommend_layout()`` and
+``pymupdf.set_messages(...)``.
 
 .. code-block:: python
 
