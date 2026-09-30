@@ -131,11 +131,21 @@ def _stable_value(value: Any, *, strict: bool = False) -> Any:
     return {"type": _type_identity(value), "repr": repr_value}
 
 
+def _unavailable(judge: Any) -> bool:
+    """Whether a judge says it cannot answer at all (``available`` is False)."""
+    try:
+        return getattr(judge, "available", True) is False
+    except Exception:
+        return False
+
+
 def _judge_identity(judge: Any) -> Optional[Dict[str, Any]]:
     """What identifies the optional ``non_content_judge`` in a cache key: its qualified
     name (a function's, or a callable object's class) and its optional ``version``
-    attribute -- never its memory address, so the key is stable across runs."""
-    if judge is None:
+    attribute -- never its memory address, so the key is stable across runs. A judge that
+    cannot answer at all (``available`` is False) screens nothing: its results are keyed
+    as results without a judge, which is what they are."""
+    if judge is None or _unavailable(judge):
         return None
     target = judge if hasattr(judge, "__qualname__") else type(judge)
     version = getattr(judge, "version", None)
@@ -182,12 +192,16 @@ def _uncacheable_reason(result: OCRResult) -> Optional[str]:
     else is the provider's answer for that image, prompt and judge (all part of the key) and is
     cached, including an answer with no text and a refusal or "no readable text" statement: a
     blank page or a photo without words gets that answer every time, and retrying it would cost
-    a call (and, for the LLM providers, the free-form recovery call behind it) on every run."""
+    a call (and, for the LLM providers, the free-form recovery call behind it) on every run. An
+    answer the optional non-content judge was asked about but could not screen (flagged
+    ``non_content_unjudged``) is not settled either: a later run asks the judge again."""
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
     if metadata.get("failed"):
         return "failed"
     if metadata.get("router_fallback") == "unresolved":
         return "values still withheld after the router firewall's redo"
+    if metadata.get("non_content_unjudged"):
+        return "the non-content judge could not screen the answer"
     return None
 
 
@@ -930,12 +944,16 @@ class CachedOCR(BaseOCR):
         results = self.batch_process_images([image], **kwargs)
         return results[0] if results else OCRResult(text="")
 
+    def _judge_state(self) -> Any:
+        return _judge_identity(getattr(getattr(self.wrapped, "config", None), "non_content_judge", None))
+
     def _store_and_fanout(
         self,
         results: List[Optional[OCRResult]],
         key: str,
         provider_result: Any,
         positions: List[int],
+        store: bool = True,
     ) -> None:
         """Cache one fresh provider result and place it at every deduped position.
 
@@ -948,6 +966,8 @@ class CachedOCR(BaseOCR):
         """
         normalized = _normalize_result(provider_result)
         reason = _uncacheable_reason(normalized)
+        if reason is None and not store:
+            reason = "the non-content judge stopped answering during the batch"
         if reason is None:
             self.cache.set(key, normalized)
         else:
@@ -1011,14 +1031,18 @@ class CachedOCR(BaseOCR):
             if context_pdfs is not None:
                 # Realign context to the deduped miss_images the provider receives.
                 call_kwargs["context_pdfs"] = miss_context
+            judge_before = self._judge_state()
             provider_results = self.wrapped.batch_process_images(miss_images, **call_kwargs)
+            # The keys name the judge as it was before the call: if it stopped answering during
+            # the batch (a rejected key), these results were not screened by it.
+            store = self._judge_state() == judge_before
             if len(provider_results) != len(miss_images):
                 for key, provider_result in zip(miss_keys, provider_results):
-                    self._store_and_fanout(results, key, provider_result, miss_positions[key])
+                    self._store_and_fanout(results, key, provider_result, miss_positions[key], store)
                 raise RuntimeError("OCR provider returned a different number of results than requested")
 
             for key, provider_result in zip(miss_keys, provider_results):
-                self._store_and_fanout(results, key, provider_result, miss_positions[key])
+                self._store_and_fanout(results, key, provider_result, miss_positions[key], store)
 
         final_results: List[OCRResult] = []
         for result in results:

@@ -508,6 +508,8 @@ class UnifiedDocumentLoader:
         if judge is None:
             return None
         try:
+            if getattr(judge, "available", True) is False:
+                return None  # a judge that cannot answer at all leaves the output to the rules: keyed as none
             explicit = getattr(judge, "cache_key", None)
             if explicit is not None:
                 return str(explicit)
@@ -531,19 +533,22 @@ class UnifiedDocumentLoader:
             logger.debug(f"judge.begin_document failed: {e!r}")
             return None
 
-    def _end_judge_document(self, start: Any, result: ProcessedDocument, file_path: Path) -> None:
+    def _end_judge_document(self, start: Any, result: ProcessedDocument, file_path: Path) -> bool:
         """Stamp what the judge did on the document (``metadata.extra["judge"]``) and warn, once
-        per document, when some of its questions got no answer (the rules decided them)."""
+        per document, when some of its questions got no answer (the rules decided them).
+        Returns False when the result must not be cached: the judge failed on some question,
+        or stopped answering during the document (its cache key named it as available)."""
         end = getattr(getattr(self, "judge", None), "end_document", None)
         if start is None or not callable(end):
-            return
+            return True
         try:
             stats = dict(end(start))
         except Exception as e:
             logger.debug(f"judge.end_document failed: {e!r}")
-            return
+            return False
+        complete = not stats.get("failed") and stats.get("unavailable") == start.get("unavailable")
         if not (stats.get("asked") or stats.get("failed")):
-            return
+            return complete
         if result.metadata.extra is None:
             result.metadata.extra = {}
         result.metadata.extra["judge"] = {
@@ -553,8 +558,9 @@ class UnifiedDocumentLoader:
         }
         if stats.get("failed"):
             reason = stats.get("unavailable") or stats.get("last_error") or "no answer"
-            logger.warning(f"{file_path.name}: {stats['failed']} judge request(s) got no answer ({reason}); "
+            logger.warning(f"{file_path.name}: {stats['failed']} judge question(s) got no answer ({reason}); "
                            f"the deterministic rules decided those cases")
+        return complete
 
     @staticmethod
     def _normalize_output_format(output_format: Union[str, OutputFormat]) -> OutputFormat:
@@ -644,12 +650,12 @@ class UnifiedDocumentLoader:
             }
             # The other hooks change what a document emits too (keys only when set, so the
             # cache keys of loaders without them stay as they were).
-            boilerplate_judge = getattr(self, "boilerplate_judge", None)
-            if boilerplate_judge is not None:
-                cache_options["boilerplate_judge"] = self._judge_identity(boilerplate_judge)
-            non_content_judge = getattr(getattr(self._unwrap_ocr(self.ocr), "config", None), "non_content_judge", None)
-            if non_content_judge is not None:
-                cache_options["non_content_judge"] = self._judge_identity(non_content_judge)
+            for name, hook in (("boilerplate_judge", getattr(self, "boilerplate_judge", None)),
+                               ("non_content_judge", getattr(getattr(self._unwrap_ocr(self.ocr), "config", None),
+                                                             "non_content_judge", None))):
+                identity = self._judge_identity(hook) if hook is not None else None
+                if identity is not None:
+                    cache_options[name] = identity
             cached = self._get_cached(file_path, output_format, cache_options)
             if cached:
                 logger.info(f"Using cached result for {file_path}")
@@ -692,7 +698,7 @@ class UnifiedDocumentLoader:
 
             # Process with mapped parameters
             result = processor.process(file_path, **processor_kwargs)
-            self._end_judge_document(judge_start, result, file_path)
+            judge_complete = self._end_judge_document(judge_start, result, file_path)
 
             if usage_ocr is not None:
                 token_usage = usage_ocr.pop_document_usage()
@@ -728,6 +734,8 @@ class UnifiedDocumentLoader:
             # must read what this one could not (see _ocr_incomplete).
             if self.cache_dir:
                 incomplete = self._ocr_incomplete(result)
+                if not judge_complete:
+                    incomplete = "the judge could not answer every question"
                 if incomplete:
                     logger.info(f"Not caching {file_path.name}: {incomplete}; the next run converts it again")
                 else:

@@ -23,6 +23,7 @@ left to the optional judge, :data:`NonContentJudge`.
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,10 @@ deterministic patterns did not fire. It returns the probability, from 0.0 to 1.0
 that the answer is *only* a refusal, an apology, an error message or a statement that
 the image has no readable text, with nothing transcribed or described from the image.
 A probability of at least :data:`JUDGE_THRESHOLD` makes the answer count as no
-content. ``None`` means "cannot judge" and keeps the answer, as does any exception the
-judge raises (it is logged). The judge must not raise for normal input and should be
+content; from :data:`SUSPECT_THRESHOLD` up to it the answer is kept and flagged
+``metadata["non_content_suspected"]``. ``None`` means "cannot judge" and keeps the answer,
+as does any exception the judge raises (it is logged); such a result is not cached. A judge
+whose ``available`` attribute is False is treated as no judge. The judge must not raise for normal input and should be
 quick; it is called at most once per answer. Cached OCR results are keyed by the
 judge's identity (its qualified name and an optional ``version`` attribute), so give
 a judge whose behaviour changes a new ``version``.
@@ -50,6 +53,9 @@ MAX_PATTERN_LINES = 3
 MAX_JUDGE_CHARS = 600
 #: Judge probability at or above which an answer counts as no content.
 JUDGE_THRESHOLD = 0.5
+#: Judge probability from which an answer below JUDGE_THRESHOLD is kept but flagged
+#: ``metadata["non_content_suspected"]``.
+SUSPECT_THRESHOLD = 0.3
 
 _APOS = "['’]"
 # "I can't", "I cannot", "I won't", "I'm unable to", "I am not able to": first person only
@@ -336,34 +342,65 @@ def matches_non_content_pattern(text: str) -> bool:
     return _WHOLE_RE.fullmatch(answer) is not None
 
 
-def non_content_reason(text: str, judge: Optional[NonContentJudge] = None) -> Optional[str]:
-    """Why ``text`` is not page content -- ``"pattern"`` (deterministic match) or
-    ``"judge"`` (the optional :data:`NonContentJudge` said so) -- or ``None`` to keep
-    it. Empty text is not judged here (it is simply empty). Pass the answer as the
-    model wrote it, not its Markdown-escaped rendering."""
+@dataclass(frozen=True)
+class NonContentScreen:
+    """What screening one answer found: ``reason`` it is no content (``"pattern"`` or
+    ``"judge"``) or None to keep it; ``suspected``: kept, but the judge rated it between
+    ``SUSPECT_THRESHOLD`` and ``JUDGE_THRESHOLD``; ``unanswered``: the judge was asked and gave
+    no usable answer (the patterns decided; a cache must not keep the result)."""
+
+    reason: Optional[str] = None
+    suspected: bool = False
+    unanswered: bool = False
+
+
+def _usable(judge: Optional[NonContentJudge]) -> Optional[NonContentJudge]:
+    """``judge``, unless it says it cannot answer at all (``available`` is False): then
+    screening is exactly what it is without a judge."""
+    try:
+        unavailable = judge is not None and getattr(judge, "available", True) is False
+    except Exception:
+        unavailable = False
+    return None if judge is None or unavailable else judge
+
+
+def screen_non_content(text: str, judge: Optional[NonContentJudge] = None) -> NonContentScreen:
+    """Screen one OCR answer: the deterministic patterns, then the optional judge (see
+    :class:`NonContentScreen`). Empty text is not judged here (it is simply empty). Pass the
+    answer as the model wrote it, not its Markdown-escaped rendering."""
     answer = _normalize(text)
     if not answer:
-        return None
+        return NonContentScreen()
     if matches_non_content_pattern(answer):
-        return "pattern"
+        return NonContentScreen(reason="pattern")
+    judge = _usable(judge)
     if judge is None or len(answer) > MAX_JUDGE_CHARS:
-        return None
+        return NonContentScreen()
     try:
         probability = judge(answer)
     except Exception as exc:  # the hook must never break OCR
         logger.warning("non_content_judge failed (%s); keeping the OCR answer", exc)
-        return None
+        return NonContentScreen(unanswered=True)
     if isinstance(probability, bool) or not isinstance(probability, (int, float)):
         if probability is not None:
             logger.warning("non_content_judge returned %r, not a probability; keeping the OCR answer", probability)
-        return None
-    return "judge" if probability >= JUDGE_THRESHOLD else None
+        return NonContentScreen(unanswered=True)
+    if probability >= JUDGE_THRESHOLD:
+        return NonContentScreen(reason="judge")
+    return NonContentScreen(suspected=probability >= SUSPECT_THRESHOLD)
+
+
+def non_content_reason(text: str, judge: Optional[NonContentJudge] = None) -> Optional[str]:
+    """Why ``text`` is not page content -- ``"pattern"`` (deterministic match) or
+    ``"judge"`` (the optional :data:`NonContentJudge` said so) -- or ``None`` to keep
+    it (see :func:`screen_non_content`)."""
+    return screen_non_content(text, judge).reason
 
 
 def prefetch_non_content(texts, judge: Optional[NonContentJudge]) -> None:
     """Hand a judge that can ``prefetch(answers)`` every answer of ``texts`` that
     :func:`non_content_reason` would ask it about, so it can ask them all at once."""
-    prefetch = getattr(judge, "prefetch", None)
+    prefetch = getattr(_usable(judge), "prefetch", None)
     if not callable(prefetch):
         return
     answers = []
@@ -380,8 +417,11 @@ def prefetch_non_content(texts, judge: Optional[NonContentJudge]) -> None:
 
 __all__ = [
     "NonContentJudge",
+    "NonContentScreen",
     "JUDGE_THRESHOLD",
+    "SUSPECT_THRESHOLD",
     "MAX_JUDGE_CHARS",
+    "screen_non_content",
     "matches_non_content_pattern",
     "non_content_reason",
     "prefetch_non_content",

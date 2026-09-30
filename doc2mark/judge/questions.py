@@ -7,7 +7,8 @@ bump the version, so no verdict of the old question is replayed for the new one.
 
 ``RAW_THRESHOLDS`` are the Jev probabilities at which each hook acts, calibrated on the
 TRAIN split of the labelled sets in ``tests/data/judge`` (``eval/judge_eval.py``) for the
-pinned model; re-validate them before moving the pin.
+pinned model; ``RAW_SUSPECT_THRESHOLDS`` mark the band below that in which a hook only flags
+its case. Re-validate them before moving the pin.
 """
 
 from dataclasses import dataclass
@@ -20,8 +21,10 @@ MODEL = "jev-1.13.0"
 #: Price of the pinned model per input token (output tokens are free), in US dollars.
 PRICE_PER_INPUT_TOKEN = 0.042 / 1_000_000
 
-#: Longest page-text sample the legibility question sends (characters).
+#: Longest page-text sample the legibility question sends (characters): a longer page is
+#: sampled at its beginning, middle and end, a third each, joined by ``SAMPLE_GAP``.
 MAX_PAGE_CHARS = 1500
+SAMPLE_GAP = "\n[...]\n"
 
 _REPLACEMENT = chr(0xFFFD)
 
@@ -44,10 +47,11 @@ class Question:
 
 LEGIBILITY = Question(
     hook="legibility",
-    version="legibility-v1",
+    version="legibility-v2",
     instructions=(
-        "`page_text` was extracted from the text layer of one PDF page. Is it legible content that a "
-        "person could read, in any language or script? Legible content includes prose, headings, short "
+        "`page_text` was extracted from the text layer of one PDF page (a long page is sampled: its "
+        "beginning, middle and end, separated by [...]). Is it legible content that a person could read, "
+        "in any language or script? Legible content includes prose, headings, short "
         "slide labels, tables of numbers, lists, part numbers, hashes, formulas and source code. It is NOT "
         "legible when it is garbled by a broken text layer: nonsense letter sequences, systematically "
         "substituted or shifted characters, mojibake, placeholder glyph codes such as (cid:12), private-use "
@@ -59,19 +63,20 @@ LEGIBILITY = Question(
 
 BOILERPLATE = Question(
     hook="boilerplate",
-    version="boilerplate-v1",
+    version="boilerplate-v2",
     instructions=(
         "`line` is printed in the same place near the top or bottom edge of many pages of one document "
-        "(`where`, `font`). Is it page furniture that can be deleted from every page without losing "
-        "information: a company, brand or product name or tagline, logo text, a confidentiality or "
-        "classification marking, a copyright notice, a website or contact line, a page or slide number, "
-        "or the same print date on every page? Answer no when a reader of the document needs the line: a "
-        "title or label that names what is on the page (for example 'Lesson 3', 'Exhibit 4', a section or "
-        "statement title), a unit note such as '(in thousands of EUR)', a disclaimer or legal note, a "
-        "table header, or a date, name, account or ID that belongs to the content."
+        "(`where`, `font`). Is it page furniture, so that one copy of it is enough and its repeats on the "
+        "other pages can be removed without losing information: a company, brand or product name or "
+        "tagline, logo text, a confidentiality or classification marking, a copyright notice, a website or "
+        "contact line, a page or slide number, or the same print date on every page? Answer no when a "
+        "reader needs the line on each page where it appears: a title or label that names what is on the "
+        "page (for example 'Lesson 3', 'Exhibit 4', a section or statement title), a unit note such as "
+        "'(in thousands of EUR)', a disclaimer or legal note, a table header, or a date, name, account or "
+        "ID that belongs to the content."
     ),
-    true="Page furniture only: branding, logo text, a marking, copyright, contact details or page numbering.",
-    false="The line carries content a reader needs: a title, label, unit, legal note, header, date, name or ID.",
+    true="Page furniture: branding, logo text, a marking, copyright, contact details or page numbering; one copy is enough.",
+    false="A reader needs the line where it appears: a title, label, unit, legal note, header, date, name or ID.",
 )
 
 NON_CONTENT = Question(
@@ -93,20 +98,40 @@ QUESTIONS: Mapping[str, Question] = {q.hook: q for q in (LEGIBILITY, BOILERPLATE
 #: Jev probability from which each hook acts (legibility: a page is illegible *below* it;
 #: boilerplate and non_content: the line is chrome / the answer is no content *at or
 #: above* it). See the module docstring.
-RAW_THRESHOLDS: Mapping[str, float] = {"legibility": 0.8, "boilerplate": 0.7, "non_content": 0.9}
+RAW_THRESHOLDS: Mapping[str, float] = {"legibility": 0.8, "boilerplate": 0.7, "non_content": 0.95}
+#: Jev probability from which a hook that does not act yet flags its case (non_content: the
+#: answer is kept, with ``metadata["non_content_suspected"]``).
+RAW_SUSPECT_THRESHOLDS: Mapping[str, float] = {"non_content": 0.9}
 
 
 # --- state -------------------------------------------------------------------
 
 
 def legibility_state(page_text: str) -> Dict[str, Any]:
-    """The page text sample the legibility question reads: the first ``MAX_PAGE_CHARS``
-    characters of the page, cut at a line break when one is near."""
+    """The page text the legibility question reads: all of it up to ``MAX_PAGE_CHARS``
+    characters; a longer page is sampled at its beginning, middle and end (a third of the
+    budget each, cut at line breaks when one is near), so a legible opening cannot hide a
+    garbled body."""
     text = (page_text or "").strip()
-    if len(text) > MAX_PAGE_CHARS:
-        cut = text.rfind("\n", MAX_PAGE_CHARS // 2, MAX_PAGE_CHARS)
-        text = text[:cut if cut > 0 else MAX_PAGE_CHARS].rstrip()
-    return {"page_text": text}
+    if len(text) <= MAX_PAGE_CHARS:
+        return {"page_text": text}
+    part = MAX_PAGE_CHARS // 3
+    head = text[:part]
+    cut = head.rfind("\n", part // 2)
+    head = head[:cut] if cut > 0 else head
+    middle_start = len(text) // 2 - part // 2
+    middle = text[middle_start:middle_start + part]
+    tail = text[-part:]
+    pieces = []
+    for piece, trim_start, trim_end in ((head, False, False), (middle, True, True), (tail, True, False)):
+        if trim_start:
+            start = piece.find("\n", 0, part // 2)
+            piece = piece[start + 1:] if start >= 0 else piece
+        if trim_end:
+            end = piece.rfind("\n", len(piece) // 2)
+            piece = piece[:end] if end > 0 else piece
+        pieces.append(piece.strip())
+    return {"page_text": SAMPLE_GAP.join(pieces)}
 
 
 def _font_words(size: Optional[float], body: Optional[float]) -> str:

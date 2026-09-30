@@ -407,7 +407,7 @@ class BaseOCR(ABC):
         otherwise empty page can be one: a page with anything else (see
         :meth:`_has_content_besides_text`) is content.
         """
-        from doc2mark.ocr.refusal import non_content_reason, prefetch_non_content
+        from doc2mark.ocr.refusal import prefetch_non_content, screen_non_content
         from doc2mark.ocr.schema import OCRPage
         judge = self._non_content_judge()
         answers: Dict[int, str] = {}
@@ -422,9 +422,30 @@ class BaseOCR(ABC):
         if judge is not None and len(answers) > 1:
             prefetch_non_content(answers.values(), judge)
         for index, answer in answers.items():
-            reason = non_content_reason(answer, judge)
-            if reason:
-                results[index] = self._without_content(results[index], non_content=reason)
+            screen = screen_non_content(answer, judge)
+            if screen.reason:
+                results[index] = self._without_content(results[index], non_content=screen.reason)
+            else:
+                results[index] = self._with_screen_flags(results[index], screen)
+
+    @staticmethod
+    def _screen_flags(screen: Any) -> Dict[str, Any]:
+        """Metadata flags of an answer the screening kept: ``non_content_suspected`` (the judge
+        rated it close to no content), ``non_content_unjudged`` (the judge gave no answer; the
+        result is not cached, so a later run asks again)."""
+        flags: Dict[str, Any] = {}
+        if screen.suspected:
+            flags["non_content_suspected"] = True
+        if screen.unanswered:
+            flags["non_content_unjudged"] = True
+        return flags
+
+    @classmethod
+    def _with_screen_flags(cls, result: OCRResult, screen: Any) -> OCRResult:
+        flags = cls._screen_flags(screen)
+        if not flags:
+            return result
+        return replace(result, metadata={**(result.metadata or {}), **flags})
 
     def _free_form_answer(self, answer: Optional[str], *, refusal: Any = None,
                           recovery: bool = False) -> "tuple[str, Dict[str, Any]]":
@@ -437,17 +458,17 @@ class BaseOCR(ABC):
         flagged ``ocr_refusal`` (a free-form answer has no recovery behind it); the rest
         is model Markdown, sanitized once here.
         """
-        from doc2mark.ocr.refusal import non_content_reason
+        from doc2mark.ocr.refusal import screen_non_content
         from doc2mark.ocr.schema import _sanitize_markdown
         if refusal:
             return "", {"refusal": refusal, "non_content": "provider_refusal", "ocr_refusal": True}
         answer = answer or ""
         if recovery:
             return answer, {}
-        reason = non_content_reason(answer, self._non_content_judge())
-        if reason:
-            return "", {"non_content": reason, "ocr_refusal": True}
-        return _sanitize_markdown(answer), {}
+        screen = screen_non_content(answer, self._non_content_judge())
+        if screen.reason:
+            return "", {"non_content": screen.reason, "ocr_refusal": True}
+        return _sanitize_markdown(answer), self._screen_flags(screen)
 
     def _apply_recovered(
         self,
@@ -474,14 +495,15 @@ class BaseOCR(ABC):
         ``failed``), the empty result is flagged ``metadata["failed"] = True`` so the next
         run asks again instead of replaying it from a cache.
         """
-        from doc2mark.ocr.refusal import non_content_reason
+        from doc2mark.ocr.refusal import NonContentScreen, screen_non_content
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
         judge = self._non_content_judge()
         for j, i in enumerate(empty_idx):
             text = (recovered[j].text or "").strip()
             recovered_meta = recovered[j].metadata or {}
             recovered_refused = bool(recovered_meta.get("ocr_refusal"))
-            if text and not recovered_refused and non_content_reason(text, judge):
+            screen = screen_non_content(text, judge) if text and not recovered_refused else NonContentScreen()
+            if screen.reason:
                 recovered_refused, text = True, ""
             if not text:
                 doc = results[i].document
@@ -505,6 +527,7 @@ class BaseOCR(ABC):
             meta["structured_fallback"] = "free_form"
             meta.pop("non_content", None)
             meta.pop("failed", None)
+            meta.update(self._screen_flags(screen))
             results[i] = OCRResult(
                 text=_sanitize_markdown(text),
                 confidence=results[i].confidence,

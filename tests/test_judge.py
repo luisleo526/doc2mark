@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -21,8 +22,8 @@ from doc2mark.judge import JUDGE_ENV, TypeSafeJudge, judge_hooks, resolve_judge
 from doc2mark.judge import questions as Q
 from doc2mark.judge.cache import DiskVerdictCache, Verdict, verdict_key
 from doc2mark.judge.typesafe import BREAKER_FAILURES, _rescale
-from doc2mark.ocr.base import BaseOCR, OCRConfig
-from doc2mark.ocr.cache import _judge_identity
+from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
+from doc2mark.ocr.cache import CachedOCR, MemoryOCRCache, _judge_identity
 from doc2mark.ocr.refusal import JUDGE_THRESHOLD, prefetch_non_content
 from tests.e2e import builders_judge
 
@@ -80,6 +81,13 @@ class APIError(Exception):
 
 # The pipeline's own thresholds: with them a hook returns Jev's probability unchanged.
 PIPELINE_THRESHOLDS = {"legibility": LEGIBILITY_JUDGE_THRESHOLD, "boilerplate": 0.5, "non_content": JUDGE_THRESHOLD}
+
+
+def screen_non_content(answer, judge):
+    """doc2mark.ocr.refusal.screen_non_content (imported here, so each test that needs it fails on its own
+    against code without it)."""
+    from doc2mark.ocr.refusal import screen_non_content as screen
+    return screen(answer, judge)
 
 
 def judge_with(client, **options):
@@ -171,11 +179,17 @@ def test_each_hook_asks_one_versioned_noul_of_the_pinned_model():
         assert questions[hook]["type"] == "noul" and set(questions[hook]["criteria"]) == {"true", "false"}
 
 
-def test_page_text_is_sampled():
-    page = "\n".join(f"line {n} of a long page with plenty of words in it" for n in range(200))
-    state = Q.legibility_state(page)
-    assert len(state["page_text"]) <= Q.MAX_PAGE_CHARS and page.startswith(state["page_text"])
-    assert state["page_text"].endswith("in it")  # cut at a line break
+def test_a_long_page_is_sampled_at_its_beginning_middle_and_end():
+    """m3: only the first 1,500 characters were sent, so a legible opening could hide a garbled body."""
+    opening = [f"Legible line {n} of the opening section." for n in range(15)]
+    body = [f"Lqyrlfh wrwdo HXU {2340 + n} gxh rq 14 Pdufk 2026" for n in range(80)]
+    page = "\n".join(opening + body + ["Closing line of the page."])
+    sample = Q.legibility_state(page)["page_text"]
+    pieces = sample.split(Q.SAMPLE_GAP)
+    assert len(pieces) == 3 and len(sample) <= Q.MAX_PAGE_CHARS + 2 * len(Q.SAMPLE_GAP)
+    assert pieces[0].startswith(opening[0]) and "Lqyrlfh" in pieces[1] and pieces[2].endswith("Closing line of the page.")
+    assert all(line in page.split("\n") for piece in pieces for line in piece.split("\n"))  # cut at line breaks
+    assert Q.legibility_state("A short page.") == {"page_text": "A short page."}
 
 
 @pytest.mark.parametrize("answer", [None, 1.5, -0.1, float("nan"), True, "0.9"])
@@ -237,7 +251,7 @@ def test_verdicts_are_cached_on_disk_and_replayed(tmp_path):
     state = Q.legibility_state("Lqyrlfh wrwdo HXU 2340")
     key = verdict_key(Q.MODEL, Q.LEGIBILITY.version, state)
     assert key != verdict_key("jev-1.14.0", Q.LEGIBILITY.version, state)
-    assert key != verdict_key(Q.MODEL, "legibility-v2", state)
+    assert key != verdict_key(Q.MODEL, "legibility-v0", state)
     stored = json.loads((tmp_path / key[:2] / f"{key}.json").read_text())
     assert stored["probability"] == 0.12 and stored["model"] == "jev-1.13.0" and stored["input_tokens"] == 321
 
@@ -262,12 +276,15 @@ def test_a_broken_cache_file_is_a_miss(tmp_path):
 # --- thresholds -----------------------------------------------------------------------------------------
 
 
-def test_rescaling_moves_the_pipeline_threshold_onto_the_calibrated_one():
-    for raw, target in ((0.6, 0.7), (0.8, 0.5), (0.5, 0.5), (0.3, 0.5)):
-        values = [n / 100 for n in range(101)]
-        mapped = [_rescale(v, raw, target) for v in values]
-        assert mapped == sorted(mapped) and mapped[0] == 0 and mapped[-1] == pytest.approx(1)
-        assert _rescale(raw, raw, target) == pytest.approx(target)
+@pytest.mark.parametrize("anchors", [
+    ((0.6, 0.7),), ((0.8, 0.5),), ((0.5, 0.5),), ((0.3, 0.5),), ((0.8, 0.7),), ((0.9, 0.3), (0.95, 0.5)),
+])
+def test_rescaling_moves_each_pipeline_threshold_onto_its_calibrated_one(anchors):
+    values = [n / 100 for n in range(101)]
+    mapped = [_rescale(v, anchors) for v in values]
+    assert mapped == sorted(mapped) and mapped[0] == 0 and mapped[-1] == pytest.approx(1)
+    for raw, target in anchors:
+        assert _rescale(raw, anchors) == target
         for value, out in zip(values, mapped):
             assert (value >= raw) == (out >= target), (value, raw, target, out)
 
@@ -279,21 +296,41 @@ def test_a_calibrated_threshold_decides_like_the_pipeline_threshold():
     assert judge.legibility_judge("page") < LEGIBILITY_JUDGE_THRESHOLD
     with pytest.raises(ValueError):
         judge_with(FakeClient(), thresholds={"legibility": 1.5})
+    with pytest.raises(ValueError):
+        judge_with(FakeClient(), suspect_thresholds={"non_content": 0.0})
+
+
+SHIPPED = dict(Q.RAW_THRESHOLDS)
 
 
 @pytest.mark.parametrize("hook, raw, acts", [
-    ("legibility", 0.79, True), ("legibility", 0.8, False), ("legibility", 0.95, False),
-    ("non_content", 0.89, False), ("non_content", 0.9, True), ("boilerplate", 0.69, False), ("boilerplate", 0.7, True),
+    ("legibility", SHIPPED["legibility"] - 0.01, True), ("legibility", SHIPPED["legibility"], False),
+    ("legibility", 0.99, False), ("boilerplate", SHIPPED["boilerplate"] - 0.01, False),
+    ("boilerplate", SHIPPED["boilerplate"], True), ("non_content", 0.94, False), ("non_content", 0.95, True),
 ])
 def test_the_calibrated_thresholds_decide(hook, raw, acts):
-    """The shipped thresholds (questions.RAW_THRESHOLDS, calibrated on the TRAIN split) as the pipeline applies
-    them: legibility acts (page illegible) below its threshold, the others at or above theirs."""
+    """The shipped thresholds (questions.RAW_THRESHOLDS) as the pipeline applies them: legibility acts (page
+    illegible) below its threshold, the others at or above theirs; non_content acts only from 0.95 (M2)."""
     judge = TypeSafeJudge(client=FakeClient(answer=raw), cache_dir=False)
     args = {"legibility": ("page text",), "non_content": ("an answer",), "boilerplate": ("a line", CONTEXT)}[hook]
     value = getattr(judge, f"{hook}_judge")(*args)
     threshold = PIPELINE_THRESHOLDS[hook]
     assert (value < threshold if hook == "legibility" else value >= threshold) is acts
-    assert Q.RAW_THRESHOLDS == {"legibility": 0.8, "boilerplate": 0.7, "non_content": 0.9}
+    assert SHIPPED["non_content"] == 0.95 and Q.RAW_SUSPECT_THRESHOLDS == {"non_content": 0.9}
+
+
+@pytest.mark.parametrize("raw, reason, suspected", [(0.89, None, False), (0.9, None, True), (0.94, None, True),
+                                                    (0.95, "judge", False), (0.99, "judge", False)])
+def test_non_content_acts_only_from_095_and_flags_the_band_below(raw, reason, suspected):
+    """M2: 0.9 sat inside the overlap of refusals and real answers. From 0.95 an answer is no content; from 0.90
+    to 0.95 it is kept and flagged ``non_content_suspected``."""
+    judge = TypeSafeJudge(client=FakeClient(answer=raw), cache_dir=False)
+    screen = screen_non_content("Unable to process the image.", judge.non_content_judge)
+    assert (screen.reason, screen.suspected, screen.unanswered) == (reason, suspected, False)
+    text, flags = _StubOCR(config=OCRConfig(non_content_judge=judge.non_content_judge))._free_form_answer(
+        "Unable to process the image.")
+    assert (text == "") is (reason is not None)
+    assert flags.get("non_content_suspected", False) is suspected
 
 
 def test_hooks_can_be_chosen(monkeypatch):
@@ -308,12 +345,13 @@ def test_hooks_can_be_chosen(monkeypatch):
 
 def test_hook_identity_is_stable_for_the_caches():
     first, second = (TypeSafeJudge(client=FakeClient(), cache_dir=False) for _ in range(2))
-    expected = f"typesafe:jev-1.13.0:non-content-v1:t{Q.RAW_THRESHOLDS['non_content']:g}"
+    expected = "typesafe:jev-1.13.0:non-content-v1:t0.95:s0.9"
     assert first.non_content_judge.version == second.non_content_judge.version == expected
     assert _judge_identity(first.non_content_judge) == _judge_identity(second.non_content_judge) == {
         "name": "doc2mark.judge.typesafe._Hook", "version": expected}
     assert judge_with(FakeClient(), thresholds={"non_content": 0.6}).non_content_judge.version != expected
-    assert first.legibility_judge.cache_key.startswith("typesafe:jev-1.13.0:legibility-v1:")
+    assert first.legibility_judge.cache_key.startswith("typesafe:jev-1.13.0:legibility-v2:")
+    assert first.boilerplate_judge.cache_key.startswith("typesafe:jev-1.13.0:boilerplate-v2:")
 
 
 # --- concurrency --------------------------------------------------------------------------------------------
@@ -407,7 +445,7 @@ def test_loader_uses_the_judge_on_page_chrome_and_reports_it(tmp_path, caplog):
 
     client = FakeClient(answer=lambda state: 0.95 if state["line"] == brand else 0.05)
     judged = UnifiedDocumentLoader(ocr_provider=None, judge=judge_with(client)).load(pdf)
-    assert judged.content.count(brand) == 0
+    assert judged.content.count(brand) == 1  # B1: the first copy always stays
     assert all(title in judged.content for title, _ in builders_judge.DECK_SLIDES)
     stats = judged.metadata.extra["judge"]
     assert stats["name"] == "typesafe" and stats["model"] == "jev-1.13.0"
@@ -417,7 +455,7 @@ def test_loader_uses_the_judge_on_page_chrome_and_reports_it(tmp_path, caplog):
         failing = UnifiedDocumentLoader(ocr_provider=None, judge=judge_with(FakeClient(error=APIError(503))))
         result = failing.load(pdf)
     assert result.content == plain.content
-    assert caplog.text.count("judge request(s) got no answer") == 1
+    assert caplog.text.count("judge question(s) got no answer") == 1
     assert result.metadata.extra["judge"]["failed"] >= 1
 
 
@@ -426,3 +464,197 @@ def test_document_cache_key_names_the_judges(tmp_path):
     loader = UnifiedDocumentLoader(ocr_provider=_StubOCR(config=OCRConfig()), judge=judge, cache_dir=str(tmp_path))
     assert loader._judge_identity(loader.boilerplate_judge) == judge.boilerplate_judge.cache_key
     assert loader._judge_identity() == judge.legibility_judge.cache_key
+
+
+# --- review round 1 ----------------------------------------------------------------------------------------
+
+
+def test_the_judge_never_removes_the_last_copy_of_a_letterhead(tmp_path):
+    """B1: a chrome verdict on the first copy of a running header (the rule had already removed the other
+    copies) deleted the sender's letterhead. The first copy always stays; such a line is not even asked about."""
+    pdf = builders_judge.letter_pdf(tmp_path / "letter.pdf")
+    plain = UnifiedDocumentLoader(ocr_provider=None).load(pdf)
+    asked = []
+
+    def always_chrome(text, context):
+        asked.append((text, context["reason"]))
+        return 1.0
+
+    judged = UnifiedDocumentLoader(ocr_provider=None, boilerplate_judge=always_chrome).load(pdf)
+    for line in builders_judge.LETTERHEAD:
+        assert plain.content.count(line) == 1 and judged.content.count(line) == 1, (line, judged.content)
+    assert judged.content == plain.content
+    assert all(reason != "first_occurrence" for _, reason in asked), asked
+
+
+def test_a_chrome_verdict_keeps_the_first_copy_as_plain_text(tmp_path):
+    """B1: the deck's brand line (attached to each slide's header row) is thinned to its first copy, which
+    stays as a plain line; every slide title and numbered label stays."""
+    pdf = builders_judge.deck_pdf(tmp_path / "deck.pdf")
+    judged = UnifiedDocumentLoader(ocr_provider=None, boilerplate_judge=lambda text, context: 1.0).load(pdf)
+    brand = builders_judge.BRAND_LINE
+    assert judged.content.count(brand) == 1
+    assert brand in judged.content.splitlines()  # a plain line, not a heading
+    for number, (title, _) in enumerate(builders_judge.DECK_SLIDES, 1):
+        assert title in judged.content and f"{number:02d} / {title}" in judged.content
+
+
+def test_a_line_already_on_the_cover_keeps_that_copy_only(tmp_path):
+    """B1, the real deck's shape: its cover shows the brand line in the page body, then every slide repeats it
+    in the header row. The cover's copy is the one that stays: the brand line goes from once per page to once."""
+    pdf = builders_judge.deck_pdf(tmp_path / "deck.pdf", cover=True)
+    brand = builders_judge.BRAND_LINE
+    plain = UnifiedDocumentLoader(ocr_provider=None).load(pdf)
+    assert plain.content.count(brand) == len(builders_judge.DECK_SLIDES) + 1
+    judged = UnifiedDocumentLoader(ocr_provider=None, boilerplate_judge=lambda text, context: 1.0).load(pdf)
+    assert judged.content.count(brand) == 1
+    assert judged.content.index(brand) < judged.content.index("01 / ")
+
+
+def _deck_verdicts(state):
+    return 0.95 if state["line"] in (builders_judge.BRAND_LINE, builders_judge.LOGO_TEXT) else 0.05
+
+
+def test_a_run_without_a_key_is_not_replayed_for_a_run_with_one(tmp_path, monkeypatch):
+    """M1: the document cache keyed the judge's identity, not whether it could answer: a run without a key
+    was replayed for a later run with the key, and the judge never ran. A judge that cannot answer is keyed
+    as no judge, which is what its output is."""
+    pdf, cache_dir = builders_judge.deck_pdf(tmp_path / "deck.pdf"), str(tmp_path / "doc-cache")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    first = UnifiedDocumentLoader(ocr_provider=None, judge=TypeSafeJudge(cache_dir=False), cache_dir=cache_dir).load(pdf)
+    assert first.content.count(builders_judge.BRAND_LINE) == len(builders_judge.DECK_SLIDES)
+
+    judge = TypeSafeJudge(client=FakeClient(answer=_deck_verdicts), cache_dir=False)
+    second = UnifiedDocumentLoader(ocr_provider=None, judge=judge, cache_dir=cache_dir).load(pdf)
+    assert second.content.count(builders_judge.BRAND_LINE) == 1
+    assert second.metadata.extra["judge"]["fresh"] >= 1
+
+
+def test_a_run_whose_judge_failed_is_not_cached(tmp_path):
+    """M1: a run in which the judge failed on some question was cached and replayed for later runs."""
+    pdf, cache_dir = builders_judge.deck_pdf(tmp_path / "deck.pdf"), str(tmp_path / "doc-cache")
+    failing = TypeSafeJudge(client=FakeClient(error=APIError(503)), cache_dir=False)
+    first = UnifiedDocumentLoader(ocr_provider=None, judge=failing, cache_dir=cache_dir).load(pdf)
+    assert first.metadata.extra["judge"]["failed"] >= 1
+
+    working = TypeSafeJudge(client=FakeClient(answer=_deck_verdicts), cache_dir=False)
+    second = UnifiedDocumentLoader(ocr_provider=None, judge=working, cache_dir=cache_dir).load(pdf)
+    assert second.content.count(builders_judge.BRAND_LINE) == 1
+    assert second.metadata.extra["judge"]["fresh"] >= 1
+
+
+class _FreeFormOCR(BaseOCR):
+    """A provider whose every answer is ``answer``, screened the way the LLM providers screen free-form answers."""
+
+    def __init__(self, answer, **kwargs):
+        super().__init__(**kwargs)
+        self.answer, self.calls = answer, 0
+
+    def batch_process_images(self, images, **kwargs):
+        self.calls += len(images)
+        return [OCRResult(text=text, metadata=flags)
+                for text, flags in (self._free_form_answer(self.answer) for _ in images)]
+
+
+def test_ocr_answers_the_judge_could_not_screen_are_not_cached():
+    """M1 (OCR cache): an answer screened while the judge failed was cached under the judge's key and never
+    screened again."""
+    judge = TypeSafeJudge(client=FakeClient(error=APIError(503)), cache_dir=False)
+    provider = _FreeFormOCR("Unable to process the image.", config=OCRConfig(non_content_judge=judge.non_content_judge))
+    cached = CachedOCR(provider, MemoryOCRCache())
+    first = cached.batch_process_images([b"image-1"])
+    assert first[0].text and first[0].metadata.get("non_content_unjudged") is True
+    cached.batch_process_images([b"image-1"])
+    assert provider.calls == 2
+
+
+def test_ocr_results_of_a_judge_that_cannot_answer_are_keyed_as_without_one(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    unavailable = TypeSafeJudge(cache_dir=False)
+    assert unavailable.non_content_judge.available is False
+    assert _judge_identity(unavailable.non_content_judge) is None
+    screen = screen_non_content("Unable to process the image.", unavailable.non_content_judge)
+    assert (screen.reason, screen.suspected, screen.unanswered) == (None, False, False)
+    provider = _FreeFormOCR("A short caption.", config=OCRConfig(non_content_judge=unavailable.non_content_judge))
+    cached = CachedOCR(provider, MemoryOCRCache())
+    cached.batch_process_images([b"image-1"])
+    cached.batch_process_images([b"image-1"])
+    assert provider.calls == 1  # cached, as without a judge
+
+
+def test_a_judge_that_stops_answering_during_a_batch_leaves_the_batch_uncached():
+    judge = TypeSafeJudge(client=FakeClient(error=APIError(401)), cache_dir=False)
+    provider = _FreeFormOCR("Unable to process the image.", config=OCRConfig(non_content_judge=judge.non_content_judge))
+    cached = CachedOCR(provider, MemoryOCRCache())
+    cached.batch_process_images([b"image-1", b"image-2"])
+    assert judge.unavailable
+    cached.batch_process_images([b"image-1", b"image-2"])
+    assert provider.calls == 4
+
+
+def test_a_failed_question_counts_once_and_keeps_its_cause():
+    """m2: a question whose prefetch failed was asked again by its hook and counted twice, and the cause was
+    replaced by "paused after repeated failures"."""
+    client = FakeClient(error=TimeoutError("read timeout"))
+    judge = judge_with(client)
+    pages = [f"page {n}: Delivery of {n} units to the Rotterdam depot" for n in range(3)]
+    judge.legibility_judge.prefetch(pages)
+    assert all(judge.legibility_judge(page) is None for page in pages)
+    usage = judge.usage()
+    assert (usage["asked"], usage["failed"], len(client.calls)) == (3, 3, 3)
+    assert usage["last_error"] == "TimeoutError"
+    assert judge.legibility_judge("one more page, while paused") is None
+    assert judge.usage()["failed"] == 4 and judge.usage()["last_error"] == "TimeoutError"
+
+
+@pytest.fixture
+def fake_sdk(monkeypatch):
+    """A stand-in ``typesafe_sdk`` module that records how its client is built (the list it returns); the
+    real SDK logger's level is restored afterwards."""
+    created = []
+    sdk_logger = logging.getLogger("typesafe_sdk")
+    previous = sdk_logger.level
+    _fake_sdk(monkeypatch, created)
+    yield created
+    sdk_logger.setLevel(previous)
+
+
+def _fake_sdk(monkeypatch, created):
+    module = types.ModuleType("typesafe_sdk")
+
+    class RetryPolicy:
+        def __init__(self, **options):
+            self.__dict__.update(options)
+
+    class TypeSafeClient:
+        def __init__(self, **options):
+            created.append(options)
+
+        def system_one(self, state, questions, model=None):
+            (name,) = questions
+            return FakeResponse(name, 0.97)
+
+    module.RetryPolicy, module.TypeSafeClient = RetryPolicy, TypeSafeClient
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", module)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts-test-not-a-real-key")
+
+
+def test_a_question_that_cannot_be_answered_costs_at_most_about_four_seconds(fake_sdk):
+    """m1: the SDK's default retries let a hanging endpoint cost 10-21 s per document."""
+    judge = TypeSafeJudge(cache_dir=False)
+    assert judge.legibility_judge("A legible page of text.") is not None
+    (options,) = fake_sdk
+    assert options["timeout"] <= 2.0 and options["retry"].max_retries <= 1 and options["retry"].timeout <= 4.0
+
+
+@pytest.mark.parametrize("requested", [None, "debug"])
+def test_the_sdk_wire_log_is_capped_unless_requested(fake_sdk, monkeypatch, requested):
+    """m4: ``doc2mark -v`` set the root logger to DEBUG and the SDK logged request bodies (page text)."""
+    sdk_logger = logging.getLogger("typesafe_sdk")
+    sdk_logger.setLevel(logging.NOTSET)
+    if requested:
+        monkeypatch.setenv("TYPESAFE_LOG_LEVEL", requested)
+    else:
+        monkeypatch.delenv("TYPESAFE_LOG_LEVEL", raising=False)
+    TypeSafeJudge(cache_dir=False).legibility_judge("A legible page of text.")
+    assert sdk_logger.level == (logging.NOTSET if requested else logging.INFO)

@@ -629,19 +629,21 @@ class PDFLoader:
                   which may be a page number or per-page content; asked once per group.
                   At or above 0.5 the group is handled like a running header with a page
                   number: its copies at the page edge are chrome except the first, which
-                  stays and is then asked about as a "first_occurrence"; copies the rule
-                  cannot take off the page edge stay, as plain text.
-                * "first_occurrence": the first copy of a running header or footer, kept
-                  so its text is not lost (every other copy is already removed).
+                  stays; copies the rule cannot take off the page edge stay, as plain text.
                 * "few_pages": it repeats on too few pages.
                 * "attached_to_content": no clear gap separates it from the page's text,
                   or other text sits between it and the page edge.
 
                 The judge returns the probability (0..1) that the line is page chrome rather
-                than content: at or above 0.5 every kept copy of the line is treated as
-                chrome (typed text:header / text:footer, left out of the Markdown), except
-                as said for "numbered_label"; below 0.5, None, an invalid value or an
-                exception keeps it. Without a judge, ambiguous lines are kept.
+                than content: at or above 0.5 every kept copy of the line but its first is
+                treated as chrome (typed text:header / text:footer, left out of the Markdown),
+                except as said for "numbered_label"; below 0.5, None, an invalid value or an
+                exception keeps them all. The first copy of a repeated line always stays (as
+                plain text unless it is heading-sized; or, when the text is already in the page
+                body at or before it, as on a cover, that copy is the one left): the judge can
+                thin a line out to one copy, never remove it. A running header's first copy, left alone by the rule (which
+                removed the other copies), is not asked about. Without a judge, ambiguous lines
+                are kept.
         """
         self.pdf_path = Path(pdf_path)
         self.doc = None
@@ -1283,8 +1285,9 @@ class PDFLoader:
         Otherwise its first copy stays as content, so a statement title, a unit note or a
         disclaimer repeated as page furniture is not lost; only the later copies are chrome.
 
-        Lines that repeat but miss the evidence bar are ambiguous and kept, like those first
-        copies, unless the optional ``boilerplate_judge`` says they are chrome.
+        Lines that repeat but miss the evidence bar are ambiguous and kept, unless the optional
+        ``boilerplate_judge`` says they are chrome: then their later copies go and the first
+        stays, as plain text. The judge is never asked about a first copy the rule keeps.
 
         Returns ``{page index: [(line bbox in get_text() space, "header" | "footer", kept), ...]}``
         where ``kept`` marks a line that stays as content, emitted as plain text.
@@ -1445,33 +1448,51 @@ class PDFLoader:
             del chrome[id(line)]
         kept = {id(line) for line in first_copies}
 
+        # The judge only ever takes later copies the rule kept: the first copy of a repeated line
+        # always stays (as plain text), so a line it calls chrome is left once, never lost -- or
+        # the text is already on the page body at or before that copy (a cover), and that copy
+        # is the one that stays. A running header whose later copies the rule removed already is
+        # not asked about.
+        judged_firsts: List[_PageLine] = []
         if judge is not None:
+            in_body: Dict[str, int] = {}
+            for line in body_lines:
+                norm = self._normalized(line.text)
+                in_body[norm] = min(in_body.get(norm, page_count), line.page)
             copies: Dict[Tuple[str, str], set] = defaultdict(set)
+            earliest: Dict[Tuple[str, str], _PageLine] = {}
             ambiguous: Dict[Tuple[str, str], List[_PageLine]] = defaultdict(list)
             for line in band_lines:
                 if id(line) in recurring or id(line) in numbered:
-                    copies[repeat_key(line)].add(line.page + 1)
+                    key = repeat_key(line)
+                    copies[key].add(line.page + 1)
+                    if key not in earliest or (line.page, line.y0) < (earliest[key].page, earliest[key].y0):
+                        earliest[key] = line
                     if id(line) not in chrome:
-                        ambiguous[repeat_key(line)].append(line)
+                        ambiguous[key].append(line)
             for key, lines in ambiguous.items():
-                first = min(lines, key=lambda line: (line.page, line.y0))
-                if id(first) in kept:
-                    reason = "first_occurrence"
-                elif all(id(line) in judged for line in lines):
+                if all(id(line) in judged for line in lines):
                     continue  # asked about as a numbered label already
-                elif id(first) in candidates:
-                    reason = "attached_to_content"
-                else:
-                    reason = "few_pages"
-                if self._judged_boilerplate(judge, first.text, page_context(lines, reason, copies[key])):
-                    chrome.update((id(line), line) for line in lines)
-                    kept.difference_update(id(line) for line in lines)
+                first = earliest[key]
+                later = [line for line in lines if line is not first]
+                if not later:
+                    continue  # only the first copy is left, and it always stays
+                reason = "attached_to_content" if any(id(line) in candidates for line in later) else "few_pages"
+                on_body = in_body.get(first.norm, page_count) <= first.page
+                if on_body:
+                    later = list(lines)  # the copy in the page body stays
+                asked = min(lines, key=lambda line: (line.page, line.y0))
+                if self._judged_boilerplate(judge, asked.text, page_context(lines, reason, copies[key])):
+                    chrome.update((id(line), line) for line in later)
+                    kept.difference_update(id(line) for line in later)
+                    if not on_body and any(line is first for line in lines):
+                        judged_firsts.append(first)
 
         # A kept line with a number counting with the pages (a page number the rule leaves, a
-        # numbered label) and a kept first copy of a running header are emitted as plain text, so
-        # they never turn into a heading, list item or footnote; a heading-sized first copy
-        # without such a number stays in its block and is classified like any other content (a
-        # title repeated on every page).
+        # numbered label) and a kept first copy of a running header or of a line the judge called
+        # chrome are emitted as plain text, so they never turn into a heading, list item or
+        # footnote; a heading-sized first copy without such a number stays in its block and is
+        # classified like any other content (a title repeated on every page).
         regions: Dict[int, List[Tuple[Tuple[float, float, float, float], str, bool]]] = defaultdict(list)
         for line in chrome.values():
             regions[line.page].append((line.rect, line.zone, False))
@@ -1479,7 +1500,8 @@ class PDFLoader:
                  if id(line) not in chrome and (id(line) in numbered or id(line) in labelled)]
         plain += [line for line in first_copies
                   if id(line) in kept and id(line) not in numbered and line.size < heading_size]
-        for line in plain:
+        plain += [line for line in judged_firsts if line.size < heading_size]
+        for line in {id(line): line for line in plain}.values():
             regions[line.page].append((line.rect, line.zone, True))
         return dict(regions)
 

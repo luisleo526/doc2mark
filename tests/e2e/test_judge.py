@@ -123,10 +123,11 @@ def test_typesafe_judge_replaces_a_garbled_text_layer_by_the_ocr_of_the_page(run
 
 
 @pytest.mark.requires_typesafe
-def test_typesafe_judge_takes_the_brand_line_off_every_slide(run_cli, e2e_dir, judge_env):
+def test_typesafe_judge_thins_the_brand_line_to_one_copy(run_cli, e2e_dir, judge_env):
     """The deck's brand line ("by Contoso Labs") sits under the logo text, in the header row of every slide:
     the rule cannot take it off the page edge, so without a judge it is emitted once per slide. Jev calls it
-    page chrome: it goes, and every slide title, numbered slide label and body line stays."""
+    page chrome: its repeats go, its first copy stays (the judge never removes the last copy of a line), and
+    every slide title, numbered slide label and body line stays."""
     pdf = builders_judge.deck_pdf(e2e_dir / "deck.pdf")
     slides = builders_judge.DECK_SLIDES
 
@@ -135,7 +136,7 @@ def test_typesafe_judge_takes_the_brand_line_off_every_slide(run_cli, e2e_dir, j
 
     assert without.exit_code == 0 and judged.exit_code == 0, judged.describe()
     assert without.markdown.count(builders_judge.BRAND_LINE) == len(slides), without.describe()
-    assert judged.markdown.count(builders_judge.BRAND_LINE) <= 1, judged.describe()
+    assert judged.markdown.count(builders_judge.BRAND_LINE) == 1, judged.describe()
     for number, (title, body) in enumerate(slides, 1):
         for result in (without, judged):
             text = words(result.markdown)
@@ -146,14 +147,31 @@ def test_typesafe_judge_takes_the_brand_line_off_every_slide(run_cli, e2e_dir, j
 
 
 @pytest.mark.requires_typesafe
+def test_typesafe_judge_keeps_the_letterhead_of_a_letter(run_cli, e2e_dir, judge_env):
+    """Review B1: the rule keeps the first copy of a letterhead repeated on every page and drops the others; a
+    chrome verdict on that first copy deleted the sender's name, address and phone. The judge is not asked
+    about a first copy: the letter comes out exactly as without it, with the letterhead once."""
+    pdf = builders_judge.letter_pdf(e2e_dir / "letter.pdf")
+
+    without = run_cli(pdf, "--judge", "none")
+    judged = run_cli(pdf, "--judge", "typesafe", fmt="both", env=judge_env)
+
+    assert without.exit_code == 0 and judged.exit_code == 0, judged.describe()
+    for line in builders_judge.LETTERHEAD:
+        assert without.markdown.count(line) == 1 and judged.markdown.count(line) == 1, judged.describe()
+    assert judged.markdown == without.markdown, judged.describe()
+    assert judge_stats(judged).get("asked", 0) == 0, judged.json
+
+
+@pytest.mark.requires_typesafe
 @pytest.mark.parametrize("answer", [
     "Unable to process the image. Please provide a clearer scan of the page.",
     "Error: the image could not be processed (unsupported content).",
 ])
 def test_typesafe_judge_rereads_an_image_whose_answer_is_only_an_error(run_cli, e2e_dir, judge_env, fake_llm, answer):
     """An OCR answer that is only an error notice has no first-person refusal the patterns can be sure of (a
-    support page says the same), so without a judge it is indexed as the page's text. Jev calls it no content:
-    the image is re-read with the free-form recovery, whose transcription becomes the page."""
+    support page says the same), so without a judge it is indexed as the page's text. Jev rates it no content
+    (at least 0.95): the image is re-read with the free-form recovery, whose transcription becomes the page."""
     scan = builders_ocr.scan_pdf(e2e_dir / "scan.pdf")
     transcription = "RENEWAL NOTICE 5518\n\nPolicy 4471 renews on 1 November 2026."
 
