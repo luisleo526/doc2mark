@@ -33,6 +33,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     document_signals as _document_signals,
     judge_text_layer as _judge_text_layer,
     pages_without_text as _pages_without_text,
+    wants_judgment as _wants_judgment,
     VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
     REASON_ILLEGIBLE as _REASON_ILLEGIBLE,
     MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
@@ -1919,6 +1920,28 @@ class PDFLoader:
             placed = self._placements[page.number] = pdf_images.placements(page)
         return placed
 
+    def _prefetch_legibility(self) -> None:
+        """Hand a legibility judge that can ``prefetch(texts)`` every page text it is about to
+        be asked about (pages whose route would keep their text layer, see ``_page_route``),
+        so it can ask them all at once; the per-page calls that follow read its answers."""
+        prefetch = getattr(self._legibility_judge, "prefetch", None)
+        if self.ocr is None or not callable(prefetch) or self.doc is None:
+            return
+        document_route = self._document_image_strategy()
+        texts = []
+        for page_num in range(len(self.doc)):
+            if page_num in self._judged_pages or page_num in self._page_routes:
+                continue
+            measure = self._page_measure(page_num)
+            if (_decide_page_route(measure.signals, document_route)[0] == "text"
+                    and _wants_judgment(measure.signals.text_layer)):
+                texts.append(measure.text or "")
+        if texts:
+            try:
+                prefetch(texts)
+            except Exception as e:  # the judge is optional: its failures must not fail the conversion
+                logger.debug(f"legibility_judge prefetch failed: {e!r}")
+
     def _ocr_image_rects(self, page) -> List[Any]:
         """Placements the text route reads one by one whatever their pixels: image XObjects the page
         shows whole that are not small (see pdf_images.single_rects; geometry only, no pixels). Small
@@ -2175,6 +2198,7 @@ class PDFLoader:
         entries of ``ocr_results_map`` its text answers), ``context_pdf_b64``, ``identity`` (what
         makes two jobs the same OCR request) and the image bytes (``image``), or ``load`` to fetch
         them when the request is new."""
+        self._prefetch_legibility()
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
             if self.ocr is not None and self._page_route(page_num)[0] == "image":

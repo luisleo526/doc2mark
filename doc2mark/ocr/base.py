@@ -407,20 +407,24 @@ class BaseOCR(ABC):
         otherwise empty page can be one: a page with anything else (see
         :meth:`_has_content_besides_text`) is content.
         """
-        from doc2mark.ocr.refusal import non_content_reason
+        from doc2mark.ocr.refusal import non_content_reason, prefetch_non_content
         from doc2mark.ocr.schema import OCRPage
         judge = self._non_content_judge()
+        answers: Dict[int, str] = {}
         for index, result in enumerate(results):
             doc = result.document
             if isinstance(doc, OCRPage):
                 if self._has_content_besides_text(doc):
                     continue
-                answer = doc.raw.text
+                answers[index] = doc.raw.text or ""
             else:  # a caller's own response model: its rendering is all there is
-                answer = result.text
-            reason = non_content_reason(answer or "", judge)
+                answers[index] = result.text or ""
+        if judge is not None and len(answers) > 1:
+            prefetch_non_content(answers.values(), judge)
+        for index, answer in answers.items():
+            reason = non_content_reason(answer, judge)
             if reason:
-                results[index] = self._without_content(result, non_content=reason)
+                results[index] = self._without_content(results[index], non_content=reason)
 
     def _free_form_answer(self, answer: Optional[str], *, refusal: Any = None,
                           recovery: bool = False) -> "tuple[str, Dict[str, Any]]":

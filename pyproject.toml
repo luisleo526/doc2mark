@@ -82,6 +82,11 @@ redis = [
 tokenizers = [
     "tiktoken>=0.5.0",
 ]
+# Optional TypeSafe (Jev) judge for the legibility, page-chrome and OCR-refusal hooks
+# (docs/judge.rst); off unless enabled with judge="typesafe" / --judge typesafe.
+typesafe = [
+    "typesafe-sdk>=0.7.2,<0.8",
+]
 all = [
     "openai>=2.0.0",
     "langchain>=1.2.0",
@@ -93,6 +98,7 @@ all = [
     "langchain-google-genai>=2.0.0",
     "redis>=5.0.0",
     "tiktoken>=0.5.0",
+    "typesafe-sdk>=0.7.2,<0.8",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -126,7 +132,7 @@ Issues = "https://github.com/luisleo526/doc2mark/issues"
 Changelog = "https://github.com/luisleo526/doc2mark/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["doc2mark", "doc2mark.core", "doc2mark.formats", "doc2mark.ocr", "doc2mark.pipelines", "doc2mark.utils"]
+packages = ["doc2mark", "doc2mark.core", "doc2mark.formats", "doc2mark.judge", "doc2mark.ocr", "doc2mark.pipelines", "doc2mark.utils"]
 include-package-data = true
 
 [tool.setuptools.package-data]
@@ -191,6 +197,7 @@ markers = [
     "ocr: Tests specifically for OCR functionality",
     "requires_api_key: Tests that require OPENAI_API_KEY to be set",
     "e2e: End-to-end tests that drive the real CLI as a subprocess (need tesseract/soffice; see docs/development.rst)",
+    "requires_typesafe: Tests that call the TypeSafe API (need the doc2mark[typesafe] extra and TYPESAFE_API_KEY; skipped otherwise)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

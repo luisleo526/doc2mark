@@ -17,6 +17,7 @@ OCR providers are initialized only when OCR is requested.
    formats
    ocr
    ocr_policy
+   judge
    tables
    contextual_ocr
    caching

@@ -360,10 +360,29 @@ def non_content_reason(text: str, judge: Optional[NonContentJudge] = None) -> Op
     return "judge" if probability >= JUDGE_THRESHOLD else None
 
 
+def prefetch_non_content(texts, judge: Optional[NonContentJudge]) -> None:
+    """Hand a judge that can ``prefetch(answers)`` every answer of ``texts`` that
+    :func:`non_content_reason` would ask it about, so it can ask them all at once."""
+    prefetch = getattr(judge, "prefetch", None)
+    if not callable(prefetch):
+        return
+    answers = []
+    for text in texts:
+        answer = _normalize(text or "")
+        if answer and len(answer) <= MAX_JUDGE_CHARS and not matches_non_content_pattern(answer):
+            answers.append(answer)
+    if answers:
+        try:
+            prefetch(answers)
+        except Exception as exc:  # the hook must never break OCR
+            logger.debug("non_content_judge prefetch failed (%r)", exc)
+
+
 __all__ = [
     "NonContentJudge",
     "JUDGE_THRESHOLD",
     "MAX_JUDGE_CHARS",
     "matches_non_content_pattern",
     "non_content_reason",
+    "prefetch_non_content",
 ]
