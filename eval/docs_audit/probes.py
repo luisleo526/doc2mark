@@ -87,7 +87,7 @@ def _():
     docs = work / "flags"
     docs.mkdir()
     shutil.copy(SAMPLES / "sample_text.txt", docs / "a.txt")
-    r = cli(str(docs), "--preserve-structure", "-o", str(work / "out4"), "-q", cwd=work)
+    r = cli(str(docs), "--preserve-structure", "-o", str(work / "out4"), cwd=work)
     print("exit", r.returncode, "| stderr:", r.stderr.strip()[-200:])
     r = cli("--help", cwd=work)
     print([line.strip() for line in r.stdout.splitlines() if "--timeout" in line or "Timeout per file" in line])

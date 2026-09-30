@@ -115,15 +115,15 @@ Folders and file lists
 :meth:`~doc2mark.UnifiedDocumentLoader.batch_process` finds every file under ``input_dir``
 (``recursive=True`` by default) that :meth:`~doc2mark.UnifiedDocumentLoader.load` accepts,
 whatever the case of its extension (``.PDF``, ``.htm`` and ``.markdown`` included; folders are
-never converted themselves), in path order, converts it and, with ``save_files=True`` (the
-default), writes ``<name>.md`` (or ``.json``; the dots of the file name are kept: ``v1.2.txt`` gives
-``v1.2.md``), keeping the folder structure (two files of one folder with the same stem, such as
-``report.txt`` and ``report.md``, write the same output file: the later one wins; the CLI names
-them apart), and, when pictures
-were extracted, a ``<name>_images/`` folder (a known issue: a PDF whose pictures were extracted
-without OCR is then reported as failed although its ``.md`` was written). With
-``output_format="text"`` no file is written. Without ``output_dir`` the files are written next to
-the inputs. One file failing does not stop the batch.
+never converted themselves), in path order, and converts it. With ``save_files=True`` (the
+default) it writes ``<name>.md`` (or ``.json``), keeping the folder structure and the dots of the
+file name (``v1.2.txt`` gives ``v1.2.md``); two files of one folder with the same stem, such as
+``report.txt`` and ``report.md``, write the same output file and the later one wins (the CLI
+names them apart). When pictures were extracted it also writes a ``<name>_images/`` folder (a
+known issue: a PDF whose pictures were extracted without OCR is then reported as failed although
+its ``.md`` was written). With ``output_format="text"`` no file is written. Without
+``output_dir`` the files are written next to the inputs. One file failing does not stop the
+batch.
 
 The returned dict maps each input path (a string, in input order) to a result:
 
