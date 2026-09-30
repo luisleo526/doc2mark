@@ -8,6 +8,8 @@ program in a subprocess of its own that uses only the public API. Inputs are bui
 import json
 import os
 import re
+import signal
+import stat
 import subprocess
 import sys
 import time
@@ -58,6 +60,19 @@ def test_a_tsv_file_converts_to_a_table(run_cli, e2e_dir):
                                            ["gadget", "12", ""]], result.describe()
     meta = result.json["metadata"]
     assert (meta["format"], meta["delimiter"], meta["row_count"], meta["column_count"]) == ("tsv", "\t", 3, 3)
+
+
+def test_a_tsv_file_keeps_its_quote_characters_as_text(run_cli, e2e_dir):
+    """Review: a TSV has no quoting, so ``5" pipe`` and ``"Best" seller`` are text, not CSV quoting. Read with CSV
+    rules the quotes were silently dropped and an unclosed one swallowed the rows after it into one cell."""
+    tsv = b.write(e2e_dir / "parts.tsv", 'id\tname\n1\t"Best" seller, 12" pipe\n2\t"Unclosed quote\n3\tlast row\n')
+
+    result = run_cli(tsv, fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert table_rows(result.markdown) == [["id", "name"], ["1", '"Best" seller, 12" pipe'],
+                                           ["2", '"Unclosed quote'], ["3", "last row"]], result.describe()
+    assert result.json["metadata"]["row_count"] == 4
 
 
 # --- item 2: the CSV delimiter argument was ignored -------------------------------------------------------------
@@ -166,19 +181,40 @@ def test_inputs_that_would_write_the_same_output_all_survive_under_distinct_name
     assert "report.txt.md" in result.stderr, result.describe()
 
 
-def test_converting_a_folder_onto_itself_never_overwrites_a_source_file(run_cli, e2e_dir):
-    """Item 4: with ``-o`` naming the input folder, the output of ``note.txt`` is ``note.md``: a source file."""
+def test_a_folder_run_refuses_to_write_into_its_own_input_folder(run_cli, e2e_dir):
+    """Item 4: with ``-o`` naming the input folder the output of ``note.txt`` is ``note.md``, a source file, and the
+    next run reads the outputs of this one as inputs. The run stops before it writes anything."""
     docs = e2e_dir / "docs"
     source = "---\ntitle: Kept\n---\n# Source note\n\nThis source file must survive.\n"
     b.write(docs / "note.md", source)
     b.write(docs / "note.txt", "Text twin of the note")
 
-    result = run_cli(docs, "-o", docs, "-q", raw=True)
+    same = run_cli(docs, "-o", docs, "-q", raw=True)
+    spelled_differently = run_cli(docs, "-o", docs / ".." / "docs", "-q", raw=True)
 
-    assert result.exit_code == 0, result.describe()
+    for result in (same, spelled_differently):
+        assert result.exit_code == 2 and "input folder" in result.stderr, result.describe()
+    assert tree(docs) == ["note.md", "note.txt"]
     assert read(docs / "note.md") == source
-    assert read(docs / "note.txt") == "Text twin of the note"
-    assert sorted(set(tree(docs)) - {"note.md", "note.txt"}) == ["note.md.md", "note.txt.md"], result.describe()
+
+
+def test_rerunning_a_folder_run_with_the_output_inside_the_input_changes_nothing(run_cli, e2e_dir):
+    """Item 4: an output folder inside the input folder is not read as input on the next run, so a run can be
+    repeated (before, the outputs of run 1 were converted again, each run adding copies of the text)."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "a.txt", "Alpha file text")
+    b.write(docs / "sub" / "b.txt", "Beta file text")
+    out = docs / "md"
+
+    first = run_cli(docs, "-r", "-o", out, raw=True)
+    after_first = tree(docs)
+    later = [run_cli(docs, "-r", "-o", out, raw=True) for _ in range(2)]
+
+    assert first.exit_code == 0 and all(result.exit_code == 0 for result in later), first.describe()
+    assert after_first == ["a.txt", "md/a.md", "md/sub/b.md", "sub/b.txt"], first.describe()
+    assert tree(docs) == after_first
+    assert read(out / "a.md").strip() == "Alpha file text"
+    assert "warn" not in (first.stderr + "".join(result.stderr for result in later)).lower()
 
 
 @pytest.mark.parametrize("workers", [[], ["-p", "2"]], ids=["sequential", "parallel"])
@@ -244,6 +280,49 @@ def test_preserve_structure_is_accepted_with_a_deprecation_warning(run_cli, e2e_
     assert tree(e2e_dir / "flagged") == tree(e2e_dir / "plain") == ["a.md", "sub/b.md"]
     assert "--preserve-structure" in flagged.stderr and "deprecated" in flagged.stderr, flagged.describe()
     assert "deprecated" not in plain.stderr, plain.describe()
+
+
+def test_a_negative_retry_count_is_a_usage_error(run_cli, e2e_dir):
+    """Review of the folder worker: ``--retry -1`` made every file's outcome ``None`` and crashed the run."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "a.txt", "Alpha file text")
+
+    result = run_cli(docs, "--retry", "-1", "-o", e2e_dir / "converted", raw=True)
+
+    assert result.exit_code == 2 and "--retry" in result.stderr, result.describe()
+
+
+def test_a_document_that_cannot_be_written_is_a_failed_file_and_leaves_no_partial_output(run_cli, e2e_dir):
+    """Review: ``--encoding ascii`` on a document with an accented letter ended the whole run, after leaving an empty
+    ``.md`` behind. Writing is part of a file's conversion: a failure is reported (and skipped with
+    ``--skip-errors``), and a file is only ever complete."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "a.txt", "Plain ascii text")
+    b.write(docs / "b.txt", "Caf\u00e9 with an accent")
+    b.write(docs / "c.txt", "More plain text")
+    out = e2e_dir / "converted"
+
+    skipped = run_cli(docs, "--encoding", "ascii", "--skip-errors", "-o", out, raw=True)
+    stopped = run_cli(docs, "--encoding", "ascii", "-o", e2e_dir / "stopped", raw=True)
+
+    assert skipped.exit_code == 0 and "b.txt" in skipped.stderr, skipped.describe()
+    assert tree(out) == ["a.md", "c.md"], skipped.describe()
+    assert stopped.exit_code == 1 and "b.txt" in stopped.stderr, stopped.describe()
+    assert all((e2e_dir / "stopped" / name).stat().st_size > 0 for name in tree(e2e_dir / "stopped"))
+
+
+def test_a_file_whose_name_is_only_a_suffix_converts_like_any_other(run_cli, e2e_dir):
+    """Review: ``..txt`` has the stem ``.``; building its output name raised and ended the run."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "..txt", "Text of a file named ..txt")
+    b.write(docs / "a.txt", "Alpha file text")
+
+    result = run_cli(docs, "-o", e2e_dir / "converted", "-q", raw=True)
+
+    assert result.exit_code == 0, result.describe()
+    written = tree(e2e_dir / "converted")
+    assert len(written) == 2 and "a.md" in written, result.describe()
+    assert any("Text of a file named ..txt" in read(e2e_dir / "converted" / name) for name in written)
 
 
 # --- item 6: the --help text --------------------------------------------------------------------------------------
@@ -564,3 +643,186 @@ def test_front_matter_with_a_date_writes_json(run_cli, e2e_dir):
     frontmatter = result.json["metadata"]["frontmatter"]
     assert frontmatter["title"] == "Dated post" and frontmatter["date"] == "2024-05-01", frontmatter
     assert frontmatter["updated"].startswith("2024-05-02"), frontmatter
+
+
+@pytest.mark.parametrize("date", ["2024-02-30", "2024-13-01", "2024-01-01 25:00:00"])
+def test_front_matter_with_an_impossible_date_is_kept_as_written(run_cli, e2e_dir, date):
+    """Review: PyYAML raises ``ValueError`` for a timestamp that is not a date. That ended the conversion of the whole
+    file ("day is out of range for month"), which before this change was converted verbatim."""
+    text = f"---\ntitle: Notes\ndate: {date}\n---\n# Heading\n\nBody text\n"
+
+    result = run_cli(b.write(e2e_dir / "notes.md", text), fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert result.markdown == text, result.describe()
+    assert result.json["metadata"]["frontmatter"] is None
+
+
+def test_front_matter_with_a_yaml_set_writes_json(run_cli, e2e_dir):
+    """Review: a ``!!set`` in front matter is a Python set, which JSON cannot hold."""
+    text = "---\ntitle: Tagged\ntags: !!set {beta, alpha}\n---\n# Heading\n"
+
+    result = run_cli(b.write(e2e_dir / "tagged.md", text), fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert result.json["metadata"]["frontmatter"] == {"title": "Tagged", "tags": ["alpha", "beta"]}
+
+
+# --- review round: the API's batch outputs, cached documents, stopping workers ------------------------------------
+
+BATCH_SAVE_TWICE = (
+    "import json, sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "root, out, files = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:]\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=None)\n"
+    "def written(results, base):\n"
+    "    return {Path(key).name + ':' + Path(key).parent.name: sorted(Path(f).relative_to(base).as_posix()\n"
+    "            for f in info['output_files']) for key, info in results.items()}\n"
+    "batch = loader.batch_process(root, output_dir=out / 'tree', show_progress=False)\n"
+    "listed = loader.batch_process_files(files, output_dir=out / 'list', show_progress=False)\n"
+    "print(json.dumps({'batch': written(batch, out), 'files': written(listed, out)}))\n"
+)
+
+
+def test_batch_outputs_to_an_output_folder_never_share_a_name(e2e_dir):
+    """Review (item 4 in the Python API): ``report.txt`` and ``report.csv`` both wrote ``report.md`` (the CSV table was
+    lost), and ``batch_process_files`` wrote flat by stem, so ``a/q1.txt`` and ``b/q1.txt`` were one file. With an
+    output folder, names that would clash get their whole file name, as in the CLI."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "report.txt", "Text version of the report")
+    b.write(docs / "report.csv", "k,v\na,1\n")
+    b.write(docs / "sub" / "notes.txt", "Notes in a sub-folder")
+    first = b.write(e2e_dir / "a" / "q1.txt", "Quarter one from a")
+    second = b.write(e2e_dir / "b" / "q1.txt", "Quarter one from b")
+
+    out = run_api(e2e_dir, BATCH_SAVE_TWICE, docs, e2e_dir / "converted", first, second)
+
+    assert out["batch"] == {"report.txt:docs": ["tree/report.txt.md"], "report.csv:docs": ["tree/report.csv.md"],
+                            "notes.txt:sub": ["tree/sub/notes.md"]}, out
+    assert out["files"] == {"q1.txt:a": ["list/q1.txt.md"], "q1.txt:b": ["list/q1.txt-2.md"]}, out
+    assert "Text version of the report" in read(e2e_dir / "converted" / "tree" / "report.txt.md")
+    assert table_rows(read(e2e_dir / "converted" / "tree" / "report.csv.md")) == [["k", "v"], ["a", "1"]]
+
+
+CACHED_STRUCTURE = (
+    "import json, sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "docx, text, cache = sys.argv[1:4]\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=None, cache_dir=cache)\n"
+    "out = {}\n"
+    "for label, path, fmt in (('docx', docx, 'markdown'), ('text_json', text, 'json')):\n"
+    "    runs = [loader.load(path, output_format=fmt) for _ in range(2)]  # the second one is read from the cache\n"
+    "    out[label] = [[len(doc.tables) if doc.tables is not None else None,\n"
+    "                   len(doc.sections) if doc.sections is not None else None] for doc in runs]\n"
+    "out['cache_files'] = len(list(Path(cache).glob('*.json')))\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def test_a_document_read_from_the_cache_has_the_tables_and_sections_of_a_fresh_one(e2e_dir):
+    """Review: a replay filled ``tables``/``sections`` with ``[]`` for a text file that has none (fresh: ``None``)."""
+    docx = b.report_docx(e2e_dir / "report.docx")
+    text = b.write(e2e_dir / "notes.txt", "Plain notes")
+
+    out = run_api(e2e_dir, CACHED_STRUCTURE, docx, text, e2e_dir / "cache")
+
+    assert out["cache_files"] == 2, out
+    assert out["docx"] == [[1, 2], [1, 2]], out
+    assert out["text_json"] == [[None, None], [None, None]], out
+
+
+FAKE_SOFFICE = "#!/bin/sh\necho $$ > \"$FAKE_SOFFICE_PIDFILE\"\nexec sleep 600\n"
+
+CLI_WITH_FAKE_SOFFICE = (
+    "import sys\n"
+    "import doc2mark.utils.libreoffice as libreoffice\n"
+    "libreoffice._CANDIDATE_PATHS = (sys.argv[1],)\n"
+    "from doc2mark.cli import main\n"
+    "sys.argv = ['doc2mark', *sys.argv[2:]]\n"
+    "main()\n"
+)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _gone(pid: int, seconds: float = 15) -> bool:
+    """Whether process ``pid`` is gone within ``seconds``."""
+    deadline = time.monotonic() + seconds
+    while _alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def _clean_up(proc, pidfile: Path) -> None:
+    """Whatever a failing test leaves behind: the CLI and the stand-in LibreOffice (it has a session of its own)."""
+    if proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+    if pidfile.exists() and pidfile.read_text().strip() and _alive(int(pidfile.read_text())):
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
+def _start_cli_on_a_hanging_libreoffice(e2e_dir, *args):
+    """Start the real CLI on a folder with one ``.doc``, whose LibreOffice is a stand-in that never finishes (a real
+    one cannot be made to hang on demand; the stand-in only takes the place of the binary). Returns
+    ``(process, path of the file that receives the stand-in's pid)``."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "old.doc", "not really a Word file: LibreOffice is never asked to read it")
+    fake = e2e_dir / "soffice"
+    fake.write_text(FAKE_SOFFICE)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    pidfile = e2e_dir / "soffice.pid"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", CLI_WITH_FAKE_SOFFICE, str(fake), str(docs), *map(str, args)], cwd=e2e_dir,
+        env={**os.environ, "FAKE_SOFFICE_PIDFILE": str(pidfile), "PYTHONIOENCODING": "utf-8"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+        start_new_session=True)
+    return proc, pidfile
+
+
+def _soffice_pid(pidfile: Path, proc) -> int:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if pidfile.exists() and pidfile.read_text().strip():
+            return int(pidfile.read_text())
+        assert proc.poll() is None, f"the CLI ended before LibreOffice started: {proc.stderr.read()}"
+        time.sleep(0.2)
+    raise AssertionError("the stand-in LibreOffice was never started")
+
+
+def test_a_timeout_takes_the_libreoffice_of_the_stopped_file_with_it(e2e_dir):
+    """Review: LibreOffice runs in a session of its own, so killing the worker left it running (and its profile
+    folder in the temp directory) for ever after "timed out"."""
+    proc, pidfile = _start_cli_on_a_hanging_libreoffice(e2e_dir, "--timeout", "5", "--skip-errors", "-o",
+                                                       e2e_dir / "converted")
+    try:
+        stdout, stderr = proc.communicate(timeout=60)
+        assert proc.returncode == 0 and "timed out after 5 s" in stderr, stdout + stderr
+        pid = int(pidfile.read_text())
+        assert _gone(pid), f"LibreOffice (pid {pid}) is still running after its file timed out"
+    finally:
+        _clean_up(proc, pidfile)
+
+
+def test_terminating_the_cli_stops_its_workers_and_their_libreoffice(e2e_dir):
+    """Review: workers run in a process group of their own, so SIGTERM to the CLI (a CI cancel, ``kill``, closing the
+    terminal) left them, and a hung LibreOffice, running for ever."""
+    proc, pidfile = _start_cli_on_a_hanging_libreoffice(e2e_dir, "-o", e2e_dir / "converted")
+    try:
+        pid = _soffice_pid(pidfile, proc)
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=30)
+        assert proc.returncode != 0
+        assert _gone(pid), f"LibreOffice (pid {pid}) is still running after the CLI was terminated"
+    finally:
+        _clean_up(proc, pidfile)
