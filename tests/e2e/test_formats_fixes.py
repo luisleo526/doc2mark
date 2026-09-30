@@ -320,6 +320,33 @@ def test_batch_process_finds_every_file_load_accepts(e2e_dir):
     assert flat == {name: "success" for name in top}, flat
 
 
+BATCH_SAVE = (
+    "import json, sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "root, out = Path(sys.argv[1]), Path(sys.argv[2])\n"
+    "results = UnifiedDocumentLoader(ocr_provider=None).batch_process(root, output_dir=out, show_progress=False)\n"
+    "print(json.dumps({Path(key).name: [Path(f).relative_to(out).as_posix() for f in info['output_files']]\n"
+    "                  for key, info in results.items()}))\n"
+)
+
+
+def test_batch_process_output_names_keep_the_dots_of_the_input_name(e2e_dir):
+    """Item 4 (Python API): ``batch_process`` named its output with ``with_suffix`` on the stem, so ``v1.2.txt`` and
+    ``v1.3.txt`` both wrote ``v1.md`` and one conversion was lost."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "v1.2.txt", "Release 1.2 notes")
+    b.write(docs / "v1.3.txt", "Release 1.3 notes")
+    b.write(docs / "sub" / "plan.v2.final.txt", "Plan, second version")
+
+    written = run_api(e2e_dir, BATCH_SAVE, docs, e2e_dir / "converted")
+
+    assert written == {"v1.2.txt": ["v1.2.md"], "v1.3.txt": ["v1.3.md"],
+                       "plan.v2.final.txt": ["sub/plan.v2.final.md"]}, written
+    assert read(e2e_dir / "converted" / "v1.2.md").strip() == "Release 1.2 notes"
+    assert read(e2e_dir / "converted" / "v1.3.md").strip() == "Release 1.3 notes"
+
+
 # --- item 8: tables and sections were never filled -----------------------------------------------------------------
 
 BATCH_TABLES = (
