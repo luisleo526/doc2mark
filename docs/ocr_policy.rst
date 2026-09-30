@@ -322,8 +322,9 @@ Text drawn in render mode 3 (or fully transparent) is not shown on the page.
 Each invisible span is classified by what the page shows under it, with or
 without OCR:
 
-- **A copy of the painted text it lies on** (the invisible duplicate some
-  exporters and OCR tools add) is dropped; the painted text stays.
+- **A copy of the painted text it lies on**, on the same line (the invisible
+  duplicate some exporters and OCR tools add), is dropped; the painted text
+  stays.
 - **Over a picture** it is the picture's text -- a scanner's OCR layer, or the
   transparent copy a slide export keeps of text it baked into the artwork --
   unless the picture is blank under it: fewer than 1 % of the span's pixels differ
@@ -336,8 +337,9 @@ without OCR:
   known prompt-injection vector in RAG.
 
 In doubt the text is kept: when the page cannot be checked (a render or a copy
-fails), all of its invisible text is kept and a warning is logged, because losing
-a scan's only text is worse than emitting a hidden line.
+fails), all of its invisible text but the copies of painted text is kept and a
+warning is logged, because losing a scan's only text is worse than emitting a
+hidden line.
 
 Text of what the page shows is emitted, except over a picture whose OCR in this
 run returned text: that OCR replaces it, so each picture gives one source, not

@@ -487,23 +487,41 @@ def classify_invisible(page, invisible: Sequence[Row], visible: Sequence[Row], p
                        copies: "PageCopies") -> Tuple[List[Row], List[Row], List[Row]]:
     """Split invisible spans into (layer, hidden, duplicates).
 
-    A duplicate repeats the painted text it lies on. A span with nothing but text
-    painted under it lies over nothing the page shows (hidden). The rest is judged on
-    the page rendered without its text (a copy is rendered only where painted text
-    overlaps them; invisible text never renders): over a picture a span is the
-    picture's text (layer) unless the region under it is blank; elsewhere it is layer
-    only over glyph-like ink (text drawn as outlines), rules and frames crossing it
-    left out.
+    A duplicate repeats the painted text it lies on. The others are judged by what the
+    page shows under them (:func:`_by_what_shows`); when the page cannot be checked,
+    they are all kept as the page's text (fail open) and a warning is logged.
     """
     rows = _array(row[2] for row in invisible) + [-0.5, -0.5, 0.5, 0.5]
     shown = _array(row[2] for row in visible)
     duplicate = _duplicates(invisible, visible, rows, shown)
-    painted = _array(box for kind, box in page.get_bboxlog() if kind in _PAINTING) + [-1, -1, 1, 1]
-    candidate = ~duplicate & _any_overlap(rows, painted)
     duplicates = [row for row, flag in zip(invisible, duplicate) if flag]
-    hidden = [row for row, flag, check in zip(invisible, duplicate, candidate) if not flag and not check]
+    rest = np.flatnonzero(~duplicate)
+    try:
+        layer, hidden = _by_what_shows(page, [invisible[index] for index in rest], rows[rest], shown, pictures,
+                                       copies)
+    except Exception as exc:  # cannot tell what shows: keep the text (fail open)
+        logger.warning(f"Page {page.number + 1}: could not check what its invisible text lies on ({exc}); "
+                       f"keeping it as the page's text")
+        layer, hidden = [invisible[index] for index in rest], []
+    return layer, hidden, duplicates
+
+
+def _by_what_shows(page, invisible: Sequence[Row], rows: np.ndarray, shown: np.ndarray,
+                   pictures: Sequence[pymupdf.Rect], copies: "PageCopies") -> Tuple[List[Row], List[Row]]:
+    """(layer, hidden) of invisible spans that copy no painted text (``rows``: their boxes).
+
+    A span with nothing but text painted under it lies over nothing the page shows
+    (hidden). The rest is judged on the page rendered without its text (a copy is
+    rendered only where painted text overlaps them; invisible text never renders): over
+    a picture a span is the picture's text (layer) unless the region under it is blank;
+    elsewhere it is layer only over glyph-like ink (text drawn as outlines), rules and
+    frames crossing it left out.
+    """
+    painted = _array(box for kind, box in page.get_bboxlog() if kind in _PAINTING) + [-1, -1, 1, 1]
+    candidate = _any_overlap(rows, painted)
+    hidden = [row for row, check in zip(invisible, candidate) if not check]
     if not candidate.any():
-        return [], hidden, duplicates
+        return [], hidden
     overlapped = bool(_any_overlap(rows[candidate], shown).any())
     try:
         pixels, to_pixels = _grey(_without_text(page, copies) if overlapped else page, LAYER_DPI)
@@ -534,7 +552,7 @@ def classify_invisible(page, invisible: Sequence[Row], visible: Sequence[Row], p
                 background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
             region = _erase(region, pymupdf.IRect(x0, y0, x1, y1), crossing, to_pixels, background)
         (layer if _glyph_like(region) else hidden).append(row)
-    return layer, hidden, duplicates
+    return layer, hidden
 
 
 @dataclass(frozen=True)
@@ -593,8 +611,8 @@ def measure_page(page, *, ocr_rects: Callable[[object], List[pymupdf.Rect]] = la
         copies = copies or PageCopies(page.parent)
         try:
             layer, hidden, duplicates = classify_invisible(page, invisible, visible, rects, copies)
-        except Exception as exc:  # cannot tell what shows: keep the text (fail open)
-            logger.warning(f"Page {page.number + 1}: could not check what its invisible text lies on ({exc}); "
+        except Exception as exc:  # cannot tell what the spans are: keep the text (fail open)
+            logger.warning(f"Page {page.number + 1}: could not classify its invisible text ({exc}); "
                            f"keeping it as the page's text")
             layer, hidden, duplicates = list(invisible), [], []
         finally:
