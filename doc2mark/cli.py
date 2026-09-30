@@ -21,6 +21,9 @@ from doc2mark.pipelines import pymupdf_compat
 
 logger = logging.getLogger(__name__)
 
+# What `--ocr openai` uses unless the loader says otherwise (the --help examples name it)
+OPENAI_DEFAULT_MODEL = inspect.signature(UnifiedDocumentLoader.__init__).parameters["model"].default
+
 
 def keep_stdout_for_documents():
     """stdout is where the CLI writes a document when no output file is given: PyMuPDF's own prints (its
@@ -318,7 +321,6 @@ def convert_files(files, loader_config, processing_config, workers, timeout):
 
 def main():
     """Main CLI entry point."""
-    openai_model = inspect.signature(UnifiedDocumentLoader.__init__).parameters["model"].default
     parser = argparse.ArgumentParser(
         description="doc2mark - Universal document processor with AI-powered OCR",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -330,7 +332,7 @@ Examples:
   doc2mark /path/to/docs/ -o /path/to/output/     # Process directory, same tree of .md files in the output
   
   # OCR options
-  doc2mark file.pdf --ocr openai --ocr-images     # Use OpenAI OCR (default model: {openai_model})
+  doc2mark file.pdf --ocr openai --ocr-images     # Use OpenAI OCR (default model: {OPENAI_DEFAULT_MODEL})
   doc2mark file.pdf --ocr vertex_ai --ocr-images  # Use Vertex AI / Gemini OCR
   doc2mark file.pdf --ocr tesseract --ocr-lang deu  # German Tesseract OCR
   doc2mark file.pdf --ocr none                    # Disable OCR

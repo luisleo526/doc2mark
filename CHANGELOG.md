@@ -508,6 +508,54 @@ else applies by default.
 - **The DeprecationWarning for inert `OCRConfig` fields names your code.** It named a doc2mark line, so
   Python's default filters hid it; it now names the line that created the provider or the loader, and a
   script shows it without `-W`. (#29)
+- **`.tsv` files convert.** Every `.tsv` failed with `got multiple values for argument 'delimiter'`. A TSV is
+  now a tab-separated table like a CSV (`metadata.delimiter` is `"\t"`; the `delimiter` argument is the CSV
+  option and does not apply to it). (#28)
+- **An explicit CSV `delimiter=` is honoured.** `load("semi.csv", delimiter=",")` and the batch methods used
+  the sniffed delimiter whatever was passed. The delimiter is sniffed only when none is given, and one that is
+  not a single character is an error. (#28)
+- **CLI folder runs convert files only and write the input tree.** The default `--pattern "*"` also yielded
+  sub-folders, which failed with `Cannot detect format for extension:` and stopped the run; only files are
+  converted now and `-r` decides whether the files inside sub-folders match. The output was flat by file stem
+  (`2024/report.md` and `report.txt` both wrote `report.md`, one was lost): `-o DIR` now mirrors the input tree
+  (`DIR/2024/report.md`), and each document is written as soon as it is converted, so a failure that stops the
+  run keeps what was written before it. Files of one folder that would write the same name (`report.txt` and
+  `report.md`), or an output that would replace an input file (`-o` naming the input folder), are written as
+  `report.txt.md` with a warning. (#28)
+- **`--timeout` stops a slow file.** It was only passed to `future.result()` after a file had finished, so
+  it never applied. Every file of a folder run (also without `-p`) is now converted in a worker process that
+  is killed when the file takes longer than `--timeout` seconds (default 300, retries included; `0` for no
+  limit) together with what it started (LibreOffice); the file counts as failed (`timed out after 300 s`),
+  like any failure (the run stops unless `--skip-errors`). A worker that dies (out of memory, a crash in a
+  native library) is a failed file too, no longer a broken pool. A single-file run is not limited. (#28)
+- **`--preserve-structure` is deprecated.** It was parsed and never read. A folder run always mirrors the
+  input tree now, so the flag has nothing left to do: it is still accepted, with a deprecation warning. (#28)
+- **The CLI `--help` is true.** The example `--max-files 10 --sort size` says it processes the 10 smallest
+  files (sorts are ascending; it said largest), `--ocr openai` no longer says "GPT-4V" (the default model is
+  read from the loader) and the supported-formats list has the image formats and EML. (#28)
+- **`batch_process()` finds every file `load()` accepts.** It globbed lower-case extensions only and not
+  `.htm`, so `report.PDF`, `Notes.TXT` and `page.htm` were skipped. One walk now takes every supported
+  extension in any case (`.htm` and `.markdown` too), in path order. (#28)
+- **`ProcessedDocument.tables` and `.sections` are filled.** No processor set them, so a batch result's
+  `tables_found` was always 0 and the JSON output had `"tables": null`. They are read from the content
+  items: one `{"page", "format", "content"}` per `table` item and one `{"level", "title", "page"}` per
+  heading (`text:title`, `text:section`), for PDF, Office and image files (`None` for formats without content
+  items); `tables_found` counts them. (#28)
+- **The convenience functions take loader settings.** `load(path, table_style=...)` and `cache_dir=` raised
+  `TypeError` because every extra keyword went to `loader.load()`. Loader settings now reach the loader, the
+  options of `load()` / the batch method (`encoding`, `delimiter`, `max_workers`, ...) reach that call, and a
+  name that is neither is a `TypeError` that says what is accepted. (#28)
+- **`table_style` is validated once, at the loader, and reaches legacy files.** A name is matched in any case
+  (`"MARKDOWN_GRID"`) or given as a `TableStyle`; an unknown one is a `ValueError` listing the valid styles.
+  Before, it failed PDF conversion but silently sent Word, Excel and PowerPoint files to the basic converter
+  (no merged cells, no `json_content`), and `.doc`/`.xls`/`.ppt`/`.rtf` files ignored the style altogether. (#28)
+- **A Markdown file that starts with a `---` rule keeps its text.** The first block (prose, a list, anything
+  between two `---` lines) went to `metadata.frontmatter` and out of the content. Only a `---` line, YAML
+  that parses to a mapping and a closing `---` line are front matter now; everything else is left as
+  written, and so is the text after the front matter (only the blank lines right after it go). (#28)
+- **Dates in Markdown front matter no longer break JSON output.** YAML reads `date: 2024-05-01` as a date,
+  which `--format json`, `output_format="json"` and `cache_dir` could not write; they are ISO strings there
+  (`datetime.date` objects in `metadata.frontmatter`). (#28)
 
 ### Security
 - **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is
