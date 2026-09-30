@@ -157,6 +157,10 @@ def test_patterns_catch_most_jev_refusals_without_false_alarms():
     "Grandma's recipe card is so faded I can't read the text on it.",
     "很抱歉，我無法處理這批照片，下週一再處理。",
     "As an AI assistant, I cannot give legal advice.",
+    "Sorry, I can't read the scans until Dr. Lee signs off.",
+    "Sorry, I couldn't process the photos from the wedding yet.",
+    "Unfortunately, I cannot provide a description of the driver.",
+    "Unfortunately, I can't comply with the request to extend the lease.",
 ])
 def test_patterns_keep_real_short_text_that_sounds_like_a_refusal(answer):
     assert not matches_non_content_pattern(answer)

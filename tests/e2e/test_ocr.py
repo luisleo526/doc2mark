@@ -244,6 +244,19 @@ def test_t10_prose_mention_before_a_real_table_keeps_the_table(run_cli, fake_llm
     assert "Use the <table> element, for example:" in build.visible_text(result.markdown)
 
 
+@pytest.mark.parametrize("markup", [
+    "<table><td>Revenue</td><td>1,200</td></table>",
+    "<table><!-- q3 --><tr><td>Revenue</td><td>1,200</td></tr></table>",
+])
+def test_t10_free_form_table_without_the_usual_row_markup_is_kept(run_cli, fake_llm, scan, markup):
+    fake_llm.script(free_form=[fake.text("Q3 results\n\n" + markup)])
+
+    result = run_llm(run_cli, scan, fake_llm, "--no-structured")
+
+    assert result.exit_code == 0, result.describe()
+    assert build.html_tables(result.markdown) == [[["Revenue", "1,200"]]], result.describe()
+
+
 def test_t10_truncated_free_form_table_keeps_its_structure(run_cli, fake_llm, scan):
     """A free-form answer cut off inside a table (max_tokens) still yields a sanitized table,
     not the table's markup as escaped text."""
@@ -490,6 +503,7 @@ def test_refused_structured_answer_is_recovered_by_free_form_ocr(run_cli, fake_l
     "There is no visible content in this folder.",
     "Leider kann ich Ihre Bildungsnachweise nicht verarbeiten, da die Unterschrift fehlt.",
     "I can't read the scans until Dr. Lee signs off.",
+    "Sorry, I can't read the scans until Dr. Lee signs off.",
     "很抱歉，我無法處理這批照片，下週一再處理。",
 ])
 def test_real_content_that_mentions_apologies_is_kept(run_cli, fake_llm, scan, content):
