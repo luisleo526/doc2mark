@@ -124,7 +124,7 @@ MIN_LAYER_INK = 0.03
 
 # Bumped whenever routing changes what a page emits for the same input, so caches of
 # converted documents (UnifiedDocumentLoader's cache_dir) do not serve stale output.
-ROUTING_VERSION = 2
+ROUTING_VERSION = 3
 
 # Reasons reported for a page route.
 REASON_DOCUMENT = "document_route"

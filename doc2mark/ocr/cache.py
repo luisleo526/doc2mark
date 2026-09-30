@@ -174,13 +174,21 @@ def _config_cache_signature(provider: Any) -> Any:
     return _stable_value(config, strict=True)
 
 
-def _is_cacheable(result: OCRResult) -> bool:
-    """A failed image, a refusal or a result that still withholds values after the
-    router firewall's verbatim redo is not a stable answer: the next run must retry it
-    rather than replay it from the cache."""
+def _uncacheable_reason(result: OCRResult) -> Optional[str]:
+    """Why an OCR result must not be cached (or replayed from a cache), or None when it is an
+    answer. A failed image (flagged ``failed`` by the provider: a timeout, a rate limit, a
+    server error) was not read, and a result that still withholds values after the router
+    firewall's verbatim redo is not settled: the next run asks the provider again. Everything
+    else is the provider's answer for that image, prompt and judge (all part of the key) and is
+    cached, including an answer with no text and a refusal or "no readable text" statement: a
+    blank page or a photo without words gets that answer every time, and retrying it would cost
+    a call (and, for the LLM providers, the free-form recovery call behind it) on every run."""
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    return not (metadata.get("failed") or metadata.get("ocr_refusal")
-                or metadata.get("router_fallback") == "unresolved")
+    if metadata.get("failed"):
+        return "failed"
+    if metadata.get("router_fallback") == "unresolved":
+        return "values still withheld after the router firewall's redo"
+    return None
 
 
 def _api_key_hash(provider: Any) -> Optional[str]:
@@ -931,15 +939,19 @@ class CachedOCR(BaseOCR):
     ) -> None:
         """Cache one fresh provider result and place it at every deduped position.
 
-        The value written to the cache is the clean, unmarked result. Only the
+        The value written to the cache is the clean, unmarked result, and only a
+        answer is written (see ``_uncacheable_reason``). Only the
         first position is a fresh provider call this batch; the remaining
         positions are intra-batch dedup copies of the SAME single call, so they
         are flagged non-fresh (``FROM_CACHE_METADATA_KEY``) to keep a usage
         consumer from counting one provider call N times.
         """
         normalized = _normalize_result(provider_result)
-        if _is_cacheable(normalized):
+        reason = _uncacheable_reason(normalized)
+        if reason is None:
             self.cache.set(key, normalized)
+        else:
+            logger.info("OCR result not cached (%s): the next run asks the provider again", reason)
         for offset, position in enumerate(positions):
             copied = _copy_result(normalized)
             if offset:
@@ -979,7 +991,9 @@ class CachedOCR(BaseOCR):
                 cache_version=self.cache_version,
             )
             cached = self.cache.get(key)
-            if cached is not None:
+            # A failed or unsettled entry (written by an older doc2mark or another writer)
+            # is not an answer: ask the provider again.
+            if cached is not None and _uncacheable_reason(cached) is None:
                 # Cache hit: no fresh provider spend this batch -> flag it so a
                 # usage consumer does not re-bill tokens that were never spent.
                 results[index] = _mark_from_cache(cached)

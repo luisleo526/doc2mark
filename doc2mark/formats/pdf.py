@@ -105,8 +105,9 @@ class PDFProcessor(BaseProcessor):
                 metadata.extra['tables_count'] = tables_count
 
             # Per-page routing facts (which pages were OCR'd and why, garbled or
-            # hidden text layers), see PDFLoader._record_routing.
-            for key in ('ocr_routing', 'text_layer_quality', 'hidden_text'):
+            # hidden text layers), see PDFLoader._record_routing, and what was sent
+            # to OCR (see PDFLoader._ocr_document).
+            for key in ('ocr_routing', 'text_layer_quality', 'hidden_text', 'ocr_images'):
                 if key in json_data:
                     metadata.extra[key] = json_data[key]
             

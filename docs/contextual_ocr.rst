@@ -59,16 +59,18 @@ at ``{k-1, k, k+1}``. The three tiers are:
    and the whole page is rasterized and OCR'd.
 
 ``context_pages = 2``
-   Renders **and** non-decorative embedded images. Opt-in; adds an upload per
-   embedded figure that survives the decorative filter. More uploads, more cost.
+   Renders **and** the embedded pictures sent to OCR (see *Pictures on the text
+   route* in :doc:`ocr_policy`). Opt-in; adds an upload per picture request, and
+   since the answer then depends on the page, a picture shown on several pages is
+   requested once per page. More uploads, more cost.
 
 The tier is resolved once, from the OCR instance's config, in the PDF loader::
 
    self._context_tier = int(getattr(cfg, "context_pages", 0) or 0)
 
-and gates context building per image in ``_collect_all_images``: whole-page
-renders pass ``self._context_tier >= 1``; embedded images pass
-``self._context_tier >= 2``.
+and gates context building per image in ``_ocr_jobs`` / ``_picture_jobs``
+(the streamed OCR pass): whole-page renders pass ``self._context_tier >= 1``;
+embedded pictures pass ``self._context_tier >= 2``.
 
 How the window PDF is built
 ---------------------------

@@ -305,7 +305,11 @@ read), ``withheld`` (images whose illustrative values stayed withheld; their Mar
 says ``[N illustrative rows not transcribed]``, and likewise for fields, metrics and
 figures), up to five ``errors``, and ``locations``: one ``{"issue", "image", "page"}``
 entry per affected image (``image`` counts the images OCR'd in the document from 1;
-``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and Excel). Such results are not cached. An OCR engine
+``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and Excel). Failed and
+withheld results are not cached, and neither is a document whose OCR failed (``cache_dir``);
+a refusal or "no readable text" answer is the provider's answer for that image and is cached
+(see :doc:`caching`). A per-image failure of the OpenAI, Vertex AI or Tesseract provider (a
+timeout, a rate limit, a server error) comes back flagged ``metadata["failed"]``. An OCR engine
 that cannot run at all, such as Tesseract without the requested language data, raises
 ``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI
 exits non-zero.

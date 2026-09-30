@@ -23,6 +23,7 @@ from doc2mark.ocr.base import (
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    FAILURE_USAGE_KEY,
     REFUSAL_USAGE_KEY,
 )
 from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
@@ -342,7 +343,9 @@ class VisionAgent:
             structured_output: List[Dict[str, Any]] = []
             for _idx, payload in sorted_results:
                 if isinstance(payload, Exception):
-                    structured_output.append({"parsed": None, "parsing_error": str(payload), "raw": None, "usage": {}})
+                    # The request failed (timeout, rate limit, server error): not an answer.
+                    structured_output.append({"parsed": None, "parsing_error": str(payload), "raw": None, "usage": {},
+                                              "failed": True})
                     continue
                 raw_msg = payload.get("raw") if isinstance(payload, dict) else None
                 structured_output.append({
@@ -358,7 +361,8 @@ class VisionAgent:
         for res in sorted_results:
             msg = res[1]
             if isinstance(msg, Exception):
-                output.append(("", {}))
+                # The request failed: the usage dict carries the signal (FAILURE_USAGE_KEY).
+                output.append(("", {FAILURE_USAGE_KEY: str(msg) or type(msg).__name__}))
                 continue
             text = msg.content.replace('```', '`') if msg.content else ""
             usage = self._extract_usage(msg)
@@ -1038,6 +1042,8 @@ class OpenAIOCR(BaseOCR):
                 }
                 if refusal:
                     metadata.update(refusal=refusal, non_content="provider_refusal")
+                if item.get("failed"):
+                    metadata.update(failed=True, error=item.get("parsing_error"))
                 # Runtime router firewall (redo happens in _batch_process_with_vision_agent).
                 violations = withholding_violations(
                     page, context_attached=bool(context_pdfs and context_pdfs[i]) and context_enabled)
@@ -1055,6 +1061,7 @@ class OpenAIOCR(BaseOCR):
                 text_result, token_usage = item
                 token_usage = dict(token_usage or {})
                 refusal = token_usage.pop(REFUSAL_USAGE_KEY, None)
+                failure = token_usage.pop(FAILURE_USAGE_KEY, None)
                 # Screened for a refusal on the answer as written, then sanitized once at
                 # this boundary (a recovery call's answers are screened by _apply_recovered).
                 text_result, flags = self._free_form_answer(
@@ -1077,6 +1084,7 @@ class OpenAIOCR(BaseOCR):
                         "token_usage": token_usage,
                         "structured": False,
                         **flags,
+                        **({"failed": True, "error": failure} if failure else {}),
                     }
                 ))
 
