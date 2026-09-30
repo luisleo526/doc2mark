@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -27,7 +28,7 @@ from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
 from doc2mark.ocr.cache import CachedOCR, OCRCache, ocr_settings_identity
 from doc2mark.ocr.prompts import PromptTemplate
 from doc2mark.ocr.usage import UsageAggregatingOCR
-from doc2mark.utils.output_paths import plan_output_names
+from doc2mark.utils.output_paths import is_inside, plan_output_names
 
 logger = logging.getLogger(__name__)
 
@@ -1038,8 +1039,13 @@ class UnifiedDocumentLoader:
         files_by_format: Dict[DocumentFormat, List[Path]] = {}
         all_files = []
 
+        # Into an output folder of its own, what an earlier run wrote there (an output folder inside the input
+        # folder) is not input; next to the inputs (the default) an output replaces the one of an earlier run
+        in_place = is_inside(input_dir, output_dir) and is_inside(output_dir, input_dir)
+        nested_output = save_files and not in_place and is_inside(output_dir, input_dir)
+
         for file_path in sorted(input_dir.rglob("*") if recursive else input_dir.glob("*")):
-            if not file_path.is_file():
+            if not file_path.is_file() or (nested_output and is_inside(file_path, output_dir)):
                 continue
             try:
                 doc_format = self._detect_format(file_path)
@@ -1062,11 +1068,10 @@ class UnifiedDocumentLoader:
                 logger.info(f"   {fmt.value.upper()}: {len(files)} files")
 
         # Into an output folder of its own, files that would share an output name (report.txt and report.md)
-        # keep their whole file name (report.txt.md). Next to the inputs (the default) each output replaces the
-        # one an earlier run wrote, so a run can be repeated.
+        # keep their whole file name (report.txt.md)
         output_names = None
         suffixes = {OutputFormat.MARKDOWN: (".md",), OutputFormat.JSON: (".json",)}.get(output_format)
-        if save_files and suffixes and output_dir.resolve() != input_dir.resolve():
+        if save_files and suffixes and not in_place:
             output_names = plan_output_names(
                 all_files, {path: path.relative_to(input_dir) for path in all_files}, output_dir, suffixes)
 
@@ -1103,7 +1108,7 @@ class UnifiedDocumentLoader:
 
                 output_files = []
                 if save_files and output_path:
-                    output_files = self._save_result(result, output_path, output_format)
+                    output_files = self._save_result(result, output_path, output_format, source=file_path)
 
                 return {
                     'status': 'success',
@@ -1282,7 +1287,8 @@ class UnifiedDocumentLoader:
             self,
             result: ProcessedDocument,
             output_path: Path,
-            output_format: OutputFormat
+            output_format: OutputFormat,
+            source: Optional[Path] = None
     ) -> List[str]:
         """Save processing result to file(s).
         
@@ -1290,25 +1296,35 @@ class UnifiedDocumentLoader:
             result: Processing result
             output_path: Base output path (without extension; a dot in the file name is part of it)
             output_format: Output format
+            source: The converted file. A result is never written over it (a Markdown file converted next to
+                itself would lose its front matter): that output is skipped.
             
         Returns:
             List of created file paths
         """
         output_files = []
 
+        def is_source(path: Path) -> bool:
+            if source is not None and path.exists() and os.path.samefile(path, source):
+                logger.warning(f"Not writing {path}: it is the file that was converted")
+                return True
+            return False
+
         if output_format == OutputFormat.MARKDOWN:
             # Save markdown
             md_path = output_path.with_name(f"{output_path.name}.md")
-            with open(md_path, 'w', encoding='utf-8') as f:
-                f.write(result.content)
-            output_files.append(str(md_path))
+            if not is_source(md_path):
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(result.content)
+                output_files.append(str(md_path))
 
         elif output_format == OutputFormat.JSON:
             # Save JSON
             json_path = output_path.with_name(f"{output_path.name}.json")
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
-            output_files.append(str(json_path))
+            if not is_source(json_path):
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
+                output_files.append(str(json_path))
 
         # Save images if extracted
         if result.images:

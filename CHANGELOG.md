@@ -546,8 +546,11 @@ else applies by default.
   on the stem, so `v1.2.txt` and `v1.3.txt` both wrote `v1.md` and one conversion was lost; they write
   `v1.2.md` and `v1.3.md` (also for JSON output). With an `output_dir` of its own, `batch_process()` and
   `batch_process_files()` also name files that would share an output (`report.txt` and `report.csv`, or
-  `q1.pdf` of two folders) by their whole file name (`report.txt.md`, `q1.pdf-2.md`), as the CLI does; without
-  one (outputs next to the inputs) an output still replaces the one of an earlier run. (#28)
+  `q1.pdf` of two folders) by their whole file name (`report.txt.md`, `q1.pdf-2.md`), as the CLI does, and an
+  `output_dir` inside the input folder is left out of the inputs (before, every run converted the outputs of
+  the run before and added copies of the text). Without an `output_dir` (outputs next to the inputs) an output
+  still replaces the one of an earlier run, but a result is never written over the file it was converted from
+  (a Markdown file next to itself lost its front matter). (#28)
 - **`ProcessedDocument.tables` and `.sections` are filled.** No processor set them, so a batch result's
   `tables_found` was always 0 and the JSON output had `"tables": null`. They are read from the content
   items: one `{"page", "format", "content"}` per `table` item and one `{"level", "title", "page"}` per

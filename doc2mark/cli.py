@@ -19,7 +19,7 @@ import time
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.ocr.base import OCRConfig, Task
 from doc2mark.pipelines import pymupdf_compat
-from doc2mark.utils.output_paths import plan_output_names
+from doc2mark.utils.output_paths import is_inside, plan_output_names
 
 logger = logging.getLogger(__name__)
 
@@ -203,24 +203,27 @@ def _terminate(signum, frame):
     raise SystemExit(128 + signum)
 
 
-def _exit_when_orphaned(parent_pid):
-    """Watchdog of a worker: when the parent is gone (even killed with SIGKILL) the worker stops the way a
-    terminate does, then for certain."""
-    while os.getppid() == parent_pid:
-        time.sleep(1)
+def _exit_when_orphaned():
+    """Watchdog of a worker: when the process that started it is gone (even killed with SIGKILL) the worker stops the
+    way a terminate does, then for certain. The parent is found through ``multiprocessing``, not ``os.getppid()``:
+    with the ``forkserver`` start method (the default on Linux from Python 3.14) the OS parent is the fork server."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+    parent.join()
     with suppress(OSError):
         os.kill(os.getpid(), signal.SIGTERM)
     time.sleep(3)
     os._exit(1)
 
 
-def _worker_main(connection, loader_config, processing_config, parent_pid):
+def _worker_main(connection, loader_config, processing_config):
     """Entry point of a conversion worker: convert every file it is sent until the parent hangs up."""
     if hasattr(os, "setsid"):
         with suppress(OSError):
             os.setsid()  # a process group of its own: the parent can stop the worker and what it started
     signal.signal(signal.SIGTERM, _terminate)
-    threading.Thread(target=_exit_when_orphaned, args=(parent_pid,), daemon=True).start()
+    threading.Thread(target=_exit_when_orphaned, daemon=True).start()
     with suppress(OSError):
         connection.send('ready')  # the imports are done: a file's time limit starts now, not at process start
     while True:
@@ -244,12 +247,13 @@ class ConversionWorker:
     def __init__(self, loader_config, processing_config):
         context = multiprocessing.get_context()
         self.connection, child_connection = context.Pipe()
-        self.process = context.Process(
-            target=_worker_main, args=(child_connection, loader_config, processing_config, os.getpid()), daemon=True)
+        self.process = context.Process(target=_worker_main, args=(child_connection, loader_config, processing_config),
+                                       daemon=True)
         self.process.start()
         child_connection.close()
         self.file_path = None
         self.deadline = None
+        self._asked_to_stop = False
         try:
             started = self.connection.poll(120) and self.connection.recv() == 'ready'
         except (EOFError, OSError):
@@ -265,12 +269,25 @@ class ConversionWorker:
         with suppress(OSError):  # a worker that died meanwhile is found out by the next wait()
             self.connection.send(file_path)
 
+    def ask_to_stop(self):
+        """Ask the worker, and what it started in its process group (Tesseract), to terminate: the conversion
+        unwinds and takes a LibreOffice, which has a session of its own, with it."""
+        if self._asked_to_stop or not self.process.is_alive():
+            return
+        self._asked_to_stop = True
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+                return
+            except OSError:  # the worker has not made its own group yet
+                pass
+        self.process.terminate()
+
     def stop(self, grace=3):
-        """Stop the worker: ask it to terminate, so the conversion unwinds and takes a LibreOffice with it, then
-        kill it, and what is left of its process group, when it has not gone within ``grace`` seconds."""
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(grace)
+        """Stop the worker: ask it to terminate, then kill it, and what is left of its process group, when it has
+        not gone within ``grace`` seconds."""
+        self.ask_to_stop()
+        self.process.join(grace)
         if hasattr(os, "killpg") and self.process.is_alive():
             with suppress(OSError):
                 os.killpg(self.process.pid, signal.SIGKILL)
@@ -319,6 +336,8 @@ def convert_files(files, loader_config, processing_config, workers, timeout):
                     idle.append(worker)
                 yield outcome
     finally:
+        for worker in busy + idle:  # all are asked first, so stopping N workers does not take N grace periods
+            worker.ask_to_stop()
         for worker in busy + idle:
             worker.stop()
 
@@ -726,14 +745,13 @@ Supported formats:
             # Get list of files to process, filter and sort them
             files = collect_files(input_path, args.pattern, args.recursive)
             if output_path:
-                output_root, input_root = output_path.resolve(), input_path.resolve()
-                if output_root == input_root:
+                if is_inside(input_path, output_path) and is_inside(output_path, input_path):
                     parser.error(f"-o {output_path} is the input folder: the converted files would be written "
                                  f"among their sources (and converted again by the next run); choose another "
                                  f"output folder")
-                if output_root.is_relative_to(input_root):
+                if is_inside(output_path, input_path):
                     # What an earlier run wrote into an output folder inside the input folder is not input
-                    files = [path for path in files if not path.resolve().is_relative_to(output_root)]
+                    files = [path for path in files if not is_inside(path, output_path)]
             files = filter_files(files, args.exclude, args.max_files, args.sort)
             
             if not files:

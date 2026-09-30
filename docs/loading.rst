@@ -119,9 +119,11 @@ never converted themselves), in path order, and converts it. With ``save_files=T
 default) it writes ``<name>.md`` (or ``.json``), keeping the folder structure and the dots of the
 file name (``v1.2.txt`` gives ``v1.2.md``). With an ``output_dir`` of its own, files that would
 share an output name (``report.txt`` and ``report.md``) are written as ``report.txt.md`` and
-``report.md.md``, as in the CLI; without one (next to the inputs) an output replaces the one an
-earlier run wrote, so the run can be repeated, and two files of one folder with the same stem
-write the same file. When pictures were extracted it also writes a ``<name>_images/`` folder (a
+``report.md.md``, as in the CLI, and an ``output_dir`` inside ``input_dir`` is left out of the
+input files. Without one (next to the inputs) an output replaces the one an earlier run wrote, so
+the run can be repeated, but it is never written over the file it was converted from (a Markdown
+file keeps its front matter), and two files of one folder with the same stem write the same
+file. When pictures were extracted it also writes a ``<name>_images/`` folder (a
 known issue: a PDF whose pictures were extracted without OCR is then reported as failed although
 its ``.md`` was written). With ``output_format="text"`` no file is written. Without
 ``output_dir`` the files are written next to the inputs. One file failing does not stop the

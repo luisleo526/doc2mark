@@ -1,6 +1,7 @@
 """Output names for a run that converts many files into one output folder."""
 
 import logging
+import os
 import unicodedata
 from collections import Counter
 from pathlib import Path, PurePath
@@ -12,6 +13,23 @@ logger = logging.getLogger(__name__)
 def _key(path: PurePath) -> str:
     """A name as a case-insensitive file system that ignores Unicode normalisation (macOS) sees it."""
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def is_inside(path: Path, folder: Path) -> bool:
+    """Whether ``path`` is ``folder`` or lies below it, compared by identity (device and inode), not by spelling:
+    ``Docs/md`` is inside ``docs`` on a case-insensitive file system (macOS), and a symlink is the folder it points
+    to. ``path`` need not exist yet (its nearest existing parent counts); ``folder`` must."""
+    try:
+        target = os.stat(folder)
+    except OSError:
+        return False
+    for candidate in (path, *path.parents):
+        try:
+            if os.path.samestat(os.stat(candidate), target):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _without_extension(relative: PurePath) -> PurePath:
