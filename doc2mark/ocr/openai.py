@@ -21,9 +21,11 @@ from doc2mark.ocr.base import (
     resolve_max_concurrency,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
+    _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    REFUSAL_USAGE_KEY,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction
+from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
 
 try:
     from pydantic import BaseModel
@@ -167,6 +169,10 @@ def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
                 "file_data": f"data:application/pdf;base64,{context_pdf}",  # VERIFIED OpenAI format
             },
         })
+    elif data.get('router'):
+        # Auto-routed request without neighbor-page context: context is absent, so
+        # the router must transcribe verbatim (it may never withhold values).
+        content.append({"type": "text", "text": _ROUTER_NO_CONTEXT_CLAUSE})
 
     return ChatPromptTemplate.from_messages(
         [
@@ -174,6 +180,18 @@ def prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
             HumanMessage(content=content),
         ]
     )
+
+
+def _native_refusal(raw_msg: Any, parsing_error: Any) -> Optional[str]:
+    """The refusal message of a structured OpenAI answer, if the API flagged one
+    (``message.refusal``, surfaced by LangChain as ``additional_kwargs["refusal"]``
+    or as an ``OpenAIRefusalError`` parsing error)."""
+    refusal = (getattr(raw_msg, "additional_kwargs", None) or {}).get("refusal")
+    if refusal:
+        return str(refusal)
+    if parsing_error is not None and type(parsing_error).__name__ == "OpenAIRefusalError":
+        return str(parsing_error) or "refused"
+    return None
 
 
 class VisionAgent:
@@ -342,8 +360,14 @@ class VisionAgent:
             if isinstance(msg, Exception):
                 output.append(("", {}))
                 continue
-            text = msg.content.replace('```', '`') if msg.content else msg.content
-            output.append((text, self._extract_usage(msg)))
+            text = msg.content.replace('```', '`') if msg.content else ""
+            usage = self._extract_usage(msg)
+            refusal = (getattr(msg, "additional_kwargs", None) or {}).get("refusal")
+            if refusal:
+                # A native refusal (message.refusal) is no content; the usage dict
+                # carries the signal (REFUSAL_USAGE_KEY) so the result gets flagged.
+                text, usage = "", {**usage, REFUSAL_USAGE_KEY: str(refusal)}
+            output.append((text, usage))
         return output
 
 
@@ -830,6 +854,7 @@ class OpenAIOCR(BaseOCR):
         # re-OCRs images at empty_idx, so context_pdfs must be sliced to match.
         cp = kwargs.pop("context_pdfs", None)
         sub_kwargs = dict(kwargs)
+        sub_kwargs["_recovery"] = True  # raw answers: _apply_recovered screens and sanitizes them
         if cp is not None:
             sub_kwargs["context_pdfs"] = [cp[i] for i in empty_idx]
 
@@ -842,6 +867,27 @@ class OpenAIOCR(BaseOCR):
             self._ensure_vision_agent(structured=True)
 
         return self._apply_recovered(results, empty_idx, recovered)
+
+    def _redo_verbatim(
+            self,
+            indices: List[int],
+            images: List[bytes],
+            language: Optional[str],
+            detail: str,
+            kwargs: Dict[str, Any],
+    ) -> List[OCRResult]:
+        """Re-OCR ``images[indices]`` with the explicit verbatim DOCUMENT task (no
+        router), for the router firewall. The caller's other options, ``instructions``
+        included, carry over."""
+        sub_kwargs = {k: v for k, v in kwargs.items() if k not in ("context_pdfs", "_recovery")}
+        context_pdfs = kwargs.get("context_pdfs")
+        if context_pdfs is not None:
+            sub_kwargs["context_pdfs"] = [context_pdfs[i] for i in indices]
+        sub_kwargs["_firewall_retry"] = True
+        return self._batch_process_with_vision_agent(
+            [images[i] for i in indices], structured=True, tasks=[Task.DOCUMENT] * len(indices),
+            language=language, detail=detail, **sub_kwargs,
+        )
 
     def _batch_process_with_vision_agent(
             self,
@@ -856,21 +902,40 @@ class OpenAIOCR(BaseOCR):
     ) -> List[OCRResult]:
         """Process images using LangChain VisionAgent for optimal performance."""
         try:
+            # This call's agent, matching its mode: the recovery swaps the shared agent
+            # between structured and free-form, so a call must not ride on an agent of
+            # the other mode that another thread installed meanwhile.
+            agent = self._vision_agent
+            if isinstance(getattr(agent, "structured", None), bool) and agent.structured != structured:
+                agent = self._ensure_vision_agent(
+                    structured=structured,
+                    response_model=self.config.response_model if self.config else None,
+                    detail=detail,
+                )
+
             # Build the per-image prompts. Structured output selects schema-aligned
             # TASK_PROMPTS; the legacy path keeps the verbose template builder.
             synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
             if structured:
                 prompts = self._resolve_task_prompts(
                     len(images), task, tasks, language, detail, synthesis_markdown=synthesis_markdown)
+                # Which images go through the auto router (for the no-context note).
+                if tasks is not None:
+                    routed = [self._coerce_task(t) == Task.AUTO for t in tasks]
+                else:
+                    single = self._coerce_task(task) if task is not None else self.config.task
+                    routed = [single == Task.AUTO] * len(images)
             else:
                 legacy_kwargs = dict(kwargs)
                 if language is not None:
                     legacy_kwargs['language'] = language
                 prompts = [self._build_prompt(**legacy_kwargs)] * len(images)
+                routed = [False] * len(images)
 
             # Optional per-image neighbor-page PDF context (len == len(images)).
             # Absent when the feature is off -> off-by-default byte-identical path.
             context_pdfs = kwargs.get('context_pdfs')
+            context_enabled = getattr(agent, '_context_pdf_enabled', False)
 
             # Prepare input data for VisionAgent
             input_dicts = []
@@ -884,16 +949,24 @@ class OpenAIOCR(BaseOCR):
                     'prompt': prompts[i],
                     'index': i,
                     'context_pdf': context_pdfs[i] if context_pdfs else None,
-                    'context_pdf_enabled': getattr(self._vision_agent, '_context_pdf_enabled', False),
+                    'context_pdf_enabled': context_enabled,
+                    'router': routed[i],
                 })
 
             # Use VisionAgent batch processing (same as original ocr_agent.py)
             logger.info(f"🚀 Processing {len(input_dicts)} images with VisionAgent")
-            batch_results = self._vision_agent.batch_invoke(input_dicts)
+            batch_results = agent.batch_invoke(input_dicts)
 
             results = self._results_from_batch(images, batch_results, language, kwargs)
             if structured:
+                # Refusals / "no readable text" answers count as empty, so the free-form
+                # recovery re-reads them; then the router firewall redoes, verbatim, any
+                # result that withheld printed values against the policy.
+                self._screen_structured_answers(results)
                 results = self._recover_empty_structured(results, images, language=language, **kwargs)
+                if not kwargs.get('_firewall_retry'):
+                    results = self._enforce_router_firewall(
+                        results, lambda indices: self._redo_verbatim(indices, images, language, detail, kwargs))
 
             successful = len([r for r in results if r.text])
             logger.info(f"✅ VisionAgent batch complete: {successful}/{len(images)} successful")
@@ -925,6 +998,8 @@ class OpenAIOCR(BaseOCR):
         # page_markdown is an image-strategy-only synthesis; null it everywhere else so
         # to_markdown() stays byte-identical for normal docs / embedded-figure OCR.
         synthesis_markdown = bool(kwargs.get('synthesis_markdown', False))
+        context_pdfs = kwargs.get('context_pdfs')
+        context_enabled = getattr(getattr(self, '_vision_agent', None), '_context_pdf_enabled', False)
         results: List[OCRResult] = []
 
         for i, item in enumerate(batch_results):
@@ -935,8 +1010,13 @@ class OpenAIOCR(BaseOCR):
                 page = item.get("parsed")
                 raw_msg = item.get("raw")
                 token_usage = item.get("usage") or {}
+                refusal = _native_refusal(raw_msg, item.get("parsing_error"))
 
-                if page is None:
+                if refusal:
+                    # The API refused (message.refusal): no content, so the empty-result
+                    # recovery re-reads the image instead of indexing the refusal.
+                    page = OCRPage()
+                elif page is None:
                     if on_parse_error == "raise":
                         raise OCRError(
                             f"Structured OCR parse failed: {item.get('parsing_error')}"
@@ -949,22 +1029,36 @@ class OpenAIOCR(BaseOCR):
 
                 if not synthesis_markdown and page.interpretation is not None:
                     page.interpretation.page_markdown = None
+                metadata = {
+                    "model": self.model,
+                    "token_usage": token_usage,
+                    "structured": True,
+                    "image_size_bytes": image_size,
+                    "batch_index": i,
+                }
+                if refusal:
+                    metadata.update(refusal=refusal, non_content="provider_refusal")
+                # Runtime router firewall (redo happens in _batch_process_with_vision_agent).
+                violations = withholding_violations(
+                    page, context_attached=bool(context_pdfs and context_pdfs[i]) and context_enabled)
+                if violations:
+                    metadata["router_violations"] = violations
                 results.append(OCRResult(
                     text=page.to_markdown(),
                     confidence=(page.interpretation.self_confidence if page.interpretation else None),
                     language=page.raw.detected_language,
-                    metadata={
-                        "model": self.model,
-                        "token_usage": token_usage,
-                        "structured": True,
-                        "image_size_bytes": image_size,
-                        "batch_index": i,
-                    },
+                    metadata=metadata,
                     document=page,
                 ))
             else:
                 # --- Legacy free-form path ---
                 text_result, token_usage = item
+                token_usage = dict(token_usage or {})
+                refusal = token_usage.pop(REFUSAL_USAGE_KEY, None)
+                # Screened for a refusal on the answer as written, then sanitized once at
+                # this boundary (a recovery call's answers are screened by _apply_recovered).
+                text_result, flags = self._free_form_answer(
+                    text_result, refusal=refusal, recovery=bool(kwargs.get('_recovery')))
                 results.append(OCRResult(
                     text=text_result,
                     confidence=1.0,
@@ -982,6 +1076,7 @@ class OpenAIOCR(BaseOCR):
                         "model_kwargs": self.model_kwargs,
                         "token_usage": token_usage,
                         "structured": False,
+                        **flags,
                     }
                 ))
 

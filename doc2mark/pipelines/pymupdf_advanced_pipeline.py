@@ -912,6 +912,10 @@ class PDFLoader:
             # Always use batch processing for efficiency
             logger.info(f"🚀 Using batch OCR processing for {len(image_data_list)} images")
             ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
+            # Tell the loader's OCR issue record which page each image is on.
+            label_issues = getattr(self.ocr, "label_last_batch", None)
+            if callable(label_issues):
+                label_issues([{"page": info["page_num"] + 1} for info in batch])
 
             # Map results back to image locations
             for info, result in zip(batch, ocr_results):
@@ -2173,13 +2177,22 @@ class PDFLoader:
                             "position_y": float(page.rect.height),
                         })
                 return items
-            # Blank render, refusal or OCR failure: keep the page's own text layer
-            # (verbatim first) rather than drop the page.
+            # Refusal (or empty answer) on a page with ink: say so on the page (ocr_issues names
+            # the page too). Either way keep the page's own text layer (verbatim first) rather
+            # than drop the page. A blank page needs no marker.
+            marker = {
+                "type": "text:image_description",
+                "content": f"<image_ocr_result>[page {page_num + 1}: OCR returned no content]</image_ocr_result>",
+                "page": page_num + 1,
+                "position_y": 0.0,
+            }
             fallback = self._process_page(page_num, extract_images=False, ocr_images=False)
             if fallback:
                 logger.warning(f"{self.pdf_path.name} page {page_num + 1}: OCR of the page render returned "
                                f"no text; keeping the page's own text layer")
-            return fallback
+            if pdf_routing.uncaptured_ink(page, ()) < pdf_routing.MIN_UNCAPTURED_INK:
+                return fallback
+            return [marker] + fallback
 
         # --- TEXT-authoritative page: rule-based text/tables + per-image OCR. ---
         # The document-wide passes read every page through _text_page: run them (once) before
@@ -3906,6 +3919,10 @@ class PDFLoader:
                         logger.info(
                             f"🚀 Using batch OCR processing for {len(image_data_list)} images on page {page_num + 1}")
                         ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
+                        # Tell the loader's OCR issue record which page each image is on.
+                        label_issues = getattr(self.ocr, "label_last_batch", None)
+                        if callable(label_issues):
+                            label_issues([{"page": page} for page, _ in image_positions])
 
                         # Extract text from results
                         ocr_texts = []

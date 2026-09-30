@@ -59,11 +59,19 @@ class TestTableHtmlNormalization:
         assert w == 2 and widths == [2, 2]
 
     def test_colspan_counted_when_normalizing(self):
-        # row 1 is 3 wide via colspan; row 2 has a single cell -> pad to 3.
+        # row 1 is 3 wide via colspan (row 2 cell by cell); row 3 has a single cell -> pad to 3.
         ragged = ('<table><tr><th colspan="3">H</th></tr>'
+                  "<tr><td>a</td><td>b</td><td>c</td></tr>"
                   "<tr><td>only</td></tr></table>")
         widths, w = _row_grid_widths(normalize_table_html(ragged))
-        assert w == 3 and widths == [3, 3]
+        assert w == 3 and widths == [3, 3, 3]
+
+    def test_colspan_is_capped_at_the_widest_row(self):
+        # no row has more than one cell, so a colspan of 3 cannot widen the grid.
+        out = normalize_table_html('<table><tr><th colspan="3">H</th></tr><tr><td>only</td></tr></table>')
+        widths, w = _row_grid_widths(out)
+        assert w == 1 and widths == [1, 1]
+        assert "colspan" not in out and "H" in out and "only" in out
 
     def test_rowspan_carryover_not_overpadded(self):
         # 'a' spans into row 2, so row 2 already occupies 2 cols (a + c) -> no padding.
@@ -230,3 +238,143 @@ class TestOCRResultDocument:
 def test_gemini_alias_exists():
     assert OCRProvider.GEMINI.value == "gemini"
     assert OCRProvider("gemini") is OCRProvider.GEMINI
+
+
+# --------------------------------------------------------------------------- #
+# Markdown boundary (review round 1: M1, M2, M3, m4)                          #
+# --------------------------------------------------------------------------- #
+import time  # noqa: E402
+
+import markdown as _python_markdown  # noqa: E402
+from bs4 import BeautifulSoup  # noqa: E402
+
+from doc2mark.ocr.schema import Figure, Metric, _escape_text_block, _sanitize_markdown  # noqa: E402
+
+
+def _rendered(markdown_text):
+    return BeautifulSoup(_python_markdown.markdown(markdown_text, extensions=["tables"]), "html.parser")
+
+
+def _live_links(markdown_text):
+    """Images and links a reader could follow that are not http(s)/mailto."""
+    soup = _rendered(markdown_text)
+    links = [a.get("href", "") for a in soup.find_all("a")]
+    return soup.find_all("img") + [h for h in links if not h.lower().startswith(("http:", "https:", "mailto:"))]
+
+
+def test_long_blank_run_in_a_cell_costs_linear_time():
+    started = time.perf_counter()
+    table = Table(html="<table><tr><td>a" + " " * 400_000 + "b</td></tr></table>")
+    assert time.perf_counter() - started < 2.0
+    assert table.html.startswith("<table><tr><td>a") and table.html.endswith("b</td></tr></table>")
+
+
+@pytest.mark.parametrize("text", [
+    "![x](javascript:alert(1))",
+    "[click](javascript:alert(1))",
+    "![](https://attacker.example/pixel.png)",
+    "[a]: javascript:alert(1)\n\n[a]",
+    "- [a]: javascript:alert(1)\n\n[a]",
+    "[x](java&#115;cript:alert(1))",
+    "[x](javascript&colon;alert(1))",
+    "[x](javascript\\:alert(1))",
+    "[x](data:text/html;base64,PHNjcmlwdD4=)",
+    "<table-x><caption>[x]</caption></table>(javascript:alert(1))",
+    "`a` <table><tr><td>![p](https://attacker.example/p.png)</td></tr></table>",
+    # blanks a browser drops from a URL: after "<", and tabs or line breaks inside the scheme
+    "[x](< javascript:alert(1)>)",
+    "[x](<\tjava\tscript:alert(1)>)",
+    "[x](java\nscript:alert(1))",
+    "[r]: < javascript:alert(1)>\n\n[r]",
+])
+def test_ocr_markdown_creates_no_image_or_script_link(text):
+    assert _live_links(_sanitize_markdown(text)) == []
+    assert _live_links(_escape_text_block(text)) == []
+
+
+def test_ocr_markdown_keeps_http_links():
+    out = _sanitize_markdown("[docs](https://example.com/a) and [mail](mailto:a@example.com)")
+    assert [a["href"] for a in _rendered(out).find_all("a")] == ["https://example.com/a", "mailto:a@example.com"]
+
+
+def test_code_is_shown_as_written():
+    out = _sanitize_markdown("Use `<div>` and `List<String>`:\n\n```html\n<div>code</div> &copy;\n```")
+    codes = [code.get_text() for code in _rendered(out).find_all("code")]
+    assert codes[:2] == ["<div>", "List<String>"]
+    assert out.endswith("```html\n<div>code</div> &copy;\n```")  # the fenced block as written
+
+
+@pytest.mark.parametrize("text", [
+    "`<img src=x onerror=alert(1)>`",
+    "<table><tr><td>1</td></tr></table>\n```\n<img src=x onerror=alert(1)>\n```",  # a table's HTML block holds the fence
+    "`<script>`alert(1)`</script>`",
+])
+def test_code_that_is_not_code_after_all_stays_inert(text):
+    """Markup left as written inside a code region must be inert even when a renderer does
+    not treat the region as code."""
+    soup = _rendered(_sanitize_markdown(text))
+    assert soup.find_all(["img", "script"]) == []
+    assert not [el for el in soup.find_all(True) if any(name.startswith("on") for name in el.attrs)]
+
+
+def test_transcribed_lists_stay_lists_and_entities_stay():
+    out = _escape_text_block("Agenda\n- Fast\n- Cheap\n1. Budget\n&copy; 2026")
+    assert out == "Agenda\n- Fast\n- Cheap\n1. Budget\n&copy; 2026"
+    assert [li.get_text() for li in _rendered(_escape_text_block("- Fast\n- Cheap")).find_all("li")] == ["Fast", "Cheap"]
+    assert "©" in _rendered(out).get_text()
+
+
+def test_withheld_fields_metrics_and_figures_leave_a_marker():
+    page = OCRPage(
+        raw=RawExtraction(text="Dashboard", fields=[KeyValue(label="Plan", value="Pro", illustrative=True)],
+                          metrics=[Metric(label="MRR", value="$1,000", illustrative=True),
+                                   Metric(label="Users", value="12", illustrative=True)]),
+        interpretation=Interpretation(document_type="screenshot",
+                                      figures=[Figure(kind="bar", title="Growth", meaning="Up", illustrative=True)]),
+    )
+    out = page.to_markdown()
+    assert "[1 illustrative field not transcribed]" in out
+    assert "[2 illustrative metrics not transcribed]" in out
+    assert "[1 illustrative figure not transcribed]" in out
+    assert "$1,000" not in out
+
+
+# --------------------------------------------------------------------------- #
+# OCR text for a renderer that escapes it itself (review round 2: N1)         #
+# --------------------------------------------------------------------------- #
+from doc2mark.core.table import html_cell, markdown_cell  # noqa: E402
+
+
+def plain_ocr_text(text, document):
+    from doc2mark.ocr.schema import plain_ocr_text as plain  # new in review round 2
+    return plain(text, document)
+
+_CELL_TEXT = "List<String> & [x](javascript:alert(1)) ![p](https://attacker.example/p.png)"
+
+
+def _cell_markdown(cell_text):
+    return "| Item | Picture |\n| --- | --- |\n| Logo | " + markdown_cell(f"[Image: {cell_text}]") + " |"
+
+
+def test_plain_ocr_text_of_a_structured_page_is_its_transcription():
+    page = OCRPage(raw=RawExtraction(text=_CELL_TEXT))
+    plain = plain_ocr_text(page.to_markdown(), page)
+    assert plain.startswith("List<String> & [x]") and "&lt;" not in plain
+    assert "List<String> &" in _rendered(_cell_markdown(plain)).get_text()
+    assert _live_links(_cell_markdown(plain)) == []
+
+
+def test_plain_ocr_text_of_a_free_form_answer_is_its_text():
+    plain = plain_ocr_text(_sanitize_markdown("**Parts:** " + _CELL_TEXT), None)
+    assert plain.startswith("**Parts:** List<String> & [x] (javascript:alert(1))"), plain
+    assert "List<String> &" in _rendered(_cell_markdown(plain)).get_text()
+    assert _live_links(_cell_markdown(plain)) == []
+    assert "&lt;" not in BeautifulSoup(html_cell(plain), "html.parser").get_text()
+
+
+def test_plain_ocr_text_keeps_http_links_and_tables_text():
+    page = OCRPage(raw=RawExtraction(text="", tables=[Table(html="<table><tr><td>Qty</td><td>12</td></tr></table>")]))
+    assert plain_ocr_text(page.to_markdown(), page) == "Qty 12"
+    assert plain_ocr_text("see [docs](https://example.com)", None) == "see [docs](https://example.com)"
+    free_form_table = _sanitize_markdown("Stock:\n\n<table><tr><td>Qty</td><td>12</td></tr></table>")
+    assert plain_ocr_text(free_form_table, None) == "Stock:\n\nQty 12"

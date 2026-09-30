@@ -18,9 +18,11 @@ from doc2mark.ocr.base import (
     resolve_max_concurrency,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
+    _ROUTER_NO_CONTEXT_CLAUSE,
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
+    REFUSAL_USAGE_KEY,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction
+from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -56,6 +58,34 @@ _RAW_DETAIL_NOTE = (
     " Leave every interpretation field empty/default — only fill the raw section."
 )
 
+# Gemini finish reasons (and their proto numbers) that mean the answer was blocked
+# for safety, recitation, a blocklist or prohibited content: no content, never text.
+_BLOCKED_FINISH_REASONS = frozenset({
+    "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+    "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION",
+})
+_BLOCKED_FINISH_REASON_NUMBERS = {3: "SAFETY", 4: "RECITATION", 7: "BLOCKLIST", 8: "PROHIBITED_CONTENT", 9: "SPII"}
+
+
+def _enum_name(value: Any) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _BLOCKED_FINISH_REASON_NUMBERS.get(value, str(value))
+    return str(getattr(value, "name", value)).upper().rsplit(".", 1)[-1]
+
+
+def _blocked_reason(msg: Any) -> Optional[str]:
+    """Why Gemini blocked this answer (safety/recitation finish reason or a blocked
+    prompt), or None. Such an answer is treated as no content."""
+    meta = getattr(msg, "response_metadata", None) or {}
+    finish = meta.get("finish_reason")
+    if finish is not None and _enum_name(finish) in _BLOCKED_FINISH_REASONS:
+        return f"finish_reason={_enum_name(finish)}"
+    feedback = meta.get("prompt_feedback") or {}
+    block = feedback.get("block_reason") if isinstance(feedback, dict) else getattr(feedback, "block_reason", None)
+    if block and _enum_name(block) not in ("0", "BLOCK_REASON_UNSPECIFIED", "NONE"):
+        return f"block_reason={_enum_name(block)}"
+    return None
+
 
 def _prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
     """Prepare prompt for LangChain batch processing with Gemini."""
@@ -81,6 +111,10 @@ def _prepare_prompt(data: Dict[str, str]) -> "ChatPromptTemplate":
             "mime_type": "application/pdf",
             "data": context_pdf,  # VERIFIED Gemini format; RAW base64
         })
+    elif data.get("router"):
+        # Auto-routed request without neighbor-page context: context is absent, so
+        # the router must transcribe verbatim (it may never withhold values).
+        content.append({"type": "text", "text": _ROUTER_NO_CONTEXT_CLAUSE})
 
     return ChatPromptTemplate.from_messages(
         [
@@ -242,6 +276,12 @@ class VertexAIVisionAgent:
             msg = res[1]
             if isinstance(msg, Exception):
                 out.append(("", {}))
+                continue
+            blocked = _blocked_reason(msg)
+            if blocked:
+                # A safety/recitation block is no content, even when partial text came
+                # back; the usage dict carries the signal so the result gets flagged.
+                out.append(("", {**self._extract_usage(msg), REFUSAL_USAGE_KEY: blocked}))
             else:
                 out.append((self._extract_text(msg.content), self._extract_usage(msg)))
         return out
@@ -483,7 +523,7 @@ class VertexAIOCR(BaseOCR):
             task_list = [single] * n
 
         custom = kwargs.get("instructions")
-        if custom:
+        if custom and not kwargs.get("_firewall_retry"):
             return [custom] * n
 
         language = kwargs.get("language") or (self.config.language if self.config else None)
@@ -497,6 +537,8 @@ class VertexAIOCR(BaseOCR):
                 base = base + _RAW_DETAIL_NOTE
             if kwargs.get("synthesis_markdown"):
                 base = base + _SYNTHESIS_MARKDOWN_INSTRUCTION
+            if custom:  # the firewall's verbatim redo keeps the caller's instructions
+                base = base + "\n\nAdditional instructions from the caller: " + custom
             prompts.append(base)
         return prompts
 
@@ -520,6 +562,7 @@ class VertexAIOCR(BaseOCR):
             if k not in ("structured", "tasks", "task", "context_pdfs")
         }
         fk["structured"] = False
+        fk["_recovery"] = True  # raw answers: _apply_recovered screens and sanitizes them
         cp = kwargs.get("context_pdfs")
         if cp is not None:
             fk["context_pdfs"] = [cp[i] for i in empty_idx]  # realign to the empty sub-batch
@@ -527,6 +570,22 @@ class VertexAIOCR(BaseOCR):
             [images[i] for i in empty_idx], **fk
         )
         return self._apply_recovered(results, empty_idx, recovered)
+
+    def _redo_verbatim(
+        self, indices: List[int], images: List[bytes], kwargs: Dict[str, Any]
+    ) -> List[OCRResult]:
+        """Re-OCR ``images[indices]`` with the explicit verbatim DOCUMENT task (no
+        router), for the router firewall. The caller's ``instructions`` carry over,
+        appended to the verbatim task instead of replacing it."""
+        sub_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ("structured", "tasks", "task", "context_pdfs", "_recovery")
+        }
+        context_pdfs = kwargs.get("context_pdfs")
+        if context_pdfs is not None:
+            sub_kwargs["context_pdfs"] = [context_pdfs[i] for i in indices]
+        sub_kwargs.update(structured=True, tasks=[Task.DOCUMENT] * len(indices), _firewall_retry=True)
+        return self._batch_process_with_vision_agent([images[i] for i in indices], **sub_kwargs)
 
     def _batch_process_with_vision_agent(
         self, images: List[bytes], **kwargs
@@ -536,8 +595,19 @@ class VertexAIOCR(BaseOCR):
         try:
             if structured:
                 prompts = self._build_structured_prompts(images, **kwargs)
+                # Which images go through the auto router (for the no-context note).
+                if kwargs.get("instructions"):
+                    routed = [False] * len(images)
+                elif kwargs.get("tasks") is not None:
+                    routed = [self._coerce_task(t) == Task.AUTO for t in kwargs["tasks"]]
+                else:
+                    task = kwargs.get("task")
+                    single = self._coerce_task(task) if task is not None else (
+                        self.config.task if self.config else Task.AUTO)
+                    routed = [single == Task.AUTO] * len(images)
             else:
                 prompts = [self._build_prompt(**kwargs)] * len(images)
+                routed = [False] * len(images)
 
             context_pdfs = kwargs.get("context_pdfs")  # Optional[List[Optional[str]]], len == len(images)
 
@@ -554,6 +624,7 @@ class VertexAIOCR(BaseOCR):
                         "prompt": prompts[i],
                         "index": i,
                         "context_pdf": context_pdfs[i] if context_pdfs else None,
+                        "router": routed[i],
                     }
                 )
 
@@ -567,7 +638,15 @@ class VertexAIOCR(BaseOCR):
 
             if structured:
                 results = self._build_structured_results(batch_results, images, **kwargs)
-                return self._recover_empty_structured(results, images, **kwargs)
+                # Refusals / "no readable text" answers count as empty, so the free-form
+                # recovery re-reads them; then the router firewall redoes, verbatim, any
+                # result that withheld printed values against the policy.
+                self._screen_structured_answers(results)
+                results = self._recover_empty_structured(results, images, **kwargs)
+                if not kwargs.get("_firewall_retry"):
+                    results = self._enforce_router_firewall(
+                        results, lambda indices: self._redo_verbatim(indices, images, kwargs))
+                return results
 
             return self._build_legacy_results(batch_results, images, **kwargs)
 
@@ -584,6 +663,12 @@ class VertexAIOCR(BaseOCR):
         results = []
         for i, (text_result, token_usage) in enumerate(batch_results):
             image_size = len(images[i])
+            token_usage = dict(token_usage or {})
+            blocked = token_usage.pop(REFUSAL_USAGE_KEY, None)
+            # Screened for a refusal on the answer as written, then sanitized once at this
+            # boundary (a recovery call's answers are screened by _apply_recovered).
+            text_result, flags = self._free_form_answer(
+                text_result, refusal=blocked, recovery=bool(kwargs.get("_recovery")))
             results.append(
                 OCRResult(
                     text=text_result,
@@ -603,6 +688,7 @@ class VertexAIOCR(BaseOCR):
                         "batch_index": i,
                         "content_type": kwargs.get("content_type"),
                         "token_usage": token_usage,
+                        **flags,
                     },
                 )
             )
@@ -622,6 +708,7 @@ class VertexAIOCR(BaseOCR):
         """
         detail = self._resolve_detail(**kwargs)
         on_parse_error = self.config.on_parse_error if self.config else "raw_text"
+        context_pdfs = kwargs.get("context_pdfs")
 
         results: List[OCRResult] = []
         for i, payload in enumerate(batch_results):
@@ -633,8 +720,13 @@ class VertexAIOCR(BaseOCR):
                 page, aimsg, parsing_error = None, payload, None
 
             usage = self._vision_agent._extract_usage(aimsg) if aimsg else {}
+            blocked = _blocked_reason(aimsg) if aimsg is not None else None
 
-            if page is None:
+            if blocked:
+                # Gemini blocked the answer (safety/recitation): no content, so the
+                # empty-result recovery re-reads the image instead of indexing a fragment.
+                page = OCRPage()
+            elif page is None:
                 if on_parse_error == "raise":
                     raise OCRError(
                         f"Structured OCR parse failed for image {i}: {parsing_error}"
@@ -642,9 +734,12 @@ class VertexAIOCR(BaseOCR):
                 text = VertexAIVisionAgent._extract_text(getattr(aimsg, "content", ""))
                 page = OCRPage(raw=RawExtraction(text=text), interpretation=None)
 
+            violations: List[str] = []
             if isinstance(page, OCRPage):
                 if detail == "raw":
                     page.interpretation = None
+                # Runtime router firewall (redo happens in _batch_process_with_vision_agent).
+                violations = withholding_violations(page, context_attached=bool(context_pdfs and context_pdfs[i]))
                 # page_markdown is image-strategy-only; null it elsewhere so to_markdown
                 # stays byte-identical for normal docs / embedded-figure OCR.
                 if not kwargs.get("synthesis_markdown") and page.interpretation is not None:
@@ -680,6 +775,8 @@ class VertexAIOCR(BaseOCR):
                         "batch_index": i,
                         "parse_error": str(parsing_error) if parsing_error else None,
                         "token_usage": usage,
+                        **({"refusal": blocked, "non_content": "provider_refusal"} if blocked else {}),
+                        **({"router_violations": violations} if violations else {}),
                     },
                     document=page if isinstance(page, OCRPage) else None,
                 )

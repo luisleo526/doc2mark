@@ -186,6 +186,131 @@ See :doc:`/tables` for how tables flow through the loader and into the final
 document.
 
 
+Sanitised output
+----------------
+
+OCR text comes from a model reading an image, and an image can show anything,
+including markup. ``OCRResult.text`` (what the loader writes into the document) is
+therefore rendered safe, while the structured fields keep what the model returned.
+
+``Table.html`` is cleaned when the result is built:
+
+- only table tags (``table``/``thead``/``tbody``/``tfoot``/``tr``/``th``/``td``/
+  ``caption``/``col``/``colgroup``), the inert ``<br>`` and the ``colspan`` /
+  ``rowspan`` / ``scope`` attributes survive; scripts, styles and embedded objects are
+  removed with their content, every other tag is unwrapped keeping its text, and HTML
+  comments and processing instructions are dropped;
+- line structure inside a cell (``<br>``, ``<p>``, ``<li>``, ``<div>``, a newline)
+  becomes ``<br>``, so ``Net<br>income`` never turns into ``Netincome``;
+- text next to a table is kept: before it, it becomes the table's ``<caption>`` (a
+  title or a unit line such as ``Unit: NT$ thousand``); after it, it follows the
+  table. A Markdown pipe table put in the field is converted to HTML;
+- the grid is made rectangular per table (a nested table or a second table keeps its
+  own grid). Spans are bounded: ``colspan`` never exceeds the widest row's cell count
+  and ``rowspan`` never runs past its row group (``rowspan="0"`` is written out as the
+  rows to the end of the group), so a model cannot make one table cost seconds or
+  megabytes. An empty cell emitted for a position a rowspan already covers is dropped,
+  and a short row is padded where its cells line up with their columns (``Cost | 80``
+  under ``Item | Unit | 2024`` keeps ``80`` under ``2024``).
+
+Every other string is escaped when the page is rendered
+(:meth:`~doc2mark.ocr.schema.OCRPage.to_markdown`), following the escaping policy used
+for all document text: a ``<`` becomes ``&lt;`` only before a letter, ``/``, ``!`` or
+``?`` (so ``x < 5`` stays as it is), and control characters are removed. Entities
+stay as written (``&copy;`` is how a model writes the character).
+
+- Code spans and fenced code blocks are shown as written (``List<String>``,
+  ``<div>code</div>``): a renderer shows them verbatim. Only what would be live if a
+  renderer did not read the region as code is escaped there: a tag with an attribute
+  value or a dangerous name (``<script>``, ``<img>``, ...), a comment, a declaration
+  or a processing instruction.
+- No OCR text creates an image (``![`` is escaped) or a link, link definition or
+  autolink whose target has a scheme other than ``http``, ``https`` or ``mailto``
+  (``javascript:``, ``data:``, ``vbscript:``, ``file:``), however the scheme is
+  spelled with entities or backslash escapes.
+- Transcriptions (``raw.text``, captions and Tesseract output) are plain text: a
+  line that starts with a heading, quote, code fence, rule, setext underline or link
+  definition marker gets a backslash, so it stays text. Their list markers stay: a
+  transcribed list is a list. Single-line labels (figure and section labels, cells)
+  escape a leading list marker too.
+- Model-written Markdown (``page_markdown``, ``Table.markdown`` and free-form
+  answers) keeps its Markdown; any ``<table>`` in it outside code goes through the
+  table cleaner above, link definitions stay text, and other raw HTML except
+  ``<br>`` is neutralised.
+- The flat ``headers`` / ``rows`` table escapes ``|`` and turns line breaks into
+  spaces, so every value stays in its cell.
+- A picture inside an Office table cell is labelled ``[Image: <OCR text>]`` with the
+  plain OCR text (the transcription, not its escaped Markdown), which the table
+  renderer escapes once; an image or a non-http(s) link in it is broken with a blank.
+
+
+Refusals and "no readable text" answers
+---------------------------------------
+
+A vision model sometimes answers with "I'm sorry, but I can't assist with that
+request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark never
+indexes such an answer as page content:
+
+1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
+   when a structured answer ignores the schema), and Gemini answers stopped for
+   ``SAFETY``, ``RECITATION``, ``BLOCKLIST``, ``PROHIBITED_CONTENT`` or ``SPII``.
+2. A short answer that, as a whole, is the model speaking about itself or about its
+   input image counts as no content too: "I'm sorry, but I can't assist with that
+   request.", "I can't read the text in this image because it's too blurry.", "The
+   image appears to be blank.", "No text detected in image", and the same statements
+   in Chinese, Japanese, Korean, German, Spanish and French. The check is
+   high-precision. Besides the refusal the answer may only hold a reason made of
+   image-quality or sensitivity words ("It may contain sensitive content.") and a
+   stock courtesy tail in the model's own wording ("Please provide a clearer image.",
+   "If you have any other questions, feel free to ask!"). Anything else is content
+   and the answer is kept: a number, a quote, a name ("Leider kann ich das Bild von
+   Herrn Müller nicht erkennen."), a description of the image or a transcribed line
+   after the refusal ("There is no text in this image. It shows a bar chart ..."), a
+   person being addressed or asked for something ("I'm sorry Dave, I'm afraid I can't
+   do that.", "Please send a clearer photo.", "your photo"), a file, folder or system,
+   a sentence that goes
+   on past what it refuses ("I can't read the scans until Dr. Lee signs off."), or a
+   mere apology ("Sorry we missed you!", "This page intentionally left blank."). What
+   the check cannot decide is left to the judge below.
+3. A structured answer with no content goes to the free-form recovery, as an empty
+   one always did. Only an otherwise empty page can be one: a page that also has
+   tables, fields, headings, metrics, figures, sections, entities or a description
+   is content whatever its ``raw.text`` says. If the recovered answer is a refusal as
+   well, the result is empty text with ``metadata["ocr_refusal"] = True``; a whole-page
+   render of a page with ink then reads ``[page N: OCR returned no content]`` in the
+   Markdown (a blank page does not).
+
+For the cases the patterns cannot decide, pass a judge:
+
+.. code-block:: python
+
+   def judge(ocr_text: str) -> float | None:
+       """Probability (0..1) that ocr_text is ONLY a refusal, apology, error or
+       "no readable text" statement; None when it cannot tell."""
+
+   ocr = OCR("openai", non_content_judge=judge)
+   loader = UnifiedDocumentLoader(ocr_provider="openai", ocr_config=OCRConfig(non_content_judge=judge))
+
+The judge sees the answer as the model wrote it (not its escaped Markdown), at most
+600 characters, and only when the patterns did not fire. A probability of 0.5 or more
+counts as no content; ``None``, or an exception (logged), keeps the answer. Without a
+judge the patterns alone decide, and an undecided answer is kept. The OCR cache keys
+results by the judge's qualified name and its optional ``version`` attribute, so
+enabling or changing a judge screens cached answers again.
+
+The loader reports what happened per document in
+``ProcessedDocument.metadata.extra["ocr_issues"]`` (present only when something did):
+``refused`` (answers emitted empty as refusals), ``failed`` (images that could not be
+read), ``withheld`` (images whose illustrative values stayed withheld; their Markdown
+says ``[N illustrative rows not transcribed]``, and likewise for fields, metrics and
+figures), up to five ``errors``, and ``locations``: one ``{"issue", "image", "page"}``
+entry per affected image (``image`` counts the images OCR'd in the document from 1;
+``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and Excel). Such results are not cached. An OCR engine
+that cannot run at all, such as Tesseract without the requested language data, raises
+``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI
+exits non-zero.
+
+
 Providers
 ---------
 

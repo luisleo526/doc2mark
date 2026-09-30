@@ -10,7 +10,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -20,7 +20,7 @@ from doc2mark.ocr.schema import OCRPage
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = "ocr-cache-v4"
+CACHE_SCHEMA_VERSION = "ocr-cache-v5"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 
@@ -40,6 +40,11 @@ FROM_CACHE_METADATA_KEY = "doc2mark_from_cache"
 _NON_LLM_CONFIG_PROVIDERS = {"doc2mark.ocr.tesseract.TesseractOCR"}
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
+# OCRConfig fields left out of the full-config signature of non-LLM providers: the
+# optional judge only screens LLM answers. For the LLM providers it is part of the key
+# (see _judge_identity): an answer the patterns kept is cached, and enabling or changing
+# a judge must screen it again rather than replay it.
+_UNCACHED_CONFIG_FIELDS = {"non_content_judge"}
 _ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
 _STAT_COUNTERS = (
     "hits",
@@ -126,6 +131,20 @@ def _stable_value(value: Any, *, strict: bool = False) -> Any:
     return {"type": _type_identity(value), "repr": repr_value}
 
 
+def _judge_identity(judge: Any) -> Optional[Dict[str, Any]]:
+    """What identifies the optional ``non_content_judge`` in a cache key: its qualified
+    name (a function's, or a callable object's class) and its optional ``version``
+    attribute -- never its memory address, so the key is stable across runs."""
+    if judge is None:
+        return None
+    target = judge if hasattr(judge, "__qualname__") else type(judge)
+    version = getattr(judge, "version", None)
+    return {
+        "name": f"{getattr(target, '__module__', '')}.{getattr(target, '__qualname__', type(judge).__name__)}",
+        "version": version if isinstance(version, (str, int, float)) else None,
+    }
+
+
 def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
     """Return only the cache-relevant LLM config knobs.
 
@@ -139,6 +158,7 @@ def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
         "structured": config.structured,
         "detail": config.detail,
         "response_model": response_model.__name__ if response_model is not None else None,
+        "non_content_judge": _judge_identity(getattr(config, "non_content_judge", None)),
     }
 
 
@@ -149,7 +169,18 @@ def _config_cache_signature(provider: Any) -> Any:
         qualname = f"{provider.__class__.__module__}.{provider.__class__.__qualname__}"
         if qualname not in _NON_LLM_CONFIG_PROVIDERS:
             return _stable_value(_slim_llm_config(config), strict=True)
+        full = {f.name: getattr(config, f.name) for f in fields(config) if f.name not in _UNCACHED_CONFIG_FIELDS}
+        return _stable_value(full, strict=True)
     return _stable_value(config, strict=True)
+
+
+def _is_cacheable(result: OCRResult) -> bool:
+    """A failed image, a refusal or a result that still withholds values after the
+    router firewall's verbatim redo is not a stable answer: the next run must retry it
+    rather than replay it from the cache."""
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return not (metadata.get("failed") or metadata.get("ocr_refusal")
+                or metadata.get("router_fallback") == "unresolved")
 
 
 def _api_key_hash(provider: Any) -> Optional[str]:
@@ -907,7 +938,8 @@ class CachedOCR(BaseOCR):
         consumer from counting one provider call N times.
         """
         normalized = _normalize_result(provider_result)
-        self.cache.set(key, normalized)
+        if _is_cacheable(normalized):
+            self.cache.set(key, normalized)
         for offset, position in enumerate(positions):
             copied = _copy_result(normalized)
             if offset:
