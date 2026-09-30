@@ -172,6 +172,14 @@ def test_documents_with_answers_without_text_or_refusals_are_cached():
         assert UnifiedDocumentLoader._ocr_incomplete(_document(extra)) is None, extra
 
 
+def test_documents_with_a_provider_refusal_are_not_cached():
+    """A provider's own refusal or safety block can be transient: the OCR cache keeps it for minutes only, so
+    ``cache_dir`` (no expiry) must not keep the document that holds it."""
+    reason = UnifiedDocumentLoader._ocr_incomplete(
+        _document({"ocr_issues": {"refused": 2, "provider_refused": 1, "failed": 0, "withheld": 0}}))
+    assert reason is not None and "refused" in reason
+
+
 def test_documents_with_failed_or_unread_ocr_are_not_cached():
     assert "failed" in UnifiedDocumentLoader._ocr_incomplete(_document({"ocr_images": {"failed": 1}}))
     assert "unread" in UnifiedDocumentLoader._ocr_incomplete(_document({"ocr_images": {"unread_pages": [2]}}))

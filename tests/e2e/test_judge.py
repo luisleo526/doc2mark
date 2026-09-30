@@ -11,6 +11,11 @@ is re-read. These tests call the real TypeSafe API (the only third party mocked 
 instead of skipping when ``D2M_REQUIRE_TYPESAFE=1``. Verdicts are cached per test under its scratch dir.
 """
 
+import json
+import os
+import subprocess
+import sys
+
 import pytest
 
 from tests.e2e import builders_judge, builders_ocr, builders_route
@@ -209,3 +214,73 @@ def test_typesafe_judge_keeps_a_short_note_that_apologises(run_cli, e2e_dir, jud
     assert builders_ocr.normalize(answer) in builders_ocr.normalize(judged.markdown), judged.describe()
     assert fake_llm.requests_of("free_form") == [], "a kept answer must not be re-read"
     assert judge_stats(judged).get("asked") == 1 and judge_stats(judged).get("failed") == 0, judged.json
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Wrap-up follow-ups: what a judged run prints, and where a suspected OCR answer is reported
+
+
+@pytest.mark.requires_typesafe
+def test_typesafe_judge_prints_no_request_lines_by_default(run_cli, e2e_dir, judge_env):
+    """A default ``--judge typesafe`` run printed one INFO line per TypeSafe request and retry: the SDK's logger
+    was set to INFO explicitly, which let its records past the CLI's WARNING level. They show with ``-v`` (the
+    request's method, URL, status and time), and a request or response body (page text) never does."""
+    pdf = builders_judge.deck_pdf(e2e_dir / "deck.pdf")
+
+    quiet = run_cli(pdf, "--judge", "typesafe", fmt="both", env=judge_env)
+    verbose = run_cli(pdf, "--judge", "typesafe", "-v",
+                      env={"DOC2MARK_JUDGE_CACHE": str(e2e_dir / "judge-cache-verbose")})
+
+    assert quiet.exit_code == 0 and verbose.exit_code == 0, verbose.describe()
+    assert judge_stats(quiet).get("fresh", 0) >= 1, quiet.json
+    assert [line for line in quiet.stderr.splitlines() if " - INFO - " in line or " - DEBUG - " in line] == [], \
+        quiet.describe()
+    requests = [line for line in verbose.stderr.splitlines() if " - INFO - " in line and "typesafe" in line.lower()
+                and " <- " in line]
+    assert requests, verbose.describe()
+    assert not [line for line in verbose.stderr.splitlines() if "body=" in line or "headers=" in line], \
+        verbose.describe()
+    assert builders_judge.BRAND_LINE not in "\n".join(requests), verbose.describe()
+
+
+SUSPECTING_JUDGE = (
+    "import json, sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "class Judge:\n"
+    "    def non_content_judge(self, answer):\n"
+    "        return json.loads(sys.argv[2])\n"
+    "loader = UnifiedDocumentLoader(ocr_provider='openai', judge=Judge())\n"
+    "result = loader.load(sys.argv[1], ocr_images=True)\n"
+    "print(json.dumps({'content': result.content, 'ocr_issues': result.metadata.extra.get('ocr_issues')}))\n"
+)
+
+
+def run_api(e2e_dir, script, *args, env=None, timeout=300):
+    """Run ``script`` with this interpreter (the public ``doc2mark`` Python API), in the test's scratch dir."""
+    proc = subprocess.run([sys.executable, "-c", script, *map(str, args)], cwd=e2e_dir, capture_output=True,
+                          text=True, encoding="utf-8", timeout=timeout, env={**os.environ, **(env or {})})
+    assert proc.returncode == 0, f"exit {proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    return proc
+
+
+@pytest.mark.parametrize("verdict, suspected", [(0.4, True), (0.1, False)])
+def test_an_answer_the_judge_suspects_is_kept_and_reported_with_its_page(e2e_dir, fake_llm, verdict, suspected):
+    """An OCR answer the non-content judge rates close to "no content" (0.90-0.95 raw for Jev, between the
+    pipeline's 0.3 and 0.5) is kept as the page's text, and was flagged only in the per-image OCR metadata,
+    which never reaches the caller. It is counted in ``metadata.extra["ocr_issues"]["suspected"]``, with its
+    page, next to refusals and failures. The judge is a plain Python object here (the hook has no CLI switch)."""
+    scan = builders_ocr.scan_pdf(e2e_dir / "scan.pdf")
+    answer = "Sorry we missed you! We'll try again tomorrow between 9 and 12. Parcel 4471-2290."
+    fake_llm.script(structured=[fake.page(answer)], free_form=[fake.text("unused")])
+
+    proc = run_api(e2e_dir, SUSPECTING_JUDGE, scan, json.dumps(verdict), env=fake_llm.env)
+
+    output = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert "Parcel 4471-2290" in output["content"], output
+    issues = output["ocr_issues"] or {}
+    if suspected:
+        assert issues.get("suspected") == 1 and issues.get("refused") == 0, output
+        assert issues.get("locations") == [{"issue": "suspected", "image": 1, "page": 1}], output
+    else:
+        assert not issues.get("suspected"), output
+    assert fake_llm.requests_of("free_form") == [], "a kept answer must not be re-read"

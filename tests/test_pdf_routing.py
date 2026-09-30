@@ -37,6 +37,39 @@ def test_lines_the_ocr_reproduced_with_markup_are_not_missing(tmp_path):
         "Revenue: $4.2M (FY2025)", "Phase 1 complete"]
 
 
+def test_lines_the_ocr_reproduced_inside_markup_are_not_missing(tmp_path):
+    """One markup token between two words of a line (a table cell boundary, an escaped tag) broke the
+    word-by-word comparison, and the line was appended again after the OCR text."""
+    doc = _page_with_lines(tmp_path, ["Invoice No: 2024-0012 Customer: ACME Ltd.", "Revenue: $4.2M (FY2025)"])
+    page = doc[0]
+    measure = pdf_routing.measure_page(page)
+    ocr = ("<table><tr><td>Invoice No</td><td>2024-0012</td></tr>"
+           "<tr><td>Customer</td><td>ACME Ltd.</td></tr></table>\n\nRevenue: &lt;b>$4.2M&lt;/b> (FY2025)")
+
+    assert pdf_routing.missing_painted_lines(page, measure, ocr) == []
+    assert pdf_routing.missing_painted_lines(page, measure, "<table><tr><td>Customer</td></tr></table>") == [
+        "Invoice No: 2024-0012 Customer: ACME Ltd.", "Revenue: $4.2M (FY2025)"]
+
+
+def test_words_scattered_over_the_ocr_text_do_not_reproduce_a_line(tmp_path):
+    doc = _page_with_lines(tmp_path, ["Total due 2340 EUR by 14 March"])
+    page = doc[0]
+    measure = pdf_routing.measure_page(page)
+    filler = " ".join(f"pallet{n}" for n in range(20))
+    ocr = f"Total {filler} due {filler} 2340 EUR {filler} by 14 March"
+    assert pdf_routing.missing_painted_lines(page, measure, ocr) == ["Total due 2340 EUR by 14 March"]
+
+
+def test_page_chrome_lines_are_not_added_to_the_ocr_text(tmp_path):
+    doc = _page_with_lines(tmp_path, ["ACME Pumps - quarterly maintenance report", "Station 12 passed its test"])
+    page = doc[0]
+    measure = pdf_routing.measure_page(page)
+    header = [line["bbox"] for block in page.get_text("dict")["blocks"] for line in block.get("lines", [])][0]
+
+    assert pdf_routing.missing_painted_lines(page, measure, "Invoice", chrome=[header]) == [
+        "Station 12 passed its test"]
+
+
 BODY = ["Invoice total EUR 2340 due on 14 March 2026", "Delivery of 1200 units to the Rotterdam depot",
         "Payment reference AX 7731 quoted on all remittances"]
 SHIFT = str.maketrans(string.ascii_letters, string.ascii_lowercase[3:] + string.ascii_lowercase[:3]

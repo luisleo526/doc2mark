@@ -438,6 +438,102 @@ def test_issue_locations_count_images_across_calls_and_take_the_page_a_pipeline_
     ]
 
 
+def test_answers_the_judge_suspected_are_counted_with_their_locations():
+    """An answer kept although the non-content judge rated it close to no content (``non_content_suspected``)
+    is an issue the caller can see, like a refusal: counted, with where it is."""
+    ocr = UsageAggregatingOCR(_IssueOCR(
+        [{"non_content_suspected": True}, {}],
+        [{"ocr_refusal": True}, {"non_content_suspected": True}],
+    ))
+    ocr.begin_document_usage()
+
+    ocr.batch_process_images([b"a", b"b"])
+    ocr.label_last_batch([{"page": 2}, {"page": 5}])
+    ocr.batch_process_images([b"c", b"d"])
+
+    issues = ocr.pop_document_issues()
+    assert issues["suspected"] == 2 and issues["refused"] == 1
+    assert issues["locations"] == [
+        {"issue": "suspected", "image": 1, "page": 2},
+        {"issue": "refused", "image": 3},
+        {"issue": "suspected", "image": 4},
+    ]
+
+
+def test_provider_refusals_are_counted_apart_from_other_refusals():
+    ocr = UsageAggregatingOCR(_IssueOCR([
+        {"ocr_refusal": True, "non_content": "provider_refusal", "refusal": "SAFETY"},
+        {"ocr_refusal": True, "non_content": "pattern"},
+    ]))
+    ocr.begin_document_usage()
+    ocr.batch_process_images([b"a", b"b"])
+
+    issues = ocr.pop_document_issues()
+    assert issues["refused"] == 2 and issues["provider_refused"] == 1
+
+
+@pytest.mark.parametrize("answer, cached", [
+    ({"ocr_refusal": True, "non_content": "provider_refusal", "refusal": "SAFETY"}, False),
+    ({"ocr_refusal": True, "non_content": "pattern"}, True),
+], ids=["provider-block", "no-text-statement"])
+def test_cache_dir_keeps_no_document_with_a_provider_refusal(tmp_path, answer, cached):
+    """cache_dir has no expiry: a document whose picture the provider refused or blocked (possibly a transient
+    decision, cached by the OCR cache for minutes only) is converted again next time; a "no readable text"
+    answer is an answer and the document is served from cache_dir."""
+    Image = pytest.importorskip("PIL.Image")
+    from doc2mark.core.loader import UnifiedDocumentLoader
+
+    img_path = tmp_path / "pic.png"
+    Image.new("RGB", (48, 32), "white").save(str(img_path))
+    inner = _IssueOCR([answer], [answer])
+    loader = UnifiedDocumentLoader(ocr_provider=inner, cache_dir=str(tmp_path / "doccache"))
+
+    loader.load(img_path, extract_images=True, ocr_images=True)
+    loader.load(img_path, extract_images=True, ocr_images=True)
+
+    assert len(inner.batches) == (1 if cached else 0)
+
+
+class _FirstBatchFailsOCR(BaseOCR):
+    """The document's batch call fails (a provider outage); every later call, one picture at a time, answers
+    with a refusal."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def batch_process_images(self, images, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("batch rejected")
+        return [OCRResult(text="", metadata={"ocr_refusal": True}) for _ in images]
+
+
+@pytest.mark.parametrize("kind", ["pptx", "xlsx"])
+def test_office_pictures_ocrd_one_by_one_keep_their_slide_or_sheet(tmp_path, kind):
+    """When the Office pipeline's batch gives no answers, each picture is OCR'd on its own; those calls did not
+    say where the picture is, so ``ocr_issues["locations"]`` had no slide or sheet for them."""
+    from doc2mark.core.loader import UnifiedDocumentLoader
+    from tests.e2e import builders_ocr, builders_office
+
+    if kind == "pptx":
+        path = builders_ocr.pptx_small_picture_deck(tmp_path / "deck.pptx")
+        expected = [{"issue": "refused", "image": 1, "slide": 1}, {"issue": "refused", "image": 2, "slide": 2}]
+    else:
+        path = builders_office.workbook(tmp_path / "book.xlsx", [
+            {"title": "Summary", "rows": [["Total", 1]]},
+            {"title": "Q3 Parts", "rows": [["Item", "Picture"], ["Logo", None]],
+             "images": {"B2": builders_office.plain_picture((160, 80))}},
+        ])
+        expected = [{"issue": "refused", "image": 1, "sheet": "Q3 Parts"}]
+    ocr = _FirstBatchFailsOCR()
+
+    result = UnifiedDocumentLoader(ocr_provider=ocr).load(path, extract_images=True, ocr_images=True)
+
+    assert ocr.calls == len(expected) + 1
+    assert result.metadata.extra["ocr_issues"]["locations"] == expected
+
+
 def test_no_issues_no_locations_key():
     ocr = UsageAggregatingOCR(_IssueOCR([{}]))
     ocr.begin_document_usage()

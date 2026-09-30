@@ -961,3 +961,93 @@ def test_cache_key_depends_on_the_non_content_judge():
     assert key(_judge_one) == key(_judge_one)
     assert key(_VersionedJudge("1")) == key(_VersionedJudge("1"))
     assert key(_VersionedJudge("1")) != key(_VersionedJudge("2"))
+
+
+# --- provider refusals are cached briefly ---------------------------------------------------------
+
+class _AnswerOCR(FakeOCR):
+    """Answers every image with no text and ``metadata``: a refusal, a safety block, a "no readable text"
+    statement or a real empty answer."""
+
+    def __init__(self, metadata):
+        super().__init__()
+        self.metadata = metadata
+
+    def batch_process_images(self, images, **kwargs):
+        self.calls.append(list(images))
+        return [OCRResult(text="", metadata=dict(self.metadata)) for _ in images]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+OPENAI_REFUSAL = {"refusal": "I can't help with that.", "non_content": "provider_refusal", "ocr_refusal": True}
+VERTEX_BLOCK = {"provider": "vertex_ai", "refusal": "SAFETY", "non_content": "provider_refusal", "ocr_refusal": True}
+NO_TEXT_STATEMENT = {"non_content": "pattern", "ocr_refusal": True}
+EMPTY_ANSWER = {}
+
+
+@pytest.mark.parametrize("metadata, short_lived", [
+    (OPENAI_REFUSAL, True), (VERTEX_BLOCK, True), (NO_TEXT_STATEMENT, False), (EMPTY_ANSWER, False),
+], ids=["openai-refusal", "vertex-block", "no-text-statement", "empty-answer"])
+def test_provider_refusals_and_blocks_are_asked_again_after_ten_minutes(metadata, short_lived):
+    """A provider's own refusal or safety block can be transient; it is cached for REFUSAL_TTL_SECONDS (10
+    minutes) and a hit does not extend that. A "no readable text" statement or an empty answer is the image's
+    answer: it keeps the normal TTL."""
+    clock = _Clock()
+    provider = _AnswerOCR(metadata)
+    ocr = CachedOCR(provider, MemoryOCRCache(ttl_seconds=3600, time_func=clock))
+
+    ocr.batch_process_images([b"page"])
+    clock.now += 300
+    ocr.batch_process_images([b"page"])
+    assert len(provider.calls) == 1
+
+    clock.now += 360
+    again = ocr.batch_process_images([b"page"])
+
+    assert len(provider.calls) == (2 if short_lived else 1)
+    assert again[0].text == "" and again[0].metadata.get("non_content") == metadata.get("non_content")
+
+
+def test_the_refusal_ttl_is_configurable():
+    clock = _Clock()
+    provider = _AnswerOCR(OPENAI_REFUSAL)
+    cache = create_ocr_cache("memory", ttl_seconds=3600, refusal_ttl_seconds=60)
+    cache._time = clock
+    ocr = CachedOCR(provider, cache)
+
+    ocr.batch_process_images([b"page"])
+    clock.now += 59
+    ocr.batch_process_images([b"page"])
+    clock.now += 2
+    ocr.batch_process_images([b"page"])
+
+    assert len(provider.calls) == 2
+    assert cache.stats()["refusal_ttl_seconds"] == 60
+    with pytest.raises(ValueError):
+        MemoryOCRCache(refusal_ttl_seconds=0)
+
+
+def test_redis_keeps_a_refusal_for_its_own_short_ttl(monkeypatch):
+    clock = _Clock()
+    client = install_fake_redis(monkeypatch)
+    cache = RedisOCRCache("redis://localhost/0", ttl_seconds=3600, key_prefix="test", time_func=clock)
+    provider = _AnswerOCR(VERTEX_BLOCK)
+    ocr = CachedOCR(provider, cache)
+
+    ocr.batch_process_images([b"page"])
+    assert client.set_calls[-1][2] == 600
+    clock.now += 300
+    ocr.batch_process_images([b"page"])
+    (key,) = client.store
+    assert _deserialize_ocr_cache_entry(client.store[key]).expires_at == 1600.0
+    clock.now += 301
+    ocr.batch_process_images([b"page"])
+
+    assert len(provider.calls) == 2
