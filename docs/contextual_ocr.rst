@@ -20,9 +20,9 @@ The idea
 
 The transcription target never changes: the page **image** is, and remains, the
 sole thing the model transcribes. The context PDF rides alongside it as a
-separate, clearly-labeled attachment. Both LLM providers prepend a strict
-instruction (``_CONTEXT_PDF_INSTRUCTION`` in ``doc2mark/ocr/base.py``) telling
-the model:
+separate, clearly-labeled attachment. Both LLM providers add a strict
+instruction (``_CONTEXT_PDF_INSTRUCTION`` in ``doc2mark/ocr/base.py``), as a text
+part after the image and before the PDF, telling the model:
 
    The IMAGE above is the PRIMARY and ONLY target to transcribe. The attached PDF
    contains the neighboring pages (previous/current/next) of the same document and
@@ -42,7 +42,7 @@ The ``context_pages`` tiers
 ---------------------------
 
 The feature is controlled by a single field on
-:class:`~doc2mark.ocr.OCRConfig`::
+:class:`~doc2mark.OCRConfig`::
 
    context_pages: int = 0
 
@@ -64,13 +64,9 @@ at ``{k-1, k, k+1}``. The three tiers are:
    since the answer then depends on the page, a picture shown on several pages is
    requested once per page. More uploads, more cost.
 
-The tier is resolved once, from the OCR instance's config, in the PDF loader::
-
-   self._context_tier = int(getattr(cfg, "context_pages", 0) or 0)
-
-and gates context building per image in ``_ocr_jobs`` / ``_picture_jobs``
-(the streamed OCR pass): whole-page renders pass ``self._context_tier >= 1``;
-embedded pictures pass ``self._context_tier >= 2``.
+The tier is read once per PDF from the OCR provider's config, and gates context
+building per image in the streamed OCR pass: whole-page renders get context from
+tier 1, embedded pictures from tier 2.
 
 How the window PDF is built
 ---------------------------
@@ -90,15 +86,15 @@ for page index ``k``:
 
 - **Per-page de-duplicated.** The result is cached in a small LRU
   (``_WINDOW_CACHE_MAXLEN = 4``) keyed by page index, so the window for a given
-  page is built at most once even though several embedded images on that page
-  share it, and overlapping windows on adjacent pages do not rebuild work.
+  page is built once even though several embedded images on that page share it
+  (adjacent pages each build their own window).
 
 - **Size-guarded.** If the compressed PDF exceeds
-  ``_CONTEXT_PDF_MAX_BYTES`` (18 MB -- chosen to stay under Gemini's ~20 MB
-  inline request cap), the function logs a warning and returns ``None``. Any
-  failure to build the PDF also returns ``None``. Callers treat ``None`` as "no
-  context" and OCR the image normally, so the feature degrades gracefully and
-  never blocks a page.
+  ``_CONTEXT_PDF_MAX_BYTES`` (18 MiB of PDF bytes, measured before base64
+  encoding, which adds a third), the function logs a warning and returns
+  ``None``. Any failure to build the PDF also returns ``None``. Callers treat
+  ``None`` as "no context" and OCR the image normally, so the feature degrades
+  gracefully and never blocks a page.
 
 The output is **raw base64** (no ``data:`` URI prefix), which makes it
 provider-independent -- each provider wraps it in its own attachment format.
@@ -160,7 +156,7 @@ Enabling it
 -----------
 
 Because context is built from neighboring PDF pages, it applies to **PDF sources
-only**, and you enable it by passing an :class:`~doc2mark.ocr.OCRConfig` with
+only**, and you enable it by passing an :class:`~doc2mark.OCRConfig` with
 ``context_pages`` set through the loader:
 
 .. code-block:: python
@@ -174,7 +170,7 @@ only**, and you enable it by passing an :class:`~doc2mark.ocr.OCRConfig` with
    )
 
    doc = loader.load(
-       "scanned-report.pdf",
+       "scan.pdf",
        extract_images=True,
        ocr_images=True,
    )
@@ -194,7 +190,7 @@ three pages -- in addition to the page image:
   with several figures multiplies the uploads (they share the same cached window
   PDF, but each call still ships it).
 
-The window PDF is capped at 18 MB and compressed, but it still adds tokens and
+The window PDF is capped at 18 MiB and compressed, but it still adds tokens and
 bytes to every call, which means more latency and higher per-call cost. Enable it
 when cross-page consistency, naming, and language continuity matter; leave it at
 the default ``0`` when they do not.

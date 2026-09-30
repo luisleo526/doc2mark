@@ -1,200 +1,112 @@
-OCR Result Caching
-==================
+Caching
+=======
 
-doc2mark can cache OCR results so that repeated processing of the same images
-skips the OCR provider call entirely. Caching is opt-in: pass an ``ocr_cache``
-instance to :func:`~doc2mark.load`, :class:`~doc2mark.UnifiedDocumentLoader`,
-or any of the batch helpers.
+doc2mark has two independent caches, both off by default:
 
-Two backends are included:
+- the **OCR cache** (``ocr_cache=``) keeps provider answers per image, so an image seen again
+  (in this document, another document, or another run with Redis) is not sent again;
+- the **document cache** (``cache_dir=``) keeps whole converted documents on disk, so loading
+  an unchanged file with the same options returns the stored result.
 
-* **MemoryOCRCache** -- thread-safe, in-process LRU cache with TTL.
-* **RedisOCRCache** -- persistent cache backed by Redis (requires
-  ``pip install doc2mark[redis]``).
-
-A ``NoOpOCRCache`` is also available for testing; it accepts writes but always
-returns a miss.
-
-Every answer is cached, including an answer with no text and a refusal or "no
-readable text" statement: a blank page or a photo without words gets that answer
-every time. Only a failed answer (flagged ``failed`` in its metadata by the
-provider: a timeout, a rate limit, a server error) and a result that still
-withholds values after the router firewall's redo are asked again on the next
-run; an entry of either kind already in a cache is a miss, and each skipped write
-is logged at INFO. The provider's own refusal or safety block (OpenAI's refusal
-field, a Gemini SAFETY or RECITATION block: ``metadata["non_content"] ==
-"provider_refusal"``) may not last, so it is cached for ``refusal_ttl_seconds``
-only (default 600, ten minutes), which a hit does not extend; so is an empty
-structured answer whose free-form recovery the provider refused or blocked.
-Refusals cached before this TTL existed had none of their own, so the cache key
-version moved to ``ocr-cache-v6``: entries written under an earlier version are
-never read (a one-time miss for every image cached before). Likewise
-``cache_dir`` (the loader's cache of converted documents, which never expires)
-does not store a document whose OCR failed somewhere, left a page showing content
-unread, or holds a provider's own refusal or block (see
-``metadata.extra["ocr_images"]`` and ``["ocr_issues"]`` in :doc:`ocr_policy`).
-
-Quick start
------------
+OCR cache
+---------
 
 .. code-block:: python
 
-   from doc2mark import load, MemoryOCRCache
+   from doc2mark import MemoryOCRCache, UnifiedDocumentLoader
 
-   cache = MemoryOCRCache(
-       ttl_seconds=3600,          # time-to-live per entry
-       max_age_seconds=43200,     # hard upper bound on entry lifetime
-       max_entries=1024,          # LRU eviction limit
-       max_refreshes=10,          # how many times a hit extends the TTL
-   )
+   cache = MemoryOCRCache(ttl_seconds=3600, max_entries=1024)
+   loader = UnifiedDocumentLoader(ocr_provider="tesseract", ocr_cache=cache)
+   first = loader.load("scan.pdf", ocr_images=True)
+   again = loader.load("scan.pdf", ocr_images=True)       # answered from the cache
+   print(cache.stats()["hits"], cache.stats()["sets"])
 
-   result = load(
-       "scan.pdf",
-       extract_images=True,
-       ocr_images=True,
-       ocr_cache=cache,
-   )
+The same ``ocr_cache`` argument is accepted by :func:`~doc2mark.load`,
+:func:`~doc2mark.document_to_markdown` and the batch functions. The loader wraps its provider in
+:class:`~doc2mark.ocr.cache.CachedOCR`, which also sends identical images of one batch once. Keys
+are built from the image bytes, the provider class and its model, temperature, token limit and
+prompt settings, the per-call task, language, structured and detail settings, and the
+non-content judge; API keys enter only as a hash. The task set in ``OCRConfig`` is not part of
+the key, so do not share one cache between providers configured with different tasks. The schema
+version ``ocr-cache-v6`` is part of every key: entries written by older versions are never read.
 
-Factory helper
---------------
+Backends
+~~~~~~~~
 
-:func:`~doc2mark.create_ocr_cache` creates a backend by name and handles
-fallback when Redis is unavailable:
+- :class:`~doc2mark.MemoryOCRCache`: in-process, thread-safe LRU with ``max_entries`` (1024).
+- :class:`~doc2mark.RedisOCRCache`: shared between processes and machines (``pip install
+  "doc2mark[redis]"``); it pings Redis when created and raises if it cannot connect. Keys start
+  with ``key_prefix`` (default ``doc2mark:ocr:ocr-cache-v6``) and expire through Redis itself.
+- :class:`~doc2mark.NoOpOCRCache`: never stores anything.
+
+:func:`~doc2mark.create_ocr_cache` builds one by name and can fall back when Redis is not
+reachable:
 
 .. code-block:: python
 
    from doc2mark import create_ocr_cache
 
-   # In-memory cache
-   cache = create_ocr_cache("memory", ttl_seconds=7200)
+   memory = create_ocr_cache("memory", ttl_seconds=7200)
+   shared = create_ocr_cache("redis", redis_url="redis://localhost:6379/0", fallback="memory")
+   off = create_ocr_cache("none")                        # None: no cache
+   print(type(memory).__name__, type(shared).__name__, off)
 
-   # Redis cache (falls back to memory if Redis is unreachable)
-   cache = create_ocr_cache(
-       "redis",
-       redis_url="redis://localhost:6379/0",
-       ttl_seconds=3600,
-       max_age_seconds=43200,
-       max_refreshes=10,
-       key_prefix="doc2mark:ocr:ocr-cache-v6",  # default prefix
-       fallback="memory",                        # "memory", "none", or "raise"
-   )
+``provider`` is ``"memory"`` (also ``"in-memory"``, ``"in_memory"``), ``"redis"``, ``"noop"``
+(``"no-op"``) or ``"none"`` (also ``"off"``, ``"false"``, ``"disabled"``, ``""``: returns
+``None``). ``fallback`` (``"memory"``, ``"none"`` or ``"raise"``) decides what happens when the
+Redis cache cannot be created (server unreachable, ``redis`` not installed, no ``redis_url``);
+the first two log a warning.
 
-   # Disable caching explicitly
-   cache = create_ocr_cache("none")
+Lifetimes
+~~~~~~~~~
 
-Using with UnifiedDocumentLoader
---------------------------------
+``ttl_seconds`` (default 3600)
+   How long an entry lives. A hit sets its expiry to ``ttl_seconds`` from now again, at most
+   ``max_refreshes`` times (default 10; ``None``: no limit) ...
+``max_age_seconds`` (default 43200)
+   ... and never beyond this age from when it was stored (``None``: no limit).
+``refusal_ttl_seconds`` (default 600)
+   A provider's own refusal or safety block (OpenAI's refusal field, a Gemini SAFETY or
+   RECITATION block) may not last, so it is kept this long only (or ``ttl_seconds`` when that is
+   shorter), and a hit does not extend it.
 
-.. code-block:: python
+What is cached
+~~~~~~~~~~~~~~
 
-   from doc2mark import UnifiedDocumentLoader, create_ocr_cache
+Every answer, including an answer with no text and a "no readable text" statement: a blank page
+or a photo without words gets the same answer every time, and asking again would cost a call.
+Never cached, so the next run asks again: an answer the provider flagged ``failed`` (timeout,
+rate limit, server error), a result that still withholds values after the router firewall's
+verbatim redo, and an answer the optional judge could not screen. An entry of such a kind already
+in a cache is treated as a miss. Each skipped write is logged at ``INFO``.
 
-   cache = create_ocr_cache("redis", redis_url="redis://localhost:6379/0")
+``cache.stats()`` returns the counters ``hits``, ``misses``, ``sets``, ``refreshes``,
+``refresh_skipped``, ``expired``, ``evictions``, ``deletes``, ``errors`` and the backend's
+settings.
 
-   loader = UnifiedDocumentLoader(
-       ocr_provider="openai",
-       ocr_cache=cache,
-   )
-   result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
-
-The same ``ocr_cache`` parameter is accepted by the convenience functions
-:func:`~doc2mark.load`, :func:`~doc2mark.document_to_markdown`,
-:func:`~doc2mark.batch_convert_to_markdown`, and
-:func:`~doc2mark.batch_process_documents`.
-
-MemoryOCRCache
+Document cache
 --------------
 
 .. code-block:: python
 
-   from doc2mark import MemoryOCRCache
+   from doc2mark import UnifiedDocumentLoader
 
-   cache = MemoryOCRCache(
-       ttl_seconds=3600,
-       max_age_seconds=43200,
-       max_entries=1024,
-       max_refreshes=10,
-   )
+   loader = UnifiedDocumentLoader(ocr_provider=None, cache_dir=".doc2mark-cache")
+   first = loader.load("report.pdf")        # converted and stored
+   second = loader.load("report.pdf")       # read back from .doc2mark-cache
+   print(first.content == second.content)
 
-Constructor parameters:
+Each entry is a JSON file named by a hash of the file's path, modification time and size, the
+output format, the ``load()`` options (``extract_images``, ``ocr_images``, ``encoding``,
+``delimiter``), the table style, the OCR provider class, the judges in use and the routing
+version of the PDF pipeline. The OCR model, task, language and prompt are **not** part of the
+key: clear the folder after changing them, or the old OCR text is returned. Entries never
+expire; delete the folder to clear it. A replayed document's ``metadata.extra["token_usage"]`` is
+renamed ``token_usage_cached``, because it cost nothing this time (``metadata.extra["judge"]`` is
+replayed as it was).
 
-``ttl_seconds`` (float, default ``3600``)
-    Time-to-live for each entry. A cache hit extends the expiry by this amount
-    (up to ``max_refreshes`` times).
-
-``max_age_seconds`` (float or ``None``, default ``43200``)
-    Absolute maximum lifetime measured from creation. Set to ``None`` for no
-    hard limit.
-
-``max_entries`` (int, default ``1024``)
-    Maximum number of cached entries. The least-recently-used entry is evicted
-    when the limit is exceeded.
-
-``max_refreshes`` (int or ``None``, default ``10``)
-    Maximum number of times a hit can extend the TTL. Set to ``None`` for
-    unlimited refreshes.
-
-``refusal_ttl_seconds`` (float, default ``600``)
-    How long a provider's own refusal or safety block is replayed. A hit does
-    not extend it (an entry stored with its own ``ttl_seconds`` through
-    ``set(key, result, ttl_seconds=...)`` is never extended by hits).
-    ``create_ocr_cache`` accepts it too.
-
-RedisOCRCache
--------------
-
-Requires the ``redis`` extra:
-
-.. code-block:: bash
-
-   pip install doc2mark[redis]
-
-.. code-block:: python
-
-   from doc2mark import RedisOCRCache
-
-   cache = RedisOCRCache(
-       redis_url="redis://localhost:6379/0",
-       ttl_seconds=3600,
-       max_age_seconds=43200,
-       max_refreshes=10,
-       key_prefix="doc2mark:ocr:ocr-cache-v6",
-   )
-
-The constructor verifies the connection with ``ping()`` and raises on failure.
-Redis handles expiry natively via ``EX`` on each key, so ``cleanup()`` is a
-no-op.
-
-Constructor parameters:
-
-``redis_url`` (str, required)
-    Redis connection URL, e.g. ``redis://localhost:6379/0``.
-
-``ttl_seconds`` (float, default ``3600``)
-    Same semantics as ``MemoryOCRCache``.
-
-``max_age_seconds`` (float or ``None``, default ``43200``)
-    Same semantics as ``MemoryOCRCache``.
-
-``max_refreshes`` (int or ``None``, default ``10``)
-    Same semantics as ``MemoryOCRCache``.
-
-``refusal_ttl_seconds`` (float, default ``600``)
-    Same semantics as ``MemoryOCRCache``.
-
-``key_prefix`` (str, default ``"doc2mark:ocr:ocr-cache-v6"``)
-    Prefix for all Redis keys. Useful for namespacing when multiple
-    applications share a Redis instance.
-
-Cache statistics
-----------------
-
-All backends expose a ``stats()`` method:
-
-.. code-block:: python
-
-   print(cache.stats())
-   # {'hits': 12, 'misses': 3, 'sets': 3, 'backend': 'memory', ...}
-
-Counters include ``hits``, ``misses``, ``sets``, ``refreshes``,
-``refresh_skipped``, ``expired``, ``evictions``, ``deletes``, and ``errors``.
+A document is **not** stored when its OCR is not a final answer: an image whose OCR failed, a
+PDF picture that could not be extracted, a PDF page that shows content but whose OCR returned
+nothing (``ocr_images["unread_pages"]``), an image the provider itself refused or blocked
+(``ocr_issues["provider_refused"]``), or, with the optional judge, a question the judge could not
+answer. An ``INFO`` log line names the reason; the next load converts it again.

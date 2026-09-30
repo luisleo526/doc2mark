@@ -1,190 +1,298 @@
 OCR
 ===
 
-doc2mark includes an AI-powered OCR layer that returns **structured output** by
-default. OCR providers are optional -- the package processes normal text
-documents without any OCR credentials; OCR is only invoked when an image needs
-to be read.
+OCR is optional. doc2mark reads text, tables and structure from the file itself; an OCR provider
+is used only for what has no usable text: scanned pages, text drawn as outlines, garbled text
+layers, pictures that carry text, and image files. There are two ways to use it:
 
-This page is a task-oriented guide to *using* OCR. The full result schema (every
-field of every model) lives on :doc:`/api/schema`, and the exhaustive facade /
-provider / config reference lives on :doc:`/api/ocr`.
+- **In the loader** (``ocr_images=True``): doc2mark decides page by page and picture by picture
+  what to send (:doc:`ocr_policy`) and puts the text where it belongs in the document.
+- **The** :class:`~doc2mark.OCR` **facade**: read images you already have and get structured
+  results.
 
+Providers
+---------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 16 24 26 34
+
+   * - Provider
+     - Install
+     - Credentials
+     - Notes
+   * - ``openai``
+     - ``doc2mark[ocr]``
+     - ``OPENAI_API_KEY`` (or ``api_key=``), read when the provider is created
+     - Default model ``gpt-5.4-mini``. ``base_url`` (or ``OPENAI_BASE_URL``) points it at any
+       OpenAI-compatible endpoint (vLLM, Ollama, a gateway); a key is still required, any value
+       your endpoint accepts. Structured answers use JSON-schema output, which the endpoint
+       must support.
+   * - ``vertex_ai`` (also ``gemini``)
+     - ``doc2mark[vertex_ai]``
+     - Google Application Default Credentials; project from ``project=`` or
+       ``GOOGLE_CLOUD_PROJECT``
+     - Default model ``gemini-3.1-flash-lite-preview``, location ``global``.
+   * - ``tesseract``
+     - ``doc2mark[ocr]`` and the ``tesseract`` program with its language data
+     - none
+     - Local, offline. Returns the transcription only (no interpretation, no tables).
+
+A provider is created without any network call; a missing extra or key shows up at the first OCR
+request. Inside the loader that request's error is reported in ``metadata.extra["ocr_issues"]``
+and the document still converts; a Tesseract that cannot run at all (no program, a language
+that is not installed) fails the conversion instead (see :ref:`ocr-failures`).
+
+.. code-block:: python
+
+   from doc2mark import UnifiedDocumentLoader
+
+   openai_loader = UnifiedDocumentLoader(ocr_provider="openai", model="gpt-5.4-mini")
+   vertex_loader = UnifiedDocumentLoader(ocr_provider="vertex_ai", project="my-gcp-project",
+                                         location="global", model="gemini-3.1-flash-lite-preview")
+   local_loader = UnifiedDocumentLoader(ocr_provider="tesseract")
+   print(openai_loader.get_ocr_configuration()["model"], vertex_loader.ocr.model)
+
+Loader settings
+~~~~~~~~~~~~~~~
+
+These :class:`~doc2mark.UnifiedDocumentLoader` arguments reach the provider:
+
+- ``model``, ``temperature``, ``max_tokens`` (default 8192): OpenAI and ``vertex_ai``. They take
+  precedence over the same fields of ``ocr_config``. Note that LangChain does not send a
+  temperature to ``gpt-5`` models.
+- ``api_key``, ``base_url``: OpenAI. ``project``, ``location``: ``vertex_ai``.
+- ``timeout`` (30 s) and ``max_retries`` (3): OpenAI only.
+- ``ocr_config`` (an :class:`~doc2mark.OCRConfig`): ``task``, ``language``, ``structured``,
+  ``detail``, ``max_concurrency``, ``context_pages`` (:doc:`contextual_ocr`) and
+  ``non_content_judge`` (see *Refusals*). ``task``, ``structured`` and ``detail`` can also be
+  passed to the loader directly.
+- ``prompt_template`` (``"default"``, ``"table_focused"``, ``"document_focused"``,
+  ``"multilingual"``, ``"form_focused"``, ``"receipt_focused"``, ``"handwriting_focused"``,
+  ``"code_focused"``) only shapes free-form answers: ``structured=False`` and the free-form
+  retry of an empty structured answer. Structured requests use the task prompts.
+
+Use ``ocr_provider="vertex_ai"`` rather than ``"gemini"`` with the loader: ``"gemini"`` reaches
+the same provider but without the loader's ``model``, ``project`` and ``location``.
+``max_workers``, ``top_p``, ``frequency_penalty``, ``presence_penalty`` and ``default_prompt``
+are accepted but have no effect on the requests.
 
 The OCR facade
 --------------
-
-The :class:`~doc2mark.ocr.OCR` class is the one entry point you are expected to
-touch. Construct it with a provider name, then call
-:meth:`~doc2mark.ocr.OCR.read` (a batch) or :meth:`~doc2mark.ocr.OCR.read_one`
-(a single image):
 
 .. code-block:: python
 
    from doc2mark import OCR
 
-   ocr = OCR("openai")                         # creds from OPENAI_API_KEY env var
-   results = ocr.read([image_bytes])           # List[bytes] -> List[OCRResult]
-   r = results[0]
+   ocr = OCR("openai")                       # or OCR("vertex_ai"), OCR("tesseract")
+   results = ocr.read([open("receipt.png", "rb").read()])     # one OCRResult per image, in order
+   result = results[0]
 
-   r.document.raw.text                         # verbatim transcription
-   r.document.raw.tables                       # list of Table objects (html / headers+rows)
-   r.document.raw.fields                       # list of KeyValue label/value pairs
-   r.document.interpretation.summary           # model's summary (None for detail="raw")
-   r.document.interpretation.document_type     # e.g. "receipt", "form", "chart"
-
-   r.text                                      # back-compat rendered markdown
-
-For a single image:
-
-.. code-block:: python
-
-   r = ocr.read_one(image_bytes)
-
-Constructor signature::
-
-   OCR(provider="openai", *, api_key=None, **config_kwargs)
-
-``provider`` is one of ``"openai"``, ``"vertex_ai"``, ``"gemini"``, or
-``"tesseract"`` (or an :class:`~doc2mark.ocr.OCRProvider` member). All keyword
-arguments are forwarded to :class:`~doc2mark.ocr.OCRConfig`; a string ``task`` is
-coerced to the matching :class:`~doc2mark.ocr.Task` member and ``detail`` is
-validated to ``"raw"`` / ``"full"`` eagerly, so a bad value raises ``ValueError``
-immediately.
-
-
-What a result looks like
-------------------------
-
-Every call returns one :class:`~doc2mark.ocr.OCRResult` per input image, in input
-order. Its ``text`` is always populated (rendered markdown, for back-compat) and
-``document`` carries the structured :class:`~doc2mark.ocr.schema.OCRPage` for the
-LLM providers (and for Tesseract, with an empty ``interpretation``), or ``None``
-for the legacy free-form path.
-
-``OCRPage`` enforces a hard boundary between **raw extraction** (verbatim, no
-inference -- the trustworthy record of the page) and **interpretation** (the
-model's analysis, which may be ``None``):
-
-.. code-block:: python
-
-   r = ocr.read_one(receipt_png, task="receipt")
-   page = r.document                           # an OCRPage
-
-   # raw -- always present, always verbatim
-   page.raw.text                               # all visible text, original language
-   page.raw.tables                             # List[Table]
-   page.raw.fields                             # List[KeyValue]
-   page.raw.headings                           # List[str], verbatim heading lines
-   page.raw.dates                              # List[str], verbatim dates
-   page.raw.metrics                            # List[Metric], typed numeric facts
-   page.raw.detected_language                  # language actually seen
-   page.raw.has_handwriting                    # bool
-
-   # interpretation -- guard for None first
+   print(result.text)                        # the page as safe Markdown
+   page = result.document                    # OCRPage (None for structured=False)
+   print(page.raw.text)                      # verbatim transcription
+   print([(t.caption, t.html[:40]) for t in page.raw.tables])
+   print([(f.label, f.value) for f in page.raw.fields])
    if page.interpretation is not None:
-       page.interpretation.document_type       # 16-way classification (below)
-       page.interpretation.summary
-       page.interpretation.self_confidence     # 0.0 .. 1.0
-       page.interpretation.legibility          # "high" / "medium" / "low"
+       print(page.interpretation.document_type, page.interpretation.summary)
 
-``interpretation`` is ``None`` when ``detail="raw"`` was requested, for the
-Tesseract provider, or when a structured-output parse failed and the layer fell
-back gracefully. **Always check ``page.interpretation is not None`` before
-reading interpretive fields.**
+``OCR(provider="openai", *, api_key=None, **config)``: every keyword is an
+:class:`~doc2mark.OCRConfig` field (``task``, ``language``, ``structured``, ``detail``,
+``max_concurrency``, ``model``, ...); anything else raises ``TypeError``. A string ``task`` is
+checked against :class:`~doc2mark.Task` and ``detail`` must be ``"raw"`` or ``"full"``, otherwise
+``ValueError``. The facade adds no cache and no document-level reports; use the loader for
+those. Settings that are not ``OCRConfig`` fields (``project``, ``location``, ``timeout``) are set
+on the provider classes directly, for example :class:`~doc2mark.ocr.vertex_ai.VertexAIOCR`
+``(project=..., location=..., model=...)``, whose model the facade does not change.
 
-``document_type`` is one of 16 values: ``document``, ``table``, ``form``,
-``receipt``, ``handwriting``, ``code``, ``chart``, ``photo``, ``screenshot``,
-``diagram``, ``infographic``, ``logo``, ``stamp``, ``mixed``, ``blank``,
-``other``.
+``read(images, *, task=None, tasks=None, language=None, structured=None, detail=None)`` and
+``read_one(image, **same)`` override the configuration per call; ``tasks`` gives one task per
+image and must have the same length as ``images``.
 
-Beyond the basics shown above, ``raw`` also carries the additive verbatim indexes
-``headings`` / ``dates`` / ``metrics``, and ``interpretation`` carries retrieval
-and knowledge-graph anchors -- ``content_fidelity``, ``page_title``,
-``primary_message``, ``keywords``, ``figures`` (List[:class:`~doc2mark.ocr.schema.Figure`]),
-``sections`` (List[:class:`~doc2mark.ocr.schema.Section`]), ``typed_entities``
-(List[:class:`~doc2mark.ocr.schema.Entity`]), ``relations``
-(List[:class:`~doc2mark.ocr.schema.Relation`]), ``column_layout``, ``page_role``,
-``primary_date``, ``action_items``, ``definitions``, and ``page_markdown``. See
-:doc:`/api/schema` for the authoritative, always-current field list of every
-model.
+Structured results
+~~~~~~~~~~~~~~~~~~
 
+With the LLM providers every image becomes an :class:`~doc2mark.ocr.schema.OCRPage` (``result.document``)
+with a hard boundary between two halves:
+
+- ``raw``: what is on the page. ``text`` (all visible text in reading order, original language),
+  ``tables`` (:class:`~doc2mark.ocr.schema.Table`: ``html`` with ``colspan`` / ``rowspan``, plus
+  a flat ``headers`` / ``rows`` view), ``fields`` (label/value pairs), ``headings``, ``dates``,
+  ``metrics``, ``detected_language``, ``has_handwriting``.
+- ``interpretation``: the model's reading, or ``None``. ``document_type`` (one of 16: document,
+  table, form, receipt, handwriting, code, chart, photo, screenshot, diagram, infographic, logo,
+  stamp, mixed, blank, other), ``summary``, ``key_findings``, ``page_title``, ``keywords``,
+  ``figures``, ``sections``, ``typed_entities``, ``relations``, ``self_confidence``,
+  ``legibility`` and more (:doc:`api/schema`).
+
+``result.text`` is ``page.to_markdown()``: ``raw.text`` (escaped), then each table (``html``
+when present), a table of the page's metrics and its figures. ``fields``, ``headings``,
+``dates`` and the interpretation are not rendered: read them from ``result.document``. For
+whole-page renders of PDF pages the model also writes a cleaner ``page_markdown``, used instead
+of ``raw.text`` when it covers at least 85 % of its words (:doc:`ocr_policy`).
+
+``detail="raw"`` asks for the transcription only: Vertex AI returns ``interpretation=None``,
+OpenAI asks the model to leave it out. ``structured=False`` returns free-form Markdown in
+``result.text`` and ``result.document`` is ``None``. Tesseract always returns an ``OCRPage`` whose
+``raw.text`` is the transcription and whose ``interpretation`` is ``None``.
+
+``result.confidence`` is the model's ``self_confidence`` for structured answers (``None``
+without an interpretation, 1.0 for free-form answers, ``None`` for Tesseract);
+``result.metadata`` holds the model, ``token_usage`` and flags such as ``failed``,
+``ocr_refusal`` and ``non_content_suspected``.
 
 Tasks
------
+~~~~~
 
-A :class:`~doc2mark.ocr.Task` names the *intent* of an image; the intent selects a
-short, schema-aligned instruction that steers the model toward the right ``raw``
-fields. Set a task at construction time or override it per call:
-
-.. code-block:: python
-
-   ocr = OCR("openai", task="receipt")          # all calls default to receipt
-   results = ocr.read(images, task="table")     # per-call override
-
-For mixed batches, assign one task per image with ``tasks`` (its length must equal
-``len(images)``; it wins over the single ``task``):
+A :class:`~doc2mark.Task` tells an LLM provider what the image is: ``auto`` (default: the model
+classifies the image first and transcribes verbatim unless it is a product screenshot with sample
+data), ``table``, ``document``, ``form``, ``receipt``, ``handwriting``, ``code``. Tesseract
+ignores it.
 
 .. code-block:: python
 
-   results = ocr.read(images, tasks=["table", "receipt", "handwriting"])
+   from pathlib import Path
+   from doc2mark import OCR, Task
 
-Available task values:
+   images = [Path("receipt.png").read_bytes()] * 2
+   ocr = OCR("openai", task="receipt")                          # default for every call
+   tables = ocr.read(images, task=Task.TABLE)                    # this call
+   mixed = ocr.read(images, tasks=["receipt", "handwriting"])    # one per image
+   raw_only = ocr.read_one(images[0], detail="raw")
+   free_form = ocr.read_one(images[0], structured=False)
+   print(free_form.document, len(mixed))
 
-- ``auto`` -- general-purpose self-routing default (classify-then-act)
-- ``table`` -- tabular data (reproduced as HTML in ``Table.html``)
-- ``document`` -- prose with headings, lists, reading order
-- ``form`` -- form label/value extraction
-- ``receipt`` -- receipts and invoices
-- ``handwriting`` -- handwritten text
-- ``code`` -- source code or terminal output
+.. _tesseract-languages:
 
-``language`` is intentionally **not** a task -- it is a separate config field
-(and a per-call ``read(..., language=...)`` override), so there is no
-"multilingual" task.
+Tesseract languages
+~~~~~~~~~~~~~~~~~~~
 
+``language`` (``OCRConfig``, the facade, or ``--ocr-lang`` on the CLI; default English) takes
+Tesseract codes (``eng``, ``deu``, ``chi_tra``, ``jpn``, ...), ``+`` combinations
+(``eng+chi_tra``) and these names: ``english``, ``chinese`` (``chi_sim+chi_tra``),
+``chinese_simplified``, ``chinese_traditional``, ``spanish``, ``french``, ``german``,
+``japanese``, ``korean``, ``russian``, ``arabic``. A language whose data is not installed, or a
+value that is not a code, fails with ``OCREngineError`` before any image is read. For the LLM
+providers ``language`` is the language the answer is written in, not a recognition setting.
 
-Raw and legacy modes
+.. code-block:: python
+
+   from doc2mark import OCR, OCRConfig, UnifiedDocumentLoader
+
+   ocr = OCR("tesseract", language="eng+chi_tra")
+   print(ocr.read_one(open("receipt.png", "rb").read()).text)
+
+   loader = UnifiedDocumentLoader(ocr_provider="tesseract", ocr_config=OCRConfig(language="english"))
+   print(loader.load("scan.pdf", ocr_images=True).content)
+
+Refusals and "no readable text" answers
+---------------------------------------
+
+A vision model sometimes answers with "I'm sorry, but I can't assist with that
+request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark never
+indexes such an answer as page content:
+
+1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
+   when a structured answer ignores the schema), and Gemini answers stopped for
+   ``SAFETY``, ``RECITATION``, ``BLOCKLIST``, ``PROHIBITED_CONTENT`` or ``SPII``.
+2. A short answer that, as a whole, is the model speaking about itself or about its
+   input image counts as no content too: "I'm sorry, but I can't assist with that
+   request.", "I can't read the text in this image because it's too blurry.", "The
+   image appears to be blank.", "No text detected in image", and the same statements
+   in Chinese, Japanese, Korean, German, Spanish and French. The check is
+   high-precision. Besides the refusal the answer may only hold a reason made of
+   image-quality or sensitivity words ("It may contain sensitive content.") and a
+   stock courtesy tail in the model's own wording ("Please provide a clearer image.",
+   "If you have any other questions, feel free to ask!"). Anything else is content
+   and the answer is kept: a number, a quote, a name ("Leider kann ich das Bild von
+   Herrn Müller nicht erkennen."), a description of the image or a transcribed line
+   after the refusal ("There is no text in this image. It shows a bar chart ..."), a
+   person being addressed or asked for something ("I'm sorry Dave, I'm afraid I can't
+   do that.", "Please send a clearer photo.", "your photo"), a file, folder or system,
+   a sentence that goes
+   on past what it refuses ("I can't read the scans until Dr. Lee signs off."), or a
+   mere apology ("Sorry we missed you!", "This page intentionally left blank."). What
+   the check cannot decide is left to the judge below.
+3. A structured answer with no content goes to the free-form recovery, as an empty
+   one always did. Only an otherwise empty page can be one: a page that also has
+   tables, fields, headings, metrics, figures, sections, entities or a description
+   is content whatever its ``raw.text`` says. If the recovered answer is a refusal as
+   well, the result is empty text with ``metadata["ocr_refusal"] = True``; a whole-page
+   render of a page with ink then reads ``[page N: OCR returned no content]`` in the
+   Markdown (a blank page does not).
+
+For the cases the patterns cannot decide, give the provider a ``non_content_judge``: a
+callable returning the probability (0 to 1) that an answer is only a refusal, an error or a "no
+readable text" statement, or ``None`` when it cannot tell. It sees answers of at most 600
+characters that the patterns kept. From 0.5 the answer counts as no content; from 0.3 up to 0.5
+it is kept and flagged ``metadata["non_content_suspected"]``; ``None`` or an exception keeps it
+(flagged ``non_content_unjudged``, and not cached). The optional TypeSafe judge (:doc:`judge`)
+provides one with its own thresholds.
+
+.. code-block:: python
+
+   from doc2mark import OCRConfig, UnifiedDocumentLoader
+
+   def non_content_judge(ocr_text):
+       return 0.99 if ocr_text.strip().lower().startswith("unable to process") else None
+
+   loader = UnifiedDocumentLoader(ocr_provider="openai", ocr_config=OCRConfig(non_content_judge=non_content_judge))
+   print(loader.load("scan.pdf", ocr_images=True).content[:80])
+
+.. _ocr-failures:
+
+Failures and reports
 --------------------
 
-Skip the interpretation pass to save output tokens:
+A per-image failure of any provider (a timeout, a rate limit, a server error) comes back as a
+result flagged ``metadata["failed"]``; in a PDF the picture shows ``[image: OCR unavailable]``.
+Errors raised by an OCR request (a missing key or extra) are listed in the document's report.
+Neither fails the document. An OCR engine that cannot run at all -- Tesseract without the program
+or the requested language -- makes :meth:`~doc2mark.UnifiedDocumentLoader.load` raise
+:class:`~doc2mark.ProcessingError` (its ``__cause__`` is ``doc2mark.ocr.base.OCREngineError``)
+and the CLI exit 1, instead of writing placeholder text.
+
+The loader reports per document in ``metadata.extra["ocr_issues"]``, present only when something
+happened: ``refused`` (answers emitted empty as refusals), ``provider_refused`` (of those, the
+provider's own refusal or safety block), ``failed``, ``withheld`` (sample values a screenshot
+left out; the Markdown says ``[N illustrative rows not transcribed]``), ``suspected`` (answers
+kept although the judge rated them close to no content), up to five ``errors`` and
+``locations``: one ``{"issue", "image", "page" | "slide" | "sheet"}`` per affected image
+(``image`` counts the images OCR'd in the document from 1).
+
+Results flagged ``failed``, results that still withhold values after the verbatim redo, and
+answers the judge could not screen are never cached; a provider's own refusal is cached for 10
+minutes only (:doc:`caching`).
+
+Concurrency, image size and cost
+--------------------------------
+
+- ``OCRConfig.max_concurrency`` (or the ``OCR_MAX_CONCURRENCY`` environment variable) caps how
+  many images an LLM provider OCRs at once. When neither is set, LangChain's default thread pool
+  is used (``min(32, CPU count + 4)`` threads). In PDFs it also sets the batch size: 32 images
+  per request batch, or twice ``max_concurrency`` when that is higher. Tesseract uses 4 threads.
+- ``OCR_MAX_IMAGE_DIM`` (pixels, off by default) downscales images whose longest side is larger
+  before an LLM provider sees them (re-encoded as PNG); smaller images are sent as they are.
+- Token counts: each LLM result has ``metadata["token_usage"]``; the loader adds a document's
+  up in ``metadata.extra["token_usage"]`` (:doc:`chunking`). The tokens of the free-form retry of
+  an empty structured answer are not included.
 
 .. code-block:: python
 
-   results = ocr.read(images, detail="raw")
-   # r.document.interpretation is None; r.document.raw is still fully populated
+   from doc2mark import OCR
 
-Disable structured output entirely for free-form markdown (legacy behaviour):
+   ocr = OCR("openai", max_concurrency=16)
+   result = ocr.read_one(open("receipt.png", "rb").read())
+   print(result.metadata["model"], result.metadata["token_usage"]["total_tokens"])
 
-.. code-block:: python
+Deprecated settings
+-------------------
 
-   results = ocr.read(images, structured=False)
-   # r.text contains free-form markdown; r.document is None
-
-Both ``detail`` and ``structured`` can also be set once on the facade
-(``OCR("openai", detail="raw")``) and overridden per call.
-
-
-Tables
-------
-
-Each transcribed table is a :class:`~doc2mark.ocr.schema.Table`. Its preferred
-representation is the ``html`` field: a clean ``<table>`` that can encode merged
-cells via ``colspan`` / ``rowspan`` -- something the flat ``headers`` / ``rows``
-grid cannot. The flat grid and a ``markdown`` fallback remain populated for simple
-machine-readable access.
-
-.. code-block:: python
-
-   for table in r.document.raw.tables:
-       print(table.html)                        # merged-cell-aware HTML (preferred)
-       print(table.headers, table.rows)         # best-effort flat view
-       if table.illustrative:                   # demo/mockup values, not real data
-           print("sample rows omitted:", table.row_count)
-
-See :doc:`/tables` for how tables flow through the loader and into the final
-document.
-
+The ``OCRConfig`` fields ``enhance_image``, ``detect_tables``, ``detect_layout``, ``timeout``,
+``max_retries`` and ``extra`` do nothing for the LLM providers. Creating an OpenAI or Vertex AI
+provider with any of them set to a non-default value emits one ``DeprecationWarning`` (shown with
+``python -W default``); they will be removed. ``enhance_image`` (grey-scale and threshold) and
+``detect_layout`` (page segmentation mode) still apply to Tesseract.
 
 Sanitised output
 ----------------
@@ -244,207 +352,4 @@ stay as written (``&copy;`` is how a model writes the character).
   renderer escapes once; an image or a non-http(s) link in it is broken with a blank.
 
 
-Refusals and "no readable text" answers
----------------------------------------
 
-A vision model sometimes answers with "I'm sorry, but I can't assist with that
-request." or "圖片中沒有可辨識的文字。" instead of a transcription. doc2mark never
-indexes such an answer as page content:
-
-1. Provider refusal signals count as no content: OpenAI's ``message.refusal`` (also
-   when a structured answer ignores the schema), and Gemini answers stopped for
-   ``SAFETY``, ``RECITATION``, ``BLOCKLIST``, ``PROHIBITED_CONTENT`` or ``SPII``.
-2. A short answer that, as a whole, is the model speaking about itself or about its
-   input image counts as no content too: "I'm sorry, but I can't assist with that
-   request.", "I can't read the text in this image because it's too blurry.", "The
-   image appears to be blank.", "No text detected in image", and the same statements
-   in Chinese, Japanese, Korean, German, Spanish and French. The check is
-   high-precision. Besides the refusal the answer may only hold a reason made of
-   image-quality or sensitivity words ("It may contain sensitive content.") and a
-   stock courtesy tail in the model's own wording ("Please provide a clearer image.",
-   "If you have any other questions, feel free to ask!"). Anything else is content
-   and the answer is kept: a number, a quote, a name ("Leider kann ich das Bild von
-   Herrn Müller nicht erkennen."), a description of the image or a transcribed line
-   after the refusal ("There is no text in this image. It shows a bar chart ..."), a
-   person being addressed or asked for something ("I'm sorry Dave, I'm afraid I can't
-   do that.", "Please send a clearer photo.", "your photo"), a file, folder or system,
-   a sentence that goes
-   on past what it refuses ("I can't read the scans until Dr. Lee signs off."), or a
-   mere apology ("Sorry we missed you!", "This page intentionally left blank."). What
-   the check cannot decide is left to the judge below.
-3. A structured answer with no content goes to the free-form recovery, as an empty
-   one always did. Only an otherwise empty page can be one: a page that also has
-   tables, fields, headings, metrics, figures, sections, entities or a description
-   is content whatever its ``raw.text`` says. If the recovered answer is a refusal as
-   well, the result is empty text with ``metadata["ocr_refusal"] = True``; a whole-page
-   render of a page with ink then reads ``[page N: OCR returned no content]`` in the
-   Markdown (a blank page does not).
-
-For the cases the patterns cannot decide, pass a judge:
-
-.. code-block:: python
-
-   def judge(ocr_text: str) -> float | None:
-       """Probability (0..1) that ocr_text is ONLY a refusal, apology, error or
-       "no readable text" statement; None when it cannot tell."""
-
-   ocr = OCR("openai", non_content_judge=judge)
-   loader = UnifiedDocumentLoader(ocr_provider="openai", ocr_config=OCRConfig(non_content_judge=judge))
-
-The judge sees the answer as the model wrote it (not its escaped Markdown), at most
-600 characters, and only when the patterns did not fire. A probability of 0.5 or more
-counts as no content; ``None``, or an exception (logged), keeps the answer. Without a
-judge the patterns alone decide, and an undecided answer is kept. The OCR cache keys
-results by the judge's qualified name and its optional ``version`` attribute, so
-enabling or changing a judge screens cached answers again.
-
-The loader reports what happened per document in
-``ProcessedDocument.metadata.extra["ocr_issues"]`` (present only when something did):
-``refused`` (answers emitted empty as refusals; ``provider_refused`` of them are the
-provider's own refusal or safety block), ``failed`` (images that could not be read),
-``withheld`` (images whose illustrative values stayed withheld; their Markdown says
-``[N illustrative rows not transcribed]``, and likewise for fields, metrics and figures),
-``suspected`` (answers kept as text although the optional non-content judge rated them close
-to no content, see :doc:`judge`), up to five ``errors``, and ``locations``: one
-``{"issue", "image", "page"}`` entry per affected image (``image`` counts the images OCR'd in
-the document from 1; ``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and
-Excel). Failed and withheld results are not cached, and neither is a document whose OCR
-failed (``cache_dir``); a refusal or "no readable text" answer is the provider's answer for
-that image and is cached, a provider's own refusal or block only for ``refusal_ttl_seconds``
-(10 minutes) and never in ``cache_dir`` (see :doc:`caching`). A per-image failure of the OpenAI, Vertex AI or Tesseract provider (a
-timeout, a rate limit, a server error) comes back flagged ``metadata["failed"]``. An OCR engine
-that cannot run at all, such as Tesseract without the requested language data, raises
-``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI
-exits non-zero.
-
-
-Providers
----------
-
-OpenAI
-~~~~~~
-
-GPT vision via LangChain. Structured output is produced with
-``with_structured_output(method="json_schema")``. Requires ``OPENAI_API_KEY``
-(or ``api_key=``) and the ``doc2mark[ocr]`` extra. The default model is
-``gpt-5.4-mini``.
-
-.. code-block:: bash
-
-   pip install "doc2mark[ocr]"
-   export OPENAI_API_KEY=sk-...
-
-.. code-block:: python
-
-   ocr = OCR("openai")
-   ocr = OCR("openai", model="gpt-5.4-mini")                       # explicit default
-   ocr = OCR("openai", base_url="http://localhost:11434/v1")       # Ollama / compatible
-
-``base_url`` (or the ``OPENAI_BASE_URL`` env var) targets OpenAI-compatible
-endpoints. Model knobs follow the precedence **explicit constructor argument ->
-OCRConfig field -> built-in default**.
-
-Google Gemini (Vertex AI)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Gemini via ``langchain-google-genai`` on the Vertex AI backend. Both
-``"vertex_ai"`` and ``"gemini"`` resolve to the same implementation.
-Authenticates with `Application Default Credentials
-<https://cloud.google.com/docs/authentication/application-default-credentials>`_
-rather than an API key. The default model is ``gemini-3.1-flash-lite-preview``
-and the default location is ``"global"``.
-
-.. code-block:: bash
-
-   pip install "doc2mark[vertex_ai]"
-   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
-   export GOOGLE_CLOUD_PROJECT=my-gcp-project
-
-.. code-block:: python
-
-   ocr = OCR("gemini")
-   ocr = OCR("vertex_ai", project="my-gcp-project", model="gemini-3.1-flash-lite-preview")
-
-Tesseract (offline)
-~~~~~~~~~~~~~~~~~~~
-
-Local OCR via ``pytesseract`` + Pillow, no API key. It is **raw-only**:
-``interpretation`` is always ``None`` (a non-LLM engine cannot infer document
-type, summaries, or confidence). ``language`` is mapped to a Tesseract language
-code (e.g. ``"chinese"`` -> ``chi_sim+chi_tra``), defaulting to English.
-
-.. code-block:: bash
-
-   pip install "doc2mark[ocr]"
-
-.. code-block:: python
-
-   ocr = OCR("tesseract", language="english")
-   r = ocr.read_one(scanned_png)
-   print(r.text)                               # transcription
-   print(r.document.interpretation)            # always None for Tesseract
-
-
-Concurrency
------------
-
-Control how many images the LLM providers OCR in parallel (inside LangChain's
-``batch_as_completed``):
-
-.. code-block:: python
-
-   ocr = OCR("openai", max_concurrency=32)
-
-Or set the ``OCR_MAX_CONCURRENCY`` environment variable. Precedence is **explicit
-config value -> env var -> ``None``**, where ``None`` means "use the LangChain
-default" (a CPU-tied thread pool, typically ~12). Raise it to keep large scanned
-documents within an SLA (e.g. ``32`` for a several-thousand-page job).
-
-
-Using OCR with the document loader
------------------------------------
-
-:class:`~doc2mark.UnifiedDocumentLoader` uses the OCR layer internally when
-``ocr_images=True``:
-
-.. code-block:: python
-
-   from doc2mark import UnifiedDocumentLoader
-
-   loader = UnifiedDocumentLoader(ocr_provider="openai")
-   result = loader.load("scan.pdf", extract_images=True, ocr_images=True)
-
-Disable OCR when it is not needed:
-
-.. code-block:: python
-
-   loader = UnifiedDocumentLoader(ocr_provider=None)
-   result = loader.load("document.pdf")
-
-.. code-block:: bash
-
-   doc2mark document.pdf --ocr none
-
-
-Deprecation notice
-------------------
-
-The old :class:`~doc2mark.ocr.OCRConfig` fields ``enhance_image``,
-``detect_tables``, ``detect_layout``, ``timeout``, ``max_retries``, and ``extra``
-are inert for the LLM providers (OpenAI / Vertex / Gemini). Setting any of them to
-a non-default value emits a single ``DeprecationWarning`` at construction, and
-they will be removed in a future release. (``enhance_image`` and ``detect_layout``
-remain live for the Tesseract provider.) Use the live knobs -- ``model``,
-``task``, ``language``, ``max_concurrency``, and the structured-output controls
-(``structured`` / ``detail`` / ``response_model`` / ``on_parse_error``) --
-instead.
-
-
-See also
---------
-
-- :doc:`/tables` -- how transcribed tables (``Table.html``) flow into output.
-- :doc:`/contextual_ocr` -- attaching neighbor-page PDF context (``context_pages``).
-- :doc:`/ocr_policy` -- the ``auto`` router's classify-then-act extraction policy.
-- :doc:`/api/ocr` -- full facade, provider, and configuration reference.
-- :doc:`/api/schema` -- the complete structured result schema.

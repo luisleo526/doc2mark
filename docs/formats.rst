@@ -1,343 +1,180 @@
-Supported formats & how each is handled
-=======================================
+Supported formats
+=================
 
-doc2mark recognises an input file by its **extension** and dispatches it to a
-dedicated processor. Every processor produces the same
-:class:`~doc2mark.ProcessedDocument` (Markdown ``content`` plus
-:class:`~doc2mark.DocumentMetadata`), so the format you feed in never changes
-how you consume the result.
-
-Two ideas are worth keeping in mind while reading this page:
-
-- **Rule-based extraction is the default.** Office, PDF, text, markup, and email
-  files are parsed structurally (no model calls), so they need **no OCR
-  credentials**. OCR is *opt-in*: it only runs when you pass
-  ``extract_images=True`` together with ``ocr_images=True`` (and only for the
-  formats that carry images). See :doc:`/ocr_policy` for exactly how that
-  decision is made, and :doc:`/ocr` for configuring a provider.
-- **Legacy Office formats need LibreOffice.** ``.doc``, ``.xls``, ``.ppt``,
-  ``.pps``, and ``.rtf`` are converted to their modern equivalents by a local
-  LibreOffice (``soffice``) install before parsing.
-
-How a format is detected
-------------------------
-
-Detection is extension-based (case-insensitive). The loader strips the leading
-dot, lowercases it, and matches it against :class:`~doc2mark.DocumentFormat`.
-Two aliases are normalised: ``.htm`` maps to ``HTML`` and ``.markdown`` maps to
-``MARKDOWN`` (whose canonical extension value is ``"md"``). An unknown extension
-raises :class:`~doc2mark.UnsupportedFormatError`.
+The format comes from the file extension, case-insensitively; the content is not sniffed, so a
+file with the wrong extension goes to the wrong reader. ``.htm`` is read as HTML and
+``.markdown`` as Markdown. Any other unknown extension (``.odt``, ``.xlsm``, ``.msg``, no
+extension) raises :class:`~doc2mark.UnsupportedFormatError`.
 
 .. code-block:: python
 
    from doc2mark import UnifiedDocumentLoader
 
-   loader = UnifiedDocumentLoader(ocr_provider=None)  # no OCR needed
-   print(loader.supported_formats)   # ['docx', 'xlsx', 'pptx', 'doc', ...]
-
-Extension → processor → OCR
----------------------------
-
-The "OCR" column reflects whether OCR can ever be involved. Where it says
-*Optional*, OCR runs only when both ``extract_images=True`` and
-``ocr_images=True`` are passed **and** an OCR provider is configured; otherwise
-the file is handled purely by rule-based extraction. Where it says *Never*, the
-processor never calls OCR regardless of those flags.
+   loader = UnifiedDocumentLoader(ocr_provider=None)
+   print(loader.supported_formats)   # ['docx', 'xlsx', 'pptx', 'doc', 'xls', 'ppt', 'rtf', 'pps', 'pdf', ...]
 
 .. list-table::
    :header-rows: 1
-   :widths: 26 22 18 34
+   :widths: 30 20 50
 
    * - Extensions
-     - Processor
      - OCR
-     - Extraction approach
-   * - ``.docx``, ``.pptx``, ``.xlsx``
-     - ``OfficeProcessor``
-     - Optional
-     - Rule-based OOXML parsing (advanced Office pipeline). Embedded images can
-       be extracted as base64 and optionally OCR'd.
+     - How it is read
    * - ``.pdf``
-     - ``PDFProcessor``
-     - Optional
-     - Rule-based text/table extraction via the advanced PDF pipeline
-       (PyMuPDF fallback). Page/figure images can be extracted and optionally
-       OCR'd.
-   * - ``.doc``, ``.ppt``, ``.pps``, ``.xls``, ``.rtf``
-     - ``LegacyProcessor``
-     - Optional
-     - LibreOffice converts to ``.docx`` / ``.pptx`` / ``.xlsx``, then the
-       Office processor runs. **Requires LibreOffice.**
-   * - ``.png``, ``.jpg``, ``.jpeg``, ``.webp``, ``.tiff``, ``.tif``,
-       ``.bmp``, ``.gif``, ``.heic``, ``.heif``, ``.avif``
-     - ``ImageProcessor``
-     - Optional
-     - Pillow reads the image; text content comes from OCR when requested.
-       ``.heic`` / ``.heif`` need the ``pillow-heif`` extra.
+     - with ``ocr_images``
+     - PyMuPDF text layer, tables from the drawn grid, per-page OCR routing (:doc:`pdf`,
+       :doc:`tables`, :doc:`ocr_policy`).
+   * - ``.docx``, ``.pptx``, ``.xlsx``
+     - with ``ocr_images``
+     - The Office XML, below.
+   * - ``.doc``, ``.xls``, ``.ppt``, ``.pps``, ``.rtf``
+     - with ``ocr_images``
+     - Converted by LibreOffice to ``.docx`` / ``.xlsx`` / ``.pptx``, then read like those.
+   * - ``.png``, ``.jpg``, ``.jpeg``, ``.webp``, ``.tif``, ``.tiff``, ``.bmp``, ``.gif``,
+       ``.heic``, ``.heif``, ``.avif``
+     - with ``ocr_images``
+     - Pillow; the text comes from OCR (:doc:`images`).
    * - ``.txt``, ``.csv``, ``.tsv``, ``.json``, ``.jsonl``
-     - ``TextProcessor``
-     - Never
-     - Plain-text and structured-data parsing only.
+     - never
+     - Standard library.
    * - ``.html``, ``.htm``, ``.xml``, ``.md``, ``.markdown``
-     - ``MarkupProcessor``
-     - Never
-     - HTML/XML/Markdown to Markdown conversion.
+     - never
+     - BeautifulSoup / defusedxml / as written.
    * - ``.eml``
-     - ``EmailProcessor``
-     - Never
-     - RFC 822 header + body extraction (optional; see below).
+     - never
+     - Standard-library ``email``.
 
-Office formats (DOCX, PPTX, XLSX)
----------------------------------
+"With ``ocr_images``" means: when ``ocr_images=True`` and an OCR provider is configured. Only PDF,
+Office and image files return a ``json_content`` list; the others have ``json_content=None``
+(see :doc:`output`).
 
-Modern Office files are parsed by ``OfficeProcessor`` through the advanced
-Office pipeline. Paragraphs, headings, lists, and tables are converted to
-Markdown with page / slide / sheet markers preserved. Complex tables with
-merged cells respect the loader's ``table_style`` (``'minimal_html'`` by
-default, or ``'markdown_grid'`` / ``'styled_html'``).
+Word, PowerPoint, Excel
+-----------------------
 
-- **Images.** With ``extract_images=True`` the embedded media is returned as
-  base64 in ``ProcessedDocument.images``; adding ``ocr_images=True`` runs the
-  configured OCR provider over those images (batched).
-- **Image-dominant docs.** A ``.docx`` / ``.pptx`` that is mostly pictures with
-  little real text (decided from the OOXML structure, no rendering) is routed
-  through the PDF image strategy: LibreOffice renders it to PDF, the PDF
-  processor OCRs whole pages, and the original Office identity is restored in the
-  metadata (``metadata.extra['routed_via'] == 'pdf'``). This route is gated on
-  OCR being requested and silently falls back to native parsing if anything
-  (including a missing LibreOffice) is unavailable. ``.xlsx`` never routes this
-  way.
+Word, PowerPoint and Excel files are read from their XML. The Markdown starts each page, slide or
+sheet with a marker comment (``<!-- page 2 -->``, ``<!-- slide 3 -->``, ``<!-- sheet 1 -->``);
+Word has no stored pages, so its page numbers count explicit page and section breaks. Text is
+escaped like PDF text (:doc:`pdf`), and ``json_content`` items carry ``page``.
+
+**Word (.docx).** Headings follow the paragraph's outline level (Title ``#``, Subtitle ``##``,
+Heading N one level per rank; a paragraph set to outline level "body text" is no heading) and
+carry ``level``; lists keep their numbers and bullets (``1.``, ``-``, ``(1)``, ``壹、``, nested).
+Text in content controls, tracked insertions, fields, hyperlinks and nested tables (flattened into
+their cell) is kept; deleted text is not. Footnotes become ``[^N]`` / ``[^N]: ...``. Not
+extracted or not in the Markdown:
+
+- text boxes are not extracted at all;
+- header and footer paragraphs are only ``text:header`` / ``text:footer`` items in
+  ``json_content``, and tables in headers and footers are lost;
+- bold, italics and link targets are not kept;
+- a paragraph that starts with *Table*, *Figure*, *Chart* (and similar) or *Source:* / *Note:*
+  is written as an italic caption.
+
+**PowerPoint (.pptx).** Each slide lists its title (``#``), subtitle (``##``) and shapes top to
+bottom, then its notes (``[Slide N Notes]``). A soft line break is a line break (``<br>`` in
+table cells); bullets stay as their characters, not Markdown lists. Tables are always written as
+HTML (``table_style`` applies), charts as their title and axis captions. Known issues: the
+slide layout's placeholder prompts (*Click to edit Master title style*, the date field, ``‹#›``)
+appear as captions on every slide, and the text of plain shapes such as rectangles is emitted
+twice.
+
+**Excel (.xlsx).** Each sheet is ``# Sheet: <name>`` followed by its table. Cells show what
+Excel displays: ``10`` not ``10.0``, ``25%``, ``$1,234.50``, a date in the cell's format
+(``2026-03-31`` for ``yyyy-mm-dd``), rounded the way the format rounds, a formula saved without
+a cached value as the formula (``=A2+B2``). Merged cells come from the sheet's merged ranges (a
+sheet without them is a plain Markdown table; a range whose top-left cell is empty is ignored);
+empty rows and columns are dropped; a single-cell row above the table becomes a paragraph only
+when it is merged across the table or separated by a blank row.
+
+**Pictures.** With ``extract_images=True`` and no OCR, each picture is embedded in the Markdown as
+a ``data:`` URI image, is an ``image`` item of ``json_content``, and is listed in
+``result.images`` as ``{"data": <bytes>, "page": n}``. With OCR, all pictures of a document are
+sent in one batch and their text replaces them (``text:image_description``); a picture in a Word
+or Excel table cell becomes ``[Image]`` / ``[Image: <text>]`` in that cell; a picture whose OCR
+finds no text adds nothing; one whose OCR fails leaves the text ``OCR failed`` and is counted in
+``metadata.extra["ocr_issues"]``.
+
+**The Office image route.** A ``.docx`` or ``.pptx`` made mostly of pictures (slides that are
+full-slide images, a Word file of scanned pages) has no text to read natively. With OCR on,
+doc2mark measures picture coverage and text length from the XML (the same thresholds as for
+PDFs: coverage at least 0.55 and fewer than 200 characters of text per slide or page); a file that
+looks image-dominant is converted to PDF with LibreOffice, and when that PDF's own route is
+``image`` it is read by the PDF pipeline (whole-page OCR), with ``metadata.extra["routed_via"] ==
+"pdf"``. Otherwise the file is read natively and, when the route was tried,
+``metadata.extra`` records ``routed_via: "native"`` with ``route_reason`` (the PDF routes as
+text) or ``route_error`` (for example LibreOffice missing). Excel files never take this route.
 
 .. code-block:: python
+
+   from doc2mark import UnifiedDocumentLoader
 
    loader = UnifiedDocumentLoader(ocr_provider=None)
    doc = loader.load("report.docx")
-   print(doc.metadata.format)        # DocumentFormat.DOCX
-   print(doc.metadata.page_count)
+   print(doc.metadata.format, doc.metadata.page_count)
+   print(doc.content[:300])
 
-If the advanced pipeline is unavailable, the processor falls back to basic
-python-docx / openpyxl / python-pptx parsing.
+Legacy Office files
+-------------------
 
-PDF
----
-
-``PDFProcessor`` uses the advanced PDF pipeline (``pdf_to_simple_json`` →
-``pdf_to_markdown``) to extract text and tables; table extraction is always on.
-The ``ocr_images`` flag is mapped to the pipeline's ``use_ocr`` and only takes
-effect together with ``extract_images=True``. When the advanced pipeline cannot
-be imported, the processor falls back to PyMuPDF (``fitz``): per-page text
-extraction, and — if OCR is enabled — rendering each page at 300 DPI and OCRing
-pages that have no text layer.
-
-The pipeline needs PyMuPDF 1.27.1 or later (``pymupdf>=1.27.1``): it is the first
-release with everything the pipeline uses (``TEXT_CLIP``, invisible-only redaction,
-``TableFinder.textpage``, besides span ``char_flags`` and ``alpha`` from 1.25). If an
-older PyMuPDF is forced into the environment, the pipeline falls back and says so once
-per process: without ``TEXT_CLIP`` a picture is measured without its clip paths (a
-warning: a picture a clip path hides or crops is taken whole); without invisible-only
-redaction hidden text that touches visible text can stay in a table cell (a warning);
-without ``TableFinder.textpage`` the text of a page with tables is read once more
-(INFO, same result).
-
-PyMuPDF prints to stdout: MuPDF's errors about a damaged file (``MuPDF error: library
-error: zlib error: ...``) and, from 1.26.7, a recommendation of its ``pymupdf_layout``
-package the first time the table finder runs. The ``doc2mark`` CLI writes the document
-to stdout when no output file is given, so it switches the recommendation off and sends
-MuPDF's messages to its log on stderr (warnings: shown by default and with ``-v``, not
-with ``-q``). The library leaves both as PyMuPDF sets them: an application that writes
-to stdout itself can call ``pymupdf.no_recommend_layout()`` and
-``pymupdf.set_messages(...)``.
+``.doc`` and ``.rtf`` are converted to ``.docx``, ``.ppt`` and ``.pps`` to ``.pptx``, ``.xls``
+to ``.xlsx``, by LibreOffice (``soffice``, looked up on the ``PATH`` and in the usual install locations when
+the loader is created), each conversion with its own throwaway profile; then the converted file is
+read as above. The original format and file name are kept in the metadata, and
+``metadata.extra`` has ``converted_from`` and ``converted_to`` (``"doc"``, ``"docx"``). Without
+LibreOffice, :meth:`~doc2mark.UnifiedDocumentLoader.load` raises
+:class:`~doc2mark.ProcessingError` with installation guidance. The loader's ``table_style`` is not
+applied to legacy files (they always use ``minimal_html``).
 
 .. code-block:: python
 
-   loader = UnifiedDocumentLoader(ocr_provider="openai", api_key="sk-...")
-   doc = loader.load("scanned.pdf", extract_images=True, ocr_images=True)
-   print(doc.content)
+   from doc2mark import UnifiedDocumentLoader
 
-Markdown conventions for PDF text:
+   doc = UnifiedDocumentLoader(ocr_provider=None).load("legacy.doc")
+   print(doc.metadata.format, doc.metadata.extra["converted_from"], doc.metadata.extra["converted_to"])
 
-- **Headings.** The title is ``#``: the largest heading of the first page with
-  text, when no other heading of the document is as large. Section headings are
-  ``##`` and deeper, ranked by font size across the document and by decimal outline
-  depth (``1.2`` below ``1``), without skipped levels. A heading is one line without
-  emphasis. The ``json_content`` items of type ``text:title`` / ``text:section``
-  carry the same ``level``.
-- **Lists.** Bullets become ``- `` (nested by indentation; ``*`` and ``+`` keep
-  their character) and numbered items keep their number. A bullet that carries
-  meaning stays in the item text (``- ✓ Approved``, ``- – sub-item``). Letters,
-  roman numerals and CJK or parenthesised numbers stay in the item text
-  (``- a) …``) and make a list only in a sequence; a lone ``A. Smith`` or
-  ``E. coli`` line is text.
-- **Captions.** Only numbered labels (``Figure 3:``, ``Table 2``, ``圖1``) and short,
-  caption-shaped text directly attached to an image or table are captions, rendered
-  in italics line by line.
-- **Superscripts** are written ``10^6^``, ``mc^2^``, ``$1.2bn^3^`` (footnote marks
-  included), never fused into the number. Raised ordinals and marks stay inline
-  (``1st``, ``ACME™``), and a footnote at the foot of a page whose number is raised
-  becomes ``[^1]: …``.
-- **Text** keeps its words: ligature glyphs are expanded (``ﬁ`` → ``fi``), a word
-  broken at a line-end hyphen is joined and keeps the hyphen (``top-down``, also when the
-  text layer reads the hyphen as U+00AD), which is removed only when the document spells
-  the word without it elsewhere (``invest-`` + ``ment`` next to ``investment``), the CJK
-  lines of a wrapped paragraph or heading
-  are joined without spaces (short stacked lines stay apart), and bold/italic mark
-  only the styled words.
-- **Escaping.** Text that looks like Markdown or HTML is escaped (``\# of patients``,
-  ``&lt;img …>``) so it renders as written; the Office Markdown output follows the
-  same rule. The kept first copy of a running header or footer is escaped too
-  (``&lt;Draft> ACME Corp``). A numbered item that starts a new list right after
-  bullets (or bullets after numbers) follows a blank line, so no renderer reads it
-  as part of the item above.
+Text and data
+-------------
 
-Reading order of PDF pages:
-
-- A page is read top to bottom. A ``/Rotate`` page (landscape pages of reports,
-  turned tables) is read as it is displayed, so a table follows its title and the
-  running header and page number stay at the edges.
-- Columns are read one after the other, top to bottom within each column: two or
-  three columns, of equal or unequal widths. Text, a picture, a drawing or a caption
-  across the columns (a title, an abstract, a full-width figure) keeps its place
-  between the columns above and below it; pictures and drawings do this also when
-  images are not extracted (the default). Running headers open the page; footnotes
-  and page numbers close it.
-- A sidebar or pull-quote beside the main text (much narrower, with fewer lines) is
-  read after the text it stands beside, as a whole.
-- Columns need clear evidence: a vertical strip of white space between items that
-  stand side by side, running text (three lines ten or more font sizes wide, one
-  under the other) beside text on the other side, and nothing reaching across the
-  strip next to them. An item reaches across the strip when it passes both of its
-  edges or is centred in it: a line of ragged text that runs a few points into the
-  strip stays in its column. Text items of the two sides that are on the same rows
-  are rows, not columns: a form's labels and values, terms set level with or centred
-  on their definitions, a grid of text boxes. Two columns of running text count as
-  rows only when three quarters of their paragraphs (and at least two) start level on
-  both sides, as in parallel texts; paragraphs that start level by chance on a shared
-  line grid do not turn column reading off. Without that evidence, and on pages that
-  mix different column layouts, the page keeps its top-to-bottom order. Reordering
-  never drops or repeats text: the pieces of a paragraph stay together.
-- Text set across the page's reading direction (a vertical arXiv stamp in the margin,
-  a turned axis label) is plain text: it is never a heading or the title, and it does
-  not count as the page's largest font size.
-
-Legacy Office formats (DOC, PPT, PPS, XLS, RTF)
------------------------------------------------
-
-``LegacyProcessor`` shells out to a local LibreOffice (``soffice``) install to
-convert each legacy file to a modern container, then hands the result to
-``OfficeProcessor``:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 30 30 40
-
-   * - Source extension
-     - Converted to
-     - Backing processor
-   * - ``.doc``
-     - ``.docx``
-     - Office (Word)
-   * - ``.rtf``
-     - ``.docx``
-     - Office (Word)
-   * - ``.ppt``
-     - ``.pptx``
-     - Office (PowerPoint)
-   * - ``.pps``
-     - ``.pptx``
-     - Office (PowerPoint)
-   * - ``.xls``
-     - ``.xlsx``
-     - Office (Excel)
-
-The original format and filename are restored in the metadata, and the
-conversion is recorded under ``metadata.extra`` (``converted_from`` /
-``converted_to``). If LibreOffice is not found, processing raises
-:class:`~doc2mark.ProcessingError` with installation guidance. Because the
-output is a real Office document, the same image extraction / OCR options apply.
-
-Images (PNG, JPG, JPEG, WEBP, TIFF, TIF, BMP, GIF, HEIC, HEIF, AVIF)
---------------------------------------------------------------------
-
-``ImageProcessor`` opens the file with Pillow and writes a small Markdown header
-describing the image (format, dimensions, mode, size). For standalone images the
-only way to recover text is OCR:
-
-- ``ocr_images=True`` (with a configured provider) transcribes the image; the
-  text is appended under an *OCR Extracted Text* section and mirrored in
-  ``json_content`` as a ``text:image_description`` entry.
-- ``extract_images=True`` (the default for this processor) also returns the
-  image re-encoded as PNG base64 in ``ProcessedDocument.images``.
-
-``.heic`` / ``.heif`` decoding requires the optional ``pillow-heif`` package; if
-it is not installed those formats simply cannot be opened.
+- **.txt**: read with ``encoding`` (default ``utf-8``, not detected: a file in another encoding
+  fails unless you pass it); a short line written entirely in capitals becomes a ``##`` heading,
+  everything else is kept as written. Metadata: ``word_count``, ``line_count``.
+- **.csv**: the delimiter is detected (``csv.Sniffer``; the ``delimiter`` argument is currently
+  ignored), the first row is the header of a Markdown table. Cell text is not escaped. Metadata:
+  ``row_count`` (header included), ``column_count``, ``delimiter``.
+- **.tsv**: recognised, but conversion currently fails with a ``ProcessingError`` (a known bug);
+  rename the file to ``.csv`` and the tab delimiter is detected.
+- **.json**: objects become ``**key**: value`` lines, lists ``-`` items, nested with indentation.
+  Metadata: ``data_type`` (``dict``, ``list``, ...), ``item_count``.
+- **.jsonl**: ``# JSONL Data (N records)`` and one ``## Record i`` per valid line; invalid lines are
+  skipped with a warning. Metadata: ``record_count``.
 
 .. code-block:: python
 
-   loader = UnifiedDocumentLoader(ocr_provider="openai", api_key="sk-...")
-   doc = loader.load("receipt.jpg", ocr_images=True)
-   print(doc.content)
+   from doc2mark import UnifiedDocumentLoader
 
-Text & data (TXT, CSV, TSV, JSON, JSONL)
-----------------------------------------
+   doc = UnifiedDocumentLoader(ocr_provider=None).load("data.csv")
+   print(doc.metadata.delimiter, doc.metadata.row_count, doc.metadata.column_count)
+   print(doc.content.splitlines()[0])
 
-``TextProcessor`` handles plain-text and structured-data files entirely with the
-standard library — **no OCR, ever**:
+Markup
+------
 
-- ``.txt`` — read as text (``encoding`` defaults to ``utf-8``); all-caps short
-  lines are promoted to Markdown headings.
-- ``.csv`` — the delimiter is auto-detected with :class:`csv.Sniffer` (override
-  with the ``delimiter`` argument) and rows become a Markdown table.
-- ``.tsv`` — same as CSV with a tab delimiter.
-- ``.json`` — parsed and rendered as nested Markdown; metadata records the
-  top-level ``data_type`` and ``item_count``.
-- ``.jsonl`` — each non-empty line is parsed as one record; invalid lines are
-  skipped with a warning, and each record is rendered under its own heading.
+- **HTML** is parsed with BeautifulSoup and converted with ``markdownify`` when that package is
+  installed (``pip install markdownify``; it is not a doc2mark dependency). Without it a much
+  simpler built-in converter is used and a warning is logged: tables are flattened and script or
+  style text can leak. Metadata: ``title``, ``word_count``, ``link_count``, ``image_count``.
+- **XML** is parsed with defusedxml and written as a heading tree (element names as headings,
+  attributes as lists, text kept). Metadata: ``root_tag``, ``element_count``.
+- **Markdown** is kept as written. YAML front matter is moved to ``metadata.frontmatter`` when
+  PyYAML is installed (it comes with the ``ocr`` and ``vertex_ai`` extras); note that a file
+  starting with a ``---`` rule is taken for front matter too. Metadata: ``header_count``,
+  ``link_count``, ``image_count``, ``line_count``.
 
-.. code-block:: python
+E-mail
+------
 
-   loader = UnifiedDocumentLoader(ocr_provider=None)
-   doc = loader.load("data.csv", delimiter=";")
-   print(doc.metadata.row_count, doc.metadata.column_count)
-
-Markup (HTML, XML, Markdown)
-----------------------------
-
-``MarkupProcessor`` converts markup to Markdown without any OCR:
-
-- **HTML / HTM** — parsed with BeautifulSoup and converted via ``markdownify``
-  (ATX headings, ``-`` bullets) when available, falling back to a built-in
-  ``SimpleHTMLToMarkdown`` parser. Title, word, link, and image counts are
-  recorded in the metadata.
-- **XML** — parsed safely with ``defusedxml`` and rendered as a heading tree
-  (tags → headings, attributes → bullet lists, text/tail preserved). Metadata
-  captures ``root_tag`` and ``element_count``.
-- **Markdown (.md / .markdown)** — passed through largely as-is. Leading YAML
-  front-matter is parsed (when PyYAML is installed) into ``metadata.frontmatter``,
-  and heading / link / image counts are computed.
-
-Email (EML)
------------
-
-``EmailProcessor`` reads RFC 822 ``.eml`` files with the standard-library
-``email`` package — no OCR. It extracts the ``From``, ``To``, ``Cc``,
-``Subject``, and ``Date`` headers and the best body representation, preferring a
-``text/plain`` part and otherwise converting the ``text/html`` part to Markdown
-with the same ``SimpleHTMLToMarkdown`` converter used for web pages. The default
-Markdown rendering uses the subject as the top-level heading followed by the
-remaining headers and the body; ``TEXT`` and ``JSON`` output formats are also
-supported.
-
-.. note::
-
-   ``.eml`` support is registered only when the email module and the
-   ``DocumentFormat.EML`` member are both present, so the rest of the loader
-   keeps working even in builds without it.
-
-Choosing whether OCR runs
--------------------------
-
-For every format above, plain extraction happens with no credentials. OCR is a
-deliberate add-on you enable per call via ``extract_images`` / ``ocr_images``
-(images, Office, PDF, and image-dominant routing). The full decision
-procedure — when an OCR provider is built, when it is invoked, and what happens
-without credentials — is documented in :doc:`/ocr_policy`.
+``.eml`` files are read with the standard-library ``email`` package: ``# <Subject>``, then
+``From``, ``To``, ``Cc`` and ``Date`` lines, a rule and the body. The body is every
+``text/plain`` part joined (including text attachments), or, without one, the ``text/html`` part
+converted with the built-in HTML converter. Attachments are not converted and nothing is OCR'd.
+The metadata has only the file name, format and size.
