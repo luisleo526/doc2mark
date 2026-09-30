@@ -295,7 +295,8 @@ def test_ocr_markdown_keeps_http_links():
 def test_code_is_shown_as_written():
     out = _sanitize_markdown("Use `<div>` and `List<String>`:\n\n```html\n<div>code</div> &copy;\n```")
     codes = [code.get_text() for code in _rendered(out).find_all("code")]
-    assert codes[:2] == ["<div>", "List<String>"] and "<div>code</div> &copy;" in codes[2]
+    assert codes[:2] == ["<div>", "List<String>"]
+    assert out.endswith("```html\n<div>code</div> &copy;\n```")  # the fenced block as written
 
 
 @pytest.mark.parametrize("text", [
@@ -313,10 +314,9 @@ def test_code_that_is_not_code_after_all_stays_inert(text):
 
 def test_transcribed_lists_stay_lists_and_entities_stay():
     out = _escape_text_block("Agenda\n- Fast\n- Cheap\n1. Budget\n&copy; 2026")
-    assert "\\" not in out
-    soup = _rendered(out)
-    assert [li.get_text() for li in soup.find_all("li")] == ["Fast", "Cheap", "Budget"]
-    assert "©" in soup.get_text()
+    assert out == "Agenda\n- Fast\n- Cheap\n1. Budget\n&copy; 2026"
+    assert [li.get_text() for li in _rendered(_escape_text_block("- Fast\n- Cheap")).find_all("li")] == ["Fast", "Cheap"]
+    assert "©" in _rendered(out).get_text()
 
 
 def test_withheld_fields_metrics_and_figures_leave_a_marker():

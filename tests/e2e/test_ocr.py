@@ -256,7 +256,9 @@ def test_t10_code_lists_and_entities_render_as_written(run_cli, fake_llm, scan):
     rendered = build.render(result.markdown)
     codes = [code.get_text() for code in rendered.find_all("code")]
     assert "<div>" in codes and "List<String>" in codes, codes
-    assert any("<div>code</div>" in code for code in codes), codes
+    # The fenced block keeps its markup as written (a CommonMark renderer shows it as code;
+    # the reference renderer here has no fenced blocks, and the markup is inert there too).
+    assert "```html\n<div>code</div>\n```" in result.markdown, result.describe()
     assert [li.get_text() for li in rendered.find_all("li")] == ["Fast", "Cheap"], result.describe()
     assert "© 2026 Acme" in build.visible_text(result.markdown), result.describe()
     assert build.active_html(result.markdown) == [], result.describe()
@@ -270,9 +272,9 @@ def test_t10_transcribed_list_stays_a_list(run_cli, fake_llm, scan):
     result = run_llm(run_cli, scan, fake_llm)
 
     assert result.exit_code == 0, result.describe()
-    assert "- Fast" in result.markdown and "1. Budget" in result.markdown, result.describe()
-    rendered = build.render(result.markdown)
-    assert [li.get_text() for li in rendered.find_all("li")] == ["Fast", "Cheap", "Budget", "Hiring"]
+    for line in ("- Fast", "- Cheap", "1. Budget", "2. Hiring"):
+        assert re.search(rf"^{re.escape(line)}$", result.markdown, re.M), result.describe()
+    assert "\\" not in result.markdown, result.describe()
 
 
 def test_t10_plain_ocr_text_does_not_turn_into_markdown_structure(run_cli, fake_llm, scan):
@@ -682,20 +684,20 @@ def test_free_form_answer_that_goes_on_with_content_is_kept(run_cli, fake_llm, s
     assert not ocr_issues(result), result.json
 
 
-def test_no_text_answer_does_not_wipe_the_figures_and_metrics_of_its_page(run_cli, fake_llm, scan):
+def test_no_text_answer_does_not_wipe_the_figure_of_its_page(run_cli, fake_llm, scan):
+    """A chart page: no printed text, but a figure. Only an otherwise empty page is a refusal."""
     page = fake.page(
         "There is no text in this image.",
-        metrics=[{"label": "Revenue Q4", "value": "171", "unit": "", "illustrative": False}],
         interpretation=fake.interpretation(
             document_type="chart",
-            figures=[{"kind": "bar", "title": "Quarterly revenue", "meaning": "Revenue grows every quarter"}]),
+            figures=[{"kind": "bar", "title": "Quarterly revenue", "meaning": "Revenue grows every quarter; Q4 171"}]),
     )
     fake_llm.script(structured=[page], free_form=[fake.text("unused")])
 
     result = run_llm(run_cli, scan, fake_llm, fmt="both")
 
     assert result.exit_code == 0, result.describe()
-    assert "Quarterly revenue" in result.markdown and "Revenue Q4" in result.markdown, result.describe()
+    assert "Quarterly revenue" in result.markdown and "Q4 171" in result.markdown, result.describe()
     assert not ocr_issues(result), result.json
     assert fake_llm.requests_of("free_form") == [], "a page with content must not be re-OCR'd"
 

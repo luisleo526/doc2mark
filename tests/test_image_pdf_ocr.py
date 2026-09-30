@@ -119,11 +119,12 @@ def test_process_page_emits_render_transcription(tmp_path):
     assert "Transcribed slide text" in out[0]["content"]
 
 
-def test_process_page_empty_render_drops_page(tmp_path):
+def test_process_page_empty_render_leaves_a_marker(tmp_path):
+    """A whole-page OCR that returned nothing (refused or empty) says so on its page."""
     p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
     out = p._process_page(0, extract_images=True, ocr_images=True,
                           ocr_results_map={(0, _PAGE_RENDER_XREF): "   "})
-    assert out == []
+    assert [c["content"] for c in out] == ["<image_ocr_result>[page 1: OCR returned no content]</image_ocr_result>"]
 
 
 def test_ocr_failure_emits_placeholder_not_base64(tmp_path):
