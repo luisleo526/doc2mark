@@ -820,8 +820,11 @@ _LIVE_TAG_NAMES = frozenset(_DANGEROUS_TAGS) | {
 }
 _TAG_NAME_RE = re.compile(r"</?([^\s/>]{1,40})")
 _LINK_TARGET_START_RE = re.compile(r"\](?:\(|:)")
-_SPACES_AND_ANGLE_RE = re.compile(r"\s*<?")
-_LINK_TARGET_RE = re.compile(r"[^\s)>]{0,512}")
+_SPACES_AND_ANGLE_RE = re.compile(r"\s*(?:<\s*)?")
+# The target up to where it surely ends. Blanks and line breaks inside are kept: some
+# renderers keep them in the URL, and a browser drops tabs and line breaks from it
+# ("java\tscript:", "java\nscript:").
+_LINK_TARGET_RE = re.compile(r"[^)>\"']{0,512}")
 _BACKSLASH_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
 _URL_IGNORED_RE = re.compile(r"[\x00-\x20\x7f]+")
 _SCHEME_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}):")
