@@ -58,6 +58,12 @@ def _texts(prompt):
 class ChatGoogleGenerativeAI(RunnableLambda):
     """Records the settings doc2mark builds the client with; answers each request like Gemini."""
 
+    # Settings the real class declares (langchain-google-genai 4.x), which doc2mark passes as arguments.
+    model_fields = dict.fromkeys([
+        "model", "temperature", "max_output_tokens", "top_p", "top_k", "frequency_penalty", "presence_penalty",
+        "timeout", "max_retries", "vertexai", "location", "project", "base_url", "credentials", "model_kwargs",
+    ])
+
     def __init__(self, **settings):
         _log({"client": {key: value for key, value in settings.items() if isinstance(value, _SCALARS)}})
         self.settings = settings

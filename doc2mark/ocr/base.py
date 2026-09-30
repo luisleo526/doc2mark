@@ -1,7 +1,9 @@
 """Base OCR interface for doc2mark."""
 
+import json
 import logging
 import os
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -25,6 +27,22 @@ REFUSAL_USAGE_KEY = "doc2mark_refusal"
 # ``metadata["failed"] = True``. A failed image was not read: it is retried, never cached,
 # while an answer with no text is an answer (see doc2mark.ocr.cache).
 FAILURE_USAGE_KEY = "doc2mark_failure"
+
+# The doc2mark package directory: frames under it are doc2mark's own code (see caller_stacklevel).
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+
+
+def caller_stacklevel() -> int:
+    """The ``stacklevel`` for a warning issued by the calling function that makes it name the
+    first frame outside the doc2mark package: the caller's own line (say, the one that created
+    a provider or a loader). Python shows a DeprecationWarning by default only when it names
+    code in ``__main__``, so a warning attributed to doc2mark's own code would stay hidden."""
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 class OCREngineError(OCRError):
@@ -52,6 +70,17 @@ def resolve_max_concurrency(config_value: Optional[int] = None) -> Optional[int]
         except ValueError:
             return None
     return None
+
+
+def split_llm_settings(llm_class: Any, settings: Dict[str, Any]) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+    """Split a provider's extra model settings (``top_p``, ``frequency_penalty``, ...) into
+    the arguments the LangChain chat class ``llm_class`` declares, which it sends itself, and
+    the rest, which go into the request body through its ``model_kwargs``."""
+    fields = getattr(llm_class, "model_fields", None) or {}
+    names = set(fields) | {getattr(f, "alias", None) for f in fields.values()} - {None}
+    declared = {key: value for key, value in settings.items() if key in names}
+    extra = {key: value for key, value in settings.items() if key not in names}
+    return declared, extra
 
 
 class OCRProvider(Enum):
@@ -186,14 +215,15 @@ class OCRResult:
 
     ``text`` is always populated (rendered from ``document.raw`` when structured
     output is used) for backward compatibility. ``document`` carries the
-    structured :class:`~doc2mark.ocr.schema.OCRPage` when available, or ``None``
-    for legacy/free-form results and non-LLM providers.
+    structured :class:`~doc2mark.ocr.schema.OCRPage` when available -- or, with
+    ``OCRConfig.response_model`` set, the answer parsed into that model (``text`` is
+    then its fields as JSON) -- or ``None`` for legacy/free-form results.
     """
     text: str
     confidence: Optional[float] = None
     language: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    document: Optional["OCRPage"] = None
+    document: Optional[Union["OCRPage", "BaseModel"]] = None
 
 
 # Fields that are inert for the LLM providers (OpenAI/Vertex). They are read
@@ -353,17 +383,47 @@ class BaseOCR(ABC):
         # Base implementation - no preprocessing
         return image_data
 
+    def _max_concurrency(self) -> Optional[int]:
+        """How many image requests an LLM provider sends at once: ``OCRConfig.max_concurrency``,
+        else the provider's ``max_workers``, else ``$OCR_MAX_CONCURRENCY``, else None
+        (LangChain's default thread pool)."""
+        configured = getattr(self.config, "max_concurrency", None) if self.config is not None else None
+        return resolve_max_concurrency(configured if configured is not None else getattr(self, "max_workers", None))
+
     @staticmethod
     def _is_empty_structured(result: OCRResult) -> bool:
         """A structured result with no usable content (some models/images cannot
-        fill the json_schema and return an empty OCRPage). Shared by all providers."""
+        fill the json_schema and return an empty OCRPage). Shared by all providers.
+        An answer parsed into the caller's own ``response_model`` is that answer."""
         if result.text and result.text.strip():
             return False
         doc = result.document
         if doc is None:
             return True
+        if BaseOCR._is_custom_document(doc):
+            return False
         raw = doc.raw
         return not (raw.text.strip() or raw.tables or raw.fields)
+
+    @staticmethod
+    def _is_custom_document(document: Any) -> bool:
+        """Whether ``document`` is an answer parsed into the caller's own ``response_model``
+        (a pydantic model other than OCRPage)."""
+        from pydantic import BaseModel
+        from doc2mark.ocr.schema import OCRPage
+        return isinstance(document, BaseModel) and not isinstance(document, OCRPage)
+
+    @staticmethod
+    def _custom_document_text(document: Any) -> str:
+        """``OCRResult.text`` of an answer parsed into the caller's own ``response_model``
+        (``OCRConfig.response_model``, not an OCRPage): its fields as JSON, escaped like a
+        transcription, since the text is Markdown a document may carry."""
+        from doc2mark.ocr.schema import _escape_text_block
+        try:
+            data: Any = document.model_dump(mode="json")
+        except Exception:  # not a pydantic model after all: its string form is all there is
+            data = str(document)
+        return _escape_text_block(json.dumps(data, ensure_ascii=False))
 
     # --- refusals and "no readable text" answers (shared by the LLM providers) ---
     def _non_content_judge(self) -> Optional[Callable[[str], Optional[float]]]:
@@ -497,6 +557,9 @@ class BaseOCR(ABC):
         refused or blocked the recovery, the empty result carries that refusal
         (``non_content="provider_refusal"`` and ``refusal``), which may not last: the OCR
         cache keeps it briefly and ``cache_dir`` not at all.
+
+        Either way the recovery call was made: its ``token_usage`` is added to the result's,
+        so the document's token count bills both calls.
         """
         from doc2mark.ocr.refusal import NonContentScreen, screen_non_content
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
@@ -505,6 +568,7 @@ class BaseOCR(ABC):
             text = (recovered[j].text or "").strip()
             recovered_meta = recovered[j].metadata or {}
             recovered_refused = bool(recovered_meta.get("ocr_refusal"))
+            usage = _sum_token_usage((results[i].metadata or {}).get("token_usage"), recovered_meta.get("token_usage"))
             screen = screen_non_content(text, judge) if text and not recovered_refused else NonContentScreen()
             if screen.reason:
                 recovered_refused, text = True, ""
@@ -513,6 +577,7 @@ class BaseOCR(ABC):
                 if isinstance(doc, OCRPage) and self._has_content_besides_text(doc):
                     continue
                 meta = dict(results[i].metadata or {})
+                meta["token_usage"] = usage
                 if recovered_meta.get("failed"):
                     meta.update(failed=True, error=recovered_meta.get("error") or meta.get("error"))
                 else:
@@ -524,11 +589,12 @@ class BaseOCR(ABC):
                     results[i] = self._without_content(results[i], ocr_refusal=True)
                 continue
             doc = results[i].document
-            if doc is not None:
+            if doc is not None and not self._is_custom_document(doc):
                 doc.raw.text = text
             else:
                 doc = OCRPage(raw=RawExtraction(text=text))
             meta = dict(results[i].metadata or {})
+            meta["token_usage"] = usage
             meta["structured_fallback"] = "free_form"
             meta.pop("non_content", None)
             meta.pop("failed", None)
@@ -650,25 +716,9 @@ class OCRFactory:
         cls._providers[provider] = provider_class
 
     @classmethod
-    def create(
-            cls,
-            provider: Union[OCRProvider, str],
-            api_key: Optional[str] = None,
-            config: Optional[OCRConfig] = None
-    ) -> BaseOCR:
-        """Create an OCR provider instance.
-        
-        Args:
-            provider: Provider type or string name
-            api_key: API key for the provider
-            config: OCR configuration
-            
-        Returns:
-            OCR provider instance
-            
-        Raises:
-            ValueError: If provider is not registered
-        """
+    def provider_class(cls, provider: Union[OCRProvider, str]) -> type:
+        """The class registered for ``provider`` (a name, case-insensitive, or an
+        :class:`OCRProvider`). Raises ValueError for an unknown or unregistered provider."""
         if isinstance(provider, str):
             try:
                 provider = OCRProvider(provider.lower())
@@ -678,8 +728,34 @@ class OCRFactory:
         if provider not in cls._providers:
             raise ValueError(f"OCR provider {provider.value} is not registered")
 
-        provider_class = cls._providers[provider]
-        return provider_class(api_key=api_key, config=config)
+        return cls._providers[provider]
+
+    @classmethod
+    def create(
+            cls,
+            provider: Union[OCRProvider, str],
+            api_key: Optional[str] = None,
+            config: Optional[OCRConfig] = None,
+            **provider_kwargs: Any,
+    ) -> BaseOCR:
+        """Create an OCR provider instance.
+        
+        Args:
+            provider: Provider type or string name
+            api_key: API key for the provider
+            config: OCR configuration
+            **provider_kwargs: Arguments of the provider class itself (for example
+                ``project`` and ``location`` of the Vertex AI provider, ``timeout`` of
+                the OpenAI one)
+            
+        Returns:
+            OCR provider instance
+            
+        Raises:
+            ValueError: If provider is not registered
+        """
+        provider_class = cls.provider_class(provider)
+        return provider_class(api_key=api_key, config=config, **provider_kwargs)
 
     @classmethod
     def list_providers(cls) -> List[str]:

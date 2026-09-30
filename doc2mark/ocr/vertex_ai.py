@@ -15,7 +15,8 @@ from doc2mark.ocr.base import (
     OCRFactory,
     Task,
     TASK_PROMPTS,
-    resolve_max_concurrency,
+    caller_stacklevel,
+    split_llm_settings,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
@@ -49,6 +50,10 @@ from doc2mark.ocr.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# "Argument not given" for the model settings that fall back to OCRConfig (see VertexAIOCR).
+_UNSET: Any = object()
+_DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 
 # Gemini supports these image formats natively
 SUPPORTED_IMAGE_FORMATS = {"png", "jpeg", "jpg", "gif", "webp"}
@@ -140,6 +145,7 @@ class VertexAIVisionAgent:
         max_retries: Optional[int] = None,
         structured: bool = False,
         response_model: Optional[type] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location
@@ -152,6 +158,8 @@ class VertexAIVisionAgent:
         # Default mode for batch_invoke when no per-call override is given.
         self.structured = structured
         self.response_model = response_model
+        # Further request settings (top_p, frequency_penalty, presence_penalty, top_k, ...).
+        self.model_kwargs = dict(model_kwargs or {})
 
         if not LANGCHAIN_GOOGLE_GENAI_AVAILABLE:
             logger.warning("langchain-google-genai not available")
@@ -161,13 +169,19 @@ class VertexAIVisionAgent:
         else:
             logger.info(f"Initializing Google Gemini VisionAgent with {model}")
 
+            # The settings ChatGoogleGenerativeAI declares go to it as arguments (the agent's
+            # own below win over a duplicate), the rest through its model_kwargs.
+            declared, extra = split_llm_settings(ChatGoogleGenerativeAI, self.model_kwargs)
             llm_kwargs = {
+                **declared,
                 "model": model,
                 "temperature": temperature,
                 "max_output_tokens": max_tokens,
                 "vertexai": True,
                 "location": location,
             }
+            if extra:
+                llm_kwargs["model_kwargs"] = extra
             if self.project:
                 llm_kwargs["project"] = self.project
 
@@ -299,13 +313,17 @@ class VertexAIOCR(BaseOCR):
         config: Optional[OCRConfig] = None,
         project: Optional[str] = None,
         location: str = "global",
-        model: str = "gemini-3.1-flash-lite-preview",
-        temperature: float = 0,
-        max_tokens: int = 8192,
+        model: Any = _UNSET,
+        temperature: Any = _UNSET,
+        max_tokens: Any = _UNSET,
         default_prompt: Optional[str] = None,
         prompt_template: Optional[Union[str, PromptTemplate]] = None,
         timeout: int = 30,
         max_retries: int = 3,
+        max_workers: Optional[int] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
         **kwargs,
     ):
         """Initialize Vertex AI OCR provider.
@@ -315,27 +333,45 @@ class VertexAIOCR(BaseOCR):
             config: OCR configuration
             project: Google Cloud project ID (defaults to GOOGLE_CLOUD_PROJECT env var)
             location: Google Cloud region (default: global)
-            model: Gemini model name (default: gemini-3.1-flash-lite-preview)
-            temperature: Temperature for response generation (0.0-2.0)
-            max_tokens: Maximum tokens in response
-            default_prompt: Custom default prompt to use
+            model: Gemini model name (default: ``config.model``, else
+                gemini-3.1-flash-lite-preview)
+            temperature: Temperature for response generation (0.0-2.0; default:
+                ``config.temperature``, else 0)
+            max_tokens: Maximum tokens in response (default: ``config.max_tokens``, else 8192)
+            default_prompt: Prompt of free-form requests (``structured=False`` and the
+                free-form retry of an empty structured answer) instead of the template's;
+                structured requests use the task prompts
             prompt_template: Template name from PROMPTS dict
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
-            **kwargs: Additional model parameters
+            max_workers: Maximum number of image requests sent at once, used when
+                ``config.max_concurrency`` is not set (then ``$OCR_MAX_CONCURRENCY``, then
+                LangChain's default thread pool)
+            top_p, frequency_penalty, presence_penalty: Sampling settings given to the
+                Gemini client when set
+            **kwargs: Further settings for the Gemini client (``ChatGoogleGenerativeAI``)
         """
         super().__init__(api_key, config)
 
+        self.config = config or OCRConfig()
+        cfg = self.config
+
+        def _resolve(param: Any, cfg_value: Any, default: Any) -> Any:
+            # An explicit argument, else the OCRConfig field, else the provider default.
+            if param is not _UNSET:
+                return param
+            return cfg_value if cfg_value is not None else default
+
         self.project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.model = _resolve(model, cfg.model, _DEFAULT_MODEL)
+        self.temperature = _resolve(temperature, cfg.temperature, 0)
+        self.max_tokens = _resolve(max_tokens, cfg.max_tokens, 8192)
         self.timeout = timeout
         self.max_retries = max_retries
-        self.model_kwargs = kwargs
-
-        self.config = config or OCRConfig()
+        self.max_workers = max_workers
+        sampling = {"top_p": top_p, "frequency_penalty": frequency_penalty, "presence_penalty": presence_penalty}
+        self.model_kwargs = {**kwargs, **{key: value for key, value in sampling.items() if value is not None}}
 
         # Warn once if the caller set fields that are inert for LLM providers.
         deprecated = self.config.deprecated_llm_overrides()
@@ -345,7 +381,7 @@ class VertexAIOCR(BaseOCR):
                 f"Vertex/Gemini provider and are deprecated; they will be removed "
                 f"in a future release.",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
 
         # Prompt configuration
@@ -400,13 +436,12 @@ class VertexAIOCR(BaseOCR):
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                max_concurrency=resolve_max_concurrency(
-                    self.config.max_concurrency if self.config else None
-                ),
+                max_concurrency=self._max_concurrency(),
                 timeout=self.timeout,
                 max_retries=self.max_retries,
                 structured=self.config.structured if self.config else True,
                 response_model=self.config.response_model if self.config else None,
+                model_kwargs=self.model_kwargs,
             )
         except Exception as e:
             logger.error(f"Failed to initialize Vertex AI VisionAgent: {e}")
@@ -439,8 +474,12 @@ class VertexAIOCR(BaseOCR):
         logger.info(f"Updated prompt template to: {template_name.value}")
 
     def _build_prompt(self, **kwargs) -> str:
-        """Build prompt based on configuration and kwargs."""
-        template_name = kwargs.get("prompt_template", self.prompt_template)
+        """Build prompt based on configuration and kwargs. Without a per-request template the
+        provider's ``default_prompt`` is the prompt text: the template's, or the caller's own."""
+        template_name = kwargs.get("prompt_template")
+        base_prompt = self.default_prompt if template_name is None else None
+        if template_name is None:
+            template_name = self.prompt_template
         language = kwargs.get("language") or (self.config.language if self.config else None)
         content_type = kwargs.get("content_type")
         custom_instructions = kwargs.get("instructions")
@@ -450,6 +489,7 @@ class VertexAIOCR(BaseOCR):
             language=language,
             content_type=content_type,
             custom_instructions=custom_instructions,
+            base_prompt=base_prompt,
         )
 
     def batch_process_images(
@@ -756,8 +796,8 @@ class VertexAIOCR(BaseOCR):
                     page.interpretation.self_confidence if page.interpretation else None
                 )
                 detected_language = page.raw.detected_language
-            else:  # BYO response_model — keep the object, render a best-effort string
-                text = str(page)
+            else:  # the caller's own response_model: that object is the document, its fields as JSON the text
+                text = self._custom_document_text(page)
                 confidence = None
                 detected_language = None
 
@@ -786,7 +826,7 @@ class VertexAIOCR(BaseOCR):
                         **({"router_violations": violations} if violations else {}),
                         **({"failed": True, "error": str(parsing_error)} if failed else {}),
                     },
-                    document=page if isinstance(page, OCRPage) else None,
+                    document=page,
                 )
             )
 
@@ -803,6 +843,10 @@ class VertexAIOCR(BaseOCR):
             "location": self.location,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+            "max_workers": self.max_workers,
+            "model_kwargs": self.model_kwargs,
             "prompt_template": self.prompt_template.value,
             "langchain_google_genai_available": LANGCHAIN_GOOGLE_GENAI_AVAILABLE,
             "vision_agent_ready": bool(self._vision_agent),

@@ -21,11 +21,22 @@ from doc2mark.core.base import (
 )
 from doc2mark.core.strategy import ROUTING_VERSION
 from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRFactory, OCRProvider, Task
-from doc2mark.ocr.cache import CachedOCR, OCRCache
+from doc2mark.ocr.cache import CachedOCR, OCRCache, ocr_settings_identity
 from doc2mark.ocr.prompts import PromptTemplate
 from doc2mark.ocr.usage import UsageAggregatingOCR
 
 logger = logging.getLogger(__name__)
+
+# Schema of the document cache (cache_dir): part of every entry's file name and stored in the
+# entry. v2: the key holds the OCR provider's answer-changing settings (model, task, language,
+# structured mode, detail, prompts, ...: doc2mark.ocr.cache.ocr_settings_identity) instead of
+# its class name only, so v1 entries, which may hold OCR text made with other settings, are
+# never read.
+DOCUMENT_CACHE_SCHEMA = "doc2mark-document-cache-v2"
+
+# The API's own defaults of the loader's sampling settings: a value equal to its default is
+# not sent (reasoning models such as gpt-5 reject the parameters).
+_SAMPLING_DEFAULTS = {"top_p": 1.0, "frequency_penalty": 0.0, "presence_penalty": 0.0}
 
 
 class UnifiedDocumentLoader:
@@ -42,7 +53,7 @@ class UnifiedDocumentLoader:
             model: str = "gpt-5.4-mini",
             temperature: float = 0,
             max_tokens: int = 8192,
-            max_workers: int = 5,
+            max_workers: Optional[int] = None,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
             max_retries: int = 3,
@@ -79,18 +90,21 @@ class UnifiedDocumentLoader:
             cache_dir: Directory for caching processed documents
             ocr_cache: Optional request-scoped OCR cache handler
 
-            # Enhanced OpenAI OCR Configuration:
-            model: OpenAI model to use (default: gpt-5.4-mini)
+            # OCR model settings (OpenAI and Vertex AI / Gemini):
+            model: Model to use (default: gpt-5.4-mini for OpenAI; for Vertex AI the
+                ``ocr_config`` model, else gemini-3.1-flash-lite-preview)
             temperature: Temperature for response generation (0.0-2.0)
             max_tokens: Maximum tokens in response (1-8192)
-            max_workers: Maximum concurrent workers for batch processing
+            max_workers: Maximum number of OCR requests sent at once, when
+                ``ocr_config.max_concurrency`` is not set (None: ``$OCR_MAX_CONCURRENCY``,
+                else LangChain's default thread pool)
             prompt_template: Template name (see PromptTemplate enum for the full list, e.g.
                 'default', 'table_focused', 'document_focused', 'multilingual',
                 'form_focused', 'receipt_focused', 'handwriting_focused', 'code_focused')
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
 
-            # Additional OpenAI parameters:
+            # Sampling settings, sent only when they differ from the API default:
             top_p: Nucleus sampling parameter (0.0-1.0)
             frequency_penalty: Reduce word repetition (-2.0 to 2.0)
             presence_penalty: Encourage new topics (-2.0 to 2.0)
@@ -101,7 +115,9 @@ class UnifiedDocumentLoader:
             location: Google Cloud region (default: global)
 
             # General OCR parameters:
-            default_prompt: Custom default prompt to override built-in prompts
+            default_prompt: Prompt of free-form OCR requests (``structured=False`` and the
+                free-form retry of an empty structured answer) instead of the
+                ``prompt_template``'s; structured requests use the task prompts
 
             # Structured-OCR knobs (LLM providers):
             task: Override the OCRConfig task (Task enum or name, e.g. 'receipt').
@@ -250,7 +266,7 @@ class UnifiedDocumentLoader:
             model: str = "gpt-5.4-mini",
             temperature: float = 0,
             max_tokens: int = 8192,
-            max_workers: int = 5,
+            max_workers: Optional[int] = None,
             prompt_template: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
             timeout: int = 30,
             max_retries: int = 3,
@@ -281,14 +297,15 @@ class UnifiedDocumentLoader:
         # supplied. This config is passed through to every provider branch below.
         ocr_config = self._resolve_ocr_config(ocr_config, task=task, structured=structured, detail=detail)
         extra_model_kwargs = dict(model_kwargs or {})
+        # Sampling settings are sent only when set to something other than the API's default.
+        sampling = {"top_p": top_p, "frequency_penalty": frequency_penalty, "presence_penalty": presence_penalty}
+        for name, value in sampling.items():
+            if value is not None and value != _SAMPLING_DEFAULTS[name]:
+                extra_model_kwargs.setdefault(name, value)
 
         if self._is_ocr_provider(ocr_provider, OCRProvider.OPENAI):
             logger.info("🔧 Using enhanced OpenAI OCR configuration")
             from doc2mark.ocr.openai import OpenAIOCR
-
-            extra_model_kwargs.setdefault("top_p", top_p)
-            extra_model_kwargs.setdefault("frequency_penalty", frequency_penalty)
-            extra_model_kwargs.setdefault("presence_penalty", presence_penalty)
 
             ocr = OpenAIOCR(
                 api_key=api_key,
@@ -307,21 +324,29 @@ class UnifiedDocumentLoader:
             self._log_ocr_configuration(ocr, title="📋 OCR Configuration Summary:")
             return ocr
 
-        if self._is_ocr_provider(ocr_provider, OCRProvider.VERTEX_AI):
+        if (self._is_ocr_provider(ocr_provider, OCRProvider.VERTEX_AI)
+                or self._is_ocr_provider(ocr_provider, OCRProvider.GEMINI)):
             logger.info("Using enhanced Vertex AI OCR configuration")
             from doc2mark.ocr.vertex_ai import VertexAIOCR
 
-            vertex_model = model if model != "gpt-5.4-mini" else "gemini-3.1-flash-lite-preview"
+            vertex_kwargs: Dict[str, Any] = {}
+            if model != "gpt-5.4-mini":
+                # The loader's default is an OpenAI model: left at it, the Vertex AI provider
+                # takes ocr_config.model, else its own default.
+                vertex_kwargs["model"] = model
             ocr = VertexAIOCR(
                 api_key=api_key,
                 config=ocr_config,
                 project=project,
                 location=location,
-                model=vertex_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 prompt_template=prompt_template,
                 default_prompt=default_prompt,
+                timeout=timeout,
+                max_retries=max_retries,
+                max_workers=max_workers,
+                **vertex_kwargs,
                 **extra_model_kwargs,
             )
             self._log_ocr_configuration(ocr, title="OCR Configuration Summary:")
@@ -387,7 +412,7 @@ class UnifiedDocumentLoader:
                 "model": "gpt-5.4-mini",
                 "temperature": 0,
                 "max_tokens": 8192,
-                "max_workers": 5,
+                "max_workers": None,
                 "prompt_template": PromptTemplate.DEFAULT,
                 "timeout": 30,
                 "max_retries": 3,
@@ -403,7 +428,7 @@ class UnifiedDocumentLoader:
             "model": getattr(current, "model", "gpt-5.4-mini"),
             "temperature": getattr(current, "temperature", 0),
             "max_tokens": getattr(current, "max_tokens", 8192),
-            "max_workers": getattr(current, "max_workers", 5),
+            "max_workers": getattr(current, "max_workers", None),
             "prompt_template": getattr(current, "prompt_template", PromptTemplate.DEFAULT),
             "timeout": getattr(current, "timeout", 30),
             "max_retries": getattr(current, "max_retries", 3),
@@ -642,7 +667,10 @@ class UnifiedDocumentLoader:
                 "encoding": encoding,
                 "delimiter": delimiter,
                 "table_style": self.table_style,
-                "ocr_provider": type(self._unwrap_ocr(self.ocr)).__name__ if self.ocr else None,
+                # The OCR provider and every setting of it that changes its answers (model, task,
+                # language, structured mode, detail, prompts, ...): another one must not be
+                # answered with the OCR text of an older run.
+                "ocr": ocr_settings_identity(self._unwrap_ocr(self.ocr), strict=False) if self.ocr else None,
                 # A different judge, or routing that changed what a page emits, must not
                 # be answered from an older cached result.
                 "legibility_judge": self._judge_identity(),
@@ -1334,6 +1362,9 @@ class UnifiedDocumentLoader:
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            if payload.get("schema") != DOCUMENT_CACHE_SCHEMA:
+                logger.debug(f"Ignoring cached {cache_file.name}: schema {payload.get('schema')!r}")
+                return None
             document = self._document_from_cache_dict(payload["document"])
             return self._demote_cached_token_usage(document)
         except Exception as e:
@@ -1377,7 +1408,7 @@ class UnifiedDocumentLoader:
         cache_file = self._cache_file_path(file_path, output_format, options or {})
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": "doc2mark-document-cache-v1",
+            "schema": DOCUMENT_CACHE_SCHEMA,
             "source": str(file_path.resolve()),
             "output_format": output_format.value,
             "document": self._document_to_cache_dict(result),
@@ -1397,6 +1428,7 @@ class UnifiedDocumentLoader:
     def _cache_file_path(self, file_path: Path, output_format: OutputFormat, options: Dict[str, Any]) -> Path:
         stat = file_path.stat()
         key_payload = {
+            "schema": DOCUMENT_CACHE_SCHEMA,
             "path": str(file_path.resolve()),
             "mtime_ns": stat.st_mtime_ns,
             "size": stat.st_size,
@@ -1571,6 +1603,12 @@ class UnifiedDocumentLoader:
                 elif key in ['max_workers', 'enable_langchain']:
                     # These are instance attributes, set directly
                     setattr(self.ocr, key, value)
+                    if key == 'max_workers':
+                        # The concurrency cap is fixed when the provider builds its client: build
+                        # it again on the next request.
+                        target = self._unwrap_ocr(self.ocr)
+                        if hasattr(target, '_vision_agent'):
+                            target._vision_agent = None
                     logger.info(f"✓ Updated {key}: {value}")
                 else:
                     # Additional model parameters

@@ -22,6 +22,8 @@ left to the optional judge, :data:`NonContentJudge`.
 """
 
 import logging
+import math
+import numbers
 import re
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -39,7 +41,9 @@ the image has no readable text, with nothing transcribed or described from the i
 A probability of at least :data:`JUDGE_THRESHOLD` makes the answer count as no
 content; from :data:`SUSPECT_THRESHOLD` up to it the answer is kept and flagged
 ``metadata["non_content_suspected"]``. ``None`` means "cannot judge" and keeps the answer,
-as does any exception the judge raises (it is logged); such a result is not cached. A judge
+as do any exception the judge raises (it is logged) and a value that is not a probability
+(a non-number, a bool, NaN, or a number outside [0, 1]: logged, like the other judge hooks
+treat it); such a result is not cached. A judge
 whose ``available`` attribute is False is treated as no judge. The judge must not raise for normal input and should be
 quick; it is called at most once per answer. Cached OCR results are keyed by the
 judge's identity (its qualified name and an optional ``version`` attribute), so give
@@ -381,10 +385,12 @@ def screen_non_content(text: str, judge: Optional[NonContentJudge] = None) -> No
     except Exception as exc:  # the hook must never break OCR
         logger.warning("non_content_judge failed (%s); keeping the OCR answer", exc)
         return NonContentScreen(unanswered=True)
-    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+    if isinstance(probability, bool) or not isinstance(probability, numbers.Real) \
+            or not (math.isfinite(float(probability)) and 0.0 <= float(probability) <= 1.0):
         if probability is not None:
             logger.warning("non_content_judge returned %r, not a probability; keeping the OCR answer", probability)
         return NonContentScreen(unanswered=True)
+    probability = float(probability)
     if probability >= JUDGE_THRESHOLD:
         return NonContentScreen(reason="judge")
     return NonContentScreen(suspected=probability >= SUSPECT_THRESHOLD)
