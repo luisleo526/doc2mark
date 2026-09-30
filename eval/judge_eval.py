@@ -1,22 +1,29 @@
 """Does the optional TypeSafe judge make doc2mark's decisions better? Per hook, on labelled data.
 
-For each hook (legibility, boilerplate, non_content) this script reads the labelled set in
+For each hook (legibility, boilerplate, non_content) this script reads the labelled sets in
 ``tests/data/judge`` (see its README), decides every item twice -- with the deterministic rule
 alone, and with the rule plus the judge exactly as the pipeline combines them -- and prints
-accuracy, precision and recall of the action the hook takes (page is illegible / line is page
-chrome / answer is no content) on the held-out TEST split. The judge's threshold per hook is
-calibrated on the TRAIN split first (``--calibrate``) or taken from
-``doc2mark.judge.questions.RAW_THRESHOLDS``.
+accuracy, precision and recall of the action the hook takes on three sets:
+
+- TRAIN: the only set thresholds are calibrated on (``--calibrate``, legibility and boilerplate);
+- TEST: held out, from the same generators but split by family (every variant of one template,
+  base text or document in one split) with near-duplicates kept together;
+- EXTERNAL (``tests/data/judge/external``): items written by the PR #22 reviewer, never used for
+  calibration.
 
 How the rule and the judge combine (as in the pipeline):
 
-- legibility: illegible when the deterministic detector flags the layer, else when the judge is
-  asked (``strategy.wants_judgment``) and its probability is below the threshold; pages the
-  route OCRs anyway (searchable scans) are not scored;
-- boilerplate: every item is a line the verbatim-first rule keeps; chrome when the judge's
-  probability is at or above the threshold;
-- non_content: no content when the whole-answer patterns fire, else when the judge is asked
-  (answers of at most ``refusal.MAX_JUDGE_CHARS``) and its probability is at or above it.
+- legibility (action: the page is illegible and OCR'd): the deterministic detector flags the
+  layer, else the judge is asked (``strategy.wants_judgment``) and its probability is below the
+  threshold; pages the route OCRs anyway (searchable scans) are not scored;
+- boilerplate (action: a repeated line the rule keeps on every page is thinned to its first
+  copy): the judge's probability is at or above the threshold; the label is the output the line
+  needs (``expected_copies`` "one" or "all"). Lines the judge is never asked about (a running
+  header's first copy, which the rule already reduced to one) are not scored;
+- non_content (action: the answer is no content): the whole-answer patterns fire, else the judge
+  is asked (answers of at most ``refusal.MAX_JUDGE_CHARS``) and its probability is at or above
+  the act threshold (0.95); from the suspect threshold (0.90) up to it the answer is kept and
+  only flagged, which counts as keeping it.
 
 Needs the ``doc2mark[typesafe]`` extra and ``TYPESAFE_API_KEY``; verdicts are cached (``--cache-dir``,
 default ``$DOC2MARK_JUDGE_CACHE`` or ``~/.cache/doc2mark/judge``), so a re-run is free and
@@ -47,14 +54,24 @@ from doc2mark.ocr.refusal import MAX_JUDGE_CHARS, _normalize, matches_non_conten
 
 HOOKS = ("legibility", "boilerplate", "non_content")
 DATA = ROOT / "tests" / "data" / "judge"
+SETS = ("train", "test", "external")
 #: What the hook's action is, i.e. the positive class of precision/recall.
-ACTION = {"legibility": "illegible page", "boilerplate": "page chrome", "non_content": "no content"}
+ACTION = {"legibility": "illegible page", "boilerplate": "thinned to one copy", "non_content": "no content"}
+#: The hooks whose threshold is calibrated on TRAIN; non_content's act and suspect thresholds are a
+#: fixed policy (the review set them above the overlap of refusals and real answers).
+CALIBRATED = ("legibility", "boilerplate")
 GRID = [round(0.05 * n, 2) for n in range(1, 20)]
 
 
 def load(hook: str, data: Path) -> List[Dict[str, Any]]:
-    with open(data / f"{hook}.jsonl", encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    """The labelled items of one hook: the TRAIN/TEST set, then the EXTERNAL one (split "external")."""
+    items = []
+    for path, split in ((data / f"{hook}.jsonl", None), (data / "external" / f"{hook}.jsonl", "external")):
+        if not path.exists():
+            continue
+        with open(path, encoding="utf-8") as handle:
+            items += [dict(json.loads(line), **({"split": split} if split else {})) for line in handle if line.strip()]
+    return items
 
 
 # --- per item: the rule's verdict, whether the judge is asked, the judge's arguments -----------------
@@ -63,6 +80,15 @@ def load(hook: str, data: Path) -> List[Dict[str, Any]]:
 def positive(hook: str, item: Dict[str, Any]) -> bool:
     """Whether the item's label is the hook's action class."""
     return item["label"] == (0 if hook == "legibility" else 1)
+
+
+def scored(hook: str, item: Dict[str, Any]) -> bool:
+    """Whether the hook's decision matters for the item: not a page the route OCRs for another reason
+    (a searchable scan), not a line the judge is never asked about."""
+    route = item.get("route")
+    if isinstance(route, str) and route.startswith("image:") and route != "image:illegible_text_layer":
+        return False
+    return item.get("asked", True) is not False
 
 
 def rule(hook: str, item: Dict[str, Any]) -> Tuple[bool, bool, tuple]:
@@ -102,7 +128,8 @@ def scores(truth: Sequence[bool], predicted: Sequence[bool]) -> Dict[str, Any]:
 def calibrate(hook: str, rows: List[Dict[str, Any]]) -> Tuple[float, float]:
     """The threshold with the best TRAIN accuracy: (threshold, accuracy). Among tied thresholds the
     pipeline's own one wins, else the one that acts least (verbatim first: the lowest for legibility,
-    which acts below its threshold, the highest for the others)."""
+    which acts below its threshold, the highest for the others). The rule was fixed before the
+    TRAIN/TEST re-split of review round 1."""
     default = Q.RAW_THRESHOLDS[hook]
     grid = sorted(set(GRID + [default]))
     truth = [row["positive"] for row in rows]
@@ -117,18 +144,11 @@ def calibrate(hook: str, rows: List[Dict[str, Any]]) -> Tuple[float, float]:
     return (min(tied) if hook == "legibility" else max(tied)), best
 
 
-def routed_elsewhere(item: Dict[str, Any]) -> bool:
-    """A PDF page the pipeline OCRs from its render for another reason than its legibility (a
-    searchable scan): neither the detector nor the judge decides it, so it is not scored."""
-    route = item.get("route")
-    return isinstance(route, str) and route.startswith("image:") and route != "image:illegible_text_layer"
-
-
 def evaluate(hook: str, items: List[Dict[str, Any]], judge: TypeSafeJudge) -> List[Dict[str, Any]]:
-    """Ask the judge about every item it would be asked about; one row per scored item."""
+    """Ask the judge about every scored item it would be asked about; one row per scored item."""
     rows = []
     for item in items:
-        if routed_elsewhere(item):
+        if not scored(hook, item):
             continue
         fired, asked, args = rule(hook, item)
         verdict = judge.verdict(hook, *args) if asked else None
@@ -138,18 +158,32 @@ def evaluate(hook: str, items: List[Dict[str, Any]], judge: TypeSafeJudge) -> Li
             "p": verdict.probability if verdict else None,
             "latency_ms": verdict.latency_ms if verdict else None,
             "input_tokens": verdict.input_tokens if verdict else None,
+            "copies": len((item.get("context") or {}).get("pages") or []) if hook == "boilerplate" else None,
         })
     return rows
 
 
 def report(hook: str, rows: List[Dict[str, Any]], threshold: float, split: str) -> Dict[str, Any]:
-    chosen = [row for row in rows if row["split"] == split] if split != "all" else rows
+    chosen = [row for row in rows if row["split"] == split]
     truth = [row["positive"] for row in chosen]
-    rule_only = scores(truth, [row["fired"] for row in chosen])
-    judged = scores(truth, [decide(hook, row["fired"], row["asked"], row["p"], threshold) for row in chosen])
-    unanswered = sum(1 for row in chosen if row["asked"] and row["p"] is None)
-    return {"split": split, "threshold": threshold, "asked": sum(row["asked"] for row in chosen),
-            "unanswered": unanswered, "rule": rule_only, "rule+jev": judged}
+    decisions = [decide(hook, row["fired"], row["asked"], row["p"], threshold) for row in chosen]
+    result = {"split": split, "threshold": threshold, "asked": sum(row["asked"] for row in chosen),
+              "unanswered": sum(1 for row in chosen if row["asked"] and row["p"] is None),
+              "rule": scores(truth, [row["fired"] for row in chosen]), "rule+jev": scores(truth, decisions)}
+    if hook == "boilerplate":
+        # Output view: copies of repeated lines the judge removed (every one but the first).
+        removed = [(row, max(0, (row["copies"] or 0) - 1)) for row, acted in zip(chosen, decisions) if acted]
+        result["copies_removed"] = sum(n for _, n in removed)
+        result["copies_removed_wrongly"] = sum(n for row, n in removed if not row["positive"])
+        result["copies_left_to_remove"] = sum(max(0, (row["copies"] or 0) - 1) for row, acted in zip(chosen, decisions)
+                                              if row["positive"] and not acted)
+    if hook == "non_content":
+        suspect = Q.RAW_SUSPECT_THRESHOLDS["non_content"]
+        flagged = [row for row, acted in zip(chosen, decisions) if not acted and row["p"] is not None
+                   and suspect <= row["p"] < threshold]
+        result["suspected"] = len(flagged)
+        result["suspected_refusals"] = sum(1 for row in flagged if row["positive"])
+    return result
 
 
 def fmt(value: Optional[float]) -> str:
@@ -158,16 +192,25 @@ def fmt(value: Optional[float]) -> str:
 
 def print_table(results: Dict[str, Dict[str, Any]]) -> None:
     print()
-    print(f"{'hook':12s} {'split':6s} {'method':9s} {'acc':>6s} {'prec':>6s} {'recall':>6s}   tp  fp  fn  tn   "
+    print(f"{'hook':12s} {'set':8s} {'method':9s} {'acc':>6s} {'prec':>6s} {'recall':>6s}   tp  fp  fn  tn   "
           f"(action: positive class)")
     for hook, result in results.items():
         for split_result in result["splits"]:
+            if not split_result["rule"]["n"]:
+                continue
             for method in ("rule", "rule+jev"):
                 s = split_result[method]
-                print(f"{hook:12s} {split_result['split']:6s} {method:9s} {fmt(s['accuracy']):>6s} "
+                print(f"{hook:12s} {split_result['split']:8s} {method:9s} {fmt(s['accuracy']):>6s} "
                       f"{fmt(s['precision']):>6s} {fmt(s['recall']):>6s}  {s['tp']:3d} {s['fp']:3d} {s['fn']:3d} "
                       f"{s['tn']:3d}   ({ACTION[hook]}; n={s['n']}, judge asked {split_result['asked']}, "
                       f"threshold {split_result['threshold']:g})")
+            if hook == "boilerplate":
+                print(f"{'':12s} {split_result['split']:8s} output: {split_result['copies_removed']} repeated copies "
+                      f"removed, {split_result['copies_removed_wrongly']} of them wrongly; "
+                      f"{split_result['copies_left_to_remove']} chrome copies left in")
+            if hook == "non_content":
+                print(f"{'':12s} {split_result['split']:8s} kept but flagged non_content_suspected: "
+                      f"{split_result['suspected']} ({split_result['suspected_refusals']} of them refusals)")
 
 
 def latency(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
@@ -210,7 +253,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--data", type=Path, default=DATA, help="labelled sets (default tests/data/judge)")
     parser.add_argument("--hooks", default=",".join(HOOKS))
-    parser.add_argument("--calibrate", action="store_true", help="calibrate each threshold on the TRAIN split")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="calibrate the legibility and boilerplate thresholds on the TRAIN split")
     parser.add_argument("--cache-dir", default=None, help="verdict cache (default: the judge's default)")
     parser.add_argument("--deck", type=Path, default=None, help="a real deck read in place for the extra slice")
     parser.add_argument("--documents", type=Path, nargs="*", default=[],
@@ -231,32 +275,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for hook in [h.strip() for h in args.hooks.split(",") if h.strip()]:
         rows = evaluate(hook, load(hook, args.data), judge)
         train = [row for row in rows if row["split"] == "train"]
-        if args.calibrate:
+        if args.calibrate and hook in CALIBRATED:
             threshold, train_accuracy = calibrate(hook, train)
         else:
             threshold, train_accuracy = Q.RAW_THRESHOLDS[hook], None
-        splits = [report(hook, rows, threshold, "train"), report(hook, rows, threshold, "test")]
-        deck_rows = []
+        splits = [report(hook, rows, threshold, split) for split in SETS]
         if deck is not None and deck.get(hook):
             deck_rows = evaluate(hook, [dict(item, split="deck") for item in deck[hook]], judge)
+            rows += deck_rows
             splits.append(report(hook, deck_rows, threshold, "deck"))
         results[hook] = {"threshold": threshold, "pipeline_threshold": _pipeline_threshold(hook),
                          "train_accuracy": train_accuracy, "splits": splits,
-                         "latency": latency(rows + deck_rows), "rows": rows + deck_rows}
+                         "latency": latency(rows), "rows": rows}
 
     print_table(results)
     print()
     for hook, result in results.items():
         lat = result["latency"]
         cost = lat["cost_usd_per_request"]
-        print(f"{hook:12s} calibrated threshold {result['threshold']:g} (pipeline {result['pipeline_threshold']:g}); "
+        how = "calibrated" if args.calibrate and hook in CALIBRATED else "shipped"
+        print(f"{hook:12s} {how} threshold {result['threshold']:g} (pipeline {result['pipeline_threshold']:g}); "
               f"fresh requests {lat['requests']}, p50 {lat['p50_ms']} ms, p95 {lat['p95_ms']} ms, "
               f"{lat['mean_input_tokens']} input tokens, ${cost:.7f} per request" if cost else
-              f"{hook:12s} calibrated threshold {result['threshold']:g}; no fresh requests (all cached)")
-        misses = [row for row in result["rows"] if row["split"] == "test"
-                  and decide(hook, row["fired"], row["asked"], row["p"], result["threshold"]) != row["positive"]]
-        for row in misses:
-            print(f"    TEST miss {row['id']} ({row['kind']}): label {row['label']}, p={row['p']}")
+              f"{hook:12s} {how} threshold {result['threshold']:g}; no fresh requests (all cached)")
+        for row in result["rows"]:
+            if row["split"] in ("test", "external") and \
+                    decide(hook, row["fired"], row["asked"], row["p"], result["threshold"]) != row["positive"]:
+                print(f"    {row['split'].upper()} miss {row['id']} ({row['kind']}): label {row['label']}, p={row['p']}")
 
     documents = {}
     for path in ([args.deck] if args.deck is not None else []) + list(args.documents):

@@ -12,12 +12,16 @@ only: the committed sample documents, PDFs generated here with PyMuPDF and Pillo
 seed items of the two judge spikes, embedded below. Every text and context is what the
 current doc2mark gives the hook: page texts come from ``pdf_routing.measure_page`` (and the
 legibility judge the pipeline actually asks), repeated lines from ``pdf_to_simple_json`` with
-a recording ``boilerplate_judge``.
+a recording ``boilerplate_judge``. Boilerplate items are labelled with how many copies must
+remain in the Markdown (``expected_copies``). Splits go by family, with near-duplicates
+clustered (``assign_splits``). ``external/{legibility,boilerplate,non_content}.jsonl`` hold
+the PR #22 reviewer's fresh items (embedded verbatim, split "external", never calibrated on).
 
 ``deck_items(path)`` builds the slice of a private deck at run time; it is never written
 into the repository (the repository is public).
 """
 import argparse
+import difflib
 import hashlib
 import io
 import json
@@ -86,41 +90,149 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def assign_splits(items: List[dict]) -> None:
-    """``split`` = "train" or "test", about 50/50 within every (kind, label) stratum. A group
-    (items from the same base text or document) goes to one split as a whole: groups are
-    taken in the order of the SHA-256 of their name and each goes to the side that keeps its
-    strata most balanced (ties by the hash)."""
-    groups: Dict[str, List[dict]] = defaultdict(list)
+NEAR_JACCARD, NEAR_RATIO = 0.5, 0.8   # near-duplicates: char 5-gram Jaccard or difflib ratio at or above
+SIMILARITY: Dict[str, dict] = {}      # per hook, filled by assign_splits: cross-split similarity report
+
+
+def _sim_text(text: str) -> str:
+    """What near-duplicate detection compares: NFKC, case folded, whitespace collapsed."""
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _grams(text: str) -> frozenset:
+    return frozenset(text[i:i + 5] for i in range(len(text) - 4)) or frozenset([text])
+
+
+def _jaccard(grams_a: frozenset, grams_b: frozenset) -> float:
+    return len(grams_a & grams_b) / len(grams_a | grams_b)
+
+
+def _ratio(a: str, b: str, floor: float = 0.0) -> float:
+    """difflib ratio (no autojunk); 0.0 when its upper bound is below ``floor`` (not computed)."""
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    if matcher.real_quick_ratio() < floor or matcher.quick_ratio() < floor:
+        return 0.0
+    return matcher.ratio()
+
+
+def _near(jaccard: float, ratio: float) -> bool:
+    return jaccard >= NEAR_JACCARD or ratio >= NEAR_RATIO
+
+
+def _cross_max(pairs, texts) -> Tuple[float, float, list]:
+    """Exact largest Jaccard and difflib ratio over ``pairs`` (i, j, Jaccard), and the pairs above
+    0.6 on either, computing a ratio only where its upper bound can still matter."""
+    best_jaccard = max((jaccard for _, _, jaccard in pairs), default=0.0)
+    best_ratio, above = 0.0, []
+    bounds = []
+    for i, j, jaccard in pairs:
+        matcher = difflib.SequenceMatcher(None, texts[i], texts[j], autojunk=False)
+        bounds.append((min(matcher.real_quick_ratio(), matcher.quick_ratio()), i, j, jaccard, matcher))
+    for bound, i, j, jaccard, matcher in sorted(bounds, key=lambda row: (-row[0], row[1], row[2])):
+        if bound <= min(best_ratio, 0.6) and jaccard <= 0.6:
+            continue
+        ratio = matcher.ratio()
+        best_ratio = max(best_ratio, ratio)
+        if ratio > 0.6 or jaccard > 0.6:
+            above.append((round(jaccard, 3), round(ratio, 3), i, j))
+    return best_jaccard, best_ratio, sorted(above, key=lambda row: (-max(row[:2]), row[2], row[3]))
+
+
+def assign_splits(items: List[dict], hook: str, external: Sequence[dict] = ()) -> None:
+    """``split`` = "train" or "test" by FAMILY: every item of one template (its translations and
+    brand or name substitutions), one base text or document, or one seed item goes to one split.
+    Families holding near-duplicates (compared text: the page text, answer or line text; char
+    5-gram Jaccard >= 0.5 or difflib ratio >= 0.8) are merged with union-find, and every merged
+    cluster goes to one split. A cluster with a near-duplicate of an ``external`` item goes to
+    test (the external set stays independent of calibration); the others are placed largest first
+    (ties by the SHA-256 of their name), each on the side that keeps the labels, then the (kind,
+    label) strata (and for boilerplate the (language, label) and (reason, label) strata) most
+    balanced, ties by the hash. Records in ``SIMILARITY[hook]`` the largest cross-split
+    similarities."""
+    texts = [_sim_text(item["text"]) for item in items]
+    grams = [_grams(text) for text in texts]
+    parent = {item["family"]: item["family"] for item in items}
+
+    def find(family):
+        while parent[family] != family:
+            parent[family] = parent[parent[family]]
+            family = parent[family]
+        return family
+
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if items[i]["family"] != items[j]["family"] and _near(
+                    _jaccard(grams[i], grams[j]), _ratio(texts[i], texts[j], NEAR_RATIO)):
+                a, b = sorted((find(items[i]["family"]), find(items[j]["family"])))
+                parent[b] = a
+    clusters: Dict[str, List[dict]] = defaultdict(list)
     for item in items:
-        groups[item["group"]].append(item)
+        clusters[find(item["family"])].append(item)
+    ext_texts = [_sim_text(ext["text"]) for ext in external]
+    ext_grams = [_grams(text) for text in ext_texts]
+    forced = {find(items[i]["family"]) for i in range(len(items)) for e in range(len(external))
+              if _near(_jaccard(grams[i], ext_grams[e]), _ratio(texts[i], ext_texts[e], NEAR_RATIO))}
     counts: Dict[tuple, List[int]] = defaultdict(lambda: [0, 0])
-    for group in sorted(groups, key=_hash):
-        strata = Counter((item["kind"], item["label"]) for item in groups[group])
+
+    def strata(members):
+        keys = Counter()
+        for item in members:
+            keys[("label", item["label"])] += 4
+            keys[("kind", item["kind"], item["label"])] += 1
+            if "lang" in item:
+                keys[("lang", item["lang"], item["label"])] += 1
+            if "context" in item:
+                keys[("reason", item["context"]["reason"], item["label"])] += 1
+        return keys
+
+    order = sorted(clusters, key=lambda name: (name not in forced, -len(clusters[name]), _hash(name)))
+    for name in order:
+        weights = strata(clusters[name])
 
         def cost(side: int) -> int:
             total = 0
-            for stratum, n in strata.items():
-                sides = list(counts[stratum])
+            for key, n in weights.items():
+                sides = list(counts[key])
                 sides[side] += n
                 total += abs(sides[0] - sides[1])
             return total
 
         costs = cost(0), cost(1)
-        side = 0 if costs[0] < costs[1] else 1 if costs[1] < costs[0] else int(_hash(group)[-1], 16) % 2
-        for stratum, n in strata.items():
-            counts[stratum][side] += n
-        for item in groups[group]:
+        side = 1 if name in forced else 0 if costs[0] < costs[1] else 1 if costs[1] < costs[0] \
+            else int(_hash(name)[-1], 16) % 2
+        for key, n in weights.items():
+            counts[key][side] += n
+        for item in clusters[name]:
             item["split"] = ("train", "test")[side]
+    cross = [(i, j, _jaccard(grams[i], grams[j])) for i in range(len(items)) for j in range(i + 1, len(items))
+             if items[i]["split"] != items[j]["split"]]
+    jaccard, ratio, above = _cross_max(cross, texts)
+    info = {"families": len(parent), "clusters": len(clusters),
+            "largest_cluster": max(len(members) for members in clusters.values()),
+            "forced_test": sum(len(clusters[name]) for name in forced),
+            "max_jaccard": jaccard, "max_ratio": ratio,
+            "above_0.6": [(a, b, items[i]["id"], items[j]["id"]) for a, b, i, j in above]}
+    if external:
+        both = texts + ext_texts
+        both_grams = grams + ext_grams
+        for split in ("train", "test"):
+            pairs = [(i, len(items) + e, _jaccard(both_grams[i], both_grams[len(items) + e]))
+                     for i in range(len(items)) if items[i]["split"] == split for e in range(len(external))]
+            jaccard, ratio, above = _cross_max(pairs, both)
+            ids = [item["id"] for item in items] + [ext["id"] for ext in external]
+            info[f"external_{split}"] = (jaccard, ratio, [(a, b, ids[j], ids[i]) for a, b, i, j in above])
+    SIMILARITY[hook] = info
 
 
 def summary(name: str, items: Sequence[dict]) -> str:
     """Counts per split x label, and per kind x label x split (Markdown)."""
     lines = [f"### {name} ({len(items)} items)", "", "| split | label 0 | label 1 | total |", "|---|---|---|---|"]
-    for split in ("train", "test"):
+    for split in [split for split in ("train", "test", "external") if any(item["split"] == split for item in items)]:
         part = [item for item in items if item["split"] == split]
         zero = sum(1 for item in part if item["label"] == 0)
         lines.append(f"| {split} | {zero} | {len(part) - zero} | {len(part)} |")
+    if any(item["split"] == "external" for item in items):
+        return "\n".join(lines)
     lines += ["", "| kind | label | train | test |", "|---|---|---|---|"]
     table = Counter((item["kind"], item["label"], item["split"]) for item in items)
     for kind, label in sorted({(item["kind"], item["label"]) for item in items}):
@@ -452,14 +564,43 @@ NON_CONTENT_AMBIGUOUS = [
 ]
 
 
+# Answers written as variants of one seed (translations, a derived hard negative, a shortened
+# form): one family, so one split. Other groups are their own family.
+_NC_FAMILY = {
+    **dict.fromkeys(("zh-tw-refusal", "zh-cn-refusal", "ja-refusal", "ko-refusal", "de-refusal",
+                     "zh-cannot-read-picture", "ja-photo-refusal"), "cant-recognize-text"),
+    **dict.fromkeys(("zh-no-text", "ko-no-text", "de-no-text", "zh-photo-no-text", "new-ko-no-text", "new-de-no-text",
+                     "new-fr-no-text", "new-es-no-text", "new-ja-no-text", "new-zh-cn-undetected",
+                     "new-zh-tw-undetected", "new-de-not-found", "no-legible-present"), "no-text-in-image"),
+    **dict.fromkeys(("new-zh-tw-blurry", "new-zh-cn-blurry", "new-ja-unclear", "new-ko-blurry", "new-de-blurry",
+                     "new-fr-blurry", "new-es-blurry", "too-blurry-because", "new-quality-too-poor"), "too-blurry"),
+    **dict.fromkeys(("new-fr-refusal", "new-es-refusal", "cannot-provide-transcription", "zh-no-transcription",
+                     "new-zh-tw-extract", "new-apologies-extract", "new-ja-recognize"), "cannot-transcribe"),
+    **dict.fromkeys(("caveat-handwritten", "caveat-signature", "caveat-stamp", "caveat-ja", "caveat-ko", "caveat-de",
+                     "new-caveat-zh", "new-caveat-fr", "new-caveat-es", "scan-corrupted", "scan-corrupted-total",
+                     "illegible-marker"), "caveat-invoice"),
+    **dict.fromkeys(("chart-description", "photo-description", "caveat-bar-chart", "caveat-factory", "caveat-map",
+                     "caveat-stop-sign", "caveat-watermark", "caveat-tsmc", "caveat-logo", "caveat-caption"),
+                    "caveat-no-text"),
+    **dict.fromkeys(("identify-people", "identify-people-short"), "identify-people"),
+    **dict.fromkeys(("illegible", "illegible-brackets", "unreadable"), "illegible"),
+    **dict.fromkeys(("no-text-found", "error-no-text-found", "search-no-text"), "no-text-found"),
+    **dict.fromkeys(("cannot-process", "cannot-process-image"), "cannot-process"),
+    **dict.fromkeys(("zh-upload-outage", "ja-upload-outage"), "upload-outage"),
+    **dict.fromkeys(("new-ja-full", "new-de-machine", "new-ko-closed", "new-zh-sold-out"), "shop-apology"),
+    **dict.fromkeys(("named-es", "named-zh", "named-ja"), "named-refusal"),
+    **dict.fromkeys(("openai-classic", "assist-courtesy"), "cant-assist"),
+}
+
+
 def build_non_content() -> Tuple[List[dict], List[dict]]:
     from doc2mark.ocr.refusal import MAX_JUDGE_CHARS, _normalize, matches_non_content_pattern
 
     def base(prefix, group, source, kind, label, text):
         answer = _normalize(text)
         fires = matches_non_content_pattern(text)
-        return {"id": None, "group": f"{prefix}-{group}", "source": source, "kind": kind, "label": label,
-                "split": None, "text": text, "pattern": fires,
+        return {"id": None, "group": f"{prefix}-{group}", "family": f"nc:{_NC_FAMILY.get(group, group)}",
+                "source": source, "kind": kind, "label": label, "split": None, "text": text, "pattern": fires,
                 "judged": bool(answer) and not fires and len(answer) <= MAX_JUDGE_CHARS}
 
     items, seen = [], Counter()
@@ -471,7 +612,6 @@ def build_non_content() -> Tuple[List[dict], List[dict]]:
     texts = [item["text"] for item in items]
     if len(set(texts)) != len(texts):
         raise ValueError("duplicate non-content texts")
-    assign_splits(items)
     ambiguous = []
     for group, text, source, why in NON_CONTENT_AMBIGUOUS:
         item = base("nca", group, source, "ambiguous", None, text)
@@ -1291,9 +1431,9 @@ def measure_pdf(path: Path) -> List[dict]:
     return pages
 
 
-def _item(id_, group, source, kind, label, text, spans, **extra) -> dict:
-    item = {"id": id_, "group": group, "source": source, "kind": kind, "label": label, "split": None,
-            "text": text, "spans": spans}
+def _item(id_, group, source, kind, label, text, spans, family=None, **extra) -> dict:
+    item = {"id": id_, "group": group, "family": family or group, "source": source, "kind": kind, "label": label,
+            "split": None, "text": text, "spans": spans}
     item.update(_stats_fields(spans))
     item.update(extra)
     return item
@@ -1321,6 +1461,11 @@ def _transform_text(text: str, factory, line_wise: bool) -> str:
     return factory()(text)
 
 
+# sample_pdf.pdf is sample_document.docx printed to PDF, and sample_text.txt their plain-text
+# sibling from the same sample generator: one family.
+_SAMPLE_FAMILY = dict.fromkeys(("sample_pdf.pdf", "sample_document.docx", "sample_text.txt"), "sample:sample-document")
+
+
 def build_legibility(tmp: Path) -> List[dict]:
     import docx
     items: List[dict] = []
@@ -1330,10 +1475,11 @@ def build_legibility(tmp: Path) -> List[dict]:
         name = Path(rel).name
         for number, page in enumerate(measure_pdf(SAMPLES / rel), 1):
             group = f"sample:{name}#p{number}"
-            bases[f"pdf:{name}#p{number}"] = {"rows": page["rows"], "group": group}
+            family = _SAMPLE_FAMILY.get(name, f"sample:{name}")
+            bases[f"pdf:{name}#p{number}"] = {"rows": page["rows"], "group": group, "family": family}
             items.append(_item(f"lg-real-{Path(rel).stem}-p{number}", group, f"sample_documents/{rel}#p{number}",
-                               "real_pdf_page", 1, page["text"], page["spans"], route=page["route"],
-                               pipeline_asks=page["pipeline_asks"]))
+                               "real_pdf_page", 1, page["text"], page["spans"], family=family,
+                               route=page["route"], pipeline_asks=page["pipeline_asks"]))
     # spike A non-deck, non-PDF legible items (committed documents read here)
     dx = docx.Document(str(SAMPLES / "sample_document.docx"))
     fx = docx.Document(str(SAMPLES / "fail-1.docx"))
@@ -1346,11 +1492,13 @@ def build_legibility(tmp: Path) -> List[dict]:
                                 "sample_documents/sample_text.txt"),
     }
     for key, (spike_id, text, source) in strings.items():
-        bases[key] = {"text": text, "group": f"sample:{key.split(':', 1)[1]}"}
+        name = key.split(":", 1)[1]
+        bases[key] = {"text": text, "group": f"sample:{name}", "family": _SAMPLE_FAMILY.get(name, f"sample:{name}")}
         items.append(_item(f"lg-spike-{spike_id}", bases[key]["group"], f"spikeA:{spike_id} <- {source}",
-                           "real_document_text", 1, text, _string_spans(text), route=None, pipeline_asks=None))
+                           "real_document_text", 1, text, _string_spans(text), family=bases[key]["family"], route=None,
+                           pipeline_asks=None))
     for spike_id, text in SPIKE_A_HARD.items():
-        bases[f"hard:{spike_id}"] = {"text": text, "group": f"spikeA:{spike_id}"}
+        bases[f"hard:{spike_id}"] = {"text": text, "group": f"spikeA:{spike_id}", "family": f"spikeA:{spike_id}"}
         items.append(_item(f"lg-spike-{spike_id}", f"spikeA:{spike_id}", f"spikeA:{spike_id}", "hard_legible_string", 1,
                            text, _string_spans(text), route=None, pipeline_asks=None))
     # spike A garbage on the same bases (the deck-derived ones are only in deck_items)
@@ -1363,7 +1511,7 @@ def build_legibility(tmp: Path) -> List[dict]:
             text = _transform_text(base["text"], factory, line_wise)
             spans = _string_spans(text)
         items.append(_item(f"lg-spike-{spike_id}", base["group"], f"spikeA:{spike_id} <- {key}", kind, 0, text, spans,
-                           route=None, pipeline_asks=None))
+                           family=base["family"], route=None, pipeline_asks=None))
     # generated PDFs
     for suffix, kind, label, key, builder in GENERATED:
         path = builder(tmp / f"lg-{suffix}.pdf", key)
@@ -1373,7 +1521,6 @@ def build_legibility(tmp: Path) -> List[dict]:
     ids = [item["id"] for item in items]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate legibility ids")
-    assign_splits(items)
     return items
 
 
@@ -1424,139 +1571,263 @@ def _const(text: str, on=None):
 BP_DOCS: List[dict] = []
 
 
-def _doc(name, lang, pages, lines, size=A4, body_size=10.5, body_top=None, body_bottom=None):
+def _doc(name, lang, pages, lines, size=A4, body_size=10.5, body_top=None, body_bottom=None, family=None):
+    """One generated document. ``family`` names the template it is a variant of (its
+    translations and brand or name substitutions share it, and so share a split)."""
     BP_DOCS.append({"name": name, "lang": lang, "pages": pages, "lines": lines, "size": size,
-                    "body_size": body_size, "body_top": body_top, "body_bottom": body_bottom})
+                    "body_size": body_size, "body_top": body_top, "body_bottom": body_bottom,
+                    "family": family or _BP_FAMILY.get(name, name)})
 
 
-CHROME, CONTENT = 1, 0
+# What must remain in the Markdown of a line repeated on several pages: ONE copy (keep only the
+# first: branding, logo text, taglines, marks, copyright, contact lines, print stamps, a brand with
+# a page number) or ALL copies (a reader needs it where it appears: per-page labels, titles, unit
+# notes, disclaimers, table header cells, identifiers that belong to the content). label = 1 / 0.
+ONE, ALL = 1, 0
+COPIES = {ONE: "one", ALL: "all"}
+
+# Documents written as variants of one template (translations, brand or name substitutions).
+_BP_FAMILY = {
+    **dict.fromkeys(("statement-header", "de-bilanz", "zh-statement", "ja-statement"), "statement-header"),
+    **dict.fromkeys(("brand-header", "zh-brand"), "brand-header"),
+    **dict.fromkeys(("classification-row", "ja-report", "zh-cn-report"), "brand-and-mark"),
+    **dict.fromkeys(("confidential-footer", "de-vertraulich", "zh-confidential", "slides-confidential"),
+                    "confidential-mark"),
+    **dict.fromkeys(("copyright-footer", "de-copyright", "zh-copyright", "ja-copyright"), "copyright-footer"),
+    **dict.fromkeys(("disclaimer-footer", "de-hinweis", "zh-disclaimer", "forward-looking", "notes-footer"),
+                    "disclaimer-footer"),
+    **dict.fromkeys(("letterhead", "de-letterhead", "url-footer"), "letterhead"),
+    **dict.fromkeys(("account-header", "customer-header", "patient-header"), "identifier-header"),
+    **dict.fromkeys(("lesson-footer", "zh-lesson", "de-lektion"), "lesson-label"),
+    **dict.fromkeys(("exhibit-header", "exhibit-plain"), "exhibit-label"),
+    **dict.fromkeys(("invoice-ids", "daily-log"), "per-page-id"),
+    **dict.fromkeys(("slides-number-brand", "de-folien", "ja-slides"), "slide-brand-number"),
+    **dict.fromkeys(("slides-slide-of", "slides-slide-plain", "de-folie"), "slide-number"),
+    **dict.fromkeys(("slides-tagline", "event-footer"), "slide-tagline"),
+    **dict.fromkeys(("section-few-pages", "slides-section-few", "two-page-title"), "few-pages-title"),
+    **dict.fromkeys(("brand-two-pages", "two-page-brand"), "few-pages-brand"),
+    **dict.fromkeys(("table-header-rows", "de-tabellenkopf"), "table-header"),
+}
 _PAGE_OF = lambda p, n: f"Page {p} of {n}"  # noqa: E731 (a page number: the rule removes it, never asked)
 
 # --- English reports --------------------------------------------------------------------------
-_doc("brand-header", "en", 6, [(40, 60, _const("Northwind Traders"), 9, "sans", "brand_name", CHROME),
-                               (-30, 270, _PAGE_OF, 9, "sans", "page_number", CHROME)])
+_doc("brand-header", "en", 6, [(40, 60, _const("Northwind Traders"), 9, "sans", "brand_name", ONE),
+                               (-30, 270, _PAGE_OF, 9, "sans", "page_number", ONE)])
 _doc("confidential-footer", "en", 5, [(-40, 60, _const("Confidential – Internal Use Only"), 8, "sans",
-                                       "confidentiality_mark", CHROME),
-                                      (-40, 500, lambda p, n: str(p), 8, "sans", "page_number", CHROME)])
+                                       "confidentiality_mark", ONE),
+                                      (-40, 500, lambda p, n: str(p), 8, "sans", "page_number", ONE)])
 _doc("copyright-footer", "en", 7, [(-32, 60, _const("© 2026 Fabrikam, Inc. All rights reserved."), 8, "sans",
-                                    "copyright", CHROME)])
+                                    "copyright", ONE)])
 _doc("url-footer", "en", 4, [(-32, 60, _const("www.northwind.example | +1 (425) 555-0100 | info@northwind.example"), 8,
-                              "sans", "contact_line", CHROME)])
-_doc("statement-header", "en", 5, [(38, 230, _const("Contoso Ltd."), 11, "bold", "brand_name", CHROME),
-                                   (54, 200, _const("Consolidated Balance Sheet"), 11, "bold", "statement_title", CONTENT),
-                                   (69, 225, _const("(in thousands of USD)"), 9, "sans", "unit_note", CONTENT),
-                                   (-30, 290, lambda p, n: str(p), 9, "sans", "page_number", CHROME)])
+                              "sans", "contact_line", ONE)])
+_doc("statement-header", "en", 5, [(38, 230, _const("Contoso Ltd."), 11, "bold", "brand_name", ONE),
+                                   (54, 200, _const("Consolidated Balance Sheet"), 11, "bold", "statement_title", ALL),
+                                   (69, 225, _const("(in thousands of USD)"), 9, "sans", "unit_note", ALL),
+                                   (-30, 290, lambda p, n: str(p), 9, "sans", "page_number", ONE)])
 _doc("disclaimer-footer", "en", 6, [(-36, 60, _const("Past performance is not a reliable indicator of future results."),
-                                     8, "sans", "disclaimer", CONTENT)])
+                                     8, "sans", "disclaimer", ALL)])
 _doc("notes-footer", "en", 4, [(-36, 60, _const("The accompanying notes are an integral part of these financial "
-                                                "statements."), 8, "sans", "legal_note", CONTENT)])
-_doc("draft-mark", "en", 5, [(38, 60, _const("DRAFT – for internal review"), 9, "bold", "marking", CHROME)])
-_doc("print-stamp", "en", 3, [(-28, 60, _const("Printed 2026-09-12 14:03 by jdoe"), 7, "sans", "print_timestamp", CHROME)])
+                                                "statements."), 8, "sans", "legal_note", ALL)])
+_doc("draft-mark", "en", 5, [(38, 60, _const("DRAFT – for internal review"), 9, "bold", "marking", ONE)])
+_doc("print-stamp", "en", 3, [(-28, 60, _const("Printed 2026-09-12 14:03 by jdoe"), 7, "sans", "print_timestamp", ONE)])
 _doc("account-header", "en", 6, [(40, 60, _const("Account No. 4471-0098-22 · Statement period August 2026"), 9, "sans",
-                                  "account_identifier", CONTENT)])
+                                  "account_identifier", ALL)])
 _doc("customer-header", "en", 4, [(40, 60, _const("Customer: Globex Corporation (ID 88213)"), 9, "sans",
-                                   "account_identifier", CONTENT)])
-_doc("section-few-pages", "en", 6, [(40, 60, _const("Adatum Research"), 9, "sans", "brand_name", CHROME),
+                                   "account_identifier", ALL)])
+_doc("section-few-pages", "en", 6, [(40, 60, _const("Adatum Research"), 9, "sans", "brand_name", ONE),
                                     (80, 60, _const("Summary of Findings", on=(1, 4)), 16, "bold", "section_title",
-                                     CONTENT)])
-_doc("brand-two-pages", "en", 8, [(40, 60, _const("Fabrikam Labs", on=(2, 6)), 9, "sans", "brand_name", CHROME)])
-_doc("letterhead", "en", 4, [(34, 60, _const("Fabrikam Legal LLP"), 10, "bold", "brand_name", CHROME),
+                                     ALL)])
+_doc("brand-two-pages", "en", 8, [(40, 60, _const("Lamna Healthcare", on=(2, 6)), 9, "sans", "brand_name", ONE)])
+_doc("letterhead", "en", 4, [(34, 60, _const("Fabrikam Legal LLP"), 10, "bold", "brand_name", ONE),
                              (48, 60, _const("1200 Harbor Blvd, Suite 400 · Seattle, WA 98101"), 8, "sans",
-                              "contact_line", CHROME),
+                              "contact_line", ONE),
                              (60, 60, _const("Tel +1 206 555 0199 · fabrikam-legal.example"), 8, "sans", "contact_line",
-                              CHROME)])
-_doc("lesson-footer", "en", 6, [(-30, 72, lambda p, n: f"Lesson · {p}", 9, "sans", "per_page_label", CONTENT),
-                                (-30, 500, lambda p, n: str(p), 9, "sans", "page_number", CHROME)])
-_doc("exhibit-header", "en", 5, [(40, 60, lambda p, n: f"Exhibit – {p + 3}", 10, "sans", "per_page_label", CONTENT)])
-_doc("exhibit-plain", "en", 5, [(40, 60, lambda p, n: f"Exhibit {p}", 10, "sans", "per_page_label", CONTENT)])
-_doc("invoice-ids", "en", 5, [(40, 60, lambda p, n: f"Invoice · {1000 + p}", 10, "sans", "per_page_id", CONTENT),
-                              (56, 60, lambda p, n: f"Invoice No. INV-{7000 + p}", 9, "sans", "per_page_id", CONTENT)])
+                              ONE)])
+_doc("lesson-footer", "en", 6, [(-30, 72, lambda p, n: f"Lesson · {p}", 9, "sans", "per_page_label", ALL),
+                                (-30, 500, lambda p, n: str(p), 9, "sans", "page_number", ONE)])
+_doc("exhibit-header", "en", 5, [(40, 60, lambda p, n: f"Exhibit – {p + 3}", 10, "sans", "per_page_label", ALL)])
+_doc("exhibit-plain", "en", 5, [(40, 60, lambda p, n: f"Exhibit {p}", 10, "sans", "per_page_label", ALL)])
+_doc("invoice-ids", "en", 5, [(40, 60, lambda p, n: f"Invoice · {1000 + p}", 10, "sans", "per_page_id", ALL),
+                              (56, 60, lambda p, n: f"Invoice No. INV-{7000 + p}", 9, "sans", "per_page_id", ALL)])
 _doc("daily-log", "en", 4, [(40, 60, lambda p, n: f"Site log – {p + 7} September 2026", 10, "sans", "per_page_date",
-                             CONTENT)])
-_doc("step-of", "en", 6, [(40, 60, lambda p, n: f"Step {p} of {n}", 10, "sans", "per_page_label", CONTENT)])
-_doc("classification-row", "en", 5, [(38, 60, _const("Contoso Ltd."), 9, "sans", "brand_name", CHROME),
-                                     (38, 470, _const("INTERNAL"), 9, "bold", "marking", CHROME)])
-_doc("brand-title-row", "en", 6, [(44, 60, _const("Contoso Labs"), 9, "sans", "brand_name", CHROME),
+                             ALL)])
+_doc("step-of", "en", 6, [(40, 60, lambda p, n: f"Step {p} of {n}", 10, "sans", "per_page_label", ALL)])
+_doc("classification-row", "en", 5, [(38, 60, _const("Contoso Ltd."), 9, "sans", "brand_name", ONE),
+                                     (38, 470, _const("INTERNAL"), 9, "bold", "marking", ONE)])
+_doc("brand-title-row", "en", 6, [(44, 60, _const("Contoso Labs"), 9, "sans", "brand_name", ONE),
                                   (46, 300, lambda p, n: ["Overview", "Market", "Pipeline", "Operations", "Finance",
                                                           "Outlook"][p - 1] + " review", 14, "bold", "section_title",
-                                   CONTENT)])
-_doc("header-no-gap", "en", 5, [(66, 60, _const("Northwind Traders"), 9, "sans", "brand_name", CHROME)], body_top=78)
+                                   ALL)])
+_doc("header-no-gap", "en", 5, [(66, 60, _const("Northwind Traders"), 9, "sans", "brand_name", ONE)], body_top=78)
 _doc("unit-note-footer", "en", 5, [(-36, 60, _const("All amounts in EUR thousands unless otherwise stated."), 8, "sans",
-                                    "unit_note", CONTENT)])
+                                    "unit_note", ALL)])
 _doc("forward-looking", "en", 3, [(-36, 60, _const("This report contains forward-looking statements that involve "
-                                                   "risks."), 8, "sans", "disclaimer", CONTENT)])
+                                                   "risks."), 8, "sans", "disclaimer", ALL)])
 _doc("chapter-headers", "en", 6, [(40, 60, lambda p, n: "Chapter 1 – Market Review" if p <= 3 else
-                                   "Chapter 2 – Operations", 9, "sans", "section_title", CONTENT)])
+                                   "Chapter 2 – Operations", 9, "sans", "section_title", ALL)])
 _doc("patient-header", "en", 4, [(40, 60, _const("Patient: Jane Roe · MRN 00412877 · DOB 1979-03-02"), 9, "sans",
-                                  "account_identifier", CONTENT)])
-_doc("two-page-brand", "en", 2, [(40, 60, _const("Adatum Corporation"), 9, "sans", "brand_name", CHROME),
+                                  "account_identifier", ALL)])
+_doc("two-page-brand", "en", 2, [(40, 60, _const("Adatum Corporation"), 9, "sans", "brand_name", ONE),
                                  (-32, 60, _const("adatum.example · +44 20 7946 0000"), 8, "sans", "contact_line",
-                                  CHROME)])
-_doc("two-page-title", "en", 2, [(40, 60, _const("Quarterly Operations Report"), 9, "sans", "section_title", CONTENT)])
+                                  ONE)])
+_doc("two-page-title", "en", 2, [(40, 60, _const("Quarterly Operations Report"), 9, "sans", "section_title", ALL)])
 _doc("event-footer", "en", 5, [(-30, 60, _const("Contoso Summit 2026 · Seattle · 14-16 October"), 8, "sans",
-                                "brand_tagline", CHROME)], size=SLIDE, body_size=18)
+                                "brand_tagline", ONE)], size=SLIDE, body_size=18)
 _doc("slides-confidential", "en", 6, [(-24, 36, _const("Contoso Labs Confidential"), 10, "sans",
-                                       "confidentiality_mark", CHROME),
-                                      (-24, 900, lambda p, n: str(p), 10, "sans", "page_number", CHROME)],
+                                       "confidentiality_mark", ONE),
+                                      (-24, 900, lambda p, n: str(p), 10, "sans", "page_number", ONE)],
      size=SLIDE, body_size=18)
 _doc("slides-number-brand", "en", 6, [(-24, 36, lambda p, n: f"{p} | Contoso Labs", 10, "sans", "page_number_label",
-                                       CHROME)], size=SLIDE, body_size=18)
+                                       ONE)], size=SLIDE, body_size=18)
 _doc("slides-slide-of", "en", 5, [(-24, 860, lambda p, n: f"Slide {p} / {n}", 10, "sans", "page_number_label",
-                                   CHROME)], size=SLIDE, body_size=18)
-_doc("slides-slide-plain", "en", 5, [(-24, 880, lambda p, n: f"Slide {p}", 10, "sans", "page_number_label", CHROME)],
+                                   ONE)], size=SLIDE, body_size=18)
+_doc("slides-slide-plain", "en", 5, [(-24, 880, lambda p, n: f"Slide {p}", 10, "sans", "page_number_label", ONE)],
      size=SLIDE, body_size=18)
-_doc("slides-tagline", "en", 7, [(-24, 36, _const("Innovation that scales"), 10, "sans", "brand_tagline", CHROME)],
+_doc("slides-tagline", "en", 7, [(-24, 36, _const("Innovation that scales"), 10, "sans", "brand_tagline", ONE)],
      size=SLIDE, body_size=18)
-_doc("slides-section-few", "en", 8, [(44, 60, _const("Roadmap", on=(2, 6)), 26, "bold", "section_title", CONTENT)],
+_doc("slides-section-few", "en", 8, [(44, 60, _const("Roadmap", on=(2, 6)), 26, "bold", "section_title", ALL)],
      size=SLIDE, body_size=18)
-_doc("table-header-rows", "en", 5, [(40, 60, _const("Contoso Bank"), 9, "sans", "brand_name", CHROME),
-                                    (96, 60, _const("Date"), 10, "bold", "table_header_row", CONTENT),
-                                    (96, 200, _const("Description"), 10, "bold", "table_header_row", CONTENT),
-                                    (96, 400, _const("Amount"), 10, "bold", "table_header_row", CONTENT),
-                                    (96, 480, _const("Balance"), 10, "bold", "table_header_row", CONTENT)],
+_doc("table-header-rows", "en", 5, [(40, 60, _const("Contoso Bank"), 9, "sans", "brand_name", ONE),
+                                    (96, 60, _const("Date"), 10, "bold", "table_header_row", ALL),
+                                    (96, 200, _const("Description"), 10, "bold", "table_header_row", ALL),
+                                    (96, 400, _const("Amount"), 10, "bold", "table_header_row", ALL),
+                                    (96, 480, _const("Balance"), 10, "bold", "table_header_row", ALL)],
      body_top=110)
 # --- German --------------------------------------------------------------------------------------
 _doc("de-letterhead", "de", 4, [(36, 60, _const("Müller & Söhne GmbH · Industriestraße 12 · 70565 Stuttgart"), 9,
-                                 "sans", "contact_line", CHROME),
+                                 "sans", "contact_line", ONE),
                                 (-34, 60, _const("Geschäftsführer: Hans Müller · Amtsgericht Stuttgart HRB 12345"), 7,
-                                 "sans", "company_imprint", CHROME)])
-_doc("de-vertraulich", "de", 5, [(40, 60, _const("Streng vertraulich"), 9, "bold", "confidentiality_mark", CHROME),
-                                 (-30, 270, lambda p, n: f"Seite {p} von {n}", 9, "sans", "page_number", CHROME)])
-_doc("de-bilanz", "de", 4, [(38, 230, _const("Fabrikam AG"), 11, "bold", "brand_name", CHROME),
+                                 "sans", "company_imprint", ONE)])
+_doc("de-vertraulich", "de", 5, [(40, 60, _const("Streng vertraulich"), 9, "bold", "confidentiality_mark", ONE),
+                                 (-30, 270, lambda p, n: f"Seite {p} von {n}", 9, "sans", "page_number", ONE)])
+_doc("de-bilanz", "de", 4, [(38, 230, _const("Fabrikam AG"), 11, "bold", "brand_name", ONE),
                             (54, 190, _const("Konzernbilanz zum 31. Dezember 2025"), 11, "bold", "statement_title",
-                             CONTENT),
-                            (69, 240, _const("(in Tausend EUR)"), 9, "sans", "unit_note", CONTENT)])
+                             ALL),
+                            (69, 240, _const("(in Tausend EUR)"), 9, "sans", "unit_note", ALL)])
 _doc("de-hinweis", "de", 5, [(-34, 60, _const("Alle Angaben ohne Gewähr. Irrtümer und Änderungen vorbehalten."), 8,
-                              "sans", "disclaimer", CONTENT)])
+                              "sans", "disclaimer", ALL)])
 _doc("de-copyright", "de", 6, [(-32, 60, _const("© 2026 Fabrikam AG. Alle Rechte vorbehalten."), 8, "sans",
-                                "copyright", CHROME)])
-_doc("de-folien", "de", 6, [(-24, 36, lambda p, n: f"Fabrikam · {p}", 10, "sans", "page_number_label", CHROME)],
+                                "copyright", ONE)])
+_doc("de-folien", "de", 6, [(-24, 36, lambda p, n: f"Fabrikam · {p}", 10, "sans", "page_number_label", ONE)],
      size=SLIDE, body_size=18)
-_doc("de-tabellenkopf", "de", 4, [(96, 60, _const("Datum"), 10, "bold", "table_header_row", CONTENT),
-                                  (96, 200, _const("Beschreibung"), 10, "bold", "table_header_row", CONTENT),
-                                  (96, 400, _const("Betrag"), 10, "bold", "table_header_row", CONTENT),
-                                  (96, 480, _const("Saldo"), 10, "bold", "table_header_row", CONTENT)], body_top=110)
+_doc("de-tabellenkopf", "de", 4, [(96, 60, _const("Datum"), 10, "bold", "table_header_row", ALL),
+                                  (96, 200, _const("Beschreibung"), 10, "bold", "table_header_row", ALL),
+                                  (96, 400, _const("Betrag"), 10, "bold", "table_header_row", ALL),
+                                  (96, 480, _const("Saldo"), 10, "bold", "table_header_row", ALL)], body_top=110)
 # --- Chinese ------------------------------------------------------------------------------------
-_doc("zh-brand", "zh", 6, [(40, 60, _const("北辰精密工業股份有限公司"), 9, "zh-t", "brand_name", CHROME),
-                           (-30, 280, lambda p, n: f"第 {p} 頁", 9, "zh-t", "page_number", CHROME)])
-_doc("zh-confidential", "zh", 5, [(-34, 60, _const("機密文件 請勿外流"), 8, "zh-t", "confidentiality_mark", CHROME)])
-_doc("zh-statement", "zh", 4, [(38, 240, _const("北辰精密工業股份有限公司"), 11, "zh-t", "brand_name", CHROME),
-                               (54, 260, _const("合併資產負債表"), 11, "zh-t", "statement_title", CONTENT),
-                               (69, 262, _const("單位：新台幣千元"), 9, "zh-t", "unit_note", CONTENT)])
-_doc("zh-disclaimer", "zh", 5, [(-34, 60, _const("本資料僅供參考，不構成任何投資建議。"), 8, "zh-t", "disclaimer", CONTENT)])
-_doc("zh-copyright", "zh", 4, [(-32, 60, _const("版權所有 © 2026 北辰精密"), 8, "zh-t", "copyright", CHROME)])
-_doc("zh-cn-report", "zh", 5, [(40, 60, _const("华东新能源科技有限公司"), 9, "zh-s", "brand_name", CHROME),
-                               (-34, 60, _const("内部资料 注意保密"), 8, "zh-s", "confidentiality_mark", CHROME)])
-_doc("zh-lesson", "zh", 5, [(40, 60, lambda p, n: f"第{p}課 基礎會計", 10, "zh-t", "per_page_label", CONTENT)])
+_doc("zh-brand", "zh", 6, [(40, 60, _const("北辰精密工業股份有限公司"), 9, "zh-t", "brand_name", ONE),
+                           (-30, 280, lambda p, n: f"第 {p} 頁", 9, "zh-t", "page_number", ONE)])
+_doc("zh-confidential", "zh", 5, [(-34, 60, _const("機密文件 請勿外流"), 8, "zh-t", "confidentiality_mark", ONE)])
+_doc("zh-statement", "zh", 4, [(38, 240, _const("北辰精密工業股份有限公司"), 11, "zh-t", "brand_name", ONE),
+                               (54, 260, _const("合併資產負債表"), 11, "zh-t", "statement_title", ALL),
+                               (69, 262, _const("單位：新台幣千元"), 9, "zh-t", "unit_note", ALL)])
+_doc("zh-disclaimer", "zh", 5, [(-34, 60, _const("本資料僅供參考，不構成任何投資建議。"), 8, "zh-t", "disclaimer", ALL)])
+_doc("zh-copyright", "zh", 4, [(-32, 60, _const("版權所有 © 2026 北辰精密"), 8, "zh-t", "copyright", ONE)])
+_doc("zh-cn-report", "zh", 5, [(40, 60, _const("华东新能源科技有限公司"), 9, "zh-s", "brand_name", ONE),
+                               (-34, 60, _const("内部资料 注意保密"), 8, "zh-s", "confidentiality_mark", ONE)])
+_doc("zh-lesson", "zh", 5, [(40, 60, lambda p, n: f"第{p}課 基礎會計", 10, "zh-t", "per_page_label", ALL)])
 # --- Japanese ------------------------------------------------------------------------------------
-_doc("ja-report", "ja", 5, [(40, 60, _const("株式会社ミナト精機"), 9, "ja", "brand_name", CHROME),
-                            (40, 480, _const("社外秘"), 9, "ja", "confidentiality_mark", CHROME)])
-_doc("ja-statement", "ja", 4, [(54, 250, _const("連結貸借対照表"), 11, "ja", "statement_title", CONTENT),
-                               (69, 250, _const("（単位：百万円）"), 9, "ja", "unit_note", CONTENT)])
+_doc("ja-report", "ja", 5, [(40, 60, _const("株式会社ミナト精機"), 9, "ja", "brand_name", ONE),
+                            (40, 480, _const("社外秘"), 9, "ja", "confidentiality_mark", ONE)])
+_doc("ja-statement", "ja", 4, [(54, 250, _const("連結貸借対照表"), 11, "ja", "statement_title", ALL),
+                               (69, 250, _const("（単位：百万円）"), 9, "ja", "unit_note", ALL)])
 _doc("ja-copyright", "ja", 6, [(-32, 60, _const("Copyright © 2026 Minato Seiki Co., Ltd. All Rights Reserved."), 7,
-                                "sans", "copyright", CHROME)])
-_doc("ja-slides", "ja", 6, [(-24, 36, lambda p, n: f"ミナト精機 | {p}", 10, "ja", "page_number_label", CHROME)],
+                                "sans", "copyright", ONE)])
+_doc("ja-slides", "ja", 6, [(-24, 36, lambda p, n: f"ミナト精機 | {p}", 10, "ja", "page_number_label", ONE)],
      size=SLIDE, body_size=18)
+
+# --- Lines the rule keeps and asks about: rows it cannot peel off (attached_to_content), lines
+# on too few pages (few_pages), numbered labels (numbered_label); every template in its own family
+# unless it is a variant of another.
+_ROW_TITLES = {"zh": ["營運概況", "財務摘要", "倉儲網路", "車隊管理", "永續發展", "未來展望"],
+               "ja": ["事業概要", "売上推移", "生産体制", "品質保証", "今後の計画"]}
+_doc("zh-brand-title-row", "zh", 6, [(44, 60, _const("遠翔物流"), 9, "zh-t", "brand_name", ONE),
+                                     (46, 260, lambda p, n: _ROW_TITLES["zh"][p - 1], 14, "zh-t", "section_title", ALL)],
+     family="brand-title-row")
+_doc("ja-brand-title-row", "ja", 5, [(44, 60, _const("ひかり電機"), 9, "ja", "brand_name", ONE),
+                                     (46, 250, lambda p, n: _ROW_TITLES["ja"][p - 1], 14, "ja", "section_title", ALL),
+                                     (44, 480, _const("社外秘"), 9, "ja", "confidentiality_mark", ONE)],
+     family="brand-title-row")
+_NOTE_TITLES = {"en": ["Revenue", "Leases", "Income taxes", "Inventories", "Provisions"],
+                "de": ["Umsatzerlöse", "Leasingverhältnisse", "Ertragsteuern", "Vorräte", "Rückstellungen"],
+                "zh": ["營業收入", "租賃", "所得稅", "存貨", "負債準備"],
+                "ja": ["売上収益", "リース", "法人所得税", "棚卸資産", "引当金"]}
+for _lang, _face, _unit in (("en", "sans", "(in USD thousands)"), ("de", "sans", "(Angaben in TEUR)"),
+                            ("zh", "zh-t", "（單位：新臺幣百萬元）"), ("ja", "ja", "（単位：千円）")):
+    _doc(f"{_lang}-notes-unit-row", _lang, 5,
+         [(46, 60, (lambda titles: lambda p, n: titles[p - 1])(_NOTE_TITLES[_lang]), 12,
+           "bold" if _face == "sans" else _face, "section_title", ALL),
+          (46, 400, _const(_unit), 9, _face, "unit_note", ALL)], family="notes-unit-row")
+_doc("zh-price-table", "zh", 4, [(96, 60, _const("品名"), 10, "zh-t", "table_header_row", ALL),
+                                 (96, 300, _const("單價"), 10, "zh-t", "table_header_row", ALL),
+                                 (96, 450, _const("數量"), 10, "zh-t", "table_header_row", ALL)],
+     body_top=110, family="price-table-header")
+_doc("ja-price-table", "ja", 4, [(96, 60, _const("品番"), 10, "ja", "table_header_row", ALL),
+                                 (96, 300, _const("単価"), 10, "ja", "table_header_row", ALL),
+                                 (96, 450, _const("数量"), 10, "ja", "table_header_row", ALL)],
+     body_top=110, family="price-table-header")
+for _name, _lang, _face, _text in (("de-konto-no-gap", "de", "sans", "Konto 4471 0098 22 · Kontoauszug August 2026"),
+                                   ("zh-account-no-gap", "zh", "zh-t", "帳號 0123-456-789 對帳單期間 2026年8月"),
+                                   ("ja-account-no-gap", "ja", "ja", "口座番号 1234567 2026年8月分お取引明細")):
+    _doc(_name, _lang, 5, [(66, 60, _const(_text), 9, _face, "account_identifier", ALL)], body_top=78,
+         family="account-no-gap")
+for _name, _lang, _face, _text in (("de-header-no-gap", "de", "sans", "Keller Präzisionstechnik GmbH"),
+                                   ("zh-header-no-gap", "zh", "zh-t", "華岳建設股份有限公司"),
+                                   ("ja-header-no-gap", "ja", "ja", "さくら精工株式会社")):
+    _doc(_name, _lang, 5, [(66, 60, _const(_text), 9, _face, "brand_name", ONE)], body_top=78, family="header-no-gap")
+for _name, _lang, _face, _text in (("footer-no-gap-mark", "en", "sans", "Trey Research Confidential"),
+                                   ("de-footer-no-gap-mark", "de", "sans", "Vertraulich – nur für den internen Gebrauch"),
+                                   ("zh-footer-no-gap-mark", "zh", "zh-t", "機密資料 未經授權不得複製"),
+                                   ("ja-footer-no-gap-mark", "ja", "ja", "社外秘 無断転載禁止")):
+    _doc(_name, _lang, 5, [(-60, 60, _const(_text), 8, _face, "confidentiality_mark", ONE)], body_bottom=770,
+         family="footer-no-gap-mark")
+for _name, _lang, _face, _text in (("continued-footer", "en", "sans", "(continued on next page)"),
+                                   ("de-continued-footer", "de", "sans", "(Fortsetzung auf der nächsten Seite)"),
+                                   ("zh-continued-footer", "zh", "zh-t", "（續下頁）"),
+                                   ("ja-continued-footer", "ja", "ja", "（次ページへ続く）")):
+    _doc(_name, _lang, 5, [(-60, 60, _const(_text, on=(1, 2, 3, 4)), 8, _face, "continuation_note", ALL)],
+         body_bottom=770, family="continued-footer")
+_doc("footer-no-gap-contact", "en", 5, [(-60, 60, _const("Tailspin Toys · 1 Toy Street, Leeds LS1 4AP · "
+                                                         "tailspintoys.example"), 8, "sans", "contact_line", ONE)],
+     body_bottom=770, family="footer-no-gap-contact")
+_doc("de-footer-no-gap-contact", "de", 5, [(-60, 60, _const("Weber Antriebstechnik GmbH · Hafenstraße 9 · 28217 Bremen"),
+                                            8, "sans", "contact_line", ONE)], body_bottom=770,
+     family="footer-no-gap-contact")
+_doc("de-lektion", "de", 5, [(-30, 72, lambda p, n: f"Lektion – {p}", 9, "sans", "per_page_label", ALL)])
+_doc("unit-footer", "en", 6, [(-30, 72, lambda p, n: f"Unit · {p}", 9, "sans", "per_page_label", ALL)], family="unit-label")
+_doc("zh-unit-footer", "zh", 5, [(-30, 72, lambda p, n: f"單元 · {p}", 9, "zh-t", "per_page_label", ALL)],
+     family="unit-label")
+_doc("ja-unit-footer", "ja", 5, [(-30, 72, lambda p, n: f"講義 · {p}", 9, "ja", "per_page_label", ALL)], family="unit-label")
+_doc("report-brand-number", "en", 6, [(40, 400, lambda p, n: f"Woodgrove Bank | {p}", 9, "sans", "page_number_label",
+                                       ONE)], family="report-brand-number")
+_doc("zh-report-brand-number", "zh", 5, [(40, 420, lambda p, n: f"聯華電訊 | {p}", 9, "zh-t", "page_number_label", ONE)],
+     family="report-brand-number")
+_doc("de-folie", "de", 5, [(-24, 860, lambda p, n: f"Folie {p} / {n}", 10, "sans", "page_number_label", ONE)],
+     size=SLIDE, body_size=18)
+_doc("de-chapter-pair", "de", 8, [(40, 60, _const("Anhang B – Messprotokolle", on=(6, 7)), 11, "bold", "section_title",
+                                   ALL)], family="chapter-title-pair")
+_doc("zh-chapter-pair", "zh", 8, [(40, 60, _const("第四章 風險管理", on=(3, 4)), 11, "zh-t", "section_title", ALL)],
+     family="chapter-title-pair")
+_doc("ja-chapter-pair", "ja", 7, [(40, 60, _const("第5章 設備投資計画", on=(2, 3)), 11, "ja", "section_title", ALL)],
+     family="chapter-title-pair")
+_doc("unit-note-few", "en", 8, [(-36, 60, _const("(in thousands of USD, unaudited)", on=(3, 4, 5)), 8, "sans",
+                                 "unit_note", ALL)])
+_doc("de-konto-few", "de", 6, [(40, 60, _const("Kontoauszug Nr. 9/2026 · Konto 5520 1187 03", on=(2, 5)), 9, "sans",
+                                "account_identifier", ALL)])
+_doc("de-mark-pair", "de", 8, [(40, 60, _const("Nur für den Dienstgebrauch", on=(3, 4)), 9, "bold",
+                                "confidentiality_mark", ONE)])
+_doc("zh-copyright-pair", "zh", 8, [(-32, 60, _const("版權所有 翻印必究", on=(7, 8)), 8, "zh-t", "copyright", ONE)])
+_doc("ja-notice-pair", "ja", 6, [(-32, 60, _const("無断転載を禁じます", on=(1, 6)), 8, "ja", "copyright", ONE)])
+_doc("website-pair", "en", 6, [(-32, 60, _const("www.lucernepublishing.example", on=(1, 6)), 8, "sans", "contact_line",
+                                ONE)])
+_doc("stamp-pair", "en", 5, [(-28, 60, _const("Printed 2026-09-18 09:12 by mlopez", on=(2, 3)), 7, "sans",
+                              "print_timestamp", ONE)])
+_doc("zh-two-page-quote", "zh", 2, [(40, 60, _const("東岳貿易股份有限公司"), 9, "zh-t", "brand_name", ONE),
+                                    (40, 400, _const("報價單 Q-2026-118"), 9, "zh-t", "document_id", ALL)],
+     family="two-page-quote")
+_doc("ja-two-page-quote", "ja", 2, [(40, 60, _const("あおば商事株式会社 営業部"), 9, "ja", "brand_name", ONE),
+                                    (40, 400, _const("見積書 No. 2026-0457"), 9, "ja", "document_id", ALL)],
+     family="two-page-quote")
 
 # Deck-like documents (16:9, the brand line under the logo text, beside a numbered per-slide label).
 DECKS = [
@@ -1569,9 +1840,11 @@ DECKS = [
     ("deck-de", "en", "by Müller Automation", "MÜLLER",
      ["Ausgangslage", "Lösung", "Architektur", "Projektplan", "Kosten", "Referenzen", "Kontakt", "Anhang"]),
 ]
+_DECK_LANG = {"deck-de": "de"}   # German titles drawn with the Latin font
 
 
-def _deck_pdf(path: Path, lang: str, brand: str, logo: str, titles: Sequence[str], registry: dict) -> Path:
+def _deck_pdf(path: Path, lang: str, brand: str, logo: str, titles: Sequence[str], registry: dict,
+              placed: dict) -> Path:
     pdf = Pdf()
     font = {"zh": "zh-t", "ja": "ja"}.get(lang, "sans")
     for number, title in enumerate(titles, 1):
@@ -1584,13 +1857,15 @@ def _deck_pdf(path: Path, lang: str, brand: str, logo: str, titles: Sequence[str
         pdf.text(page, 1440 - 52 - width, 62, label, 20, font)
         pdf.text(page, 60, 190, title, 48, font if font != "sans" else "bold")
         _body(pdf, page, lang, f"{path.name}-{number}", 290, 700, 20)
-        registry[logo] = ("logo_text", CHROME)
-        registry[brand] = ("brand_tagline", CHROME)
-        registry[label] = ("per_page_label", CONTENT)
+        registry[logo] = ("logo_text", ONE)
+        registry[brand] = ("brand_tagline", ONE)
+        registry[label] = ("per_page_label", ALL)
+        for text in (logo, brand, label):
+            placed.setdefault(text, set()).add(number)
     return pdf.save(path)
 
 
-def _bp_pdf(path: Path, spec: dict, registry: dict) -> Path:
+def _bp_pdf(path: Path, spec: dict, registry: dict, placed: dict) -> Path:
     pdf = Pdf()
     width, height = spec["size"]
     body_size = spec["body_size"]
@@ -1604,11 +1879,14 @@ def _bp_pdf(path: Path, spec: dict, registry: dict) -> Path:
                 continue
             pdf.text(page, x, y if y > 0 else height + y, text, size, font)
             registry[text] = (kind, label)
+            placed.setdefault(text, set()).add(p)
         _body(pdf, page, spec["lang"], f"{spec['name']}-{p}", top, bottom, body_size)
     return pdf.save(path)
 
 
-def _capture(path: Path, registry: dict, oracle: bool) -> List[Tuple[str, dict]]:
+def _capture(path: Path, registry: dict, oracle: bool) -> Tuple[List[Tuple[str, dict]], dict]:
+    """The questions the pipeline asks a recording judge (None, or the intended answer with
+    ``oracle``), and the converted document."""
     from doc2mark.pipelines.pymupdf_advanced_pipeline import pdf_to_simple_json
     calls = []
 
@@ -1616,10 +1894,26 @@ def _capture(path: Path, registry: dict, oracle: bool) -> List[Tuple[str, dict]]
         calls.append((text, dict(context)))
         if not oracle:
             return None
-        return 1.0 if _lookup(registry, text)[1] == CHROME else 0.0
+        return 1.0 if _lookup(registry, text)[1] == ONE else 0.0
 
-    pdf_to_simple_json(str(path), extract_images=False, ocr_images=False, show_progress=False, boilerplate_judge=judge)
-    return calls
+    output = pdf_to_simple_json(str(path), extract_images=False, ocr_images=False, show_progress=False,
+                                boilerplate_judge=judge)
+    return calls, output
+
+
+def _nfkc(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def _copies_left(output: dict, placed: dict) -> Dict[str, int]:
+    """Per placed line: on how many of its pages it is still content (not typed text:header or
+    text:footer, i.e. in the Markdown)."""
+    pages: Dict[int, List[str]] = defaultdict(list)
+    for entry in output["content"]:
+        if entry.get("type") not in ("text:header", "text:footer") and isinstance(entry.get("content"), str):
+            pages[entry["page"]].append(entry["content"])
+    text_of = {page: _nfkc(" ".join(parts)) for page, parts in pages.items()}
+    return {text: sum(1 for page in on if _nfkc(text) in text_of.get(page, "")) for text, on in placed.items()}
 
 
 def _lookup(registry: dict, text: str) -> Tuple[str, int]:
@@ -1632,44 +1926,212 @@ def _lookup(registry: dict, text: str) -> Tuple[str, int]:
     raise KeyError(f"the pipeline asked about a line no generator placed: {text!r}")
 
 
+def _masked(text: str) -> str:
+    return re.sub(r"[0-9]+", "#", _nfkc(text))
+
+
 def build_boilerplate(tmp: Path, report: Optional[list] = None) -> List[dict]:
+    """The questions the pipeline asks about repeated lines (reasons attached_to_content,
+    few_pages, numbered_label), labelled with how many copies must remain in the Markdown.
+    ``report`` receives every designed line it does not ask about, with the copies the rule
+    leaves in the output."""
     sys.path.insert(0, str(ROOT))
     from tests.e2e import builders_judge
     jobs = []
     for spec in BP_DOCS:
-        registry: dict = {}
-        path = _bp_pdf(tmp / f"bp-{spec['name']}.pdf", spec, registry)
-        jobs.append((spec["name"], f"generated:{spec['name']}", path, registry))
+        registry, placed = {}, {}
+        path = _bp_pdf(tmp / f"bp-{spec['name']}.pdf", spec, registry, placed)
+        jobs.append((spec["name"], spec["family"], spec["lang"], f"generated:{spec['name']}", path, registry, placed))
     for name, lang, brand, logo, titles in DECKS:
-        registry = {}
-        path = _deck_pdf(tmp / f"bp-{name}.pdf", lang, brand, logo, titles, registry)
-        jobs.append((name, f"generated:{name}", path, registry))
-    registry = {builders_judge.BRAND_LINE: ("brand_tagline", CHROME), builders_judge.LOGO_TEXT: ("logo_text", CHROME)}
+        registry, placed = {}, {}
+        path = _deck_pdf(tmp / f"bp-{name}.pdf", lang, brand, logo, titles, registry, placed)
+        jobs.append((name, "deck", _DECK_LANG.get(name, lang), f"generated:{name}", path, registry, placed))
+    slides = set(range(1, len(builders_judge.DECK_SLIDES) + 1))
+    registry = {builders_judge.BRAND_LINE: ("brand_tagline", ONE), builders_judge.LOGO_TEXT: ("logo_text", ONE)}
+    placed = {builders_judge.BRAND_LINE: set(slides), builders_judge.LOGO_TEXT: set(slides)}
     for number, (title, _) in enumerate(builders_judge.DECK_SLIDES, 1):
-        registry[f"{number:02d} / {title}"] = ("per_page_label", CONTENT)
-    jobs.append(("e2e-deck", "tests/e2e/builders_judge.py:deck_pdf", builders_judge.deck_pdf(tmp / "bp-e2e-deck.pdf"),
-                 registry))
-    jobs.append(("sample-pdf", "sample_documents/sample_pdf.pdf", SAMPLES / "sample_pdf.pdf", {}))
+        registry[f"{number:02d} / {title}"] = ("per_page_label", ALL)
+        placed[f"{number:02d} / {title}"] = {number}
+    jobs.append(("e2e-deck", "deck", "en", "tests/e2e/builders_judge.py:deck_pdf",
+                 builders_judge.deck_pdf(tmp / "bp-e2e-deck.pdf"), registry, placed))
+    jobs.append(("sample-pdf", "sample:sample_pdf.pdf", "en", "sample_documents/sample_pdf.pdf",
+                 SAMPLES / "sample_pdf.pdf", {}, {}))
     items, never = [], []
-    for name, source, path, registry in jobs:
-        asked = {}
+    for name, family, lang, source, path, registry, placed in jobs:
+        asked, left = {}, {}
         for run in ("none", "oracle"):
-            for text, context in _capture(path, registry, oracle=run == "oracle"):
+            calls, output = _capture(path, registry, oracle=run == "oracle")
+            if run == "none":
+                left = _copies_left(output, placed)
+            for text, context in calls:
+                if context.get("reason") not in ("attached_to_content", "few_pages", "numbered_label"):
+                    raise AssertionError(f"{name}: unexpected reason {context.get('reason')!r} for {text!r}")
                 key = (text, json.dumps(context, sort_keys=True, ensure_ascii=False))
                 asked.setdefault(key, []).append(run)
+        covered = set()
         for index, ((text, context_json), runs) in enumerate(asked.items(), 1):
             kind, label = _lookup(registry, text)
-            items.append({"id": f"bp-{name}-{index}", "group": f"bp:{name}", "source": source, "kind": kind,
-                          "label": label, "split": None, "text": text, "context": json.loads(context_json),
+            context = json.loads(context_json)
+            items.append({"id": f"bp-{name}-{index}", "group": f"bp:{name}", "family": f"bp:{family}", "source": source,
+                          "kind": kind, "lang": lang, "label": label, "expected_copies": COPIES[label], "split": None,
+                          "asked": True, "text": text, "context": context,
                           "asked_in": "both" if len(set(runs)) == 2 else runs[0]})
-        asked_kinds = {_lookup(registry, text) for text, _ in asked}
-        for kind, label in sorted(set(registry.values()) - asked_kinds):
-            example = next(placed for placed, value in registry.items() if value == (kind, label))
-            never.append((name, kind, label, example))
+            if context["reason"] == "numbered_label":   # one question for the whole numbered series
+                covered |= {placed_text for placed_text, on in placed.items()
+                            if _masked(placed_text) == _masked(text) and on & set(context["pages"])}
+            covered |= {placed_text for placed_text in registry if _nfkc(placed_text) == _nfkc(text)}
+        for text, (kind, label) in registry.items():
+            if text not in covered:
+                never.append({"doc": name, "kind": kind, "expected_copies": COPIES[label], "text": text,
+                              "pages": len(placed.get(text, ())), "copies_left": left.get(text)})
     if report is not None:
         report.extend(never)
-    assign_splits(items)
     return items
+
+
+# ========================================================================== external set
+#
+# Fresh items written by the PR #22 reviewer (not by the generators above), never used for
+# calibration: .executors/d2m-review-jev/probes/fresh_items.py, embedded verbatim below.
+
+
+def _review_pr22_items():
+    import codecs
+
+    def rot13(s): return codecs.encode(s, "rot13")
+    def rev_lines(s): return "\n".join(l[::-1] for l in s.split("\n"))
+    def mojibake(s, enc_from, enc_to):
+        return s.encode(enc_from).decode(enc_to, errors="ignore")
+
+    EN_MEMO = ("Operations update - Week 38\nThe Kaohsiung warehouse shipped 4,812 orders this week, up 6 percent.\n"
+               "Two forklifts are scheduled for maintenance on Thursday morning.\nPlease submit overtime requests by Friday noon.")
+    ZH_NOTICE = "重大訊息公告\n主旨：本公司董事會決議通過第二季合併財務報告。\n說明：合併營業收入新台幣三十二億元，較去年同期成長百分之十二。"
+    EL_TEXT = "Τιμολόγιο αρ. 88\nΕκδότης: Αιγαίο Λογισμικό Α.Ε.\nΣύνολο πληρωμής: 1.240,00 EUR\nΠληρωμή εντός 30 ημερών."
+    RU_TEXT = "Счёт-фактура № 45 от 12.09.2026\nПродавец: ООО «Северный ветер»\nИтого к оплате: 118 000,00 руб."
+
+    LEGIBILITY = [  # (id, label 1=legible, text)
+        ("f-lg-lorem", 1, "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\nUt enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.\nDuis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur."),
+        ("f-lg-pem", 1, "Appendix C - Server certificate\n-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\nRTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD\nVQQDExlCYWx0aW1vcmUgQ3liZXJUcnVzdCBSb290MB4XDTAwMDUxMjE4NDYwMFoX\n-----END CERTIFICATE-----\nFingerprint (SHA-1): D4:DE:20:D0:5E:66:FC:53:FE:1A:50:88:2C:78:DB:28:52:CA:E4:74"),
+        ("f-lg-hexdump", 1, "Firmware image header (offset 0x0000)\n00000000  7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00  |.ELF............|\n00000010  03 00 3e 00 01 00 00 00  60 10 00 00 00 00 00 00  |..>.....`.......|\n00000020  40 00 00 00 00 00 00 00  e8 3a 00 00 00 00 00 00  |@........:......|\nChecksum: 0x5A3C  Build: 2026.09.14-r3"),
+        ("f-lg-medical", 1, "Progress note 09/12\nPt c/o SOB x3d, worse on exertion. Hx HTN, DM2, CKD3a.\nVitals: BP 152/94, HR 104, RR 22, SpO2 93% RA, T 37.9\nA/P: r/o CAP vs CHF exac. CXR, CBC w/ diff, BMP, BNP, trop q6h. Start ceftriaxone 1 g IV qd + azithro 500 mg PO."),
+        ("f-lg-welsh", 1, "Cyngor Sir Ceredigion\nMae'r cyngor yn gwahodd ceisiadau am grantiau cymunedol ar gyfer prosiectau sy'n gwella llwybrau cerdded a chyfleusterau chwarae.\nDylid cyflwyno pob cais erbyn dydd Gwener, 31 Hydref 2026."),
+        ("f-lg-vietnamese", 1, "HỢP ĐỒNG DỊCH VỤ\nĐiều 5. Quyền và nghĩa vụ của các bên\nBên A có trách nhiệm thanh toán đầy đủ và đúng hạn theo quy định tại Điều 3 của hợp đồng này.\nBên B cam kết bảo mật mọi thông tin liên quan đến khách hàng."),
+        ("f-lg-thai", 1, "ประกาศบริษัท\nบริษัทจะปิดทำการในวันจันทร์ที่ 13 ตุลาคม 2569 เนื่องในวันหยุดราชการ\nกรุณาติดต่อฝ่ายบริการลูกค้าในวันทำการถัดไป"),
+        ("f-lg-legal-cites", 1, "II. ARGUMENT\nA. Plaintiff states a claim under 42 U.S.C. § 1983.\nSee Monell v. Dep't of Soc. Servs., 436 U.S. 658, 690-91 (1978); cf. Pembaur v. City of Cincinnati, 475 U.S. 469, 480 (1986).\nId. at 481 n.9. Accord Fed. R. Civ. P. 12(b)(6)."),
+        ("f-lg-chem", 1, "Safety Data Sheet - Section 3\nIbuprofen: 2-(4-isobutylphenyl)propanoic acid, C13H18O2, CAS 15687-27-1, EC 239-784-6\nMagnesium stearate: CAS 557-04-0, 0.5-1.0 % w/w\nHPMC E5: hydroxypropyl methylcellulose, CAS 9004-65-3"),
+        ("f-lg-parts", 1, "PICK LIST PL-20260912-07\nSKU 4471-AX  QTY 12  BIN C-14-03  LOT 26J0912\nSKU 88-0192-R QTY 4   BIN A-02-11  LOT 26H3301\nSKU TX9-4L-BK QTY 40  BIN F-07-02  LOT 26G1187\nPicked by: KWL  Checked: ____"),
+        ("f-lg-rot13", 0, rot13(EN_MEMO)),
+        ("f-lg-reversed", 0, rev_lines(EN_MEMO)),
+        ("f-lg-greek-cp1252", 0, mojibake(EL_TEXT, "cp1253", "cp1252")),
+        ("f-lg-russian-cp1252", 0, mojibake(RU_TEXT, "cp1251", "cp1252")),
+        ("f-lg-big5-as-gbk", 0, mojibake(ZH_NOTICE, "big5", "gbk")),
+        ("f-lg-sjis-as-cp1252", 0, mojibake("第3章 品質管理体制\n当社は全工程において品質マネジメントシステムを運用している。", "shift_jis", "cp1252")),
+    ]
+
+    BOILERPLATE = [  # (id, label 1=chrome, line, context)
+    ]
+    def ctx(zone, n, total, fs, body, reason):
+        pages = list(range(1, n + 1))
+        return {"zone": zone, "pages": pages, "repeated_on": pages, "page_count": total, "font_size": fs,
+                "body_font_size": body, "reason": reason}
+    BOILERPLATE += [
+        ("f-bp-notes-title", 0, "Notes to the Consolidated Financial Statements", ctx("header", 12, 14, 9.0, 10.0, "first_occurrence")),
+        ("f-bp-unit-ntd", 0, "Amounts in NT$ thousands, except per-share data", ctx("header", 6, 6, 8.0, 10.0, "first_occurrence")),
+        ("f-bp-prepared-for", 0, "Prepared for: Industrial Development Administration, Ministry of Economic Affairs", ctx("footer", 9, 10, 8.0, 10.5, "first_occurrence")),
+        ("f-bp-project-rev", 0, "Project: Riverside Tower - Structural Calculations - Rev. B", ctx("header", 20, 22, 9.0, 10.0, "first_occurrence")),
+        ("f-bp-court-case", 0, "Case 2:24-cv-01187-JLR Document 45 Filed 09/12/26", ctx("header", 18, 18, 10.0, 12.0, "first_occurrence")),
+        ("f-bp-patient", 0, "陳大文 MRN 0048123 出生日期 1962-05-14", ctx("header", 4, 4, 9.0, 10.5, "first_occurrence")),
+        ("f-bp-spec-section", 0, "Section 23 05 00 - Common Work Results for HVAC", ctx("footer", 7, 7, 8.0, 10.0, "first_occurrence")),
+        ("f-bp-table-cont", 0, "Table 3 - Test results by batch (continued)", ctx("header", 3, 9, 10.0, 10.0, "attached_to_content")),
+        ("f-bp-safety", 0, "WARNING: Disconnect power before servicing. Read all instructions before use.", ctx("footer", 10, 10, 8.0, 10.0, "first_occurrence")),
+        ("f-bp-effective", 0, "Policy HR-07 Rev. 3.2 - Effective 1 July 2026", ctx("footer", 8, 8, 8.0, 10.5, "first_occurrence")),
+        ("f-bp-exam", 0, "Student: Lin Yu-Chen   Exam: Physics 101 Midterm", ctx("header", 5, 5, 9.0, 11.0, "first_occurrence")),
+        ("f-bp-contract-no", 0, "Contract No. C-2026-0457 between Contoso Ltd. and Fabrikam AG", ctx("footer", 15, 16, 8.0, 10.5, "first_occurrence")),
+        ("f-bp-chapter-few", 0, "Chapter 4: Thermal Management", ctx("header", 2, 12, 9.0, 10.0, "few_pages")),
+        ("f-bp-brand-pharma", 1, "Contoso Pharmaceuticals", ctx("header", 8, 8, 9.0, 10.5, "first_occurrence")),
+        ("f-bp-proprietary", 1, "PROPRIETARY AND CONFIDENTIAL", ctx("footer", 12, 12, 7.5, 10.0, "first_occurrence")),
+        ("f-bp-website", 1, "www.fabrikam.example", ctx("footer", 6, 6, 8.0, 10.5, "first_occurrence")),
+        ("f-bp-recycled", 1, "Printed on 100% recycled paper", ctx("footer", 4, 4, 7.0, 10.0, "first_occurrence")),
+        ("f-bp-zh-contact", 1, "台北市信義區松仁路100號 | 電話 (02) 2720-1234 | www.beichen.example", ctx("footer", 5, 5, 8.0, 10.5, "first_occurrence")),
+        ("f-bp-copyright-short", 1, "© 2026 Contoso. Proprietary.", ctx("footer", 9, 9, 7.0, 10.0, "first_occurrence")),
+        ("f-bp-slide-brand", 1, "Northwind | Investor Day 2026", ctx("footer", 14, 15, 10.0, 20.0, "attached_to_content")),
+    ]
+
+    NON_CONTENT = [  # (id, label 1=non-content, text)
+        ("f-nc-qr", 0, "Scan the QR code to download the app"),
+        ("f-nc-bsod", 0, "Your PC ran into a problem and needs to restart. We're just collecting some error info.\nStop code: INACCESSIBLE_BOOT_DEVICE"),
+        ("f-nc-prop65", 0, "WARNING: This product can expose you to chemicals known to the State of California to cause cancer."),
+        ("f-nc-fig-caption", 0, "Figure 5. No significant difference was observed between the groups (p = 0.42)."),
+        ("f-nc-reconnecting", 0, "Connection lost. Reconnecting..."),
+        ("f-nc-no-results", 0, "No results found for \"quarterly report 2019\""),
+        ("f-nc-left-blank", 0, "This page has been intentionally left blank."),
+        ("f-nc-access-denied", 0, "Access denied\nYou do not have permission to view this file. Request access from the owner."),
+        ("f-nc-out-of-stock", 0, "Out of stock"),
+        ("f-nc-printer", 0, "Unable to connect to printer.\nCheck the USB cable and try again."),
+        ("f-nc-handwritten", 0, "Call Mr. Wang re: shipment - ext. 214"),
+        ("f-nc-table", 0, "| Item | Qty |\n|---|---|\n| Bolt M8 x 40 | 200 |\n| Washer M8 | 400 |"),
+        ("f-nc-feuerwehr", 0, "Feuerwehrzufahrt - Parken verboten"),
+        ("f-nc-zh-maintenance", 0, "系統維護中，暫停服務，造成不便敬請見諒。"),
+        ("f-nc-captcha", 0, "Please verify you are human.\nI'm not a robot"),
+        ("f-nc-black", 1, "The image you've provided appears to be completely black; there's no discernible text."),
+        ("f-nc-corrupted", 1, "Sorry - the file seems to be corrupted and I couldn't open it."),
+        ("f-nc-nothing", 1, "Nothing to transcribe here."),
+        ("f-nc-zh-clearer", 1, "这张图片的内容我无法识别，请提供更清晰的版本。"),
+        ("f-nc-blurred", 1, "I can only see a blurred image; unfortunately no characters are recognizable."),
+        ("f-nc-fr-none", 1, "Il n'y a aucun texte visible sur cette image."),
+        ("f-nc-ja-none", 1, "該当するテキストは見つかりませんでした。"),
+        ("f-nc-only-photo", 1, "The image only contains a photograph without any text, so there is nothing to transcribe."),
+        ("f-nc-it-refusal", 1, "Mi dispiace, non riesco a leggere il testo di questa immagine."),
+    ]
+    return LEGIBILITY, BOILERPLATE, NON_CONTENT
+
+
+_EXT_LEGIBILITY_KIND = {"f-lg-rot13": "garb_shifted_latin", "f-lg-reversed": "garb_reversed",
+                        "f-lg-greek-cp1252": "garb_mojibake", "f-lg-russian-cp1252": "garb_mojibake",
+                        "f-lg-big5-as-gbk": "garb_mojibake", "f-lg-sjis-as-cp1252": "garb_mojibake"}
+_EXT_BOILERPLATE_KIND = {
+    "f-bp-notes-title": ("statement_title", "en"), "f-bp-unit-ntd": ("unit_note", "en"),
+    "f-bp-prepared-for": ("document_id", "en"), "f-bp-project-rev": ("document_id", "en"),
+    "f-bp-court-case": ("document_id", "en"), "f-bp-patient": ("account_identifier", "zh"),
+    "f-bp-spec-section": ("section_title", "en"), "f-bp-table-cont": ("continuation_note", "en"),
+    "f-bp-safety": ("disclaimer", "en"), "f-bp-effective": ("document_id", "en"),
+    "f-bp-exam": ("account_identifier", "en"), "f-bp-contract-no": ("document_id", "en"),
+    "f-bp-chapter-few": ("section_title", "en"), "f-bp-brand-pharma": ("brand_name", "en"),
+    "f-bp-proprietary": ("confidentiality_mark", "en"), "f-bp-website": ("contact_line", "en"),
+    "f-bp-recycled": ("print_note", "en"), "f-bp-zh-contact": ("contact_line", "zh"),
+    "f-bp-copyright-short": ("copyright", "en"), "f-bp-slide-brand": ("brand_tagline", "en"),
+}
+
+
+def build_external() -> Dict[str, List[dict]]:
+    """The reviewer's fresh items in the schemas of the three sets (split "external")."""
+    from doc2mark.ocr.refusal import MAX_JUDGE_CHARS, _normalize, matches_non_content_pattern
+    legibility_items, boilerplate_items, non_content_items = _review_pr22_items()
+    source = "review-pr22"
+    legibility = [_item(id_, id_, source, _EXT_LEGIBILITY_KIND.get(id_, "hard_legible_string"), label, text,
+                        _string_spans(text), family=f"{source}:{id_}", route=None, pipeline_asks=None)
+                  for id_, label, text in legibility_items]
+    boilerplate = []
+    for id_, label, text, context in boilerplate_items:
+        asked = context["reason"] != "first_occurrence"
+        copies = COPIES[label] if asked else "one"
+        kind, lang = _EXT_BOILERPLATE_KIND[id_]
+        boilerplate.append({"id": id_, "group": id_, "family": f"{source}:{id_}", "source": source, "kind": kind,
+                            "lang": lang, "label": 1 if copies == "one" else 0, "expected_copies": copies,
+                            "split": "external", "asked": asked, "text": text, "context": dict(context),
+                            "reviewer_label": label})
+    non_content = []
+    for id_, label, text in non_content_items:
+        answer = _normalize(text)
+        fires = matches_non_content_pattern(text)
+        non_content.append({"id": id_, "group": id_, "family": f"{source}:{id_}", "source": source,
+                            "kind": "no_content" if label else "content", "label": label, "split": "external",
+                            "text": text, "pattern": fires,
+                            "judged": bool(answer) and not fires and len(answer) <= MAX_JUDGE_CHARS})
+    for items in (legibility, boilerplate, non_content):
+        for item in items:
+            item["split"] = "external"
+    return {"legibility": legibility, "boilerplate": boilerplate, "non_content": non_content}
 
 
 # ============================================================================ deck slice
@@ -1700,20 +2162,21 @@ def deck_items(path) -> Dict[str, List[dict]]:
                                 kind, 0, _join(rows), spans, route=None, pipeline_asks=None))
     boilerplate, unlabelled = [], []
     asked = {}
-    for text, context in _capture(path, {}, oracle=False):
+    for text, context in _capture(path, {}, oracle=False)[0]:
         asked.setdefault((text, json.dumps(context, sort_keys=True, ensure_ascii=False)), None)
     for index, (text, context_json) in enumerate(asked, 1):
         if re.match(r"^by\s+\S", text):
-            kind, label = "brand_tagline", CHROME
+            kind, label = "brand_tagline", ONE
         elif re.fullmatch(r"[A-Z]{1,6}", text):
-            kind, label = "logo_text", CHROME
+            kind, label = "logo_text", ONE
         elif re.match(r"^\d{1,2}\s*/\s*\S", text):
-            kind, label = "per_page_label", CONTENT
+            kind, label = "per_page_label", ALL
         else:
             unlabelled.append({"text": text, "context": json.loads(context_json)})
             continue
-        boilerplate.append({"id": f"deck-bp-{index}", "group": "deck", "source": "deck", "kind": kind, "label": label,
-                            "split": "test", "text": text, "context": json.loads(context_json), "asked_in": "none"})
+        boilerplate.append({"id": f"deck-bp-{index}", "group": "deck", "family": "deck", "source": "deck", "kind": kind,
+                            "lang": "zh", "label": label, "expected_copies": COPIES[label], "split": "test",
+                            "asked": True, "text": text, "context": json.loads(context_json), "asked_in": "none"})
     for item in legibility:
         item["split"] = "test"
     return {"legibility": legibility, "boilerplate": boilerplate, "unlabelled": unlabelled}
@@ -1722,9 +2185,13 @@ def deck_items(path) -> Dict[str, List[dict]]:
 # ================================================================================== main
 
 
+HOOKS = ("legibility", "boilerplate", "non_content")
+
+
 def build_all(only: Optional[str] = None, report: Optional[list] = None) -> Dict[str, List[dict]]:
     _doc2mark()
     sets: Dict[str, List[dict]] = {}
+    external = build_external()
     with tempfile.TemporaryDirectory(prefix="judge-sets-") as tmp:
         if only in (None, "non_content"):
             sets["non_content"], sets["non_content_ambiguous"] = build_non_content()
@@ -1732,13 +2199,33 @@ def build_all(only: Optional[str] = None, report: Optional[list] = None) -> Dict
             sets["legibility"] = build_legibility(Path(tmp))
         if only in (None, "boilerplate"):
             sets["boilerplate"] = build_boilerplate(Path(tmp), report)
+    for hook in HOOKS:
+        if hook in sets:
+            assign_splits(sets[hook], hook, [item for item in external[hook] if item.get("asked", True)])
+            sets[f"external/{hook}"] = external[hook]
     return sets
+
+
+def _print_similarity() -> None:
+    for hook, info in SIMILARITY.items():
+        print(f"{hook}: {info['families']} families in {info['clusters']} clusters (largest {info['largest_cluster']} "
+              f"items; {info['forced_test']} items forced to test by an external near-duplicate); max cross-split "
+              f"char-5-gram Jaccard {info['max_jaccard']:.3f}, difflib ratio {info['max_ratio']:.3f}; pairs above "
+              f"0.6: {len(info['above_0.6'])}")
+        for jaccard, ratio, a, b in info["above_0.6"]:
+            print(f"    {a} ~ {b}: Jaccard {jaccard:.3f}, ratio {ratio:.3f}")
+        for split in ("train", "test"):
+            if f"external_{split}" in info:
+                jaccard, ratio, above = info[f"external_{split}"]
+                print(f"    external vs {split}: max Jaccard {jaccard:.3f}, ratio {ratio:.3f}; above 0.6: {len(above)}")
+                for jac, rat, a, b in above:
+                    print(f"        {a} ~ {b}: Jaccard {jac:.3f}, ratio {rat:.3f}")
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=ROOT / "tests" / "data" / "judge")
-    parser.add_argument("--only", choices=("non_content", "legibility", "boilerplate"))
+    parser.add_argument("--only", choices=HOOKS)
     parser.add_argument("--check", action="store_true", help="rebuild and compare with --out, byte for byte")
     parser.add_argument("--deck", type=Path, help="build the uncommitted deck slice (prints counts)")
     args = parser.parse_args(argv)
@@ -1766,10 +2253,16 @@ def main(argv=None) -> int:
         if name != "non_content_ambiguous":
             print(summary(name, items))
         print()
+    _print_similarity()
     if never:
-        print("Designed lines the pipeline never asked about (decided by the rule):")
-        for name, kind, label, text in never:
-            print(f"  {name}: [{kind}, {label}] {text!r}")
+        repeated = [line for line in never if line["pages"] >= 2]
+        one_copy = [line for line in repeated if line["copies_left"] == 1]
+        print(f"\nDesigned lines the pipeline does not ask about: {len(never)} texts; repeated on 2+ pages: "
+              f"{len(repeated)}, of which the rule keeps exactly one copy: {len(one_copy)} "
+              f"({Counter(line['expected_copies'] for line in one_copy)})")
+        for line in never:
+            print(f"  {line['doc']}: [{line['kind']}, {line['expected_copies']}] {line['text']!r} "
+                  f"on {line['pages']} pages, {line['copies_left']} left")
     return status
 
 
