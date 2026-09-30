@@ -16,6 +16,7 @@ that OpenAI strict mode (which requires all properties to be present) is
 satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 """
 
+import copy
 import html as _html
 import re
 from bisect import bisect_left, bisect_right
@@ -981,24 +982,91 @@ def _dangerous_target(text: str, pos: int) -> bool:
     return scheme is not None and scheme.group(1).lower() not in _SAFE_LINK_SCHEMES
 
 
-def _break_dangerous_links(text: str, *, bracket: str = "\\]") -> str:
+def _break_dangerous_links(text: str, *, bracket: str = "\\]", escaped_too: bool = False) -> str:
     """Replace the "]" of every inline link or link definition (``](`` / ``]:``) whose
     target has a dangerous scheme (``javascript:``, ``data:``, ``vbscript:``,
-    ``file:``, ...) with ``bracket`` (an escaped "]", or "&#93;" inside HTML), so it
-    closes no link. An escaped "]" is left alone."""
+    ``file:``, ...) with ``bracket`` (an escaped "]", "&#93;" inside HTML, or "] " in
+    plain text), so it closes no link. An escaped "]" is left alone, unless
+    ``escaped_too`` (plain text that another renderer escapes: its escaping of the
+    backslash would free the bracket)."""
     out: List[str] = []
     last = 0
     for match in _LINK_TARGET_START_RE.finditer(text):
         backslashes, k = 0, match.start() - 1
         while k >= last and text[k] == "\\":
             backslashes, k = backslashes + 1, k - 1
-        if backslashes % 2 or not _dangerous_target(text, match.end()):
+        if (backslashes % 2 and not escaped_too) or not _dangerous_target(text, match.end()):
             continue
         out.append(text[last:match.start()])
         out.append(bracket)
         last = match.start() + 1
     out.append(text[last:])
     return "".join(out)
+
+
+def plain_ocr_text(text: str, document: Optional["OCRPage"] = None) -> str:
+    """An OCR result's text for a renderer that escapes it itself -- a table cell's
+    ``[Image: <text>]`` label goes through the table renderer's own cell escaping. That
+    needs plain text, not this module's escaped Markdown (escaped twice, "<" would read
+    as "&lt;"): the structured page's verbatim transcription (without one, its tables'
+    cell text), or else the model's Markdown as it wrote it (this module's escapes undone,
+    its sanitized tables as their cell text). A table cell still renders inline Markdown,
+    so an image and a link to a target other than http(s) or mailto are broken with a
+    blank ("! [", "] ("), which that escaping keeps."""
+    if isinstance(document, OCRPage) and (document.raw.text.strip() or document.raw.tables):
+        plain = document.raw.text.strip() or _tables_text(document.raw.tables)
+    else:
+        plain = _unsanitized_markdown(text or "")
+    return _break_dangerous_links(plain.replace("![", "! ["), bracket="] ", escaped_too=True)
+
+
+def _tables_text(tables: List["Table"]) -> str:
+    """The cell text of ``tables``, one line per table."""
+    from lxml import html as lxml_html
+    lines = []
+    for table in tables:
+        if table.html:
+            fragment = lxml_html.fragment_fromstring(table.html, create_parent="div")
+            cells = []
+            for cell in fragment.iter("caption", "th", "td"):
+                own = copy.deepcopy(cell)  # its own text: a nested table's cells come on their own
+                for nested in own.findall(".//table"):
+                    nested.drop_tree()
+                cells.append(" ".join(own.text_content().split()))
+        else:
+            cells = [cell.strip() for row in [table.caption, *table.headers, *sum(table.rows, [])]
+                     for cell in ([row] if isinstance(row, str) else row)]
+        lines.append(" ".join(cell for cell in cells if cell))
+    return "\n".join(line for line in lines if line)
+
+
+_TABLE_TOKEN_RE = re.compile(r"<(/?)table\b[^<>]*>", re.I)
+
+
+def _unsanitized_markdown(markdown_text: str) -> str:
+    """Text :func:`_sanitize_markdown` wrote, back to the model's Markdown: its escapes
+    ("&lt;", "!\\[", "\\[", "\\]") undone and each sanitized table as its cell text."""
+    out: List[str] = []
+    depth, start, last = 0, 0, 0
+    for match in _TABLE_TOKEN_RE.finditer(markdown_text):
+        if not match.group(1):
+            if depth == 0:
+                start = match.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                out.append(_unescaped(markdown_text[last:start]))
+                out.append(_tables_text([Table.model_construct(html=markdown_text[start:match.end()])]))
+                last = match.end()
+    out.append(_unescaped(markdown_text[last:start] if depth else markdown_text[last:]))
+    if depth:
+        out.append(_tables_text([Table.model_construct(html=markdown_text[start:])]))
+    return "".join(out).strip()
+
+
+def _unescaped(text: str) -> str:
+    return text.replace("&lt;", "<").replace("!\\[", "![").replace("\\[", "[").replace("\\]", "]")
 
 
 def _escape_line_starts(text: str, *, lists: bool = False) -> str:

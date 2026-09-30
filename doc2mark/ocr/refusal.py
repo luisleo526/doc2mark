@@ -13,10 +13,11 @@ The deterministic check is high-precision on purpose. It only looks at short ans
 statement (English, Chinese, Japanese, Korean, German, Spanish, French): a model
 speaking about itself or about its input image, optionally with a reason made only of
 words about image quality or sensitivity ("because it's too blurry", "It may contain
-personal information.") and a stock courtesy tail ("Please provide a clearer image.",
-"If you have any other questions, feel free to ask!"). Anything else in the answer --
-a number, a quote, a description of the image, a transcribed line, a person being
-addressed -- is content, and the answer is kept. What the patterns cannot decide is
+personal information.") and a stock courtesy tail in the model's own wording ("Please
+provide a clearer image.", "If you have any other questions, feel free to ask!").
+Anything else in the answer -- a number, a quote, a name, a description of the image, a
+transcribed line, a person being addressed or asked for something -- is content, and
+the answer is kept. What the patterns cannot decide is
 left to the optional judge, :data:`NonContentJudge`.
 """
 
@@ -96,15 +97,16 @@ _REASON_SENTENCE = (
     rf"(?:it|this|the\s+(?:{_IMAGE_NOUN}|text|writing|handwriting|resolution|quality|content))\s+{_REASON_WORDS}"
 )
 
-# A model's stock courtesy tail: nothing from the image in it.
-_CLEARER = r"(?:clearer|sharper|higher[- ]resolution|higher[- ]quality|better(?:[- ]quality)?|more\s+legible|larger)"
-_COPY_NOUN = rf"(?:{_IMAGE_NOUN}|version|copy)"
+# A model's stock courtesy tail, in its own wording: nothing from the image in it. A request
+# a person makes ("Please send a clearer photo.", "Please upload a clearer copy.") is not
+# one: that answer reads as a support reply and stays content.
+_CLEARER = r"(?:clearer|sharper|higher[- ]resolution|higher[- ]quality|better[- ]quality|more\s+legible)"
+_CLEARER_IMAGE = rf"(?:a|an)\s+{_CLEARER}\s+{_IMAGE_NOUN}(?:\s+of\s+the\s+(?:page|document|text))?"
 _COURTESY = (
-    rf"(?:please\s+(?:provide|upload|send|share|try)\s+(?:(?:a|an)\s+{_CLEARER}|another)\s+{_COPY_NOUN}"
-    rf"(?:\s+of\s+the\s+(?:page|document|text|{_IMAGE_NOUN}))?"
-    rf"|if\s+you\s+(?:can|could)\s+(?:provide|upload|share|send)\s+(?:(?:a|an)\s+{_CLEARER}|another)\s+{_COPY_NOUN}"
-    rf"(?:\s+of\s+the\s+(?:page|document|text))?\s*,?\s*i(?:{_APOS}d|\s+would|{_APOS}ll|\s+will)\s+be\s+(?:happy|glad)\s+to"
-    r"\s+(?:help|assist|try\s+again)(?:\s+with\s+(?:that|it|the\s+transcription))?"
+    rf"(?:please\s+provide\s+{_CLEARER_IMAGE}"
+    rf"|feel\s+free\s+to\s+(?:share|provide)\s+{_CLEARER_IMAGE}"
+    rf"|if\s+you\s+(?:can|could)\s+provide\s+{_CLEARER_IMAGE}\s*,?\s*i(?:{_APOS}d|\s+would|{_APOS}ll|\s+will)\s+be\s+(?:happy|glad)"
+    r"\s+to\s+(?:help|assist|try\s+again)(?:\s+with\s+(?:that|it|the\s+transcription))?"
     r"|if\s+you\s+have\s+any\s+other\s+(?:questions|requests)(?:\s+or\s+need\s+(?:help|assistance)\s+with\s+something\s+else)?"
     rf"\s*,?\s*(?:feel\s+free\s+to\s+ask|let\s+me\s+know|i(?:{_APOS}d|\s+would)\s+be\s+happy\s+to\s+help)"
     r"|is\s+there\s+anything\s+else\s+i\s+can\s+(?:help\s+(?:you\s+)?with|do\s+for\s+you|assist\s+(?:you\s+)?with)"
@@ -148,7 +150,8 @@ _APOLOGY_REFUSED = (
     rf"{_MODEL_TOPIC}"
     r"|provide\s+(?:a\s+|the\s+|any\s+)?transcription\s+of\s+"
     rf"(?:{_TRANSCRIPTION_OBJECT}|(?:the\s+|this\s+|any\s+)?copyrighted\s+\w+(?:\s+\w+)?)"
-    r"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?)"
+    r"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?"
+    r"|share\s+(?:that|this|it)(?:\s+with\s+you)?)"
 )
 # The apology itself, and nothing between it and the refusal ("I'm sorry Dave, I'm
 # afraid I can't do that." is a quote).
@@ -166,6 +169,7 @@ _BLANK = (
     r"(?:blank|empty|illegible|unreadable|not\s+(?:legible|readable))"
 )
 _IN_THE_IMAGE = rf"(?:in|on|within)\s+(?:this|the)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b"
+_TOO_BAD = r"(?:blurry|blurred|small|faint|dark|low[- ]resolution|pixelated|unclear|grainy)"
 _IN_IMAGE = rf"(?:in|on|within)\s+(?:(?:this|the)\s+)?(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b"
 _NO_TEXT = (
     # "The image appears to be blank (or contains no visible text)", "The page seems to be
@@ -188,6 +192,9 @@ _NO_TEXT = (
     rf"|(?:the|this)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\s+(?:(?:does\s+not|doesn{_APOS}t|did\s+not|didn{_APOS}t)"
     r"\s+(?:appear\s+to\s+|seem\s+to\s+)?(?:contain|have|include|show)\s+any|(?:contains|has|shows|appears\s+to\s+contain"
     rf"|seems\s+to\s+contain)\s+no)\s+(?:{_TEXT_QUALIFIER}\s+)?{_TEXT_NOUN}"
+    # "The image is too blurry to read.", "The text in the image is too small and blurry to read."
+    rf"|(?:(?:the|this)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}|the\s+(?:text|writing|handwriting)\s+{_IN_THE_IMAGE})"
+    rf"\s+is\s+too\s+{_TOO_BAD}(?:\s+(?:and|or)\s+{_TOO_BAD})?\s+to\s+(?:read|transcribe|make\s+out)"
     # the whole answer is a placeholder: "[No content]", "No readable text.", "Illegible."
     r"|\[\s*(?:no\s+(?:readable\s+)?(?:text|content)(?:\s+(?:found|detected|available))?"
     r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\]"
@@ -197,8 +204,28 @@ _END = r"\s*[.!]?"
 _ZH_IMAGE = r"(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
 # ... the image (中的文字 / 的內容), and nothing after it but the full stop.
 _ZH_IMAGE_END = (
-    rf"(?:這張|这张|此|該|该|本|這個|这个)?[^。，,\n0-9]{{0,6}}?{_ZH_IMAGE}"
+    rf"(?:這張|这张|此|該|该|本|這個|这个|這些|这些)?{_ZH_IMAGE}"
     r"(?:中|裡|里|上|內|内)?(?:的)?(?:文字|內容|内容|字|資訊|信息)?[。.!！]?"
+)
+# How a model says it cannot read: nothing else between "cannot" and the verb.
+_ZH_CANNOT = r"(?:無法|无法|不能|沒辦法|没办法|未能)(?:進行|进行|清楚|清晰|正確|正确|完整|準確|准确){0,2}"
+# Words a refusal in German, Spanish, French, Korean or Japanese uses for what it cannot
+# read: a name or any other word makes the sentence content ("das Bild von Herrn Müller").
+_DE_WORD = (
+    r"(?:den|diesen|dieses|diese|diesem|dieser|das|die|dem|der|des|ein|eine|einen|im|in|auf|aus|"
+    r"text|texte|textes|bild|bildes|bilde|inhalt|inhalte|inhalts|foto|fotos|abbildung|grafik|scan|"
+    r"dokument|dokuments|seite|schrift|handschrift|handschriftlichen|handschriftliche|gedruckten|"
+    r"lesbaren|enthaltenen|geschriebenen|wörter|worte|zeichen|buchstaben|leider|hier|darauf|darin)"
+)
+_ES_WORD = r"(?-i:[a-záéíóúüñ]+)"  # lower case: a capitalized word is a name
+_FR_WORD = r"(?-i:[a-zàâçéèêëîïôûùüÿœæ'’-]+)"
+_KO_OBJECT = (
+    r"(?:(?:이|해당|제공된|첨부된)\s*)?(?:이미지|사진|그림)(?:의|에서|에|속의|안의)?\s*"
+    r"(?:텍스트|글자|문자|내용|손글씨)?(?:를|을|은|는|가|이)?\s*"
+)
+_JA_OBJECT = (
+    r"(?:この|その|提供された|添付の|添付された)?(?:画像|写真|イメージ)(?:の|に|内の|中の)?"
+    r"(?:文字|テキスト|内容|手書き部分|手書きの文字|手書き)?(?:は|を|が)?"
 )
 _ZH_READ = r"(?:辨識|辨识|識別|识别|讀取|读取|處理|处理|轉錄|转录|解析|看清|判讀|判读)"
 # Gaps inside a non-English sentence: no digits or quotes (a number or a quote is content).
@@ -223,20 +250,20 @@ _WHOLE_PATTERNS = [
     # find any content to transcribe."
     rf"{_NO_TEXT}(?:\s*[.;,]\s*(?:and\s+)?{_NO_TEXT})?{_REASON_CLAUSE}?{_END}",
     # Chinese: first person (我) cannot read the image
-    rf"(?=[^。\n]*我)(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n0-9]{{0,30}}?"
-    rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n0-9]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
-    rf"我(?:無法|无法|不能|沒辦法|没办法)[^。，,\n0-9]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
+    rf"(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[，,、\s]*(?:但是?[，,\s]*)?我(?:目前|暫時|暂时|現在|现在)?"
+    rf"{_ZH_CANNOT}{_ZH_READ}{_ZH_IMAGE_END}",
+    rf"我(?:目前|暫時|暂时|現在|现在)?{_ZH_CANNOT}{_ZH_READ}{_ZH_IMAGE_END}",
     r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
     r"(?:中|裡|里|上|內|内)?(?:並|并)?(?:沒有|没有|無|无|不含|未包含|未發現|未发现|找不到|未能找到)"
     r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)[。.!！]?",
     # Japanese
-    r"(?=[^。\n]*(?:画像|写真|イメージ))(?![^\n]*(?:アップロード|お客様|現在))"
-    r"(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n0-9]{0,40}?"
+    r"(?![^\n]*(?:アップロード|お客様|現在))"
+    rf"(?:申し訳(?:ありません|ございません)(?:が)?|すみません(?:が)?|ごめんなさい)[、,\s]*{_JA_OBJECT}"
     r"(?:読み取|読|認識|処理|文字起こし|転記|抽出|判読)[^。\n0-9]{0,10}?(?:できません|ません|不可|困難)(?:でした)?[。.!！]?",
     r"(?:この)?画像(?:に|には|の中に)(?:は)?(?:読み取れる|判読できる|認識できる)?(?:文字|テキスト)"
     r"(?:は|が)(?:ありません|含まれていません|見つかりません|見当たりません)(?:でした)?[。.!！]?",
     # Korean
-    rf"(?=[^.\n]*(?:이미지|사진|그림))(?![^\n]*(?:현재|업로드|고객님))(?:죄송|미안)(?:하지만|합니다|해요){_GAP}{{0,40}}?"
+    rf"(?![^\n]*(?:현재|업로드|고객님))(?:죄송|미안)(?:하지만|합니다|해요)[,.\s]*{_KO_OBJECT}"
     rf"(?:인식|읽|처리|추출|판독|전사){_GAP}{{0,10}}?(?:수\s*없|못){_GAP}{{0,8}}?[.!]?",
     r"(?:이\s*)?이미지(?:에는|에|에서)\s*(?:읽을\s*수\s*있는\s*)?(?:텍스트|글자|문자)(?:가|는)\s*"
     r"(?:없습니다|없어요|보이지\s*않습니다)[.!]?",
@@ -245,20 +272,18 @@ _WHOLE_PATTERNS = [
     r"(?![^\n]*\b(?:ihr|ihre|ihren|ihrem|ihrer|ihres|dein|deine|deinen|deinem|du|dich|dir)\b)"
     r"(?:leider\s+(?:kann|konnte)\s+ich|es\s+tut\s+mir\s+leid[,.\s]+(?:aber\s+)?ich\s+(?:kann|konnte)"
     r"|ich\s+(?:kann|konnte)\s+(?:den|diesen|dieses|das|die)\s+(?:text|bild|inhalt))\b"
-    rf"{_GAP}{{0,80}}?\b(?:nicht|keinen|keine)\b{_GAP}{{0,40}}?"
+    rf"(?:\s+{_DE_WORD}\b){{0,8}}\s+(?:nicht|keinen|keine)\b(?:\s+{_DE_WORD}\b){{0,4}}\s+"
     r"(?:erkennen|lesen|entziffern|transkribieren|verarbeiten|extrahieren)[.!]?",
     r"(?:das|dieses)\s+bild\s+enth(?:ä|ae)lt\s+keinen\s+(?:lesbaren\s+|erkennbaren\s+)?text[.!]?",
     # Spanish (first person; "su foto" / "tú" is a person writing to someone)
     r"(?=[^.\n]*\b(?:imagen|foto|fotograf(?:í|i)a)\b)(?![^\n]*\b(?:su|sus|tu|tus|usted|ustedes|te|me)\b)"
-    rf"(?:(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+{_GAP}{{0,40}}?)?no\s+(?:puedo|pude)\s+"
-    r"(?:\w+\s+){0,2}?(?:transcribir|leer|procesar|extraer|reconocer|identificar)"
-    r"(?:\s+[^.\n,;¿?!0-9\"“”«»]{1,60})?[.!]?",
+    r"(?:(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+(?:pero\s+)?)?no\s+(?:puedo|pude)\s+"
+    rf"(?:{_ES_WORD}\s+){{0,2}}?(?:transcribir|leer|procesar|extraer|reconocer|identificar)(?:\s+{_ES_WORD}){{0,8}}[.!]?",
     # French ("vous" is a person writing to someone)
     r"(?=[^.\n]*\b(?:image|photo|capture)\b)(?![^\n]*\b(?:vous|votre|vos|tu|ton|ta|tes|te)\b)"
-    rf"(?:(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+{_GAP}{{0,40}}?)?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
-    r"(?:pas\s+)?(?:de\s+|à\s+)?(?:\w+\s+){0,2}?"
-    r"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier)"
-    r"(?:\s+[^.\n,;?!0-9\"“”«»]{1,60})?[.!]?",
+    r"(?:(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+(?:mais\s+)?)?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
+    rf"(?:pas\s+)?(?:de\s+|à\s+)?(?:{_FR_WORD}\s+){{0,2}}?"
+    rf"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier)(?:\s+{_FR_WORD}){{0,8}}[.!]?",
 ]
 _WHOLE_RE = re.compile("|".join(f"(?:{p})" for p in _WHOLE_PATTERNS), re.IGNORECASE)
 # An answer that asks someone to do something (resend, retake, upload, try again, "can

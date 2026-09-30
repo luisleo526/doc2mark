@@ -239,6 +239,9 @@ stay as written (``&copy;`` is how a model writes the character).
   ``<br>`` is neutralised.
 - The flat ``headers`` / ``rows`` table escapes ``|`` and turns line breaks into
   spaces, so every value stays in its cell.
+- A picture inside an Office table cell is labelled ``[Image: <OCR text>]`` with the
+  plain OCR text (the transcription, not its escaped Markdown), which the table
+  renderer escapes once; an image or a non-http(s) link in it is broken with a blank.
 
 
 Refusals and "no readable text" answers
@@ -258,12 +261,14 @@ indexes such an answer as page content:
    in Chinese, Japanese, Korean, German, Spanish and French. The check is
    high-precision. Besides the refusal the answer may only hold a reason made of
    image-quality or sensitivity words ("It may contain sensitive content.") and a
-   model's stock courtesy tail ("Please provide a clearer image.", "If you have any
-   other questions, feel free to ask!"). Anything else is content and the answer is
-   kept: a number, a quote, a description of the image or a transcribed line after
-   the refusal ("There is no text in this image. It shows a bar chart ..."), a person
-   being addressed ("I'm sorry Dave, I'm afraid I can't do that.", "can you resend
-   it?", "your photo", "please ..."), a file, folder or system, a sentence that goes
+   stock courtesy tail in the model's own wording ("Please provide a clearer image.",
+   "If you have any other questions, feel free to ask!"). Anything else is content
+   and the answer is kept: a number, a quote, a name ("Leider kann ich das Bild von
+   Herrn Müller nicht erkennen."), a description of the image or a transcribed line
+   after the refusal ("There is no text in this image. It shows a bar chart ..."), a
+   person being addressed or asked for something ("I'm sorry Dave, I'm afraid I can't
+   do that.", "Please send a clearer photo.", "your photo"), a file, folder or system,
+   a sentence that goes
    on past what it refuses ("I can't read the scans until Dr. Lee signs off."), or a
    mere apology ("Sorry we missed you!", "This page intentionally left blank."). What
    the check cannot decide is left to the judge below.
@@ -272,7 +277,8 @@ indexes such an answer as page content:
    tables, fields, headings, metrics, figures, sections, entities or a description
    is content whatever its ``raw.text`` says. If the recovered answer is a refusal as
    well, the result is empty text with ``metadata["ocr_refusal"] = True``; a whole-page
-   render then reads ``[page N: OCR returned no content]`` in the Markdown.
+   render of a page with ink then reads ``[page N: OCR returned no content]`` in the
+   Markdown (a blank page does not).
 
 For the cases the patterns cannot decide, pass a judge:
 
@@ -299,7 +305,7 @@ read), ``withheld`` (images whose illustrative values stayed withheld; their Mar
 says ``[N illustrative rows not transcribed]``, and likewise for fields, metrics and
 figures), up to five ``errors``, and ``locations``: one ``{"issue", "image", "page"}``
 entry per affected image (``image`` counts the images OCR'd in the document from 1;
-``page`` is there for PDFs). Such results are not cached. An OCR engine
+``page`` is there for PDFs, ``slide`` or ``sheet`` for PowerPoint and Excel). Such results are not cached. An OCR engine
 that cannot run at all, such as Tesseract without the requested language data, raises
 ``OCREngineError`` from ``load()`` instead of producing placeholder text, and the CLI
 exits non-zero.

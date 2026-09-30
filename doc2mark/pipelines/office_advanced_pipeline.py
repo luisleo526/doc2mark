@@ -32,6 +32,7 @@ def _safe_lxml_parser():
 
 
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
+from doc2mark.ocr.schema import plain_ocr_text  # noqa: E402
 from doc2mark.utils.number_format import format_cell_value  # noqa: E402
 
 # Office document libraries
@@ -600,6 +601,16 @@ def _xlsx_rich_value_images(archive, names) -> Dict[int, str]:
     return images
 
 
+def _issue_location(location: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Where a picture sits, for the loader's OCR issue record: its slide or sheet."""
+    location = location or {}
+    if 'slide' in location:
+        return {"slide": location['slide']}
+    if 'sheet' in location:
+        return {"sheet": location.get('sheet_name') or location['sheet']}
+    return {}
+
+
 class BaseOfficeLoader:
     """Base class for Office document loaders"""
 
@@ -609,6 +620,9 @@ class BaseOfficeLoader:
             raise FileNotFoundError(f"File not found: {self.file_path}")
         self.doc = None
         self.ocr = ocr  # Store the OCR instance
+        # Each picture's OCR text for a table cell label (by image hash): plain text, which the
+        # table renderer escapes once (the OCR result's own text is escaped Markdown).
+        self._ocr_cell_texts: Dict[str, str] = {}
         
         # Set table output style
         if table_style is None:
@@ -682,6 +696,8 @@ class BaseOfficeLoader:
 
             result = self.ocr.process_image(image_bytes, **kwargs)
             if hasattr(result, 'text'):
+                self._ocr_cell_texts[_image_hash(image_bytes)] = plain_ocr_text(
+                    result.text, getattr(result, 'document', None))
                 return result.text
             else:
                 return str(result)
@@ -767,6 +783,10 @@ class BaseOfficeLoader:
 
             # Always use batch processing
             ocr_results = self.ocr.batch_process_images(image_data_list, **kwargs)
+            # Tell the loader's OCR issue record which slide or sheet each picture is on.
+            label_issues = getattr(self.ocr, "label_last_batch", None)
+            if callable(label_issues):
+                label_issues([_issue_location(info.get('location')) for info in images_info])
 
             # Map results back using both hash and ID for duplicate handling
             # This ensures compatibility with individual lookup methods while preserving duplicates
@@ -782,6 +802,8 @@ class BaseOfficeLoader:
                 
                 # Store by hash (for compatibility)
                 results_map[img_hash] = ocr_text
+                if hasattr(ocr_result, 'text'):
+                    self._ocr_cell_texts[img_hash] = plain_ocr_text(ocr_text, getattr(ocr_result, 'document', None))
                 
                 # Also store by ID (for handling duplicates)
                 id_to_result[image_info['id']] = ocr_text
@@ -1665,6 +1687,8 @@ class DocxLoader(BaseOfficeLoader):
                     continue
                 img_hash = _image_hash(image_bytes)
                 ocr_text = ocr_results_map[img_hash] if img_hash in ocr_results_map else self._ocr_image(image_bytes)
+                # The cell's text is escaped by the table renderer: give it the plain OCR text.
+                ocr_text = self._ocr_cell_texts.get(img_hash, ocr_text).strip()
                 markers.append(f"[Image: {ocr_text}]" if ocr_text else "[Image]")
         return markers
 
@@ -2754,7 +2778,8 @@ class XlsxLoader(BaseOfficeLoader):
         text = ocr_results_map.get(img_hash)
         if text is None:  # not in the batch: OCR it once, and remember it for the image item
             text = ocr_results_map[img_hash] = self._ocr_image(data)
-        text = (text or "").strip()
+        # The cell's text is escaped by the table renderer: give it the plain OCR text.
+        text = (self._ocr_cell_texts.get(img_hash, text) or "").strip()
         return f"[Image: {text}]" if text else "[Image]"
 
     @staticmethod

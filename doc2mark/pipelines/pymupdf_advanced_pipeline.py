@@ -848,8 +848,9 @@ class PDFLoader:
                             "position_y": float(page.rect.height),
                         })
                 return items
-            # Blank render or refusal: say so on the page (ocr_issues names the page too),
-            # and keep the page's own text layer (verbatim first) rather than drop the page.
+            # Refusal (or empty answer) on a page with ink: say so on the page (ocr_issues names
+            # the page too). Either way keep the page's own text layer (verbatim first) rather
+            # than drop the page. A blank page needs no marker.
             marker = {
                 "type": "text:image_description",
                 "content": f"<image_ocr_result>[page {page_num + 1}: OCR returned no content]</image_ocr_result>",
@@ -860,6 +861,8 @@ class PDFLoader:
             if fallback:
                 logger.warning(f"{self.pdf_path.name} page {page_num + 1}: OCR of the page render returned "
                                f"no text; keeping the page's own text layer")
+            if pdf_routing.uncaptured_ink(page, ()) < pdf_routing.MIN_UNCAPTURED_INK:
+                return fallback
             return [marker] + fallback
 
         # --- TEXT-authoritative page: rule-based text/tables + per-image OCR. ---
