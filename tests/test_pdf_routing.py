@@ -51,6 +51,16 @@ def test_lines_the_ocr_reproduced_inside_markup_are_not_missing(tmp_path):
         "Invoice No: 2024-0012 Customer: ACME Ltd.", "Revenue: $4.2M (FY2025)"]
 
 
+def test_a_printed_word_in_angle_brackets_is_text_not_markup(tmp_path):
+    """Only the OCR answer is markup: a page that prints ``<DRAFT>`` shows the word DRAFT. The OCR's escaped
+    ``&lt;DRAFT>`` reproduces it; an OCR answer without it leaves it missing."""
+    doc = _page_with_lines(tmp_path, ["<DRAFT>", "Revenue grew 12 percent"])
+    page = doc[0]
+    measure = pdf_routing.measure_page(page)
+    assert pdf_routing.missing_painted_lines(page, measure, "&lt;DRAFT>\n\nRevenue grew 12 percent") == []
+    assert pdf_routing.missing_painted_lines(page, measure, "Revenue grew 12 percent") == ["<DRAFT>"]
+
+
 def test_words_scattered_over_the_ocr_text_do_not_reproduce_a_line(tmp_path):
     doc = _page_with_lines(tmp_path, ["Total due 2340 EUR by 14 March"])
     page = doc[0]

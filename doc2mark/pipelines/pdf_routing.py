@@ -765,10 +765,13 @@ _TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
 _ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 
-def _tokens(text: str) -> List[str]:
-    """Words, case-folded; markup (HTML tags, entities, Markdown backslash escapes) and punctuation
-    dropped; CJK split per character (OCR engines space CJK text unpredictably)."""
-    text = _ESCAPED.sub(r"\1", _TAG.sub(" ", html.unescape(text)))
+def _tokens(text: str, markup: bool = False) -> List[str]:
+    """Words, case-folded, punctuation dropped; CJK split per character (OCR engines space CJK text
+    unpredictably). ``markup``: ``text`` is an OCR answer (Markdown with HTML tables), whose tags are
+    dropped, then its entities and backslash escapes undone, so ``&lt;DRAFT>`` still reads DRAFT. A text
+    layer line is not markup: ``<DRAFT>`` printed on the page is a word."""
+    if markup:
+        text = _ESCAPED.sub(r"\1", html.unescape(_TAG.sub(" ", text)))
     words = []
     for word in re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()):
         words.extend(_CJK_CHAR.findall(word) if _CJK_CHAR.search(word) else [word])
@@ -881,7 +884,7 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled:
                 lines.append(spans)
     legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
                              for spans in lines])
-    ocr_words = _tokens(ocr_text)
+    ocr_words = _tokens(ocr_text, markup=True)
     where: Dict[str, List[int]] = {}
     for position, word in enumerate(ocr_words):
         where.setdefault(word, []).append(position)
