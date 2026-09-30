@@ -61,6 +61,34 @@ def test_a_printed_word_in_angle_brackets_is_text_not_markup(tmp_path):
     assert pdf_routing.missing_painted_lines(page, measure, "Revenue grew 12 percent") == ["<DRAFT>"]
 
 
+@pytest.mark.parametrize("lines, ocr, missing", [
+    (["Risk Factors", "Market risk and credit factors are reviewed monthly."],
+     "Market risk and credit factors are reviewed monthly.", ["Risk Factors"]),
+    (["Widget A 5 15 20 USD", "Widget B 15 20 USD"],
+     "<table><tr><td>Widget A</td><td>5</td><td>15</td><td>20</td><td>USD</td></tr></table>", ["Widget B 15 20 USD"]),
+    (["Net loss before tax 1,200", "Net 1,200"], "Net loss before tax 1,200", ["Net 1,200"]),
+], ids=["heading-words-in-the-body", "row-inside-another-row", "short-line-inside-a-longer-one"])
+def test_a_line_the_ocr_left_out_is_not_explained_by_the_words_of_another_line(tmp_path, lines, ocr, missing):
+    """Review of this change: with gaps allowed, a short line the OCR left out matched its words inside another
+    line the OCR did reproduce. Words another line reproduces in place are that line's."""
+    doc = _page_with_lines(tmp_path, lines)
+    page = doc[0]
+    assert pdf_routing.missing_painted_lines(page, pdf_routing.measure_page(page), ocr) == missing
+
+
+def test_digits_between_cjk_characters_are_words(tmp_path):
+    """Only the CJK characters of a mixed word were kept, so every date line of a CJK report read the same and
+    one the OCR left out counted as reproduced by another."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for n, line in enumerate(["\u622a\u81f32024\u5e743\u670831\u65e5\u6b62", "\u622a\u81f32023\u5e7412\u670831\u65e5\u6b62"]):
+        page.insert_text((72, 100 + 30 * n), line, fontsize=14, fontname="china-t")
+    doc.save(str(tmp_path / "dates.pdf"))
+    page = pymupdf.open(str(tmp_path / "dates.pdf"))[0]
+    first, second = [line["spans"][0]["text"] for block in page.get_text("dict")["blocks"] for line in block["lines"]]
+    assert pdf_routing.missing_painted_lines(page, pdf_routing.measure_page(page), first) == [second]
+
+
 def test_words_scattered_over_the_ocr_text_do_not_reproduce_a_line(tmp_path):
     doc = _page_with_lines(tmp_path, ["Total due 2340 EUR by 14 March"])
     page = doc[0]

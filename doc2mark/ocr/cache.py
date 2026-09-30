@@ -1016,8 +1016,9 @@ class CachedOCR(BaseOCR):
         if reason is None and not store:
             reason = "the non-content judge stopped answering during the batch"
         if reason is None and _short_lived(normalized):
-            self.cache.set(key, normalized,
-                           ttl_seconds=getattr(self.cache, "refusal_ttl_seconds", None) or REFUSAL_TTL_SECONDS)
+            ttl = getattr(self.cache, "refusal_ttl_seconds", None) or REFUSAL_TTL_SECONDS
+            ttl = min(ttl, getattr(self.cache, "ttl_seconds", None) or ttl)   # never longer than an answer
+            self.cache.set(key, normalized, ttl_seconds=ttl)
         elif reason is None:
             self.cache.set(key, normalized)
         else:

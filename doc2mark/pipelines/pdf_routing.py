@@ -22,6 +22,7 @@ import math
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -758,7 +759,9 @@ def text_source(page, measure: PageMeasure, copies: PageCopies, ocrd_rects: Sequ
 # --- Verbatim tail ----------------------------------------------------------------
 
 _CJK_RANGES = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF))
-_CJK_CHAR = re.compile("[" + "".join(f"{chr(low)}-{chr(high)}" for low, high in _CJK_RANGES) + "]")
+_CJK_CLASS = "".join(f"{chr(low)}-{chr(high)}" for low, high in _CJK_RANGES)
+_CJK_CHAR = re.compile(f"[{_CJK_CLASS}]")
+_CJK_PIECES = re.compile(f"[{_CJK_CLASS}]|[^{_CJK_CLASS}]+")   # each CJK character, and the runs between them
 
 
 _TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
@@ -767,14 +770,14 @@ _ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 def _tokens(text: str, markup: bool = False) -> List[str]:
     """Words, case-folded, punctuation dropped; CJK split per character (OCR engines space CJK text
-    unpredictably). ``markup``: ``text`` is an OCR answer (Markdown with HTML tables), whose tags are
+    unpredictably), the digits and letters between CJK characters kept as words. ``markup``: ``text`` is an OCR answer (Markdown with HTML tables), whose tags are
     dropped, then its entities and backslash escapes undone, so ``&lt;DRAFT>`` still reads DRAFT. A text
     layer line is not markup: ``<DRAFT>`` printed on the page is a word."""
     if markup:
         text = _ESCAPED.sub(r"\1", html.unescape(_TAG.sub(" ", text)))
     words = []
     for word in re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold()):
-        words.extend(_CJK_CHAR.findall(word) if _CJK_CHAR.search(word) else [word])
+        words.extend(_CJK_PIECES.findall(word) if _CJK_CHAR.search(word) else [word])
     return words
 
 
@@ -799,26 +802,39 @@ def _in_order(words: List[str], window: List[str]) -> List[int]:
     return found
 
 
-def _match(words: List[str], ocr_words: List[str],
-           where: Optional[Dict[str, List[int]]] = None) -> Optional[List[int]]:
-    """Which OCR words reproduce a line's ``words``: at least 80 % of them, in order, within a stretch
-    of OCR words at most twice as long as the line (words may come between them: a table cell
-    boundary, a word the text layer lacks; markup, punctuation, case and spacing are ignored); None
-    when there is none. ``where`` maps each OCR word to its positions (computed when omitted)."""
+def _needed(words: List[str]) -> int:
+    return (4 * len(words) + 4) // 5   # 80 % of a line's words, rounded up
+
+
+def _in_place(words: List[str], ocr_words: List[str]) -> Optional[List[int]]:
+    """The OCR words that reproduce a line's ``words`` in place: the first stretch of OCR words as
+    long as the line holding at least 80 % of its words at the same places; None when there is none."""
     if not words:
         return []
-    needed = (4 * len(words) + 4) // 5   # 80 %, rounded up
-    span = 2 * len(words)
-    if where is None:
-        where = {}
-        for position, word in enumerate(ocr_words):
-            where.setdefault(word, []).append(position)
+    size, needed = len(words), _needed(words)
+    for start in range(max(1, len(ocr_words) - size + 1)):
+        window = ocr_words[start:start + size]
+        if sum(1 for a, b in zip(window, words) if a == b) >= needed:
+            return list(range(start, start + len(window)))
+    return None
+
+
+def _with_gaps(words: List[str], ocr_words: List[Optional[str]],
+               where: Dict[str, List[int]]) -> Optional[List[int]]:
+    """The OCR words that reproduce a line's ``words`` with other words between them (a table cell
+    boundary, an escaped tag, a word the text layer lacks): at least 80 % of them, in order, within a
+    stretch of OCR words at most twice as long as the line; None when there is none. ``ocr_words``
+    holds None at positions taken by other lines; ``where`` maps each word to its positions."""
+    if not words:
+        return []
+    needed, span = _needed(words), 2 * len(words)
     # The first word found is among the first len(words) - needed + 1 words of the line.
     starts = sorted({position for word in words[:len(words) - needed + 1] for position in where.get(word, ())})
-    wanted = set(words)
+    counts = Counter(words)
     for start in starts:
         window = ocr_words[start:start + span]
-        if sum(1 for word in window if word in wanted) < needed:
+        # How many of the line's words the window holds at most, in any order: a bound on the match.
+        if sum(min(count, counts[word]) for word, count in Counter(window).items() if word in counts) < needed:
             continue
         found = _in_order(words, window)
         if len(found) >= needed:
@@ -885,17 +901,31 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled:
     legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
                              for spans in lines])
     ocr_words = _tokens(ocr_text, markup=True)
-    where: Dict[str, List[int]] = {}
-    for position, word in enumerate(ocr_words):
-        where.setdefault(word, []).append(position)
+    # First the lines the OCR reproduces in place; then the others, with gaps, but only on OCR words no
+    # other line explains: a short line whose words also occur, apart, in a longer one is not taken
+    # for reproduced.
     explained: Set[int] = set()
-    candidates = []
+    unmatched = []
     for spans, readable in zip(lines, legible):
         text = "".join(span["text"] for span in spans).strip()
         words = _tokens(text)
-        found = _match(words, ocr_words, where)
+        found = _in_place(words, ocr_words)
         if found is not None:
             explained.update(found)
+        else:
+            unmatched.append((spans, readable, text, words))
+    free: List[Optional[str]] = [None if position in explained else word for position, word in enumerate(ocr_words)]
+    where: Dict[str, List[int]] = {}
+    for position, word in enumerate(free):
+        if word is not None:
+            where.setdefault(word, []).append(position)
+    candidates = []
+    for spans, readable, text, words in unmatched:
+        found = _with_gaps(words, free, where)
+        if found is not None:
+            explained.update(found)
+            for position in found:
+                free[position] = None
         elif readable:
             candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans)), len(words)))
     if candidates:

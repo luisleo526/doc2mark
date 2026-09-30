@@ -1034,6 +1034,20 @@ def test_the_refusal_ttl_is_configurable():
         MemoryOCRCache(refusal_ttl_seconds=0)
 
 
+def test_a_refusal_is_never_kept_longer_than_an_answer():
+    """Review of this change: a cache whose TTL is shorter than refusal_ttl_seconds replayed refusals longer
+    than real answers."""
+    clock = _Clock()
+    provider = _AnswerOCR(OPENAI_REFUSAL)
+    ocr = CachedOCR(provider, MemoryOCRCache(ttl_seconds=60, time_func=clock))
+
+    ocr.batch_process_images([b"page"])
+    clock.now += 61
+    ocr.batch_process_images([b"page"])
+
+    assert len(provider.calls) == 2
+
+
 def test_redis_keeps_a_refusal_for_its_own_short_ttl(monkeypatch):
     clock = _Clock()
     client = install_fake_redis(monkeypatch)
