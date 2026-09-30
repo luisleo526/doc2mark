@@ -186,3 +186,14 @@ def test_numbered_line_after_bullets_is_an_item_of_its_own(run_cli, e2e_dir):
     texts = [" ".join(item.get_text(" ").split()) for item in html.find_all("li")]
     assert "Costs decreased" in texts and "Outlook for the next year" in texts, (texts, result.describe())
     assert [ol.get("start") for ol in html.find_all("ol")] == ["5"], (str(html), result.describe())
+
+
+def test_sibling_items_of_a_nested_list_stay_together(run_cli, e2e_dir):
+    result = convert(run_cli, b.nested_bullets_pdf(e2e_dir / "nested.pdf"))
+    lines = result.markdown.splitlines()
+
+    first = next(k for k, line in enumerate(lines) if "Plan the kick-off sessions" in line)
+    assert all(line.strip().startswith("- ") for line in lines[first:first + 3]), result.describe()
+    nested = [token.content for token in _COMMONMARK.parse(result.markdown) if token.type == "inline"]
+    assert nested[-3:] == ["Run the hands-on courses", "Track adoption after launch", "Reporting"], \
+        (nested, result.describe())

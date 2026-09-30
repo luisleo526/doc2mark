@@ -388,3 +388,23 @@ def bullets_then_number_pdf(path: Path) -> Path:
     page.insert_text((72, 220), "The next meeting is planned for the end of January.", fontsize=10,
                      fontname="helv")
     return _save(doc, path)
+
+
+NESTED_ITEMS = [(72, "4. Training and rollout"), (90, "\u2022 Plan the kick-off sessions"),
+                (90, "\u2022 Run the hands-on courses"), (90, "\u2022 Track adoption after launch"),
+                (72, "5. Reporting")]
+
+
+def nested_bullets_pdf(path: Path) -> Path:
+    """A numbered item with three nested bullets and the next numbered item (a Word proposal's
+    shape): a tight list that must stay tight."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((72, 80), "The work plan has five parts, the last two of which are listed here.", fontsize=10,
+                     fontname="helv")
+    font = pymupdf.Font("helv")
+    writer = pymupdf.TextWriter(page.rect)
+    for index, (x, line) in enumerate(NESTED_ITEMS):
+        writer.append((x, 110 + 12 * index), line, font=font, fontsize=10)
+    writer.write_text(page)
+    return _save(doc, path)

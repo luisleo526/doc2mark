@@ -3893,28 +3893,30 @@ class PDFLoader:
         output: List[str] = []
         stack: List[Tuple[Optional[float], str, str]] = []   # open levels: (x0, indent, marker prefix)
         joins = getattr(self, "_hyphen_joins", None)
-        opened = None   # kind of list that opened the current run of lines (bullets, ``1.`` or ``1)``)
+        opened, opened_depth = None, 0   # kind and depth of the item after the last blank line
         for x0, prefix, item_lines, item_wraps, item_views in items:
             while len(stack) > 1 and x0 is not None and stack[-1][0] is not None and x0 < stack[-1][0] - 2:
                 stack.pop()
             # A blank line goes before an item that would otherwise read as a lazy continuation of
-            # the text above it: an item of another kind than the list its lines continue (numbers
-            # after bullets, bullets after numbers, ``1)`` after ``1.``) in renderers that keep list
-            # types apart (Python-Markdown's sane_lists), and a nested numbered list that does not
-            # start at 1 (CommonMark too).
+            # the text above it: an item of another kind than its sibling above (numbers after
+            # bullets, bullets after numbers, ``1)`` after ``1.``) or than the list that follows the
+            # last blank line when the item returns to an outer level (renderers that keep list
+            # types apart, like Python-Markdown's sane_lists), and a nested numbered list that does
+            # not start at 1 (CommonMark too).
             kind = list_kind(prefix)
             if not stack:
-                indent, new_list = "", False
+                indent, depth, new_list = "", 1, False
             elif x0 is not None and stack[-1][0] is not None and x0 > stack[-1][0] + 2:
-                indent = stack[-1][1] + " " * len(stack[-1][2])
+                indent, depth = stack[-1][1] + " " * len(stack[-1][2]), len(stack) + 1
                 new_list = kind != "-" and prefix.rstrip()[:-1] != "1"
             else:
-                indent = stack.pop()[1]
-                new_list = kind != opened
+                sibling = stack.pop()
+                indent, depth = sibling[1], len(stack) + 1
+                new_list = kind != list_kind(sibling[2]) or (depth < opened_depth and kind != opened)
             if new_list and output:
                 output.append("")
             if opened is None or (new_list and output):
-                opened = kind
+                opened, opened_depth = kind, depth
             stack.append((x0, indent, prefix))
             physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
             lines = [_render_runs(runs) for runs in physical] or [""]
