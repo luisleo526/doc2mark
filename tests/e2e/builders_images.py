@@ -279,9 +279,13 @@ def clipped_screenshot_pdf(path: Path, slide_lines: Sequence[str], shown: Sequen
     in the screenshot outside the crop: the slide does not show it."""
     image = Image.new("RGB", (1920, 1080), "white")
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=40)
+    font = ImageFont.load_default(size=32)
+    crop_px = (400, 368)   # the 250 x 230 pt crop, in image pixels (1920 px drawn over 1200 pt)
     for index, line in enumerate(shown):
-        draw.text((24, 24 + 60 * index), line, fill="black", font=font)
+        right, bottom = draw.textbbox((24, 24 + 52 * index), line, font=font)[2:]
+        if right > crop_px[0] - 8 or bottom > crop_px[1] - 8:
+            raise ValueError(f"shown line does not fit the crop: {line!r}")
+        draw.text((24, 24 + 52 * index), line, fill="black", font=font)
     draw.text((460, 520), hidden, fill="black", font=font)
     draw.rectangle((900, 700, 1800, 1000), fill=(200, 220, 240))
     doc = pymupdf.open()
