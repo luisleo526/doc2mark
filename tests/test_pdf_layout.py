@@ -4,7 +4,7 @@ The E2E suite (tests/e2e/test_order.py) covers real PDFs through the CLI; these 
 on hand-made boxes: columns, rows, anchored items and the permutation guarantee.
 """
 
-from doc2mark.pipelines.pdf_layout import Region, reading_order
+from doc2mark.pipelines.pdf_layout import Region, cluster_boxes, reading_order
 
 
 def paragraph(x0, top, lines, width=240.0, size=10.0, pitch=12.0, group=None):
@@ -96,3 +96,93 @@ def test_background_picture_does_not_hide_the_columns():
     regions = by_top([background] + left + right)
     order = [regions[k] for k in reading_order(regions)]
     assert order == [background] + left + right
+
+
+# --- Review round 1 ----------------------------------------------------------------------------
+
+def test_ragged_line_reaching_into_the_gutter_stays_in_its_column():
+    # the right column ends early; lower in the left column a paragraph runs 2pt further right than
+    # the lines beside the right column's text, into the gutter: it is not an item across the gutter
+    left = [paragraph(50, 100, 10, width=236), paragraph(50, 230, 10, width=236), paragraph(50, 360, 10, width=242)]
+    right = [paragraph(305, 100, 8, width=240), paragraph(305, 205, 8, width=240)]
+    regions = by_top(left + right)
+    order = [regions[k] for k in reading_order(regions)]
+    assert order == left + right
+
+
+def test_page_number_centred_in_the_gutter_closes_the_columns():
+    left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
+    right = [paragraph(305, 100, 15), paragraph(305, 300, 25)]
+    number = Region((294, 810, 300, 820), "text", ((6, 9, 810, 820),))
+    regions = by_top(left + right + [number])
+    order = [regions[k] for k in reading_order(regions)]
+    assert order == left + right + [number]
+
+
+def test_figure_that_is_not_an_item_separates_the_bands():
+    upper = [paragraph(50, 60, 12), paragraph(305, 60, 12)]
+    lower = [paragraph(50, 520, 12), paragraph(305, 520, 12)]
+    regions = by_top(upper + lower)
+    figure = (50, 330, 545, 480)
+    order = [regions[k] for k in reading_order(regions, 842, figures=lambda: [figure])]
+    assert order == upper + lower
+    # without the figure the two bands are one pair of columns
+    assert [regions[k] for k in reading_order(regions, 842)] == [upper[0], lower[0], upper[1], lower[1]]
+
+
+def test_rule_in_the_gutter_and_under_a_pull_quote_do_not_cut_the_columns():
+    left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
+    right = [paragraph(305, 100, 15), paragraph(305, 300, 25)]
+    regions = by_top(left + right)
+    rules = [(297, 90, 298, 700), (150, 250, 450, 251)]   # a column rule; a rule across the gutter, beside text
+    order = [regions[k] for k in reading_order(regions, 842, figures=lambda: rules)]
+    assert order == left + right
+
+
+def test_picture_with_text_over_it_is_not_a_band_separator():
+    left = [paragraph(50, 100, 20), paragraph(50, 360, 20)]
+    right = [paragraph(305, 100, 15), paragraph(305, 300, 25)]
+    regions = by_top(left + right)
+    background = (0, 0, 595, 842)
+    order = [regions[k] for k in reading_order(regions, 842, figures=lambda: [background])]
+    assert order == left + right
+
+
+def test_terms_centred_on_multi_line_definitions_are_rows():
+    terms, definitions = [], []
+    for k in range(6):
+        top = 80 + 90 * k
+        definitions.append(paragraph(180, top, 6, width=360))
+        terms.append(paragraph(50, top + 18, 3, width=70))   # three lines, centred on the definition
+    regions = by_top(terms + definitions)
+    assert reading_order(regions) == list(range(len(regions)))
+
+
+def test_paragraphs_starting_level_by_chance_are_still_columns():
+    # two of five paragraph starts level in each column (paragraphs on one line grid)
+    left = [paragraph(50, 100 + 96 * k, 7) for k in range(5)]
+    right = [paragraph(305, 100, 5), paragraph(305, 172, 9), paragraph(305, 292, 5), paragraph(305, 364, 9),
+             paragraph(305, 484, 7)]
+    regions = by_top(left + right)
+    order = [regions[k] for k in reading_order(regions)]
+    assert order == left + right
+
+
+def test_one_row_of_long_table_labels_is_not_running_text():
+    # a table header row: a label on the left, the column labels on the right in pieces of one row
+    labels = Region((48, 123, 131, 129), "text", ((83, 6, 123, 129),))
+    header = Region((137, 123, 533, 129), "text", tuple((120, 6, 123, 129) for _ in range(3)))
+    title = Region((72, 73, 296, 85), "text", ((224, 12, 73, 85),))
+    body = [Region((48, 135 + 30 * k, 531, 160 + 30 * k), "text", ((483, 6, 135 + 30 * k, 141 + 30 * k),))
+            for k in range(3)]
+    regions = by_top([title, labels, header] + body)
+    assert reading_order(regions) == list(range(len(regions)))
+
+
+def test_cluster_boxes_groups_nearby_paths_and_drops_small_marks():
+    bars = [(70 + 38 * k, 400, 96 + 38 * k, 470) for k in range(10)]   # 12pt apart: separate figures
+    frame = [(50, 330, 545, 330.5), (50, 480, 545, 480.5), (50, 330, 50.5, 480), (545, 330, 545.5, 480)]
+    bullet = [(40, 600, 43, 603)]
+    figures = cluster_boxes(bars + frame + bullet)
+    assert len(figures) == 1 and figures[0] == (50, 330, 545.5, 480.5)
+    assert cluster_boxes([(0, 0, 1, 1)] * 5000) == []

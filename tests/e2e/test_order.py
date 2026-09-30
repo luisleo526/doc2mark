@@ -13,6 +13,7 @@ import re
 from typing import List
 
 import markdown as python_markdown
+import pytest
 from bs4 import BeautifulSoup
 from markdown_it import MarkdownIt
 
@@ -67,17 +68,19 @@ def test_two_column_paper_reads_column_by_column(run_cli, e2e_dir):
     assert found.index("[/FN1]") < found.index("[/P10]"), result.describe()
 
 
-def test_three_unequal_columns_with_a_spanning_figure(run_cli, e2e_dir):
+@pytest.mark.parametrize("images", [False, True], ids=["default", "extract-images"])
+def test_three_unequal_columns_with_a_spanning_figure(run_cli, e2e_dir, images):
     path, above, below = b.three_column_pdf(e2e_dir / "three.pdf")
-    result = convert(run_cli, path, "--extract-images")
+    result = convert(run_cli, path, *(["--extract-images"] if images else []))
     found = tags_in(result.markdown)
 
     assert found == pairs(above) + ["[FIG]", "[/FIG]"] + pairs(below), result.describe()
     markdown = result.markdown
     assert markdown.index("Three Column Newsletter") < markdown.index("[A1]"), result.describe()
-    # the picture spanning the columns sits between the two bands, before its caption
-    picture = markdown.index("![Image](data:")
-    assert markdown.index("[/A5]") < picture < markdown.index("[FIG]"), result.describe()
+    if images:
+        # the picture spanning the columns sits between the two bands, before its caption
+        picture = markdown.index("![Image](data:")
+        assert markdown.index("[/A5]") < picture < markdown.index("[FIG]"), result.describe()
 
 
 def test_sidebar_and_pull_quote_do_not_split_the_main_flow(run_cli, e2e_dir):
@@ -197,3 +200,75 @@ def test_sibling_items_of_a_nested_list_stay_together(run_cli, e2e_dir):
     nested = [token.content for token in _COMMONMARK.parse(result.markdown) if token.type == "inline"]
     assert nested[-3:] == ["Run the hands-on courses", "Track adoption after launch", "Reporting"], \
         (nested, result.describe())
+
+
+# --- Review round 1 ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["picture", "drawing"])
+def test_figure_across_the_columns_cuts_them_without_image_extraction(run_cli, e2e_dir, kind):
+    # CLI default (no --extract-images): the picture is not an output item, and the short caption
+    # under it does not reach across the gutter; the figure itself still separates the two bands
+    path, tags = b.spanning_figure_pdf(e2e_dir / f"spanning_{kind}.pdf", kind)
+    result = convert(run_cli, path)
+
+    assert tags_in(result.markdown) == pairs(tags), result.describe()
+
+
+def test_word_picture_between_column_sections(run_cli, require_tool, e2e_dir):
+    require_tool("soffice")
+    built = [b.word_picture_between_sections_docx(e2e_dir / f"wfig{k}.docx", caption=not k) for k in (0, 1)]
+    pdfs = b.docx_to_pdfs([docx for docx, _ in built])
+    for pdf, (_, tags) in zip(pdfs, built):
+        result = convert(run_cli, pdf)
+        assert tags_in(result.markdown) == pairs(tags), (pdf.name, result.describe())
+
+
+def test_ragged_lines_reaching_into_the_gutter_stay_in_their_column(run_cli, e2e_dir):
+    path, tags = b.ragged_columns_pdf(e2e_dir / "ragged.pdf")
+    result = convert(run_cli, path)
+
+    assert tags_in(result.markdown) == pairs(tags), result.describe()
+    assert result.markdown.count("Journal of Ordering Vol. 3") == 1, result.describe()
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+def test_rotated_two_column_page_reads_column_by_column(run_cli, e2e_dir, rotation):
+    path, tags = b.rotated_two_column_pdf(e2e_dir / f"rotated{rotation}.pdf", rotation)
+    result = convert(run_cli, path)
+
+    assert tags_in(result.markdown) == pairs(tags), result.describe()
+
+
+def test_word_ragged_two_column_exports(run_cli, require_tool, e2e_dir):
+    require_tool("soffice")
+    built = [b.word_columns_docx(e2e_dir / f"w{seed:02d}.docx", seed) for seed in (0, 11)]
+    pdfs = b.docx_to_pdfs([docx for docx, _ in built])
+    for pdf, (_, tags) in zip(pdfs, built):
+        result = convert(run_cli, pdf)
+        assert tags_in(result.markdown) == pairs(tags), (pdf.name, result.describe())
+
+
+def test_terms_centred_on_their_definitions_keep_their_rows(run_cli, e2e_dir):
+    # three-line terms set vertically centred on their definitions are rows, not a column: each
+    # term stays next to its definition (the page keeps its top-to-bottom order)
+    path, rows = b.glossary_centred_terms_pdf(e2e_dir / "glossary.pdf")
+    result = convert(run_cli, path)
+    found = [tag.strip("[]") for tag in tags_in(result.markdown) if not tag.startswith("[/")]
+
+    assert sorted(found) == sorted(tag for row in rows for tag in row), result.describe()
+    for term, definition in rows:
+        assert abs(found.index(term) - found.index(definition)) == 1, (term, found, result.describe())
+
+
+def test_vertical_margin_stamp_is_neither_the_title_nor_a_heading(run_cli, e2e_dir):
+    result = convert(run_cli, b.margin_stamp_paper_pdf(e2e_dir / "stamp.pdf"))
+    headings = [(len(line) - len(line.lstrip("#")), line.lstrip("#").strip())
+                for line in result.markdown.splitlines() if re.match(r"#{1,6} ", line)]
+
+    assert headings[0] == (1, "Ordering Text In Two Column Papers"), (headings, result.describe())
+    assert b.STAMP.split()[0] in result.markdown, result.describe()
+    assert not any(b.STAMP.split()[0] in text for _, text in headings), (headings, result.describe())
+    # sibling sections get one level, whichever page they are on
+    levels = {text: level for level, text in headings}
+    assert {levels.get(section) for section in b.PAPER_SECTIONS} == {2}, (headings, result.describe())

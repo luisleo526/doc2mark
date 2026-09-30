@@ -408,3 +408,217 @@ def nested_bullets_pdf(path: Path) -> Path:
         writer.append((x, 110 + 12 * index), line, font=font, fontsize=10)
     writer.write_text(page)
     return _save(doc, path)
+
+
+# --------------------------------------------------------------------------------------
+# Review round 1 (supervisor review of PR #23): layouts from ~/code/.executors/d2m-review-order
+# --------------------------------------------------------------------------------------
+
+def spanning_figure_pdf(path: Path, kind: str = "picture") -> Tuple[Path, List[str]]:
+    """After the reviewer's ``L04_spanfig``: two columns above and below a figure across both
+    columns (a raster picture, or with ``kind="drawing"`` a bar chart drawn with vector paths and no
+    text), with a short caption under it that does not reach across the gutter. Returns the path and
+    the tags in reading order (the caption opens the band under the figure)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    rnd = random.Random(50)
+    above = [f"F{k}" for k in range(1, 7)]
+    below = [f"F{k}" for k in range(7, 11)]
+    flow([page], [(0, 50, 60, 290, 315), (0, 305, 60, 545, 315)],
+         [("p", tagged(tag, rnd.randint(30, 42), 50 + k)) for k, tag in enumerate(above, 1)])
+    if kind == "picture":
+        page.insert_image(pymupdf.Rect(50, 330, 545, 480), stream=_png(400, 120))
+    else:
+        page.draw_rect(pymupdf.Rect(50, 330, 545, 480), color=(0.3, 0.3, 0.3), width=0.8)
+        for k in range(12):
+            height = 20 + 9 * ((k * 7) % 12)
+            page.draw_rect(pymupdf.Rect(70 + 38 * k, 470 - height, 96 + 38 * k, 470), color=None, fill=(0.2, 0.4, 0.7))
+    page.insert_text((50, 495), "[CAP] Figure 1: a figure across both columns [/CAP]", fontsize=9, fontname="helv")
+    flow([page], [(0, 50, 515, 290, 790), (0, 305, 515, 545, 790)],
+         [("p", tagged(tag, rnd.randint(30, 42), 60 + k)) for k, tag in enumerate(below, 1)])
+    return _save(doc, path), above + ["CAP"] + below
+
+
+def word_picture_between_sections_docx(path: Path, caption: bool = True) -> Tuple[Path, List[str]]:
+    """Port of the reviewer's ``mk_word_fig.py``: a title, a two-column section, a full-width
+    picture (with or without a caption) in a one-column section, then another two-column section.
+    Returns the .docx path and the tags in reading order."""
+    from docx import Document
+    from docx.enum.section import WD_SECTION
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches
+
+    def columns(section, count):
+        sect_pr = section._sectPr
+        for old in sect_pr.findall(qn("w:cols")):
+            sect_pr.remove(old)
+        cols = OxmlElement("w:cols")
+        cols.set(qn("w:num"), str(count))
+        cols.set(qn("w:space"), "360")
+        sect_pr.append(cols)
+
+    rnd = random.Random(50 + (0 if caption else 1))
+    document = Document()
+    document.add_heading("Paper With A Wide Figure", level=0)
+    columns(document.sections[0], 1)
+    tags = []
+    columns(document.add_section(WD_SECTION.CONTINUOUS), 2)
+    for k in range(1, 5):
+        tags.append(f"A{k}")
+        document.add_paragraph(f"[A{k}] " + " ".join(rnd.choice(WORDS) for _ in range(rnd.randint(40, 60))) + f" [/A{k}]")
+    columns(document.add_section(WD_SECTION.CONTINUOUS), 1)
+    document.add_picture(io.BytesIO(_png(600, 200)), width=Inches(6))
+    if caption:
+        document.add_paragraph("Figure 1: Overview of the system.")
+    columns(document.add_section(WD_SECTION.CONTINUOUS), 2)
+    for k in range(1, 5):
+        tags.append(f"B{k}")
+        document.add_paragraph(f"[B{k}] " + " ".join(rnd.choice(WORDS) for _ in range(rnd.randint(40, 60))) + f" [/B{k}]")
+    document.save(str(path))
+    return Path(path), tags
+
+
+def word_columns_docx(path: Path, seed: int) -> Tuple[Path, List[str]]:
+    """Port of the reviewer's ``mk_word.py``: a title and 4-9 sections of 2-4 ragged-right paragraphs
+    in a two-column Word section. Returns the .docx path and the tags in reading order."""
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    rnd = random.Random(seed)
+    document = Document()
+    document.add_heading("Two Column Paper Title", level=0)
+    cols = OxmlElement("w:cols")
+    cols.set(qn("w:num"), "2")
+    cols.set(qn("w:space"), "360")
+    document.sections[0]._sectPr.append(cols)
+    tags, number = [], 0
+    for section in range(rnd.randint(4, 9)):
+        document.add_heading(f"Section {section + 1}", level=1)
+        for _ in range(rnd.randint(2, 4)):
+            number += 1
+            tag = f"W{number:02d}"
+            tags.append(tag)
+            document.add_paragraph(f"[{tag}] " + " ".join(rnd.choice(WORDS) for _ in range(rnd.randint(25, 80)))
+                                   + f" [/{tag}]")
+    document.save(str(path))
+    return Path(path), tags
+
+
+def docx_to_pdfs(paths: Sequence[Path]) -> List[Path]:
+    """Convert several .docx files with one LibreOffice run (private profile) and return the PDFs."""
+    import shutil
+    import subprocess
+
+    paths = [Path(p) for p in paths]
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if soffice is None:
+        raise RuntimeError("soffice is not on PATH")
+    folder = paths[0].parent
+    profile = folder / ".lo-profile-order"
+    subprocess.run([soffice, f"-env:UserInstallation={profile.resolve().as_uri()}", "--headless",
+                    "--convert-to", "pdf", "--outdir", str(folder), *map(str, paths)],
+                   check=True, capture_output=True, timeout=300)
+    pdfs = [path.with_suffix(".pdf") for path in paths]
+    missing = [pdf for pdf in pdfs if not pdf.exists()]
+    if missing:
+        raise RuntimeError(f"LibreOffice did not write {missing}")
+    return pdfs
+
+
+def ragged_columns_pdf(path: Path) -> Tuple[Path, List[str]]:
+    """Port of the reviewer's ``L16_chrome_2col``: three pages of two ragged-right columns under a
+    running header and over a ``Page N`` footer. Lower in the left column some lines run a point or
+    two further right than the lines beside the right column's text. Returns the tags in order."""
+    doc = pymupdf.open()
+    for _ in range(3):
+        doc.new_page(width=A4[0], height=A4[1])
+    pages = [doc[k] for k in range(3)]
+    tags, blocks = [], []
+    for k in range(1, 25):
+        tags.append(f"H{k}")
+        blocks.append(("p", tagged(f"H{k}", random.Random(180 + k).randint(50, 70), 180 + k)))
+    for number, page in enumerate(pages, 1):
+        page.insert_text((50, 35), "Journal of Ordering Vol. 3", fontsize=8, fontname="helv")
+        page.insert_text((480, 820), f"Page {number}", fontsize=8, fontname="helv")
+    flow(pages, [(k, x0, 60, x1, 790) for k in range(3) for x0, x1 in ((50, 290), (305, 545))], blocks)
+    return _save(doc, path), tags
+
+
+def rotated_two_column_pdf(path: Path, rotation: int) -> Tuple[Path, List[str]]:
+    """Port of the reviewer's ``L14``/``L15``: one landscape page built as a portrait MediaBox with
+    ``/Rotate`` 90 or 270, set upright in two ragged-right columns under a title. Returns the tags
+    in reading order."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.set_rotation(rotation)
+    matrix = page.derotation_matrix
+    page.insert_text(pymupdf.Point(40, 45) * matrix, "[RT] Landscape report title [/RT]", fontsize=14, fontname="hebo",
+                     rotate=rotation)
+    tags = ["RT"]
+    frames = [(40, 70, 410, 560), (430, 70, 800, 560)]
+    frame, y = 0, None
+    seed = 160 if rotation == 90 else 170
+    for k in range(1, 11):
+        tags.append(f"R{k}")
+        words = tagged(f"R{k}", random.Random(seed + k).randint(40, 60), seed + k).split()
+        while words:
+            x0, y0, x1, y1 = frames[frame]
+            y = y0 + 9.5 if y is None else y
+            if y > y1:
+                frame, y = frame + 1, None
+                continue
+            count = 1
+            while count < len(words) and pymupdf.get_text_length(" ".join(words[:count + 1]), "helv", 9.5) <= x1 - x0:
+                count += 1
+            page.insert_text(pymupdf.Point(x0, y) * matrix, " ".join(words[:count]), fontsize=9.5, fontname="helv",
+                             rotate=rotation)
+            words = words[count:]
+            y += 11.5
+        y += 7
+    return _save(doc, path), tags
+
+
+def glossary_centred_terms_pdf(path: Path) -> Tuple[Path, List[Tuple[str, str]]]:
+    """Port of the reviewer's ``L19_glossary_centred3``: six bold three-line terms at x=50, each
+    centred vertically on its multi-line definition at x=180. Returns the (term, definition) tags."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    y, pairs = 80, []
+    for k in range(1, 7):
+        lines = wrap(tagged(f"D{k}", 60 + k * 4, 300 + k), 360, 10)
+        height = 12 * len(lines)
+        page.insert_text((180, y), "\n".join(lines), fontsize=10, fontname="helv", lineheight=1.2)
+        page.insert_text((50, y + height / 2 - 18), f"[G{k}] Long term\nname number\n{k} here", fontsize=10,
+                         fontname="hebo", lineheight=1.2)
+        y += height + 16
+        pairs.append((f"G{k}", f"D{k}"))
+    return _save(doc, path), pairs
+
+
+STAMP = "arXiv:2609.01234v1 [cs.CL] 30 Sep 2026"
+PAPER_SECTIONS = ["Abstract", "1. Introduction", "2. Related Work", "3. Method", "4. Results"]
+
+
+def margin_stamp_paper_pdf(path: Path) -> Path:
+    """Two pages of a two-column paper with an arXiv-style stamp set vertically (20pt, grey) in the
+    left margin of page 1, larger than the 16pt title. Sections ``Abstract``, ``1. Introduction`` ..
+    ``4. Results`` are bold 11pt headings; the last ones fall on page 2."""
+    doc = pymupdf.open()
+    for _ in range(2):
+        doc.new_page(width=A4[0], height=A4[1])
+    pages = [doc[0], doc[1]]
+    title = "Ordering Text In Two Column Papers"
+    width = pymupdf.get_text_length(title, "hebo", 16)
+    pages[0].insert_text(((A4[0] - width) / 2, 70), title, fontsize=16, fontname="hebo")
+    pages[0].insert_text((30, 620), STAMP, fontsize=20, fontname="tiro", color=(0.5, 0.5, 0.5), rotate=90)
+    blocks = []
+    for number, heading in enumerate(PAPER_SECTIONS):
+        blocks.append(("h", heading))
+        for k in range(3 if number else 1):
+            tag = f"S{number}x{k}"
+            blocks.append(("p", tagged(tag, random.Random(number * 10 + k).randint(60, 90), number * 10 + k)))
+    flow(pages, [(0, 60, 100, 295, 790), (0, 310, 100, 545, 790), (1, 60, 60, 295, 790), (1, 310, 60, 545, 790)],
+         blocks, size=9.5, leading=11.5)
+    return _save(doc, path)
