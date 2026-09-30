@@ -626,3 +626,26 @@ def test_r1_5_columnar_pages_without_tables_cost_about_what_prose_costs(run_cli,
     assert tables(result) == [], result.markdown[:2000]
     assert columns_seconds < 1.5 * prose_seconds + 0.5, (
         f"four-column pages took {columns_seconds:.2f}s, the same text as prose {prose_seconds:.2f}s")
+
+
+def test_r1_9_continuation_under_a_running_header_the_first_page_lacks(run_cli, e2e_dir):
+    """Word's "different first page": page 1 has a letterhead instead of the running header that
+    pages 2 and 3 carry. The table running on from page 1 still continues under page 2's running
+    header, which the next page repeats."""
+    result = convert(run_cli, B.different_first_page_pdf(e2e_dir / "first.pdf"))
+
+    first, second = tables(result)
+    assert first.rows == [B.SPLIT_HEADER] + _employee_rows(1, 8), result.markdown
+    assert second.rows == [B.SPLIT_HEADER] + _employee_rows(8, 11), result.markdown
+
+
+@pytest.mark.parametrize("centred", [False, True], ids=["header_and_two_rows", "centred_numbers"])
+def test_r1_5_pre_check_passes_what_the_table_checks_accept(run_cli, e2e_dir, centred):
+    """The cheap pre-check before the borderless-table search must not reject tables the search
+    itself accepts: two numeric rows under a header, numbers centred in their columns."""
+    result = convert(run_cli, B.small_borderless_pdf(e2e_dir / "small.pdf", centred=centred))
+
+    assert [grid.rows for grid in tables(result)] == [B.CENTRED_ROWS if centred else B.QUARTER_ROWS], \
+        result.markdown
+    for text in (B.SMALL_LEAD, B.SMALL_CLOSE):
+        assert occurrences(result, text) == 1, result.markdown

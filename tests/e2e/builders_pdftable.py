@@ -795,3 +795,56 @@ def page_top_table_pdf(path: Path, *, heading: bool, running_header: bool) -> Pa
     doc.save(str(path))
     doc.close()
     return Path(path)
+
+
+def different_first_page_pdf(path: Path) -> Path:
+    """Word's "different first page": page 1 has a letterhead and no running header, pages 2 and 3
+    carry ``ACME Annual Report 2025 - page N`` at the very top. The staff table (bold header row)
+    ends page 1 and continues right under page 2's running header (Emp8-Emp10, no repeated header);
+    page 3 is text."""
+    doc = pymupdf.open()
+    for page_no in range(3):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        if page_no == 0:
+            page.insert_text((50, 40), "ACME Corporation", fontname="hebo", fontsize=16)
+            page.insert_text((50, 56), "1 Harbour Road, Springfield", fontsize=9)
+            rows = [SPLIT_HEADER] + [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(1, 8)]
+            page.insert_text((50, 620), "Staff list", fontsize=10)
+            ruled_table(page, 50, 650, [100, 80, 80], [18] * len(rows), grid(rows), bold_rows=[0])
+            continue
+        page.insert_text((50, 24), f"ACME Annual Report 2025 - page {page_no + 1}", fontsize=8)
+        if page_no == 1:
+            rows = [[f"Emp{i}", f"D{i % 3}", f"{50 + i}k"] for i in range(8, 11)]
+            ruled_table(page, 50, 56, [100, 80, 80], [18] * len(rows), grid(rows))
+        else:
+            page.insert_text((50, 80), "Headcount figures are as of 31 December 2025.", fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
+QUARTER_ROWS = [["Region", "Q1", "Q2"], ["North", "120", "135"], ["South", "98", "101"]]
+CENTRED_ROWS = [["Item", "Units", "Share"], ["Paper", "5", "2%"], ["Toner", "120", "31%"],
+                ["Laptops", "1,234", "67%"]]
+SMALL_LEAD = "Regional figures for the first half are summarised below."
+SMALL_CLOSE = "All figures are unaudited."
+
+
+def small_borderless_pdf(path: Path, *, centred: bool) -> Path:
+    """Borderless tables at the validator's minimums, a paragraph away from a lead-in and a closing
+    sentence: a header and two rows of right-aligned numbers (``QUARTER_ROWS``), or numbers centred
+    in their columns the way Word centres cells (``CENTRED_ROWS``)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_text((50, 40), SMALL_LEAD, fontsize=10)
+    y = 64
+    for row in CENTRED_ROWS if centred else QUARTER_ROWS:
+        page.insert_text((50, y), row[0], fontsize=10)
+        for anchor, value in zip([220, 300], row[1:]):
+            width = pymupdf.get_text_length(value, fontsize=10)
+            page.insert_text((anchor - width / 2 if centred else anchor - width, y), value, fontsize=10)
+        y += 14
+    page.insert_text((50, y + 14), SMALL_CLOSE, fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
