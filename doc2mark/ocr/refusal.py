@@ -227,6 +227,9 @@ def matches_non_content_pattern(text: str) -> bool:
         return False
     if _ADDRESSES_A_USER.search(answer):
         return False
+    # One space between words, one line break between lines: the patterns' optional
+    # whitespace cannot backtrack over long runs of blanks.
+    answer = "\n".join(" ".join(line.split()) for line in answer.split("\n") if line.strip())
     return bool(_START_RE.match(answer) or _ANYWHERE_RE.search(answer))
 
 
