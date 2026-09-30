@@ -305,7 +305,7 @@ def test_large_scan_keeps_memory_bounded(e2e_dir):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# F3 empty OCR results: never cached as an answer; a dropped page leaves a marker
+# F3 failed OCR results: never cached as an answer; what could not be read leaves a marker
 
 FLAKY_SCRIPT = (
     "import json, sys\n"
@@ -314,7 +314,8 @@ FLAKY_SCRIPT = (
     "from doc2mark.ocr.cache import MemoryOCRCache\n"
     "from doc2mark.ocr.tesseract import TesseractOCR\n"
     "class FlakyOCR(BaseOCR):\n"
-    "    '''Returns no text on its first call (an outage, a refusal), then reads with Tesseract.'''\n"
+    "    '''Fails every image of its first call (an outage, flagged failed as the built-in providers flag a\n"
+    "    per-image timeout or error), then reads with Tesseract.'''\n"
     "    def __init__(self):\n"
     "        super().__init__(api_key=None)\n"
     "        self.engine = TesseractOCR()\n"
@@ -322,7 +323,7 @@ FLAKY_SCRIPT = (
     "    def batch_process_images(self, images, **kwargs):\n"
     "        self.calls += 1\n"
     "        if self.calls == 1:\n"
-    "            return [OCRResult(text='') for _ in images]\n"
+    "            return [OCRResult(text='', metadata={'failed': True, 'error': 'timeout'}) for _ in images]\n"
     "        return self.engine.batch_process_images(images, **kwargs)\n"
     "    def process_image(self, image, **kwargs):\n"
     "        return self.batch_process_images([image], **kwargs)[0]\n"
@@ -338,13 +339,13 @@ FLAKY_SCRIPT = (
 
 @pytest.mark.parametrize("cache", ["ocr_cache", "cache_dir"])
 @pytest.mark.parametrize("shown_as", ["scanned page", "picture on a text page"])
-def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_tool, e2e_dir, cache, shown_as):
-    """F3: a scanned page whose OCR came back empty (a failing provider) was dropped without a trace, and the
-    empty answer was cached (by an OCR cache, ``ocr_cache=``, or with the whole converted document, ``cache_dir=``),
-    so a re-run with a healthy provider dropped the page again. The empty answer is not cached, the second run
-    reads the page, and the first run marks the page it could not read. The same for a picture on a text page
-    (review round: an empty per-picture answer, which is how a per-image timeout comes back, let the whole
-    document into ``cache_dir``)."""
+def test_failed_ocr_result_is_not_cached_and_the_unread_picture_is_marked(require_tool, e2e_dir, cache, shown_as):
+    """F3: a scanned page whose OCR failed (an outage) was dropped without a trace, and the failed answer was
+    cached (by an OCR cache, ``ocr_cache=``, or with the whole converted document, ``cache_dir=``), so a re-run
+    with a healthy provider dropped the page again. A failed answer is not cached, the second run reads the page,
+    and the first run marks what it could not read. The same for a picture on a text page. (Review round 1: a
+    failure is an answer the provider flags ``failed``; an answer with no text is an answer, see
+    ``test_real_empty_answers_are_cached_and_only_failed_ones_are_retried``.)"""
     require_tool("tesseract")
     if shown_as == "scanned page":
         pdf = pdfgen.image_pdf(e2e_dir / "scan.pdf", "INVOICE 8812\nTOTAL EUR 912")
@@ -356,9 +357,131 @@ def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_t
     output = json.loads(proc.stdout.strip().splitlines()[-1])
     first, second = (words(run) for run in output["runs"])
     assert output["calls"] == 2, output
-    assert "8812" not in first, output
+    assert "8812" not in first and "[image: OCR unavailable]" in first, output
     if shown_as == "scanned page":
-        assert re.search(r"page 1\b.*OCR returned no content", first), output
         assert "INVOICE 8812" in second and "TOTAL EUR 912" in second, output
     else:
         assert "INVOICE 8812" in second and all(line in second for line in BODY), output
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Review round 1 (PR #21): B1 failures vs real empty answers, M1 textless pages of small pictures, M2 clip paths,
+# m1 a picture repeated on every page
+
+CACHE_SCRIPT = (
+    "import json, sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "from doc2mark.ocr.base import BaseOCR, OCRResult\n"
+    "from doc2mark.ocr.cache import MemoryOCRCache\n"
+    "from doc2mark.ocr.tesseract import TesseractOCR\n"
+    "class CountingOCR(BaseOCR):\n"
+    "    '''Tesseract, counting the images it is sent. The very first image fails (a timeout, flagged failed).'''\n"
+    "    def __init__(self):\n"
+    "        super().__init__(api_key=None)\n"
+    "        self.engine = TesseractOCR()\n"
+    "        self.sent = 0\n"
+    "    def batch_process_images(self, images, **kwargs):\n"
+    "        first = self.sent == 0\n"
+    "        self.sent += len(images)\n"
+    "        results = self.engine.batch_process_images(images, **kwargs)\n"
+    "        if first:\n"
+    "            results[0] = OCRResult(text='', metadata={'failed': True, 'error': 'timeout'})\n"
+    "        return results\n"
+    "    def process_image(self, image, **kwargs):\n"
+    "        return self.batch_process_images([image], **kwargs)[0]\n"
+    "    def validate_api_key(self):\n"
+    "        return True\n"
+    "mode = sys.argv[2]\n"
+    "cache = {}\n"
+    "if mode in ('ocr_cache', 'both'):\n"
+    "    cache['ocr_cache'] = MemoryOCRCache()\n"
+    "if mode in ('cache_dir', 'both'):\n"
+    "    cache['cache_dir'] = sys.argv[3]\n"
+    "ocr = CountingOCR()\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=ocr, **cache)\n"
+    "runs = []\n"
+    "for _ in range(3):\n"
+    "    before = ocr.sent\n"
+    "    content = loader.load(sys.argv[1], ocr_images=True).content\n"
+    "    runs.append({'sent': ocr.sent - before, 'content': content})\n"
+    "print(json.dumps(runs))\n"
+)
+
+
+@pytest.mark.parametrize("cache", ["ocr_cache", "cache_dir", "both"])
+def test_real_empty_answers_are_cached_and_only_failed_ones_are_retried(require_tool, e2e_dir, cache):
+    """B1: an answer with no text (a blank duplex back side, a photo without words) is a real answer. It was
+    treated like a failure: never cached by the OCR cache, and it kept the whole document out of ``cache_dir``,
+    so every run re-sent every image of the document. Only an answer the provider flags ``failed`` (a timeout, an
+    error) is retried; everything else is served from the caches."""
+    require_tool("tesseract")
+    sheets = ["SHEET 1 ALPHA", "SHEET 2 BRAVO", "SHEET 3 CHARLIE"]
+    pdf = builders_images.scan_with_blank_sheet_pdf(e2e_dir / "scan.pdf", sheets, 2, BODY)
+
+    proc = run_api(e2e_dir, CACHE_SCRIPT, pdf, cache, e2e_dir / "document-cache")
+
+    runs = json.loads(proc.stdout.strip().splitlines()[-1])
+    sent = [run["sent"] for run in runs]
+    assert sent[0] >= 4, sent
+    assert "SHEET 1" not in words(runs[0]["content"]) and "OCR unavailable" in runs[0]["content"], runs[0]
+    for run in runs[1:]:
+        assert "SHEET 1 ALPHA" in words(run["content"]) and "SHEET 3 CHARLIE" in words(run["content"]), run
+    if cache == "cache_dir":
+        assert sent[1:] == [sent[0], 0], sent  # no OCR cache: run 2 reads everything again, then it is stored
+    else:
+        assert sent[1:] == [1, 0], sent  # only the failed image is asked again
+
+
+def test_textless_page_of_small_labelled_pictures_is_read(run_cli, require_tool, e2e_dir):
+    """M1: a catalogue sheet without a text layer made of 20 small labelled thumbnails (58 x 84 pt, a photo area over
+    a printed SKU and price) counted as "read one by one" by the text route, so the page kept the text route; each
+    thumbnail then read as "shapes" (the photo area outweighs the label) and was skipped: the page emitted nothing.
+    Small pictures on a page without a text layer leave the page to its render, which is OCR'd."""
+    require_tool("tesseract")
+    labels = [(f"SKU {4100 + n}", f"EUR {10 + n}") for n in range(20)]
+    pdf = builders_images.thumbnail_sheet_pdf(e2e_dir / "thumbs.pdf", labels, [BODY] * 4)
+
+    result = run_ocr(run_cli, pdf)
+
+    overrides = result.json["metadata"]["extra"]["ocr_routing"]["overrides"]
+    assert [(entry["page"], entry["route"]) for entry in overrides] == [(1, "image")], overrides
+    page_one = words(" ".join(item["content"] for item in ocr_items(result, 1)))
+    read = [sku for sku, _ in labels if sku in page_one]
+    assert len(read) >= 15, (read, page_one)
+    assert all(line in words(result.markdown) for line in BODY), result.describe()
+
+
+def test_picture_cropped_by_a_clip_path_is_read_as_the_page_shows_it(run_cli, require_tool, e2e_dir):
+    """M2: a 1920 x 1080 screenshot drawn at 1200 x 675 pt and cropped by a clip path to its top-left 250 x 230 pt
+    showed 7.7 % of itself on the slide, and the share rule judged it "not shown": its numbers were lost. What the
+    page shows is measured with the clip applied, and a partly shown picture is OCR'd as the page shows it (the
+    visible part, rendered): its shown numbers are read, and the text the crop hides is not."""
+    require_tool("tesseract")
+    slide = ["Quarterly results for the northern region", "Key numbers are in the cropped screenshot",
+             "Figures are unaudited and in thousands"]
+    pdf = builders_images.clipped_screenshot_pdf(e2e_dir / "crop.pdf", slide, ["Revenue 2025: 48,210",
+                                                                               "Margin: 31.4 %"], "HIDDEN 9999")
+
+    result = run_ocr(run_cli, pdf)
+
+    text = words(result.markdown)
+    assert "48,210" in text and "31.4" in text, result.describe()
+    assert "9999" not in text, result.describe()
+    assert all(line in text for line in slide), result.describe()
+
+
+def test_picture_repeated_at_the_same_place_on_every_page_is_kept_once(run_cli, require_tool, e2e_dir):
+    """m1: a lettered logo at the same place on every page (a letterhead, a slide template) put its text on every
+    page. Like a running header, the first copy stays and the later copies are typed text:header (left out of the
+    Markdown, kept in the JSON). A picture on two pages only, at different places, stays where it is."""
+    require_tool("tesseract")
+    pdf = builders_images.repeated_logo_pdf(e2e_dir / "logo.pdf", [BODY] * 6, "NORTHWIND 2026", "APPROVED 5521",
+                                            [2, 5])
+
+    result = run_ocr(run_cli, pdf)
+
+    text = words(result.markdown)
+    assert text.count("NORTHWIND") == 1 and text.count("5521") == 2, result.describe()
+    logos = [item for item in result.json["json_content"] if "NORTHWIND" in item["content"]]
+    assert [(item["page"], item["type"]) for item in logos] == (
+        [(1, PICTURE_OCR)] + [(page, "text:header") for page in range(2, 7)]), logos

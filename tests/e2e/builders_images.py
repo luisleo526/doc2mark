@@ -226,3 +226,102 @@ def screenshot_pdf(path: Path, body: Sequence[str], lines: Sequence[str]) -> Pat
     page = text_page(doc, body)
     page.insert_image(pymupdf.Rect(MARGIN, 330, MARGIN + 450, 555), stream=_png(image))
     return _save(doc, path)
+
+
+# ------------------------------------------------------------------- review round 1 (PR #21)
+
+
+def scan_with_blank_sheet_pdf(path: Path, sheets: Sequence[str], blank_after: int, photo_page: Sequence[str]) -> Path:
+    """Scanned sheets of ``sheets`` (one per page, no text layer) with one blank sheet (the back of a duplex scan:
+    paper grey, nothing printed) after sheet ``blank_after``, then a text page ``photo_page`` with a photo that
+    carries no text."""
+    doc = pymupdf.open()
+    for index, text in enumerate(sheets):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.insert_image(page.rect, stream=pdfgen.text_png(text, font_size=110))
+        if index + 1 == blank_after:
+            blank = doc.new_page(width=A4[0], height=A4[1])
+            blank.insert_image(blank.rect, stream=_png(Image.new("L", (827, 1170), 246)))
+    page = text_page(doc, photo_page)
+    rng = random.Random(3)
+    photo = Image.new("RGB", (600, 400))
+    pixels = photo.load()
+    for y in range(400):
+        for x in range(600):
+            shade = 90 + 50 * ((x // 40 + y // 40) % 2) + rng.randrange(-20, 20)
+            pixels[x, y] = (shade, shade + 15, int(shade * 0.8))
+    page.insert_image(pymupdf.Rect(MARGIN, 380, MARGIN + 360, 620), stream=_png(photo))
+    return _save(doc, path)
+
+
+def thumbnail_sheet_pdf(path: Path, labels: Sequence[Tuple[str, str]], text_pages: Sequence[Sequence[str]]) -> Path:
+    """Page 1 has no text layer: a catalogue sheet of small thumbnails (58 x 84 pt, under 10 % of the page), each a
+    photo area over a two-line printed label ``labels[i]``. Then one text page per item of ``text_pages``."""
+    doc = pymupdf.open()
+    sheet = doc.new_page(width=A4[0], height=A4[1])
+    font = ImageFont.load_default(size=48)
+    for index, (first, second) in enumerate(labels):
+        image = Image.new("RGB", (290, 420), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 280, 270), fill=(80 + 7 * index, 110, 150))
+        draw.text((12, 282), first, fill="black", font=font)
+        draw.text((12, 348), second, fill="black", font=font)
+        x0, y0 = MARGIN + (index % 5) * 70, MARGIN + (index // 5) * 100
+        sheet.insert_image(pymupdf.Rect(x0, y0, x0 + 58, y0 + 84), stream=_png(image), keep_proportion=False)
+    for lines in text_pages:
+        text_page(doc, lines)
+    return _save(doc, path)
+
+
+def clipped_screenshot_pdf(path: Path, slide_lines: Sequence[str], shown: Sequence[str], hidden: str) -> Path:
+    """A 960 x 540 pt slide with a text layer and a 1920 x 1080 px screenshot drawn at 1200 x 675 pt from
+    (700, 300), cropped by a clip path to its top-left 250 x 230 pt, which shows ``shown``. ``hidden`` is printed
+    in the screenshot outside the crop: the slide does not show it."""
+    image = Image.new("RGB", (1920, 1080), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=40)
+    for index, line in enumerate(shown):
+        draw.text((24, 24 + 60 * index), line, fill="black", font=font)
+    draw.text((460, 520), hidden, fill="black", font=font)
+    draw.rectangle((900, 700, 1800, 1000), fill=(200, 220, 240))
+    doc = pymupdf.open()
+    page = doc.new_page(width=SLIDE[0], height=SLIDE[1])
+    insert_lines(page, slide_lines, top=60, fontsize=20, left=60)
+    xref = page.insert_image(pymupdf.Rect(0, 0, 1, 1), stream=_png(image))
+    name = [info for info in page.get_images(full=True) if info[0] == xref][0][7]
+    contents = page.get_contents()[-1]
+    kept = [line for line in doc.xref_stream(contents).split(b"\n")
+            if not (f"/{name} Do".encode() in line or line.strip().endswith(b" cm"))]
+    height = SLIDE[1]
+    draw_image = (f"q 700 {height - 530} 250 230 re W n 1200 0 0 675 700 {height - 975} cm /{name} Do Q\n").encode()
+    doc.update_stream(contents, b"\n".join(kept) + b"\n" + draw_image)
+    return _save(doc, path)
+
+
+def repeated_logo_pdf(path: Path, pages: Sequence[Sequence[str]], logo: str, stamp: str, stamp_pages: Sequence[int]) -> Path:
+    """One text page per item of ``pages``, each showing the same lettered logo ``logo`` at the same place (top
+    right, as letterheads and slide templates do), and a stamp picture ``stamp`` on the 1-based ``stamp_pages``
+    only, at a different place on each."""
+    font = ImageFont.load_default(size=80)
+
+    def lettered(text: str, size: Tuple[int, int]) -> bytes:
+        image = Image.new("RGB", size, "white")
+        ImageDraw.Draw(image).text((20, 30), text, fill="black", font=font)
+        return _png(image)
+
+    doc = pymupdf.open()
+    logo_xref = stamp_xref = 0
+    for number, lines in enumerate(pages, 1):
+        page = text_page(doc, lines)
+        rect = pymupdf.Rect(A4[0] - MARGIN - 180, 24, A4[0] - MARGIN, 60)
+        if logo_xref:
+            page.insert_image(rect, xref=logo_xref)
+        else:
+            logo_xref = page.insert_image(rect, stream=lettered(logo, (900, 180)))
+        if number in stamp_pages:
+            spot = pymupdf.Rect(MARGIN, 500 + 40 * number, MARGIN + 200, 540 + 40 * number)
+            if stamp_xref:
+                page.insert_image(spot, xref=stamp_xref)
+            else:
+                stamp_xref = page.insert_image(spot, stream=lettered(stamp, (1000, 200)))
+    return _save(doc, path)

@@ -897,7 +897,6 @@ class _FlaggedOCR(FakeOCR):
 
 @pytest.mark.parametrize("flags", [
     pytest.param({"router_fallback": "unresolved"}, id="firewall-unresolved"),
-    pytest.param({"ocr_refusal": True}, id="refusal"),
     pytest.param({"failed": True}, id="failed"),
 ])
 def test_unstable_results_are_retried_not_replayed(flags):
@@ -908,6 +907,19 @@ def test_unstable_results_are_retried_not_replayed(flags):
     cached.batch_process_images([b"img"])
 
     assert len(provider.calls) == 2
+
+
+def test_a_refusal_or_no_text_answer_is_replayed():
+    """PR #21 review round 1 (B1): a refusal / "no readable text" answer is the provider's answer for that image,
+    prompt and judge (all in the key); retrying it on every run costs two calls per image (structured plus the
+    free-form recovery) and gives the same answer."""
+    provider = _FlaggedOCR({"ocr_refusal": True, "non_content": "pattern"})
+    cached = CachedOCR(provider, MemoryOCRCache())
+
+    cached.batch_process_images([b"img"])
+    cached.batch_process_images([b"img"])
+
+    assert len(provider.calls) == 1
 
 
 def test_a_clean_firewall_redo_is_cached():
