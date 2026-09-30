@@ -74,11 +74,30 @@ class Char:
         self.visible = visible  # False for invisible text (an OCR layer: render mode 3, alpha 0)
 
 
+def _glyph_band(span) -> Optional[Tuple[float, float]]:
+    """How far a glyph box of ``span`` reaches above and below the baseline: the font's ascender
+    and descender scaled to the font size, as MuPDF computes small glyph heights."""
+    ascender, descender = span.get("ascender"), span.get("descender")
+    if ascender is None or descender is None:
+        return None
+    if ascender < 1e-3:  # a glyphless (OCR) font, treated as MuPDF does
+        ascender, descender = 0.9, -0.1
+    height = ascender - descender
+    if height <= 0:
+        return None
+    size = span.get("size", 0.0)
+    return ascender / height * size, -descender / height * size
+
+
 def read_chars(textpage, matrix=None) -> List[Char]:
     """All characters of ``textpage``, optionally mapped through ``matrix``.
 
     Glyph boxes are read with PyMuPDF's small glyph heights, as ``find_tables()``
     does, so a character's centre lies on its baseline band and not in the next row.
+    On a left-to-right line the band is rebuilt from each glyph's baseline: the text
+    page ``find_tables()`` builds in PyMuPDF 1.28 measures glyphs by their ink, which
+    puts an underscore's box below its line (``user_id`` would read ``user id`` and
+    ``_``, or lose its underscore to the next row).
     """
     small = bool(pymupdf.TOOLS.set_small_glyph_heights())
     pymupdf.TOOLS.set_small_glyph_heights(True)
@@ -94,6 +113,7 @@ def read_chars(textpage, matrix=None) -> List[Char]:
         for line in block.get("lines", ()):
             run += 1
             dx, dy = line.get("dir", (1.0, 0.0))
+            left_to_right = abs(dy) < 1e-3 and dx > 0  # before mapping: the text's own direction
             if matrix is not None:
                 dx, dy = dx * matrix.a + dy * matrix.c, dx * matrix.b + dy * matrix.d
             upright = abs(dy) < 1e-3 and dx > 0
@@ -102,8 +122,11 @@ def read_chars(textpage, matrix=None) -> List[Char]:
                 bold = bool(span.get("flags", 0) & 16 or span.get("char_flags", 0) & 8)
                 # invisible text: fully transparent, or neither filled nor stroked (render mode 3)
                 visible = span.get("alpha", 255) != 0 and ("char_flags" not in span or bool(span["char_flags"] & 48))
+                band = _glyph_band(span) if left_to_right else None
                 for char in span.get("chars", ()):
                     x0, y0, x1, y1 = char["bbox"]
+                    if band is not None and "origin" in char:
+                        y0, y1 = char["origin"][1] - band[0], char["origin"][1] + band[1]
                     if matrix is not None:
                         x0, y0, x1, y1 = pymupdf.Rect(x0, y0, x1, y1) * matrix
                     chars.append(Char(char["c"], x0, y0, x1, y1, size, run, upright, bold, visible))

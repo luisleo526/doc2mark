@@ -50,7 +50,10 @@ contains the centre of the glyph. So a table nested inside another table's cell
 keeps its own text and the outer cell does not repeat it, and cells that overlap (an
 L-shaped merged region, a frame drawn around cells) never share a character. Inside
 a cell, words split at spaces and at gaps wider than 3 pt, and lines stay separate
-(``\n``), as in ``Table.extract()``.
+(``\n``), as in ``Table.extract()``. A glyph's height is taken from its baseline and
+font size: the text page ``find_tables()`` builds in PyMuPDF 1.28 measures glyphs by
+their ink, which put an underscore below its line (``user_id`` read as ``user id``
+and ``_``).
 
 Text drawn over other text is handled by what it is:
 
