@@ -767,7 +767,7 @@ _TAG = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
 _ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 SHORT_LINE_WORDS = 3          # a line of at most this many words is found only in one piece
-GAPPED_CELLS_PER_WORD = 100   # the gapped search of a page aligns at most this many cells per OCR word
+GAPPED_CELLS_PER_WORD = 200   # the gapped search of a page aligns at most this many cells per OCR word
 _NO_PATH = 1 << 60
 
 
@@ -913,8 +913,8 @@ class _OcrWords:
             if searched is not None and low + edits <= searched:
                 continue   # its band lies in the one just searched
             high = low + edits
-            for later in candidates[position + 1:position + 1 + edits]:
-                if later > high:
+            for later in candidates[position + 1:position + 1 + edits]:   # the next bands starting in it
+                if later > low + edits:
                     break
                 high = later + edits
             cells = size * (high - low + 1)
