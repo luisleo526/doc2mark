@@ -317,7 +317,7 @@ def convert_files(files, loader_config, processing_config, workers, timeout):
                         outcome, reusable = ('error', worker.file_path, reason), False
                 elif worker.deadline is not None and now >= worker.deadline:
                     worker.stop()
-                    outcome, reusable = ('error', worker.file_path, f"timed out after {timeout} s"), False
+                    outcome, reusable = ('error', worker.file_path, f"timed out after {timeout} s (--timeout)"), False
                 else:
                     continue
                 busy.remove(worker)

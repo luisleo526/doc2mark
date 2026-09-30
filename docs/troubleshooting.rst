@@ -59,7 +59,7 @@ after 1,000 characters; use ``-v`` or ``-o FILE``.
 ``.svg`` or ``.DS_Store``, fails the run. Pass ``--pattern "*.pdf"`` (or similar) or
 ``--skip-errors``.
 
-**A file in a folder run fails with ``timed out after 300 s``.** ``--timeout`` limits the time one
+**A file in a folder run fails with ``timed out after 300 s (--timeout)``.** ``--timeout`` limits the time one
 file may take (300 seconds, retries included); a slow conversion, a hung OCR service or a stuck
 LibreOffice is stopped and the file counts as failed. Raise the limit (``--timeout 900``) for big
 scans, or pass ``--timeout 0`` for no limit.
