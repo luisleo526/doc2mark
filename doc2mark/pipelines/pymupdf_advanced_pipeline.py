@@ -2609,8 +2609,9 @@ class PDFLoader:
         matrix = page.rotation_matrix
         figures = []
         try:
-            figures.extend(tuple(placement.visible * matrix) for placement in self._placements_of(page)
-                           if not placement.visible.is_empty)
+            if page.number in self._placements or page.get_images():   # measuring placements reads the page
+                figures.extend(tuple(placement.visible * matrix) for placement in self._placements_of(page)
+                               if not placement.visible.is_empty)
         except Exception as e:
             logger.debug(f"Picture placements of page {page.number + 1} unavailable: {e}")
         try:
