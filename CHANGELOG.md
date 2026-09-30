@@ -7,6 +7,439 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+What existing users will notice compared with 0.6.1, in their output, their install and their CLI
+runs. The groups below give the details and the reasons. Only the judge add-on is opt-in; everything
+else applies by default.
+
+**Install, API and CLI**
+
+- **pandas is no longer installed, numpy is a declared dependency.** `pip install doc2mark` no
+  longer pulls in pandas (nothing in doc2mark imports it), so code that relied on that must depend on
+  it directly; `XlsxLoader.df_sheets` is gone. `numpy>=1.21.0` is now listed (it used to arrive through
+  pandas). (#14, #18)
+- **`ocr_images=True` implies `extract_images=True` for every format** when an OCR provider is
+  configured, not only in the CLI. (#18)
+- **Tesseract failures are visible.** A Tesseract that cannot run (missing binary or language data,
+  bad `TESSDATA_PREFIX`) makes the CLI exit non-zero with the cause on stderr, and `load()` raise
+  `ProcessingError` (cause `OCREngineError`), as soon as the document has something to OCR. Before, the
+  run exited 0 with a placeholder (`[image: OCR unavailable]`, `OCR failed`) or with the pictures
+  silently missing. Directory runs with `--skip-errors` list the file as failed and go on (and exit 0).
+  An `--ocr-lang` that is not installed is rejected the same way, and `--ocr-lang deu`, `chi_tra` and
+  `eng+chi_tra` now take effect (they silently meant English before). (#19)
+- **New optional `doc2mark[typesafe]` extra and `--judge {none,typesafe}` flag** (also
+  `UnifiedDocumentLoader(judge="typesafe")` and `DOC2MARK_JUDGE=typesafe`). Off by default: nothing is
+  sent anywhere unless it is enabled. `doc2mark[all]` now includes the extra. (#22)
+- **`D2M_E2E_*` environment variables for the test runner** (`scripts/run_e2e_docker.sh`, developers
+  only): `D2M_E2E_STRICT=1` (set by the runner) makes a missing Tesseract or LibreOffice fail an E2E
+  test instead of skipping it, `D2M_E2E_PASS_ENV` names the host variables forwarded into the
+  container, and `D2M_E2E_EXTRAS` picks the extras installed there (default `ocr,dev`). Separately,
+  `D2M_REQUIRE_TYPESAFE=1` makes the `requires_typesafe` tests fail instead of skip when the extra or
+  the key is missing. The runner exits 90 when it could not set the run up. (#13, #22)
+
+**Word, Excel and PowerPoint**
+
+- **XLSX shows each cell as the spreadsheet displays it, rounded the way it displays it:** `10` not
+  `10.0`, `25%` not `0.25`, `$1,234.50`, and a date in the cell's own date format (`2026-03-31` for
+  `yyyy-mm-dd`, not `2026-03-31 00:00:00`; Excel's built-in short date comes out as `mm-dd-yy`,
+  `03-31-26`). That is the displayed value, not the stored precision: `#,##0` shows 1234.5678 as
+  `1,235`, `0%` shows 0.12345 as `12%`, `0.00` shows 2.675 as `2.68` (rounded half-up, as Excel does for
+  display); `General` keeps up to 15 significant digits (every digit of an integer). A negative number
+  keeps its minus, even where Excel shows the sign only by colour (`#,##0.00;[Red]#,##0.00` shows
+  -1234.5 as `-1,234.50`); the exception is a negative (or condition-selected) section that prints a
+  bare or backslash-escaped `-` or `(` itself, while quoted text counts as a label, not a sign.
+  Condition sections such as `[>=100]` are honoured, and a formula saved without a cached value shows
+  the formula (`=A2+B2`). (#14)
+- **XLSX layout:** sheets without merged cells come out as plain Markdown tables (no invented
+  `rowspan`/`colspan`), empty rows and columns are gone, and a single-cell row above the table becomes a
+  paragraph only when it (or a row between it and the table) is merged across the table or a blank row
+  separates it. With image extraction on, a picture in a table is marked `[Image]` or `[Image: OCR
+  text]` where it sits, and without OCR an anchored picture is also returned after the table; `#VALUE!`
+  no longer stands in for a picture. (#14)
+- **DOCX** gains list markers (`1.`, `-`, `(1)`, `壹、`, nested), deeper heading levels and text that was
+  missing (content controls, tracked insertions, fields, nested tables). A paragraph set to outline
+  level "body text" (on the paragraph or on its style, such as Word's `TOC Heading`) is not a heading
+  whatever its style is called, while Title and Subtitle keep `#` and `##`. **PPTX** soft line breaks
+  are line breaks (`<br>` in table cells), and with image extraction a slide's own background picture
+  and pictures in content placeholders appear. In every Office format a picture in which OCR finds no
+  text no longer yields an empty description item. (#14)
+- **Office image route:** PPTX decks built from background pictures, grouped pictures or picture
+  placeholders, and DOCX files made up of floating pictures or of pictures in headers and footers, now
+  take the image route when OCR is on; forms and text in tables, groups and text boxes stay native (DOCX
+  text-box text is then not extracted). `metadata.extra["routed_via"]` (already `pdf` in 0.6.1) is now
+  also `native`, with `route_reason` or `route_error`, whenever the route was tried and the file stayed
+  native (files the OOXML check passes over get no key). Each LibreOffice conversion now uses its own
+  profile, which adds a fraction of a second per conversion (about 0.7 s where it was measured) and
+  makes conversions safe to run in parallel. (#14)
+
+**PDF text, structure and reading order**
+
+- **Running headers and footers are verbatim first.** A line counts as a running header or footer only
+  on strong evidence: it sits in the top or bottom band of the page and repeats at about the same height
+  on at least 3 pages (or per chapter), at a height that carries such lines on more than half of the
+  pages; it is set apart from the content by a clear gap (bare page numbers need none) and is not a
+  table header row. Anything weaker keeps every copy. Of the lines that qualify, only bare page numbers
+  (now in many more forms: `Page N of M`, `N/M`, `- N -`, roman numerals, `第 N 頁`, `Seite N von M`, ...,
+  and a number printed alone that counts with the pages, such as `1001`, `1002`) and lines that repeat a
+  title or heading of the document (heading-sized text printed on or before their first copy; a mid-page
+  heading counts only on the first copy's page and the two before it) leave the Markdown on every page.
+  Any other one (a statement title, a unit note, a disclaimer, a letterhead, `ACME | Page N`, a
+  per-chapter header) keeps its **first copy**, as plain text (or classified like other content when
+  heading-sized), instead of vanishing; its later copies stay out of the Markdown (they are
+  `text:header` / `text:footer` items in the JSON: one raw line each, or the whole table for a repeated
+  table). A per-page number labelled without a page word (`3 | ACME Corp`, `Lesson · 3`) stays on every
+  page. Documents of exactly 3 pages are now analysed too. (#17)
+- **Text next to tables is kept:** a caption or note printed against a table, or a title beside a logo
+  box, no longer disappears with the table; rotated (`/Rotate`) pages no longer print table text twice
+  or lose text (with a CropBox inherited from `/Pages`, table text can still print twice); overprinted,
+  fake-bold and shadowed text is emitted once. (#17)
+- **Heading levels** are ranked by font size and outline depth without skipped levels, are one line and
+  carry no bold markup. In the text layer `#` (the title) appears at most once: the largest heading of
+  the first page with text, when no other heading in the document is as large (an OCR'd page can still
+  carry its own page title). More lines become headings (bold body-size lines, Word 2013+ headings,
+  `第一條`-style CJK headings) and far fewer become captions: body paragraphs next to tables and images
+  are no longer italic. (#16)
+- **Superscripts are written `^x^`** (`10^6^`, `mc^2^`, `$1.2bn^3^`, footnote marks included); raised
+  ordinals (`1st`) and `™`/`®` stay inline. (#16)
+- **Escapes appear in the Markdown source** where PDF or Office text looks like Markdown or HTML
+  (`\#`, `\-`, `1\.`, `\>`, `&lt;` for a `<` that would open a tag, `&amp;` for the `&` of an
+  entity-like sequence); they render as written. Table cells and OCR text follow their own escaping
+  rules, described below. (#15, #16, #19)
+- **Lists and text:** bullets are `- ` (`*` and `+` keep their character; check-mark, arrow and dash bullets
+  keep their glyph, `- ✓ ...`), lettered items are `- a) ...`, nested items are indented, and a lead-in
+  line and the paragraph after a list are separate paragraphs. A word broken at a line-end hyphen is
+  joined and keeps the hyphen (`top-down`) unless the document spells it without one elsewhere
+  (`investment`); ligatures are expanded; CJK lines of one paragraph are joined without spaces; bold and
+  italic mark only the styled words. JSON `text:title` / `text:section` items carry `level`, and text
+  `content` no longer ends with a newline. (#16)
+- **Multi-column PDF pages are read column by column** when the page clearly shows columns. Sidebars,
+  pull-quotes and margin notes come after the text they stand beside, a picture or drawing with no text
+  over it across the columns keeps its place between them (also without image extraction), `/Rotate`
+  pages are read as displayed (a table follows its title) and sideways margin text (an arXiv stamp) is
+  plain text, never the title. Single-column pages and text set out in rows (forms, tables set as text,
+  parallel texts) keep their order, as do pages that mix column layouts and pages with more than 400
+  text blocks, tables and pictures. Heading levels can differ on reordered pages. (#23)
+
+**PDF tables**
+
+- **A line break inside a table cell is `<br>` in every table style** (the HTML styles, `markdown_grid`
+  and the pipe tables used for tables without merged cells; PDF cells used to be joined with a space).
+  Markdown cells escape `|`, a `<` that would open a tag and an entity-like `&`, and double a backslash
+  that Markdown would swallow; HTML cells escape `&`, `<` and `>`; control characters are removed. PDF
+  cell text follows PyMuPDF's word assembly (touching runs in different fonts are no longer split by a
+  space, whitespace including full-width spaces collapses to one space). (#15)
+- **Different tables are found:** logos, frames and slide backgrounds drawn as boxes are no longer
+  tables (their text stays text); borderless and booktabs tables of at least three rows and three
+  columns with a numeric column (not the first) now are (a table of contents, or a table that shares its
+  text block with a caption or note, stays text); a table continued on the next page gets the previous
+  header, or an empty header row, instead of promoting its first data row; a header row drawn without
+  borders is part of the table; merged cells follow the drawn cell boxes. Pages whose text lines up in
+  numeric columns pay for a second, text-strategy table search. (#15)
+
+**OCR, routing and pictures**
+
+- **OCR is routed per page.** A page overrides its document's route when its own signals clearly
+  disagree: scanned pages in a text report, vector-outlined pages, pages with a garbled text layer and
+  pages with little text over inline pictures are OCR'd from their render, and dense text pages in an
+  image deck keep their text. On a page overridden to render OCR, legible painted text that the page
+  shows but the OCR missed is kept after it, verbatim. (#18)
+- **Hidden text and duplicate scan layers are gone:** invisible text over nothing the page shows is no
+  longer output (pages and character counts are recorded in `metadata.extra["hidden_text"]`), and a
+  searchable scan yields one text (the OCR, or the invisible layer when OCR is off) instead of both. (#18)
+- **Pictures are OCR'd by their content, not by size alone, once per image and emitted once per place
+  they show.** Small charts, stamps and lettered logos are read, plain backgrounds, colour blocks and
+  icons without text are not sent to OCR, tiled figures and pictures cropped by a clip path are read as
+  the page shows them, and a logo repeated at the same place on most pages is kept once. PDF renders and
+  pictures go to the provider in bounded batches (32 images, or twice `max_concurrency` when that is
+  higher) instead of one call per document. (#21)
+- **Refusals are no longer indexed.** A provider refusal, a safety block, or a short answer that is, as
+  a whole, a refusal or a "no readable text" statement is (in the default structured mode) re-read once
+  in free-form mode and, if that also refuses or returns nothing, becomes an empty result
+  (`ocr_refusal`), listed in `metadata.extra["ocr_issues"]`. A whole-page render of a page that shows
+  content, but whose OCR answered with nothing, reads `[page N: OCR returned no content]`, followed by
+  the page's own text layer (a failed render is counted in `ocr_issues` instead). Withheld illustrative
+  rows, fields, metrics and figures leave an `[N illustrative ... not transcribed]` marker, and a result
+  that violates the router firewall costs one extra verbatim OCR call. (#19)
+- **OCR Markdown is safe to embed:** model text is escaped, tables keep `<br>` inside cells and their
+  `<caption>`, table spans are bounded, and no OCR text creates an image, or a link whose target has a
+  scheme other than http(s) or mailto. (#19)
+- **Caches miss once:** the document cache key gains `routing_version` (now 3) and the judges'
+  identities, and the OCR cache schema is now `ocr-cache-v5` (was v4), so cached results are recomputed
+  once. OCR answers are cached as answers, including an empty one and a refusal (now stored empty,
+  flagged `ocr_refusal`); a failed answer, which 0.6.1 cached as an empty one, is never cached, and a
+  document is not written to `cache_dir` when an OCR image came back failed, a PDF picture could not be
+  extracted, a PDF OCR batch failed or a PDF page showing content stayed unread, or (with a TypeSafe
+  judge) when the judge could not answer every question (an INFO log names the reason). (#18, #19, #21,
+  #22)
+- **New `metadata.extra` keys:** for PDFs `ocr_routing` and `ocr_images` (with OCR on), and
+  `text_layer_quality` and `hidden_text` when a page's text layer is garbled or hidden text is found
+  (#18, #21); `ocr_issues` when an OCR image was refused, failed or withheld, or an OCR call raised
+  (#19); `route_reason` / `route_error`, and `routed_via: "native"`, when the Office image route was
+  tried and the file stayed native (#14); `judge` when a TypeSafe judge was asked something (#22). OCR
+  results can carry `ocr_refusal`, `router_fallback`, `non_content_suspected` and `non_content_unjudged`
+  in their `metadata`. Warnings are logged for garbled layers kept without OCR, hidden text, pages that
+  need OCR, and empty or partly unextractable PDFs. (#14, #18, #19, #21, #22)
+
+### Added
+- **Optional quality judge (TypeSafe/Jev).** `pip install 'doc2mark[typesafe]'`, then `--judge
+  typesafe`, `UnifiedDocumentLoader(judge="typesafe")` or `DOC2MARK_JUDGE=typesafe`, with the key in
+  `TYPESAFE_API_KEY` (see `docs/judge.rst`). `doc2mark.judge.TypeSafeJudge` asks TypeSafe's Jev (pinned
+  `jev-1.13.0`) the three questions the deterministic rules leave open: is a PDF page's text layer
+  legible (asked only with OCR on, for nearly every text page the garbage detector does not flag; a
+  garbled page is OCR'd from its render), is a repeated header or footer line page chrome (it is
+  thinned, normally to its first copy, and never removed), and is an answer from an LLM OCR provider
+  only a refusal, an error or a "no readable text" statement (from 0.95 it is re-read or dropped, from
+  0.90 up to 0.95 it is kept and flagged `non_content_suspected`). On the held-out TEST set accuracy
+  rises from 67 % to 100 % (legibility), 50 % to 95 % (page chrome) and 77 % to 98 % (OCR non-content);
+  on a separate external set from 69 % to 100 %, 67 % to 100 % (3 of its 20 items reach the judge) and
+  63 % to 83 %. It is off by default, without the extra or the key the output is unchanged, and a judge
+  that cannot answer never fails a conversion. With it on, document text is sent to TypeSafe
+  (`api.typesafe.ai` by default): up to 1,500 characters of each judged page (with OCR on, nearly every
+  text page), the judged header/footer lines and OCR answers of up to 600 characters. Verdicts are
+  cached on disk (in the user cache directory unless `$DOC2MARK_JUDGE_CACHE` says otherwise),
+  `$DOC2MARK_JUDGE_HOOKS` picks which questions it answers, and `metadata.extra["judge"]` records the
+  questions asked, cached and failed, the tokens and the cost. The labelled sets are in
+  `tests/data/judge`; `eval/judge_eval.py` re-measures the numbers (it needs the extra and a TypeSafe
+  key). (#22)
+- **Judge hooks.** The three decisions are plain callables that return the probability of a "yes", or
+  `None` when they cannot judge (the rule then decides): `legibility_judge(page_text)` (#18) and
+  `boilerplate_judge(line_text, context)` (#17), both accepted by `UnifiedDocumentLoader`,
+  `PDFProcessor`, `PDFLoader` and `pdf_to_simple_json`, and `OCRConfig(non_content_judge=...)` (#19),
+  which travels with the OCR provider. A plain hook is compared with the pipeline's own thresholds
+  (garbled below 0.7, page chrome from 0.5, no content from 0.5, flagged from 0.3);
+  `UnifiedDocumentLoader(judge=...)` wires all three from one object, and `TypeSafeJudge`'s hooks
+  rescale Jev's probabilities so that its thresholds (0.8, 0.7, 0.95 and 0.90) fall on the pipeline's.
+  (#17, #18, #19, #22)
+- **Table style on the CLI:** `--table-style {minimal_html,markdown_grid,styled_html}` (the default is
+  unchanged). (#15)
+- **Per-document reports in `metadata.extra`.** PDFs get `ocr_routing` (the document route and the pages
+  that overrode it) and `ocr_images` (OCR requests, page renders, batches, empty and failed requests,
+  skipped placements, unread pages) when OCR is on, and `text_layer_quality` and `hidden_text` when a
+  page's text layer is garbled or hidden text is found (#18, #21); any format gets `ocr_issues`
+  (refused, failed and withheld OCR images, with their image number and page, slide or sheet where
+  known) when one occurred (#19); DOCX and PPTX files the image route was tried on get `routed_via`:
+  `pdf` (as in 0.6.1), or now `native` with `route_reason` or `route_error` (#14); documents on which
+  the TypeSafe judge was asked something get `judge` (#22).
+- **New public names:** `doc2mark.ocr.base.OCREngineError`,
+  `doc2mark.ocr.schema.withholding_violations`, `doc2mark.ocr.refusal`, the escaping helpers in
+  `doc2mark.utils.markdown`, and `doc2mark_refusal` / `doc2mark_failure` keys in the usage dict of
+  free-form `batch_invoke` results the provider refused, blocked or failed. (#16, #19, #21)
+- **CLI-driven E2E test suite** (`tests/e2e`): it runs the installed `doc2mark` command as a subprocess
+  against real Tesseract and LibreOffice, in a reference Docker image (`scripts/run_e2e_docker.sh`; see
+  `docs/development.rst`). CI runs it on every pull request to `main`; the `requires_typesafe` tests
+  skip there because CI has neither the extra nor a key. (#13, #20, #22)
+
+### Changed
+- **Dependencies.** `pandas` is no longer a dependency (nothing in doc2mark imports it; the XLSX loader
+  reads cells with openpyxl, and `XlsxLoader.df_sheets` is gone). `numpy>=1.21.0` is now declared: PDF
+  routing uses it and it used to arrive through pandas. `doc2mark[all]` now includes `typesafe-sdk`, which
+  is imported only when a judge is enabled. (#14, #18, #22)
+- **`ocr_images=True` implies `extract_images=True` for every format** when an OCR provider is configured
+  (`UnifiedDocumentLoader.load()`; the PDF pipeline implies it too and warns when no provider is set).
+  For DOCX and PPTX this also turns on the LibreOffice image-dominance route (LibreOffice is required,
+  otherwise the file stays native). (#18)
+- **Running headers and footers: verbatim first.** A running header or footer line (see Behaviour
+  changes for what counts as one) that is not a bare page number and does not repeat a title or heading
+  of the document keeps its first copy, as plain text (or classified like other content when
+  heading-sized); the later copies are typed `text:header` / `text:footer` in the JSON and stay out of
+  the Markdown. Statement titles, unit notes and disclaimers used as page furniture are no longer lost.
+  The optional judge is asked only about repeated top/bottom lines the rule leaves more than one copy of
+  (too few pages; not set apart from the content, including repeated table header rows; numbered
+  labels); it can thin them, normally to one copy, but never removes a line's last copy. (#17, #22)
+- **Caches.** The document cache key gains the legibility judge and `routing_version` (now 3, so cached
+  converted documents are rebuilt once), plus the `boilerplate_judge` and `non_content_judge` identities
+  when they are set; the OCR cache schema is `ocr-cache-v5` (was v4) and its key includes the
+  `non_content_judge`'s qualified name and `version`. OCR answers are cached as answers, including an
+  empty one and a refusal (a refusal is now stored empty and flagged `ocr_refusal`); a failed answer
+  (0.6.1 cached it as an empty one), a firewall-unresolved result and an answer the judge could not
+  screen are never cached. A document is not written to `cache_dir` when an OCR image came back failed,
+  a PDF picture could not be extracted, a PDF OCR batch failed or a PDF page showing content stayed
+  unread, or (with a TypeSafe judge) when the judge could not answer every question; each skipped write
+  is logged at INFO with the reason. (#18, #19, #21, #22)
+- **PDF OCR requests are streamed.** Renders and pictures go to the provider in batches of 32 images (or
+  twice the provider's `max_concurrency` when higher), sent early once 128 MiB have accumulated, and each
+  batch is released once answered, instead of one call that holds every render; identical images or
+  renders are sent once. Whole-page renders and embedded figures are OCR'd in separate batches, so
+  figures are no longer asked for page-Markdown synthesis. Office images still go to the provider in one
+  call per document. (#18, #21)
+- **The router firewall runs on every structured OCR result.** Results that withhold printed values
+  against the policy are redone verbatim (one extra call), and every auto-routed prompt carries the
+  context-absent-means-verbatim clause. (#19)
+- **Tests and CI.** The unit job excludes `tests/e2e` and no longer cancels the other Python versions
+  when one fails. A separate E2E job runs the suite in Docker (Tesseract eng/chi_tra/chi_sim, LibreOffice,
+  Noto CJK) with pytest-xdist workers (`-n 4`) and `OMP_THREAD_LIMIT=1` (Tesseract otherwise runs several
+  OpenMP threads for every call, which slows parallel runs down and can push tests past their
+  timeouts), which takes the job from about 34 minutes to about 12; the unit matrix stays serial because
+  xdist saved at most a few seconds there, within run-to-run noise. `scripts/run_e2e_docker.sh` installs
+  the extras named in `$D2M_E2E_EXTRAS`, and the `dev` extra gains `markdown-it-py` (the CommonMark
+  parser the tests use). (#16, #20, #22, #24)
+
+### Fixed
+- **Word, Excel and PowerPoint conversion no longer drops text.** XLSX: sheets without merged ranges no
+  longer get `rowspan`/`colspan` invented from blank cells (which overwrote values), merges come only from
+  the file, and header-only sheets, single-cell sheets, error values (`#DIV/0!`) and columns with a header
+  but no data are kept. Formulas saved without a cached value show their formula, also in
+  namespace-prefixed sheet XML. Values display as the spreadsheet shows them (see Behaviour changes for
+  the rounding and sign rules). A title row above a table becomes text only when it is merged across the
+  table or separated from it by a blank row; empty rows and columns are dropped; with image extraction
+  on, pictures are marked `[Image]` / `[Image: OCR text]` in their cell instead of `#VALUE!`, and without
+  OCR an anchored picture is still returned. A title merged across the full sheet width (`A1:XFD1`) no
+  longer exhausts memory (a 20,000-row sheet now converts in about a second). DOCX: text inside
+  hyperlinks in cells, content controls, tracked insertions, simple fields, smart tags and custom XML is
+  kept (deleted text is not), nested tables are flattened into their cell, rows with `gridBefore` /
+  `gridAfter` keep their columns and no longer send the whole document to the basic converter, headings
+  keep their level (Heading 3 is `###`, Subtitle is `##`, and a paragraph set to outline level "body
+  text" is no heading unless it is styled Title or Subtitle) and lists keep their numbers and bullets.
+  PPTX: soft line breaks become line breaks, and a slide's own background picture and pictures in
+  content placeholders are extracted. Office pictures in which OCR finds no text no longer produce empty
+  description items. Still open: DOCX text boxes are not extracted, DOCX header and footer paragraphs are
+  only in the JSON items (`text:header` / `text:footer`), not in the Markdown, and tables in DOCX headers
+  and footers are lost. (#14)
+- **Reliable Office image route.** Background picture fills, grouped pictures and placeholder pictures count
+  as images; text in tables, groups, text boxes and DOCX headers and footers counts as text; the OOXML
+  signals only pre-filter, and the converted PDF's own decision is final (only `image` routes, `text` or
+  no answer means native extraction). LibreOffice conversions use a per-conversion profile, so
+  `batch_process(max_workers>1)` and `doc2mark --parallel` no longer fail or fall back, a timed-out
+  conversion cannot hang the caller, and any fallback is recorded in `metadata.extra` (`routed_via`,
+  `route_reason`, `route_error`). (#14)
+- **PDF tables are built from what is drawn on the page.** Values drawn over other text (flattened form
+  fields, ticks in checkboxes, rows crossed by a watermark) are no longer deleted (only true overprint
+  duplicates are merged), an invisible OCR layer over visible text no longer garbles cells, nested tables
+  and overlapping cells no longer duplicate text, and cells keep their line breaks. Merged cells come from
+  the drawn cell boxes (blank cells are not shown as merges, tall merges and 2x2 blocks are found), also on
+  landscape pages with PyMuPDF before 1.27. Logos, page frames and slide backgrounds are no longer output
+  as tables. A borderless header row above a table is its header, a table continued on the next page no
+  longer turns its first data row into the header, and a new table under a heading at the top of a page is
+  not taken for a continuation. Borderless and booktabs tables with a numeric column are detected; a table
+  of contents, or a table whose text block also holds a caption, a note or text running past its edges,
+  stays text so no text is lost. Identifiers with underscores (`user_id`) no longer split with PyMuPDF
+  1.28, and dense tables are extracted much faster (about 8x on a 1,200-cell benchmark). (#15)
+- **A merged cell can no longer hide another cell's value**; cells that repeat the merged value are merged
+  into it, and a table whose merges were all dropped renders as a plain Markdown table instead of HTML.
+  Table cells no longer break rows or leak markup in any style: Markdown cells escape `|`, a `<` that
+  would open a tag and an entity-like `&` and double a backslash that Markdown would swallow, HTML cells
+  escape `&`, `<` and `>`, control characters are removed, and line breaks of every kind become `<br>`.
+  (#15)
+- **PDF text is no longer lost to table, rotation and header/footer handling.** Text next to a table (a
+  caption or note against its rules, a title beside a logo box) is no longer dropped together with the
+  table; only text inside the table's box is left to the table. Pages with `/Rotate` 90/180/270 no
+  longer emit table text twice or drop text where the rotated table box lands, including cropped pages
+  (where the CropBox is inherited from `/Pages` or the page boxes cannot be read, table text may still
+  repeat, but nothing is lost). Running headers and footers are recognised line by line, before
+  classification, so they no longer turn into list items, headings or footnotes; bare page numbers in
+  common forms (`Page N of M`, `N/M`, `- N -`, `p. N`, roman numerals, `第 N 頁`, bold, a number right
+  under a full page's text or placed differently on a cover page) and numbers printed alone that count
+  with the pages (`1001`, `1002`) are removed from every page, while lines such as `ACME | Page N` and
+  per-chapter running headers keep only their first copy, and labelled numbers and IDs (`Lesson · 3`, `3
+  | ACME Corp`), dates such as `15/03`, titles, headings, continued slide titles, repeated table header
+  rows of three or more cells and repeated body text are kept. OCR text of page renders and `[image: OCR
+  unavailable]` placeholders are no longer hidden as page headers, overprinted, fake-bold and shadowed
+  text is emitted once, and a table repeated at the top or bottom of most pages (a letterhead or logo
+  box) appears once. (#17)
+- **PDF Markdown is faithful and valid.** List-marker rewriting no longer deletes text (`A. Smith`,
+  `E. coli`, `p. 3`, `I. Background` keep their letters); letters, roman numerals and CJK markers make a
+  list only in a sequence. Superscripts are written `^x^` instead of fusing into the number, and a
+  footnote whose number is raised becomes a `[^N]:` definition. Only numbered labels (`Figure 3:`,
+  `Table 2`, `圖1`) or short caption-shaped text attached to an image or table become captions, and
+  captions are valid Markdown. Heading detection uses a robust body size and layout tiers, so uppercase
+  labels, CJK lines with acronyms, `Section 5 applies...`, running headers, chart labels and drop caps are
+  no longer headings while Word 2013+ non-bold headings, bold body-size headings, `?`/comma/colon
+  headings, CJK headings without bold, `第一条`, three-line titles and OCR text layers are; heading levels
+  follow the document's font-size tiers and outline numbers without skipped levels, multi-line headings
+  stay whole and labels side by side are not merged into one heading (no more `## ##` or `## **x**`).
+  Word bullets, numbers separated from their item by a tab, lists that share a block with their lead-in
+  line, nested sub-bullets and inline bold render correctly. Ligatures are expanded, a word broken at a
+  line-end hyphen is joined and keeps the hyphen unless the document spells it without one elsewhere, CJK
+  paragraph lines are joined without spaces, and every line of a multi-line footnote is kept (only the
+  first one was). (#16)
+- **Text that looks like Markdown or HTML is escaped, in PDF and Office text alike** (`\# of patients`,
+  `&lt;img ...>`), per one shared policy (`doc2mark.utils.markdown`); a kept running-header copy is escaped
+  too, and a numbered list right after bullets (or the reverse) is separated by a blank line instead of
+  being glued to the last item. (#16, #23)
+- **PDF reading order follows the layout.** Multi-column pages (two or three columns, equal or unequal
+  widths, with a title, abstract or figure across the columns) are read column by column; sidebars,
+  pull-quotes and margin notes come after the text they stand beside; pictures or drawings with no text
+  over them across the columns keep their place between them even when images are not extracted; `/Rotate`
+  pages are ordered as displayed, so a table follows its title; and vertical margin text (such as an arXiv
+  stamp) is no longer taken for the title. Columns are used only when the page clearly shows them:
+  single-column pages and text set out in rows (forms, tables set as text, parallel texts) keep their
+  order. (#23)
+- **PDF OCR routing is decided per page.** A page overrides its document's route when its own signals
+  clearly disagree (searchable scan, garbled text layer, vector-outlined or inline-image content, a
+  scanned page in a text report, a dense text page in an image deck), and on such pages legible painted
+  text that the render OCR misses is kept verbatim after it. Searchable scans emit one text (the OCR, or
+  the invisible OCR layer when OCR is off) instead of both. A text-layer quality gate checks every page
+  (U+FFFD, private-use runs except icon-font glyphs, control and CID codes, mojibake, weighted by
+  prominence): with OCR on, garbled pages are OCR'd from their render (the legible lines the OCR did not
+  reproduce are kept after it, unless only the judge found the layer garbled or the OCR read those lines
+  differently); with OCR off, the text is kept and reported in `metadata.extra["text_layer_quality"]`
+  with a warning. Garbled pages no longer change the route of the rest of the document. Image coverage is
+  the union of the visible picture area (clipped to the page, inline images included) and text density
+  counts legible non-whitespace characters, CJK-aware. Invisible (render mode 3) text over nothing the
+  page shows is no longer emitted, in paragraphs or table cells (`metadata.extra["hidden_text"]`; with
+  PyMuPDF older than 1.27, hidden text that touches painted text inside a table can still reach its
+  cells), and neither are invisible copies of painted text; invisible text over a picture that shows
+  something (a scan's OCR layer) or over outlined glyphs is kept, unless that picture's OCR returned
+  text. Empty or partly unextractable PDFs log warnings instead of producing silent empty output. (#18)
+- **PDF pictures are collected once per place the page shows them.** An image listed twice (directly and
+  through a Form XObject) or placed several times is one OCR request and one item per placement, and
+  identical images and renders are OCR'd once. Pictures are OCR'd by content, not by size alone: small
+  charts, stamps and lettered logos are read, while plain backgrounds, colour blocks, frames and icons
+  without text are not sent to OCR; tiles of one picture, inline images and pictures cropped by a clip
+  path or the page edge are OCR'd as the page shows them, images off the page or clipped away are
+  skipped, and transparent pictures are composited onto white instead of read as solid black. A page
+  without a text layer whose small, tiled, inline or cropped pictures cover at least 5 % of the page is
+  OCR'd from its render; on other such pages, when no picture qualifies on its own, the pictures that
+  are not plain are OCR'd rather than skipped. A picture repeated at the same place on most pages is
+  kept once. (#18, #21)
+- **OCR failures are told apart from answers.** The OpenAI and Vertex AI providers flag a per-image
+  failure `metadata["failed"]` (as Tesseract does); a failed PDF picture shows `[image: OCR
+  unavailable]` (failed Office pictures are counted in `ocr_issues`) and is never cached, an answer with
+  no text is an answer, and a PDF page that shows content but whose render OCR answered with nothing
+  carries `[page N: OCR returned no content]` (a failed render is counted in `ocr_issues`, and its
+  pictures show `[image: OCR unavailable]`). (#19, #21)
+- **OCR tables** keep line breaks, paragraphs and list items inside cells (`<br>`), caption and unit text
+  next to a table, nested and multiple tables, `rowspan="0"` and Markdown tables in `Table.html`; spans are
+  bounded (a model-emitted `colspan=50000` used to expand to about 250,000 characters), ragged rows are
+  padded where their cells line up, a free-form table cut off at `max_tokens` is still a table, and the
+  flat headers/rows fallback escapes `|` and line breaks. (#19)
+- **OCR refusals and "no readable text" answers** (OpenAI `message.refusal`, Gemini safety and
+  recitation blocks, multilingual refusal phrases) are no longer indexed: they go to the free-form
+  recovery and, if that also refuses or returns nothing, the result is empty with
+  `metadata["ocr_refusal"] = True`. The pattern check fires only on answers that are, as a whole, a
+  refusal or "no text" statement and never on a structured page with other content; what it cannot
+  decide is kept, or left to `non_content_judge`. (#19)
+- **Runtime router firewall.** Structured results that withhold printed values against the policy are
+  redone verbatim, and withheld rows, fields, metrics and figures leave a visible `[N illustrative ... not
+  transcribed]` marker. (#19)
+- **Tesseract:** `--ocr-lang` accepts native codes and `+` combinations (`deu`, `chi_tra`,
+  `eng+chi_tra`), keeps the long-name aliases and rejects languages that are not installed; an OCR
+  engine that cannot run fails the conversion as soon as there is something to OCR (non-zero CLI exit;
+  `--skip-errors` reports the file as failed and continues) instead of writing placeholder Markdown;
+  Tesseract output is escaped like any OCR text. (#19)
+
+### Security
+- **OCR output is sanitized at the Markdown boundary.** Every model-supplied string except sanitized tables is
+  escaped, no OCR text can create an image, or a link whose target has a scheme other than http(s) or
+  mailto, raw HTML in model output shows as text (code spans and fenced blocks keep their markup where it
+  is inert), HTML comments in tables are dropped, and a `<` right before a table that the sanitizer
+  unwraps cannot complete a tag. Tesseract output goes through the same boundary. (#19)
+- **Table cells cannot inject markup in any table style.** `|`, HTML tags (`<img onerror>`, `<script>`) and
+  control characters in PDF, Office and OCR cells are escaped or removed, so a cell can no longer break
+  its row or leak live HTML into the output. (#15, #19)
+- **Spans in OCR tables are bounded** (a colspan by the widest row and by 1,000, a rowspan by its row
+  group; a table that would need more than 500,000 column slots loses its spans), so a model-emitted
+  `colspan=50000` (about 250,000 characters of Markdown before) or a wall of huge spans can no longer
+  balloon the output. (#19)
+- **The optional judge does not log document text or the key.** Request-failure log lines name the hook,
+  the exception class, the HTTP status and the request id, never document text or the key, and the
+  TypeSafe SDK's wire log (which would contain request bodies) stays off unless `TYPESAFE_LOG_LEVEL` is
+  set or the `typesafe_sdk` logger is configured; the key is read from `TYPESAFE_API_KEY`. With the judge
+  enabled, text does leave the machine for TypeSafe; see `docs/judge.rst`. (#22)
+
+## [0.6.1] - 2026-07-03
+
 ### Added
 - **Document-level OCR token-usage aggregation.** The token usage that each LLM
   OCR call records in `OCRResult.metadata["token_usage"]` (LangChain
@@ -33,6 +466,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload nor changes the cache key. A document-cache replay renames its stamped
   `token_usage` to `token_usage_cached` (the original run was billed once; the
   count stays visible for diagnostics).
+
+## [0.6.0] - 2026-07-03
+
+### Added
 - **Image-dominant Office docs routed like image PDFs.** A `.docx`/`.pptx` that is
   mostly pictures with no usable text layer (e.g. a slide deck exported as images)
   is now detected from its OOXML structure (picture coverage + text density, via the
