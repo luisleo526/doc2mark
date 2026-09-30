@@ -770,6 +770,7 @@ _ESCAPED = re.compile(r"\\([!-/:-@\[-`{-~])")
 SHORT_LINE_WORDS = 3          # a line of at most this many words is found only as a whole copy
 GAPPED_CELLS_PER_WORD = 200   # the alignment search of a page spends at most this many cells per OCR word
 _ALIGN_OVERHEAD = 64          # cells charged per alignment on top of its own
+_SEARCH_ALIGNMENTS = 8        # places one search aligns the line with, at most
 _NO_PATH = 1 << 60
 
 
@@ -849,13 +850,13 @@ class _OcrWords:
            best fit (fewest edits, then fewest misses) first: of two lines competing for one row, the one
            the OCR read is found and the other stays missing.
         3. A line still missing whose alignment needs words a shorter line claimed as a whole copy (a
-           longer line's whole copy is better evidence than this alignment): when that line has a spare
-           whole copy elsewhere, it moves there and the line takes the words. An alignment made only of
-           other lines' whole copies is those lines' words. One that also takes words no line claimed
-           is the line's when its words keep their places (a misread word, the OCR copy of a longer
-           line that a short line took a word of): the short line is missing instead. With OCR words
-           inserted between its words the OCR text may be either line's: both stay missing (verbatim
-           first).
+           longer line's whole copy is better evidence than this alignment). With OCR words inserted
+           between its words, the OCR text may be either line's: the line stays missing, and so does a
+           shorter line with no other copy when the alignment also takes words no line claimed
+           (verbatim first). Without inserted words (a misread word, the OCR copy of a longer line
+           that a short line took a word of), the shorter lines move to spare whole copies, or are
+           missing instead when the alignment also takes words no line claimed, and the line takes the
+           words; an alignment made only of the whole copies of shorter lines that cannot move is theirs.
         """
         lines = []
         for text in texts:
@@ -953,7 +954,7 @@ class _OcrWords:
         for other, start in spare_copies.items():
             self.taken[start:start + len(lines[other].codes)] = False
         mixed = bool((owner[used] < 0).any())
-        if len(spare_copies) == len(owners) or (mixed and not alignment.inserted):
+        if not alignment.inserted and (len(spare_copies) == len(owners) or mixed):
             for other in owners:
                 if other in spare_copies:
                     self.taken[owner == other] = False
@@ -970,8 +971,10 @@ class _OcrWords:
                     found[other] = False
 
     def _search(self, line: _Line, free: np.ndarray) -> Optional[_Alignment]:
-        """The first alignment of the line with the ``free`` OCR words within its edits and misses (see
-        the class), in OCR order; None when there is none or the page's search budget is spent."""
+        """The best alignment of the line with the ``free`` OCR words within its edits and misses (see the
+        class) among the first ``_SEARCH_ALIGNMENTS`` places in OCR order that could hold it: the fewest
+        edits, then the fewest misses, then the first; one with a single inserted word ends the search.
+        None when there is none or the page's search budget is spent."""
         size = len(line.codes)
         edits = max(2, size // 5)
         misses = min(edits, size - _needed(size))
@@ -986,7 +989,7 @@ class _OcrWords:
             bands.append(votes[np.minimum(np.arange(length) + edits + 1, length)] - votes[:length])
         candidates = np.flatnonzero((bands[0] >= size - misses)
                                     & (bands[1] >= size - 1 - misses - edits)).tolist()
-        searched = None
+        searched, best, aligned = None, None, 0
         for position, low in enumerate(candidates):
             if searched is not None and low + edits <= searched:
                 continue   # its band lies in the one just aligned
@@ -1004,10 +1007,13 @@ class _OcrWords:
                 return None
             self._cells -= cells
             alignment = self._align(line, free, low - shift, high - shift, edits, misses)
-            if alignment is not None:
-                return alignment
+            if alignment is not None and (best is None or alignment[:2] < best[:2]):
+                best = alignment
+            aligned += 1
+            if (best is not None and best.edits + best.misses <= 1) or aligned == _SEARCH_ALIGNMENTS:
+                break
             searched = high
-        return None
+        return best
 
     def _align(self, line: _Line, free: np.ndarray, low: int, high: int, edits: int,
                misses: int) -> Optional[_Alignment]:
