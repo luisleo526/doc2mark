@@ -72,7 +72,8 @@ somewhere, a page showing content stayed unread, the provider refused an image, 
 could not answer; an ``INFO`` log line gives the reason. (Conversely, an Office or image file
 whose OCR request raised, for example for a missing key, is cached with the error text: clear the
 cache folder after fixing it.) Changing the loader's options (output
-format, table style, OCR provider, judges) also changes the cache key (:doc:`caching`).
+format, table style, OCR provider or its settings, judges) also changes the cache key
+(:doc:`caching`).
 
 **Token chunking stalls or fails offline.** tiktoken downloads its encoding data on first use;
 pre-fill ``TIKTOKEN_CACHE_DIR`` on machines without network access.

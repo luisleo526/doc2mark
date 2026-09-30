@@ -56,26 +56,62 @@ that is not installed) fails the conversion instead (see :ref:`ocr-failures`).
 Loader settings
 ~~~~~~~~~~~~~~~
 
-These :class:`~doc2mark.UnifiedDocumentLoader` arguments reach the provider:
+These :class:`~doc2mark.UnifiedDocumentLoader` arguments reach the provider (``"vertex_ai"`` and
+its alias ``"gemini"`` take the same ones):
 
-- ``model``, ``temperature``, ``max_tokens`` (default 8192): OpenAI and ``vertex_ai``. They take
-  precedence over the same fields of ``ocr_config``. Note that LangChain does not send a
-  temperature to ``gpt-5`` models.
-- ``api_key``, ``base_url``: OpenAI. ``project``, ``location``: ``vertex_ai``.
-- ``timeout`` (30 s) and ``max_retries`` (3): OpenAI only.
-- ``ocr_config`` (an :class:`~doc2mark.OCRConfig`): ``task``, ``language``, ``structured``,
-  ``detail``, ``max_concurrency``, ``context_pages`` (:doc:`contextual_ocr`) and
-  ``non_content_judge`` (see *Refusals*). ``task``, ``structured`` and ``detail`` can also be
-  passed to the loader directly.
-- ``prompt_template`` (``"default"``, ``"table_focused"``, ``"document_focused"``,
-  ``"multilingual"``, ``"form_focused"``, ``"receipt_focused"``, ``"handwriting_focused"``,
-  ``"code_focused"``) only shapes free-form answers: ``structured=False`` and the free-form
-  retry of an empty structured answer. Structured requests use the task prompts.
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 20 30
 
-Use ``ocr_provider="vertex_ai"`` rather than ``"gemini"`` with the loader: ``"gemini"`` reaches
-the same provider but without the loader's ``model``, ``project`` and ``location``.
-``max_workers``, ``top_p``, ``frequency_penalty``, ``presence_penalty`` and ``default_prompt``
-are accepted but have no effect on the requests.
+   * - Argument (default)
+     - OpenAI
+     - Vertex AI / Gemini
+     - Notes
+   * - ``model``, ``temperature`` (0), ``max_tokens`` (8192)
+     - yes
+     - yes
+     - They take precedence over the same fields of ``ocr_config``. With Vertex AI the default
+       ``model`` (``gpt-5.4-mini``) means ``ocr_config.model``, else
+       ``gemini-3.1-flash-lite-preview``. LangChain does not send a temperature to ``gpt-5``
+       models.
+   * - ``api_key``, ``base_url``
+     - yes
+     - no
+     -
+   * - ``project``, ``location`` (``"global"``)
+     - no
+     - yes
+     -
+   * - ``timeout`` (30 s), ``max_retries`` (3)
+     - yes
+     - yes
+     - Per request.
+   * - ``max_workers`` (``None``)
+     - yes
+     - yes
+     - At most this many requests at once, when ``ocr_config.max_concurrency`` is not set (see
+       *Concurrency* below).
+   * - ``top_p`` (1.0), ``frequency_penalty`` (0.0), ``presence_penalty`` (0.0)
+     - yes
+     - yes
+     - Sent only when set to another value than the default shown, which is the API's own.
+       Some models reject them (OpenAI's reasoning models may); such a request fails and is
+       reported like any failed request.
+   * - ``prompt_template`` (``"default"``), ``default_prompt`` (``None``)
+     - yes
+     - yes
+     - The prompt of free-form requests: ``structured=False`` and the free-form retry of an
+       empty structured answer. ``prompt_template`` is ``"default"``, ``"table_focused"``,
+       ``"document_focused"``, ``"multilingual"``, ``"form_focused"``, ``"receipt_focused"``,
+       ``"handwriting_focused"`` or ``"code_focused"``; ``default_prompt`` is your own prompt
+       text instead of the template's (the language instruction is still added). Structured
+       requests use the task prompts.
+
+``ocr_config`` (an :class:`~doc2mark.OCRConfig`) carries ``task``, ``language``, ``structured``,
+``detail``, ``max_concurrency``, ``context_pages`` (:doc:`contextual_ocr`) and
+``non_content_judge`` (see *Refusals*); ``task``, ``structured`` and ``detail`` can also be passed
+to the loader directly. Tesseract takes only ``ocr_config`` (its ``language``, ``enhance_image``
+and ``detect_layout``).
 
 The OCR facade
 --------------
@@ -96,14 +132,17 @@ The OCR facade
    if page.interpretation is not None:
        print(page.interpretation.document_type, page.interpretation.summary)
 
-``OCR(provider="openai", *, api_key=None, **config)``: every keyword is an
+``OCR(provider="openai", *, api_key=None, **settings)``: a keyword that is an
 :class:`~doc2mark.OCRConfig` field (``task``, ``language``, ``structured``, ``detail``,
-``max_concurrency``, ``model``, ...); anything else raises ``TypeError``. A string ``task`` is
-checked against :class:`~doc2mark.Task` and ``detail`` must be ``"raw"`` or ``"full"``, otherwise
-``ValueError``. The facade adds no cache and no document-level reports; use the loader for
-those. Settings that are not ``OCRConfig`` fields (``project``, ``location``; ``timeout`` is one,
-but deprecated and without effect) are set on the provider classes directly, for example :class:`~doc2mark.ocr.vertex_ai.VertexAIOCR`
-``(project=..., location=..., model=...)``, whose model the facade does not change.
+``max_concurrency``, ``model``, ``temperature``, ``max_tokens``, ...) goes into the config; one of
+the provider's own arguments goes to the provider: ``project`` and ``location`` (Vertex AI),
+``timeout`` and ``max_retries`` (the request timeout and retries, not the deprecated config
+fields), ``max_workers``, ``prompt_template``, ``default_prompt``, ``top_p``,
+``frequency_penalty``, ``presence_penalty``. Anything else raises ``TypeError``. A string
+``task`` is checked against :class:`~doc2mark.Task` and ``detail`` must be ``"raw"`` or
+``"full"``, otherwise ``ValueError``. The facade adds no cache and no document-level reports; use
+the loader for those. For example ``OCR("vertex_ai", project="my-gcp-project",
+location="europe-west4", model="gemini-2.0-flash", timeout=60)``.
 
 ``read(images, *, task=None, tasks=None, language=None, structured=None, detail=None)`` and
 ``read_one(image, **same)`` override the configuration per call; ``tasks`` gives one task per
@@ -139,8 +178,17 @@ OpenAI asks the model to leave it out. ``structured=False`` returns free-form Ma
 ``result.text`` and ``result.document`` is ``None``. Tesseract always returns an ``OCRPage`` whose
 ``raw.text`` is the transcription and whose ``interpretation`` is ``None``.
 
+With ``OCRConfig(response_model=YourModel)`` (a pydantic model; OpenAI and Vertex AI, for
+example ``OCR("openai", response_model=Receipt)``) the answer is parsed into your model instead:
+``result.document`` is that object (``result.document.total``; read the values there) and
+``result.text`` its fields as JSON, escaped for Markdown like a transcription. Such an answer is
+not screened for refusals and has no router firewall. When the model refuses, the request fails
+or the answer cannot be parsed, the result is what it would be without a response model (an
+``OCRPage``, after the free-form retry), so check ``isinstance(result.document, YourModel)``.
+
 ``result.confidence`` is the model's ``self_confidence`` for structured answers (``None``
-without an interpretation, 1.0 for free-form answers, ``None`` for Tesseract);
+without an interpretation or for your own model, 1.0 for free-form answers, ``None`` for
+Tesseract);
 ``result.metadata`` holds the model, ``token_usage`` and flags such as ``failed``,
 ``ocr_refusal`` and ``non_content_suspected``.
 
@@ -228,8 +276,9 @@ For the cases the patterns cannot decide, give the provider a ``non_content_judg
 callable returning the probability (0 to 1) that an answer is only a refusal, an error or a "no
 readable text" statement, or ``None`` when it cannot tell. It sees answers of at most 600
 characters that the patterns kept. From 0.5 the answer counts as no content; from 0.3 up to 0.5
-it is kept and flagged ``metadata["non_content_suspected"]``; ``None`` or an exception keeps it
-(flagged ``non_content_unjudged``, and not cached). The optional TypeSafe judge (:doc:`judge`)
+it is kept and flagged ``metadata["non_content_suspected"]``; ``None``, an exception or a value
+that is not a probability (outside 0 to 1, NaN, not a number) keeps it (flagged
+``non_content_unjudged``, and not cached). The optional TypeSafe judge (:doc:`judge`)
 provides one with its own thresholds.
 
 .. code-block:: python
@@ -270,15 +319,17 @@ minutes only (:doc:`caching`).
 Concurrency, image size and cost
 --------------------------------
 
-- ``OCRConfig.max_concurrency`` (or the ``OCR_MAX_CONCURRENCY`` environment variable) caps how
-  many images an LLM provider OCRs at once. When neither is set, LangChain's default thread pool
-  is used (``min(32, CPU count + 4)`` threads). In PDFs it also sets the batch size: 32 images
-  per request batch, or twice ``max_concurrency`` when that is higher. Tesseract uses 4 threads.
+- ``OCRConfig.max_concurrency`` caps how many images an LLM provider OCRs at once; when it is
+  not set, the provider's ``max_workers`` (the loader's and the facade's ``max_workers``), then
+  the ``OCR_MAX_CONCURRENCY`` environment variable. When none is set, LangChain's default thread
+  pool is used (``min(32, CPU count + 4)`` threads). In PDFs ``max_concurrency`` also sets the
+  batch size: 32 images per request batch, or twice ``max_concurrency`` when that is higher.
+  Tesseract uses 4 threads.
 - ``OCR_MAX_IMAGE_DIM`` (pixels, off by default) downscales images whose longest side is larger
   before an LLM provider sees them (re-encoded as PNG); smaller images are sent as they are.
-- Token counts: each LLM result has ``metadata["token_usage"]``; the loader adds a document's
-  up in ``metadata.extra["token_usage"]`` (:doc:`chunking`). The tokens of the free-form retry of
-  an empty structured answer are not included.
+- Token counts: each LLM result has ``metadata["token_usage"]``, which includes the free-form
+  retry of an empty structured answer and the router firewall's verbatim redo; the loader adds a
+  document's up in ``metadata.extra["token_usage"]`` (:doc:`chunking`).
 
 .. code-block:: python
 
@@ -293,9 +344,12 @@ Deprecated settings
 
 The ``OCRConfig`` fields ``enhance_image``, ``detect_tables``, ``detect_layout``, ``timeout``,
 ``max_retries`` and ``extra`` do nothing for the LLM providers. Creating an OpenAI or Vertex AI
-provider with any of them set to a non-default value emits one ``DeprecationWarning`` (shown with
-``python -W default``); they will be removed. ``enhance_image`` (grey-scale and threshold) and
-``detect_layout`` (page segmentation mode) still apply to Tesseract.
+provider with any of them set to a non-default value emits one ``DeprecationWarning``, which
+names the line of your code that created the provider or the loader (so Python shows it by
+default in a script); they will be removed. The request timeout and retries are the provider's
+``timeout`` and ``max_retries`` arguments (the loader's, or ``OCR(..., timeout=...)``).
+``enhance_image`` (grey-scale and threshold) and ``detect_layout`` (page segmentation mode) still
+apply to Tesseract.
 
 Sanitised output
 ----------------

@@ -548,7 +548,8 @@ def build_prompt(
         template_name: Union[str, PromptTemplate] = PromptTemplate.DEFAULT,
         language: str = None,
         content_type: str = None,
-        custom_instructions: str = None
+        custom_instructions: str = None,
+        base_prompt: str = None,
 ) -> str:
     """Build a complete prompt with all specified options.
     
@@ -557,6 +558,8 @@ def build_prompt(
         language: Language hint to add
         content_type: Content type hint to add
         custom_instructions: Custom instructions to use instead of template
+        base_prompt: Prompt text to use instead of the template's (a provider's
+            ``default_prompt``); the language and content-type hints are still added
         
     Returns:
         Complete prompt string
@@ -566,7 +569,7 @@ def build_prompt(
         return custom_instructions
 
     # Get base prompt
-    prompt = get_prompt(template_name)
+    prompt = base_prompt if base_prompt else get_prompt(template_name)
 
     # Add language instruction (works for both specified language and auto-detection)
     prompt = add_language_instruction(prompt, language)

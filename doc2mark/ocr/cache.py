@@ -14,7 +14,9 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from doc2mark.ocr.base import BaseOCR, OCRConfig, OCRResult
+from pydantic import BaseModel
+
+from doc2mark.ocr.base import TASK_PROMPTS, BaseOCR, OCRConfig, OCRResult
 from doc2mark.ocr.schema import OCRPage
 
 
@@ -22,7 +24,11 @@ logger = logging.getLogger(__name__)
 
 # v6: provider refusals are kept only briefly (REFUSAL_TTL_SECONDS); a refusal cached under v5 has no TTL of
 # its own and would be replayed for the cache's full sliding TTL, so v5 entries are never read.
-CACHE_SCHEMA_VERSION = "ocr-cache-v6"
+# v7: the key holds every setting that changes an answer (the task, parse-error mode, the model settings as
+# the provider resolved them, the response model's schema, and the text of doc2mark's prompts and page schema),
+# and no longer max_concurrency (how many requests run at once changes no answer). A v6 key could serve an
+# answer made for another task, so v6 entries are never read.
+CACHE_SCHEMA_VERSION = "ocr-cache-v7"
 OCR_CACHE_VALUE_SCHEMA_VERSION = "ocr-cache-value-v2"
 DEFAULT_REDIS_KEY_PREFIX = f"doc2mark:ocr:{CACHE_SCHEMA_VERSION}"
 
@@ -51,11 +57,21 @@ _NON_LLM_CONFIG_PROVIDERS = {"doc2mark.ocr.tesseract.TesseractOCR"}
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
 # OCRConfig fields left out of the full-config signature of non-LLM providers: the
-# optional judge only screens LLM answers. For the LLM providers it is part of the key
-# (see _judge_identity): an answer the patterns kept is cached, and enabling or changing
-# a judge must screen it again rather than replay it.
-_UNCACHED_CONFIG_FIELDS = {"non_content_judge"}
+# optional judge only screens LLM answers (for the LLM providers it is part of the key,
+# see _judge_identity: an answer the patterns kept is cached, and enabling or changing a
+# judge must screen it again rather than replay it), and max_concurrency only says how
+# many requests run at once.
+_UNCACHED_CONFIG_FIELDS = {"non_content_judge", "max_concurrency"}
 _ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
+# Extra model settings that shape how a request is sent, not what it answers: left out of keys (a rate
+# limiter, callbacks or an HTTP client are objects that have no stable form anyway).
+_UNKEYED_MODEL_KWARGS = frozenset({
+    "rate_limiter", "callbacks", "callback_manager", "http_client", "http_async_client", "client",
+    "async_client", "verbose", "tags", "metadata", "timeout", "request_timeout", "max_retries",
+})
+# OCRConfig model settings a provider resolves into its own attributes (argument > config > default):
+# keyed as resolved, so the same request is one key however it was configured.
+_RESOLVED_CONFIG_FIELDS = ("model", "temperature", "max_tokens", "base_url")
 _STAT_COUNTERS = (
     "hits",
     "misses",
@@ -67,6 +83,16 @@ _STAT_COUNTERS = (
     "deletes",
     "errors",
 )
+
+
+class _StoredDocument(dict):
+    """The fields of an answer parsed into a caller's own ``response_model``, as a cache that
+    stores JSON (Redis) reads them back, with the model's name (``model``): CachedOCR parses
+    them with the provider's response model, and a refresh stores them again as they are."""
+
+    def __init__(self, fields: Dict[str, Any], model: str):
+        super().__init__(fields)
+        self.model = model
 
 
 def _copy_result(result: OCRResult) -> OCRResult:
@@ -165,33 +191,78 @@ def _judge_identity(judge: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
-    """Return only the cache-relevant LLM config knobs.
-
-    Inert/deprecated fields (e.g. detect_tables) are excluded so toggling them no
-    longer produces spurious cache misses for LLM providers.
-    """
-    response_model = getattr(config, "response_model", None)
+def _response_model_identity(response_model: Any) -> Optional[Dict[str, Any]]:
+    """What identifies ``OCRConfig.response_model`` in a key: its qualified name and a hash of
+    its JSON schema, so a model whose fields change is a new model."""
+    if response_model is None:
+        return None
+    try:
+        schema = json.dumps(response_model.model_json_schema(), sort_keys=True, default=str)
+    except Exception:
+        schema = None
     return {
+        "name": f"{getattr(response_model, '__module__', '')}.{getattr(response_model, '__qualname__', repr(response_model))}",
+        "schema_sha256": hashlib.sha256(schema.encode("utf-8")).hexdigest() if schema is not None else None,
+    }
+
+
+def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
+    """Return the config fields that change an LLM provider's answer.
+
+    Left out: the fields that are inert for the LLM providers (e.g. detect_tables, so
+    toggling them causes no spurious misses), ``max_concurrency`` (how many requests run at
+    once), ``context_pages`` (the neighbour-page PDF a request carries is keyed with the
+    request) and the model settings a provider resolves itself (keyed as resolved, see
+    :func:`ocr_settings_identity`). The judge is keyed by its identity.
+    """
+    return {
+        "task": config.task,
         "language": config.language,
-        "max_concurrency": config.max_concurrency,
         "structured": config.structured,
         "detail": config.detail,
-        "response_model": response_model.__name__ if response_model is not None else None,
+        "response_model": _response_model_identity(getattr(config, "response_model", None)),
+        "on_parse_error": config.on_parse_error,
         "non_content_judge": _judge_identity(getattr(config, "non_content_judge", None)),
     }
 
 
-def _config_cache_signature(provider: Any) -> Any:
+def _config_cache_signature(provider: Any, strict: bool = True) -> Any:
     """Hash a slim config for LLM providers, the full config otherwise."""
     config = getattr(provider, "config", None)
     if isinstance(config, OCRConfig):
         qualname = f"{provider.__class__.__module__}.{provider.__class__.__qualname__}"
         if qualname not in _NON_LLM_CONFIG_PROVIDERS:
-            return _stable_value(_slim_llm_config(config), strict=True)
+            return _stable_value(_slim_llm_config(config), strict=strict)
         full = {f.name: getattr(config, f.name) for f in fields(config) if f.name not in _UNCACHED_CONFIG_FIELDS}
-        return _stable_value(full, strict=True)
-    return _stable_value(config, strict=True)
+        return _stable_value(full, strict=strict)
+    return _stable_value(config, strict=strict)
+
+
+_PROMPTS_SHA256: Optional[str] = None
+
+
+def _prompts_fingerprint() -> str:
+    """A hash of the text of doc2mark's own OCR prompts (task prompts, router clauses, the
+    free-form templates and the instructions added to them) and of the page schema sent with
+    structured requests, so answers made with other wording, by another doc2mark version, are
+    not replayed."""
+    global _PROMPTS_SHA256
+    if _PROMPTS_SHA256 is None:
+        from doc2mark.ocr import base, prompts
+        texts = [TASK_PROMPTS[task] for task in sorted(TASK_PROMPTS, key=lambda task: task.value)]
+        texts += [base._ROUTER_NO_CONTEXT_CLAUSE, base._ROUTER_CONFIDENCE_CLAUSE, base._CONTEXT_PDF_INSTRUCTION,
+                  base._SYNTHESIS_MARKDOWN_INSTRUCTION]
+        texts += [prompts.PROMPTS[name] for name in sorted(prompts.PROMPTS, key=lambda name: name.value)]
+        texts += [prompts.add_language_instruction("", None), prompts.add_language_instruction("", "{language}")]
+        texts += [prompts.add_content_type_hint("", kind)
+                  for kind in ("table", "document", "form", "receipt", "handwriting", "code")]
+        from doc2mark.ocr.openai import _RAW_DETAIL_INSTRUCTION
+        from doc2mark.ocr.vertex_ai import _RAW_DETAIL_NOTE
+        texts += [_RAW_DETAIL_INSTRUCTION, _RAW_DETAIL_NOTE]
+        # The page schema goes with every structured request, its field descriptions included.
+        texts.append(json.dumps(OCRPage.model_json_schema(), sort_keys=True))
+        _PROMPTS_SHA256 = hashlib.sha256("\x00".join(texts).encode("utf-8")).hexdigest()
+    return _PROMPTS_SHA256
 
 
 def _uncacheable_reason(result: OCRResult) -> Optional[str]:
@@ -240,28 +311,58 @@ def _prompt_hash(prompt: Any) -> Optional[str]:
     return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
 
+def ocr_settings_identity(provider: Any, *, strict: bool = True) -> Dict[str, Any]:
+    """Everything about an OCR provider that changes its answer for a given image, as JSON-stable
+    values: its class, the config fields that matter to it (task, language, structured mode,
+    detail, response model, ...: see ``_slim_llm_config``), its model, temperature, token limit
+    and endpoint as it resolved them, its project and location, its prompt template and
+    ``default_prompt``, its further request settings (``top_p``, ...) and, for the LLM
+    providers, the text of doc2mark's own prompts. Not in it: the API key, timeouts, retries,
+    concurrency, and client objects such as a rate limiter.
+
+    The OCR cache key is built from it (plus the image and the call's own options), and so is
+    the document cache key of the loader's ``cache_dir``. ``strict`` raises TypeError for a value
+    that has no stable form (an object known only by its memory address); otherwise such a value
+    is named by its type."""
+    qualname = f"{provider.__class__.__module__}.{provider.__class__.__qualname__}"
+    config = getattr(provider, "config", None)
+    resolved = {}
+    for name in _RESOLVED_CONFIG_FIELDS:
+        # The provider's own resolved value; the config's for a provider that keeps none.
+        value = getattr(provider, name, None)
+        if value is None and isinstance(config, OCRConfig):
+            value = getattr(config, name)
+        resolved[name] = _stable_value(value, strict=strict)
+    model_kwargs = getattr(provider, "model_kwargs", None)
+    if isinstance(model_kwargs, dict):
+        model_kwargs = {key: value for key, value in model_kwargs.items() if key not in _UNKEYED_MODEL_KWARGS}
+    return {
+        "provider": qualname,
+        "config": _config_cache_signature(provider, strict=strict),
+        **resolved,
+        "prompt_template": _stable_value(getattr(provider, "prompt_template", None), strict=strict),
+        "default_prompt_sha256": _prompt_hash(getattr(provider, "default_prompt", None)),
+        "model_kwargs": _stable_value(model_kwargs, strict=strict),
+        "project": _stable_value(getattr(provider, "project", None), strict=strict),
+        "location": _stable_value(getattr(provider, "location", None), strict=strict),
+        "prompts_sha256": None if qualname in _NON_LLM_CONFIG_PROVIDERS else _prompts_fingerprint(),
+    }
+
+
 def build_ocr_cache_key(
     provider: Any,
     image: bytes,
     kwargs: Optional[Dict[str, Any]] = None,
     cache_version: str = CACHE_SCHEMA_VERSION,
 ) -> str:
-    """Build a stable cache key for an OCR request."""
+    """Build a stable cache key for an OCR request: the image, the provider's answer-changing
+    settings (:func:`ocr_settings_identity`), a hash of its API key (so tenants never share
+    answers) and the call's own options (a per-call task, language, instructions, ...)."""
     payload = {
         "schema": cache_version,
         "image_sha256": hashlib.sha256(image).hexdigest(),
-        "provider": f"{provider.__class__.__module__}.{provider.__class__.__qualname__}",
         "api_key_sha256": _api_key_hash(provider),
-        "config": _config_cache_signature(provider),
-        "model": _stable_value(getattr(provider, "model", None), strict=True),
-        "temperature": _stable_value(getattr(provider, "temperature", None), strict=True),
-        "max_tokens": _stable_value(getattr(provider, "max_tokens", None), strict=True),
-        "prompt_template": _stable_value(getattr(provider, "prompt_template", None), strict=True),
-        "default_prompt_sha256": _prompt_hash(getattr(provider, "default_prompt", None)),
-        "model_kwargs": _stable_value(getattr(provider, "model_kwargs", None), strict=True),
-        "base_url": _stable_value(getattr(provider, "base_url", None), strict=True),
-        "project": _stable_value(getattr(provider, "project", None), strict=True),
-        "location": _stable_value(getattr(provider, "location", None), strict=True),
+        **ocr_settings_identity(provider, strict=True),
         "call_kwargs": _stable_value(kwargs or {}, strict=True),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -287,6 +388,15 @@ def _serialize_ocr_cache_entry(
 ) -> str:
     """Serialize an OCR cache value without request source data or secrets."""
     normalized = _normalize_result(result)
+    document = normalized.document
+    if document is None:
+        document_fields = None
+    elif isinstance(document, OCRPage):
+        document_fields = document.model_dump()
+    elif isinstance(document, _StoredDocument):
+        document_fields = dict(document)
+    else:
+        document_fields = document.model_dump(mode="json")
     payload = {
         "schema": OCR_CACHE_VALUE_SCHEMA_VERSION,
         "result": {
@@ -294,12 +404,16 @@ def _serialize_ocr_cache_entry(
             "confidence": normalized.confidence,
             "language": normalized.language,
             "metadata": _stable_value(normalized.metadata),
-            "document": normalized.document.model_dump() if normalized.document else None,
+            "document": document_fields,
         },
         "created_at": float(created_at),
         "expires_at": float(expires_at),
         "refresh_count": int(refresh_count),
     }
+    if document is not None and not isinstance(document, OCRPage):
+        # The caller's own response model: read back as its fields, which CachedOCR parses with it.
+        payload["result"]["document_model"] = (
+            document.model if isinstance(document, _StoredDocument) else _type_identity(document))
     if ttl_seconds is not None:
         payload["ttl_seconds"] = float(ttl_seconds)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -335,7 +449,11 @@ def _deserialize_ocr_cache_entry(payload: Any) -> _SerializedCacheEntry:
         raise ValueError("Malformed OCR cache metadata") from exc
 
     document_payload = result_payload.get("document")
-    document = OCRPage.model_validate(document_payload) if document_payload else None
+    if result_payload.get("document_model"):
+        # The caller's own response model's fields (see CachedOCR._restored).
+        document = _StoredDocument(document_payload or {}, str(result_payload["document_model"]))
+    else:
+        document = OCRPage.model_validate(document_payload) if document_payload else None
 
     return _SerializedCacheEntry(
         result=OCRResult(
@@ -995,6 +1113,22 @@ class CachedOCR(BaseOCR):
     def _judge_state(self) -> Any:
         return _judge_identity(getattr(getattr(self.wrapped, "config", None), "non_content_judge", None))
 
+    def _restored(self, result: OCRResult) -> Optional[OCRResult]:
+        """A cached result, with the document of an answer parsed into the caller's own
+        ``response_model`` parsed again: a cache that stores JSON (Redis) returns its fields. The
+        key names that model and its schema; None (a miss) when the fields no longer fit it."""
+        document = result.document
+        if document is None or isinstance(document, BaseModel):
+            return result
+        response_model = getattr(getattr(self.wrapped, "config", None), "response_model", None)
+        if response_model is None:
+            return None
+        try:
+            result.document = response_model.model_validate(document)
+        except Exception:
+            return None
+        return result
+
     def _store_and_fanout(
         self,
         results: List[Optional[OCRResult]],
@@ -1064,6 +1198,8 @@ class CachedOCR(BaseOCR):
                 cache_version=self.cache_version,
             )
             cached = self.cache.get(key)
+            if cached is not None:
+                cached = self._restored(cached)
             # A failed or unsettled entry (written by an older doc2mark or another writer)
             # is not an answer: ask the provider again.
             if cached is not None and _uncacheable_reason(cached) is None:

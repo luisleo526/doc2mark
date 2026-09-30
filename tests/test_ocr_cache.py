@@ -507,7 +507,7 @@ def test_cache_key_schema_and_api_key_identity_are_credential_scoped():
     provider.api_key = "tenant-b-secret"
     tenant_b_key = build_ocr_cache_key(provider, image)
 
-    assert CACHE_SCHEMA_VERSION == "ocr-cache-v6"
+    assert CACHE_SCHEMA_VERSION == "ocr-cache-v7"
     assert tenant_a_key != tenant_b_key
     assert "tenant-a-secret" not in tenant_a_key
     assert "tenant-b-secret" not in tenant_b_key
@@ -518,7 +518,8 @@ def test_cache_key_rejects_address_based_unstable_values():
         pass
 
     provider = FakeOCR()
-    provider.model_kwargs = {"client": CustomClient()}
+    # A request setting (client objects such as "client" or "rate_limiter" are not part of the key).
+    provider.model_kwargs = {"stop": CustomClient()}
 
     with pytest.raises(TypeError, match="stable OCR cache key"):
         build_ocr_cache_key(provider, b"image")

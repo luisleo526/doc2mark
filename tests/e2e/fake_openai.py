@@ -8,11 +8,14 @@ the ``openai`` SDK all run for real and talk HTTP to it. Nothing from ``doc2mark
 Replies are scripted per request kind. A *structured* request is one that carries a
 ``response_format`` (doc2mark's structured OCR call); every other request is *free-form*
 (doc2mark's free-form recovery call). Each kind has its own queue of replies, consumed in
-arrival order; once a queue is down to its last reply, that reply is repeated.
+arrival order; once a queue is down to its last reply, that reply is repeated. ``delay`` holds every
+reply back that many seconds (for timeout and concurrency tests); ``max_in_flight`` is the largest
+number of requests the server was answering at once.
 """
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -59,11 +62,15 @@ def refusal(message: str) -> dict:
 class FakeOpenAI:
     """Serve ``POST <base_url>/chat/completions`` from scripted replies. Use as a context manager."""
 
-    def __init__(self):
+    def __init__(self, delay: float = 0.0):
         self.requests: List[Dict[str, Any]] = []
+        self.delay = delay
+        self.max_in_flight = 0
+        self._in_flight = 0
         self._queues: Dict[str, List[dict]] = {"structured": [], "free_form": []}
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self._server.daemon_threads = True  # a reply held back for a client that timed out must not block shutdown
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     def __enter__(self) -> "FakeOpenAI":
@@ -121,6 +128,17 @@ class FakeOpenAI:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 with fake._lock:
                     fake.requests.append(body)
+                    fake._in_flight += 1
+                    fake.max_in_flight = max(fake.max_in_flight, fake._in_flight)
+                try:
+                    if fake.delay:
+                        time.sleep(fake.delay)
+                    self._reply(body)
+                finally:
+                    with fake._lock:
+                        fake._in_flight -= 1
+
+            def _reply(self, body):
                 if not self.path.rstrip("/").endswith("/chat/completions"):
                     self._send(404, {"error": {"message": f"unexpected path {self.path}"}})
                     return
@@ -146,11 +164,14 @@ class FakeOpenAI:
 
             def _send(self, status: int, payload: dict) -> None:
                 data = json.dumps(payload).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):  # the client gave up waiting (a timeout test)
+                    pass
 
         return Handler
 

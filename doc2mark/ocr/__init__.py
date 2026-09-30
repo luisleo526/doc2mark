@@ -1,6 +1,8 @@
 """OCR providers for doc2mark."""
 
-from typing import List, Optional, Union
+import dataclasses
+import inspect
+from typing import FrozenSet, List, Optional, Union
 
 from doc2mark.ocr.base import (
     OCRProvider,
@@ -53,6 +55,23 @@ def _coerce_task(task: Union[str, Task]) -> Task:
         raise ValueError(f"Unknown OCR task: {task!r}. Available: {available}")
 
 
+# OCRConfig fields that the facade hands to the provider instead: as config fields they are
+# deprecated no-ops, while the provider arguments of the same name are the live request timeout
+# and retries.
+_PROVIDER_FIRST = frozenset({"timeout", "max_retries"})
+
+
+def _provider_arguments(provider: Union[str, OCRProvider]) -> FrozenSet[str]:
+    """The named arguments of the provider class (``project``, ``location``, ``timeout``, ...),
+    besides ``api_key`` and ``config``."""
+    parameters = inspect.signature(OCRFactory.provider_class(provider).__init__).parameters
+    return frozenset(
+        name for name, parameter in parameters.items()
+        if name not in ("self", "api_key", "config")
+        and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+    )
+
+
 def _validate_detail(detail: str) -> str:
     """Validate that ``detail`` is one of the supported levels."""
     if detail not in ("raw", "full"):
@@ -77,6 +96,13 @@ class OCR:
     Ergonomic kwargs are coerced: ``OCR("openai", task="receipt")`` maps the
     string to :class:`Task.RECEIPT`, and an unknown ``task``/``detail`` raises a
     clear ``ValueError``.
+
+    Keyword arguments that are :class:`OCRConfig` fields build the config; the
+    provider's own arguments go to the provider: ``OCR("vertex_ai",
+    project="my-gcp-project", location="europe-west4")``, ``timeout`` and
+    ``max_retries`` (the request timeout and retries, not the deprecated config
+    fields), ``max_workers``, ``prompt_template``, ``default_prompt``, ``top_p``,
+    ``frequency_penalty``, ``presence_penalty``. Anything else raises ``TypeError``.
     """
 
     def __init__(
@@ -93,8 +119,14 @@ class OCR:
         if "detail" in config_kwargs:
             config_kwargs["detail"] = _validate_detail(config_kwargs["detail"])
 
+        config_fields = {field.name for field in dataclasses.fields(OCRConfig)}
+        provider_arguments = _provider_arguments(provider)
+        provider_kwargs = {
+            name: config_kwargs.pop(name) for name in list(config_kwargs)
+            if name in provider_arguments and (name not in config_fields or name in _PROVIDER_FIRST)
+        }
         self.config = OCRConfig(**config_kwargs)
-        self._provider = OCRFactory.create(provider, api_key=api_key, config=self.config)
+        self._provider = OCRFactory.create(provider, api_key=api_key, config=self.config, **provider_kwargs)
 
     def read(
             self,

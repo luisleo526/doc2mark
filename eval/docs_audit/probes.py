@@ -233,19 +233,17 @@ def _():
     print("footnotes kept:", joined.count("company filings"), "of 2")
 
 
-@probe("OCR facade and loader: settings that do not reach the Vertex AI provider")
+@probe("OCR facade and loader: settings reach the Vertex AI provider (issue 11, fixed)")
 def _():
     from doc2mark import OCR, UnifiedDocumentLoader
-    try:
-        OCR("vertex_ai", project="my-gcp-project")
-    except TypeError as exc:
-        print("OCR('vertex_ai', project=...):", "TypeError:", exc)
+    vertex = OCR("vertex_ai", project="my-gcp-project", timeout=7)._provider
+    print("OCR('vertex_ai', project=..., timeout=7): project", vertex.project, "| timeout", vertex.timeout)
     print("OCR('vertex_ai', model='gemini-2.0-flash').model ->", OCR("vertex_ai", model="gemini-2.0-flash")._provider.model)
     gemini = UnifiedDocumentLoader(ocr_provider="gemini", model="gemini-2.0-flash", location="europe-west4").ocr
     print("loader 'gemini': model", gemini.model, "| location", gemini.location)
 
 
-@probe("OCR cache key ignores OCRConfig.task")
+@probe("OCR cache key includes OCRConfig.task (issue 12, fixed)")
 def _():
     from doc2mark import OCRConfig, Task
     from doc2mark.ocr.cache import build_ocr_cache_key
@@ -255,14 +253,14 @@ def _():
     print("same key for task=auto and task=receipt:", build_ocr_cache_key(a, b"img") == build_ocr_cache_key(b, b"img"))
 
 
-@probe("non_content_judge values outside [0, 1] are not rejected")
+@probe("non_content_judge values outside [0, 1] are no verdict (issue 15, fixed)")
 def _():
     from doc2mark.ocr.refusal import non_content_reason
     print("judge returning 1.5 ->", non_content_reason("Totals by region: see chart", judge=lambda text: 1.5))
     print("judge returning None ->", non_content_reason("Totals by region: see chart", judge=lambda text: None))
 
 
-@probe("loader top_p / frequency_penalty / presence_penalty never reach the OpenAI request")
+@probe("loader top_p / frequency_penalty / presence_penalty reach the OpenAI request (issue 10, fixed)")
 def _():
     import os
     from tests.e2e import fake_openai as fo

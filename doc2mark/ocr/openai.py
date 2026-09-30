@@ -1,4 +1,4 @@
-"""OpenAI GPT-4V OCR implementation."""
+"""OpenAI OCR implementation (vision models such as gpt-5.4-mini, through LangChain)."""
 
 import base64
 import io
@@ -18,7 +18,8 @@ from doc2mark.ocr.base import (
     OCRFactory,
     Task,
     TASK_PROMPTS,
-    resolve_max_concurrency,
+    caller_stacklevel,
+    split_llm_settings,
     _CONTEXT_PDF_INSTRUCTION,
     _ROUTER_CONFIDENCE_CLAUSE,
     _ROUTER_NO_CONTEXT_CLAUSE,
@@ -216,6 +217,7 @@ class VisionAgent:
             structured: bool = False,
             response_model: Optional[Type[BaseModel]] = None,
             detail: str = "full",
+            model_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the vision agent.
 
@@ -235,6 +237,9 @@ class VisionAgent:
                 :class:`~doc2mark.ocr.schema.OCRPage` when ``None``.
             detail: ``"full"`` or ``"raw"`` — recorded for callers; the prompt-side
                 instruction is added by the provider, not here.
+            model_kwargs: Further request settings (``top_p``, ``frequency_penalty``,
+                ``presence_penalty``, ``seed``, ...): the ones ChatOpenAI declares are
+                passed to it, the rest go into the request body.
         """
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY')
         self.model = model
@@ -247,6 +252,7 @@ class VisionAgent:
         self.structured = structured
         self.response_model = response_model
         self.detail = detail
+        self.model_kwargs = dict(model_kwargs or {})
 
         # Neighbor-page PDF context: enabled when the model can ingest PDF. The
         # nested {"type":"file","file":{"filename","file_data":"data:...;base64"}}
@@ -262,13 +268,18 @@ class VisionAgent:
             if self.base_url:
                 logger.info(f"🌐 Using custom base URL: {self.base_url}")
 
-            # Prepare kwargs for ChatOpenAI
+            # Prepare kwargs for ChatOpenAI: the extra settings first, so the agent's own
+            # arguments below win over a duplicate among them.
+            declared, extra = split_llm_settings(ChatOpenAI, self.model_kwargs)
             llm_kwargs = {
+                **declared,
                 "model": model,
                 "api_key": self.api_key,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
+            if extra:
+                llm_kwargs["model_kwargs"] = extra
 
             # Forward resilience knobs when explicitly set
             if self.timeout is not None:
@@ -385,12 +396,15 @@ class OpenAIOCR(BaseOCR):
             model: Any = _UNSET,
             temperature: Any = _UNSET,
             max_tokens: Any = _UNSET,
-            max_workers: int = 5,
+            max_workers: Optional[int] = None,
             default_prompt: Optional[str] = None,
             prompt_template: Optional[Union[str, PromptTemplate]] = None,
             timeout: int = 30,
             max_retries: int = 3,
             base_url: Any = _UNSET,
+            top_p: Optional[float] = None,
+            frequency_penalty: Optional[float] = None,
+            presence_penalty: Optional[float] = None,
             **kwargs
     ):
         """Initialize OpenAI OCR provider with comprehensive configuration.
@@ -401,13 +415,19 @@ class OpenAIOCR(BaseOCR):
             model: OpenAI model to use (default: gpt-5.4-mini)
             temperature: Temperature for response generation (0.0-2.0)
             max_tokens: Maximum tokens in response (1-8192)
-            max_workers: Maximum concurrent workers for batch processing
-            default_prompt: Custom default prompt to use instead of built-in
+            max_workers: Maximum number of image requests sent at once, used when
+                ``config.max_concurrency`` is not set (then ``$OCR_MAX_CONCURRENCY``, then
+                LangChain's default thread pool)
+            default_prompt: Prompt of free-form requests (``structured=False`` and the
+                free-form retry of an empty structured answer) instead of the template's;
+                structured requests use the task prompts
             prompt_template: Template name from PROMPTS dict ('default', 'table_focused', etc.)
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
             base_url: Optional base URL for OpenAI-compatible API endpoints
-            **kwargs: Additional model parameters (passed to OpenAI API)
+            top_p, frequency_penalty, presence_penalty: Sampling settings sent with every
+                request when set (some models, such as reasoning models, may reject them)
+            **kwargs: Further request settings, sent with every request
         """
         # Use provided API key or fall back to environment variable
         api_key = api_key or os.environ.get('OPENAI_API_KEY')
@@ -425,7 +445,7 @@ class OpenAIOCR(BaseOCR):
                 f"be removed in a future release: {', '.join(deprecated)}. "
                 "Use the live knobs (model/task/language/structured/detail/...) instead.",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
 
         # Resolve model knobs with precedence: explicit param > config > default.
@@ -444,7 +464,8 @@ class OpenAIOCR(BaseOCR):
         self.max_retries = max_retries
         resolved_base_url = base_url if base_url is not _UNSET else cfg.base_url
         self.base_url = resolved_base_url or os.environ.get('OPENAI_BASE_URL')
-        self.model_kwargs = kwargs
+        sampling = {"top_p": top_p, "frequency_penalty": frequency_penalty, "presence_penalty": presence_penalty}
+        self.model_kwargs = {**kwargs, **{key: value for key, value in sampling.items() if value is not None}}
 
         # Batch processing configuration
         self.max_workers = max_workers
@@ -460,6 +481,9 @@ class OpenAIOCR(BaseOCR):
                 available = [template.value for template in PromptTemplate]
                 raise ValueError(f"Unknown prompt template: {self.prompt_template}. Available: {available}")
 
+        # A default_prompt of the caller's own replaces the template's text in free-form
+        # requests; without one the template (prompt_template, also when changed later) decides.
+        self._custom_default_prompt = bool(default_prompt)
         if default_prompt:
             self.default_prompt = default_prompt
         elif self.prompt_template in PROMPTS:
@@ -506,8 +530,10 @@ class OpenAIOCR(BaseOCR):
         The chain's final stage depends on ``structured``, so when a request
         toggles structured output relative to the cached agent we rebuild it.
         """
-        if self._vision_agent is not None and getattr(self._vision_agent, "structured", False) == structured:
-            return self._vision_agent
+        agent = self._vision_agent
+        if (agent is not None and getattr(agent, "structured", False) == structured
+                and (not structured or getattr(agent, "response_model", None) is response_model)):
+            return agent
 
         if not LANGCHAIN_AVAILABLE:
             logger.error("❌ LangChain is required but not available")
@@ -532,14 +558,13 @@ class OpenAIOCR(BaseOCR):
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 base_url=self.base_url,
-                max_concurrency=resolve_max_concurrency(
-                    self.config.max_concurrency if self.config else None
-                ),
+                max_concurrency=self._max_concurrency(),
                 timeout=self.timeout,
                 max_retries=self.max_retries,
                 structured=structured,
                 response_model=response_model,
                 detail=detail,
+                model_kwargs=self.model_kwargs,
             )
         except Exception as e:
             logger.error(f"❌ Failed to initialize VisionAgent: {e}")
@@ -577,6 +602,7 @@ class OpenAIOCR(BaseOCR):
 
         self.prompt_template = template_name
         self.default_prompt = PROMPTS[template_name]
+        self._custom_default_prompt = False
         logger.info(f"📝 Updated prompt template to: {template_name.value}")
 
     def update_model_config(
@@ -605,6 +631,12 @@ class OpenAIOCR(BaseOCR):
         if max_tokens is not None:
             self.max_tokens = max_tokens
             logger.info(f"📊 Updated max_tokens to: {max_tokens}")
+
+        # The request timeout and retries are the provider's own settings, not request settings.
+        for name in ("timeout", "max_retries"):
+            if name in kwargs:
+                setattr(self, name, kwargs.pop(name))
+                logger.info(f"Updated {name} to: {getattr(self, name)}")
 
         if kwargs:
             self.model_kwargs.update(kwargs)
@@ -688,8 +720,13 @@ class OpenAIOCR(BaseOCR):
         Returns:
             Prompt string
         """
-        # Extract parameters for the build_prompt function
-        template_name = kwargs.get('prompt_template', self.prompt_template)
+        # Extract parameters for the build_prompt function. Without a per-request template, a
+        # default_prompt of the caller's own is the prompt text; otherwise the template's.
+        template_name = kwargs.get('prompt_template')
+        custom = template_name is None and getattr(self, "_custom_default_prompt", False)
+        base_prompt = self.default_prompt if custom else None
+        if template_name is None:
+            template_name = self.prompt_template
         # Use language from kwargs, or fall back to config.language if available
         language = kwargs.get('language') or (self.config.language if self.config else None)
         content_type = kwargs.get('content_type')
@@ -700,7 +737,8 @@ class OpenAIOCR(BaseOCR):
             template_name=template_name,
             language=language,
             content_type=content_type,
-            custom_instructions=custom_instructions
+            custom_instructions=custom_instructions,
+            base_prompt=base_prompt,
         )
 
         # Log what we're using
@@ -868,7 +906,10 @@ class OpenAIOCR(BaseOCR):
                 [images[i] for i in empty_idx], structured=False, language=language, **sub_kwargs
             )
         finally:
-            self._ensure_vision_agent(structured=True)
+            # Back to the structured agent, with the caller's response model: later requests
+            # must not fall back to OCRPage (nor be cached under the other model's key).
+            self._ensure_vision_agent(
+                structured=True, response_model=self.config.response_model if self.config else None)
 
         return self._apply_recovered(results, empty_idx, recovered)
 
@@ -1030,6 +1071,28 @@ class OpenAIOCR(BaseOCR):
                     if isinstance(content, str):
                         content = content.replace('```', '`')
                     page = OCRPage(raw=RawExtraction(text=content), interpretation=None)
+
+                if not isinstance(page, OCRPage):
+                    # Parsed into the caller's own OCRConfig.response_model: that object is the
+                    # document; the text is its fields as JSON. No router firewall (it checks
+                    # OCRPage fields) and no page Markdown to null.
+                    metadata = {
+                        "model": self.model,
+                        "token_usage": token_usage,
+                        "structured": True,
+                        "image_size_bytes": image_size,
+                        "batch_index": i,
+                    }
+                    if item.get("failed"):
+                        metadata.update(failed=True, error=item.get("parsing_error"))
+                    results.append(OCRResult(
+                        text=self._custom_document_text(page),
+                        confidence=None,
+                        language=language or (self.config.language if self.config else None),
+                        metadata=metadata,
+                        document=page,
+                    ))
+                    continue
 
                 if not synthesis_markdown and page.interpretation is not None:
                     page.interpretation.page_markdown = None
