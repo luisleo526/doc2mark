@@ -235,10 +235,11 @@ These whole-page renders also request ``page_markdown`` synthesis (Layer 4).
 Renders are streamed: pages are rendered and sent to the provider in batches of
 at most 32 images (or twice the provider's ``max_concurrency`` when that is
 higher) and 128 MiB of image data, and each batch's images are released once it
-is answered. Memory stays flat whatever the page count (a 160-page scan whose
-renders are about 2.9 MB each peaked at 1.2 GB when every render was held for
-one call; streamed, about 0.5 GB, the same as for 40 pages). The output keeps
-page order. Identical renders (blank pages, repeated slides) are one request.
+is answered. Memory stays flat whatever the page count: a 400-page scan whose
+renders are about 2.9 MB each peaked at 2.7 GB when every render was held for
+one call, and peaks at 0.26 GB streamed, as a 40-page one does (Linux). The
+output keeps page order. Identical renders (blank pages, repeated slides) are
+one request.
 
 The ``"text"`` route
 ~~~~~~~~~~~~~~~~~~~~

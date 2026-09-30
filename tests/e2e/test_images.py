@@ -252,8 +252,9 @@ MEMORY_SCRIPT = (
 
 def test_large_scan_keeps_memory_bounded(e2e_dir):
     """F11 at scale: 160 pages that each render to a large, distinct PNG (about 2.9 MB). With every render held
-    until one OCR call, the peak memory grew by about 6 MB a page (1.4 GB here); bounded batches keep it flat,
-    under 1 GB whatever the page count. The provider (your own ``BaseOCR``) sees the batch sizes."""
+    until one OCR call, the peak memory grew by about 6.4 MB a page (1.2 GB here, 2.7 GB at 400 pages);
+    bounded batches keep it flat (about 0.26 GB at 40 or 400 pages). The provider (your own ``BaseOCR``) sees
+    the batch sizes."""
     pages = 160
     pdf = builders_images.noisy_scan_pdf(e2e_dir / "noisy_scan.pdf", pages)
 
@@ -262,7 +263,7 @@ def test_large_scan_keeps_memory_bounded(e2e_dir):
     output = json.loads(proc.stdout.strip().splitlines()[-1])
     assert sum(output["batches"]) == pages and output["pages"] == pages, output
     assert max(output["batches"]) <= 32, output
-    assert output["peak_mb"] < 1024, output
+    assert output["peak_mb"] < 768, output
 
 
 # ---------------------------------------------------------------------------------------------------------------
