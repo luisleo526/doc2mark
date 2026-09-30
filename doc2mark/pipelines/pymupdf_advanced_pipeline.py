@@ -2536,21 +2536,29 @@ class PDFLoader:
             items = sorted(items, key=displayed_top)
         else:
             items = sorted(items, key=lambda item: item.position_y)
-        order = pdf_layout.reading_order([region(item) for item in items])
+        try:
+            order = pdf_layout.reading_order([region(item) for item in items])
+        except Exception as e:   # never lose a page over its layout: keep the top-to-bottom order
+            logger.warning(f"Reading order of page {page.number + 1} failed, keeping top-to-bottom order: {e}")
+            return items
         return [items[index] for index in order]
 
     def _lines_region(self, page, lines: List[Dict[str, Any]], group=None, anchored: bool = False) -> pdf_layout.Region:
         """Where text lines stand on the page as displayed: their box (from the glyphs' baselines,
         ``_visual_box``) and each line's width, font size, top and bottom."""
-        matrix = page.rotation_matrix
         box, measured = None, []
-        for line in lines:
-            if not self._raw_line_text(line).strip():
-                continue
-            rect = pymupdf.Rect(self._visual_box(line)) * matrix
-            size = max((span.get("size") or 0.0 for span in line.get("spans", [])), default=0.0)
-            measured.append((rect.width, size, rect.y0, rect.y1))
-            box = rect if box is None else box | rect
+        try:
+            matrix = page.rotation_matrix
+            for line in lines:
+                if not self._raw_line_text(line).strip():
+                    continue
+                rect = pymupdf.Rect(self._visual_box(line)) * matrix
+                size = max((span.get("size") or 0.0 for span in line.get("spans", [])), default=0.0)
+                measured.append((rect.width, size, rect.y0, rect.y1))
+                box = rect if box is None else box | rect
+        except Exception as e:   # unknown place: the item is placed by its height alone
+            logger.debug(f"Line geometry unavailable: {e}")
+            box, measured = None, []
         return pdf_layout.Region(tuple(box) if box is not None else None, "text", tuple(measured),
                                  group=group, anchored=anchored)
 

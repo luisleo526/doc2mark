@@ -246,9 +246,7 @@ def _column_split(units: List[_Unit]):
             slots[sum(1 for _, high in gutters if unit.box[0] >= high - 1.0)].append(unit)
         filled = [slot for slot in slots if slot]
         if len(filled) >= 2 and _is_columns(filled):
-            if len(filled) == 2 and _secondary(filled[0], filled[1]):
-                filled = [filled[1], filled[0]]
-            segments.append(("columns", filled))
+            segments.append(("columns", _reading_slots(filled)))
             if floating[number]:
                 segments.append(("keep", [floating[number]]))
             columns_found = True
@@ -347,12 +345,17 @@ def _widths(side: List[_Unit]) -> List[float]:
     return sorted(line[0] for unit in side for line in unit.lines)
 
 
-def _secondary(left: List[_Unit], right: List[_Unit]) -> bool:
-    """Is the left side a sidebar or margin notes beside the right side: lines much narrower than
-    the right side's, and fewer of them?"""
-    left_widths, right_widths = _widths(left), _widths(right)
-    if not left_widths or not right_widths:
-        return False
-    left_width = left_widths[len(left_widths) // 2]
-    right_width = right_widths[len(right_widths) // 2]
-    return left_width < _SECONDARY_WIDTH * right_width and len(left_widths) < len(right_widths)
+def _median_width(slot: List[_Unit]) -> float:
+    widths = _widths(slot)
+    return widths[len(widths) // 2] if widths else 0.0
+
+
+def _reading_slots(slots: List[List[_Unit]]) -> List[List[_Unit]]:
+    """The slots of a column band in reading order: left to right, except that a sidebar, a
+    pull-quote column or margin notes (lines much narrower than the widest column's, and fewer of
+    them) come after the columns they stand beside."""
+    widest = max(slots, key=_median_width)
+    minor = [slot for slot in slots if slot is not widest
+             and _median_width(slot) < _SECONDARY_WIDTH * _median_width(widest)
+             and len(_widths(slot)) < len(_widths(widest))]
+    return [slot for slot in slots if not any(slot is other for other in minor)] + minor
