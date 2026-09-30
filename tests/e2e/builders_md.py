@@ -1079,6 +1079,78 @@ def invoice_batch_pdf(path: Path) -> Path:
     return _save(doc, path)
 
 
+# --- review round 2 (after the rebase onto main) --------------------------------------------------
+
+SOFT_HYPHEN_EXPECTED = ["the new investment policy", "the top-down plan", "a follow-up meeting"]
+
+
+def soft_hyphen_line_ends_pdf(path: Path) -> Path:
+    """Line-end hyphens whose glyph the text layer reads as U+00AD (the reviewer's probe f6 built
+    with an Arial font): ``invest-``/``ment`` with ``Investment`` elsewhere in the document, and
+    ``top-``/``down`` and ``follow-``/``up`` without such evidence. Drawn with a TextWriter,
+    which keeps U+00AD in the text layer."""
+    doc = pymupdf.open()
+    font = pymupdf.Font("helv")
+
+    def lines(page, y, texts):
+        writer = pymupdf.TextWriter(page.rect)
+        for index, text in enumerate(texts):
+            writer.append((72, y + index * 12), text, font=font, fontsize=10)
+        writer.write_text(page)
+
+    page = _new_page(doc)
+    lines(page, 80, ["The committee approved the new invest\u00ad", "ment policy after a long review of the top\u00ad",
+                     "down plan and the risks."])
+    _text(page, 72, 160, "Investment income rose again this year.", 10)
+    page = _new_page(doc)
+    lines(page, 80, ["Our strategy relies on a follow\u00ad", "up meeting every quarter with the whole team."])
+    return _save(doc, path)
+
+
+NUMBERED_AFTER_BULLETS = {
+    "item": "4. Execution and training",
+    "paragraph": "The team runs the courses and supports the companies after the training sessions.",
+    "bullets": ["\u2022 Plan the training sessions for all participating companies in each region of",
+                "\u2022 Record the results of every session in the shared project workspace and"],
+    "next": "5. Fit for the programme",
+    "after": "The company has run similar programmes for the association since 2021.",
+}
+
+
+def numbered_item_after_bullets_pdf(path: Path) -> Path:
+    """A numbered item, its paragraph and a bullet list whose last line runs to the right edge
+    without end punctuation, then the next numbered item in its own block (fail-1's
+    ``5. 計畫執行適配性``)."""
+    doc = pymupdf.open()
+    page = _new_page(doc)
+    _text(page, 72, 80, MARKERS_BODY, 10)
+    spec = NUMBERED_AFTER_BULLETS
+    _text(page, 72, 170, spec["item"], 10)
+    _text(page, 72, 192, spec["paragraph"], 10)
+    _text(page, 72, 214, "\n".join(spec["bullets"]), 10)
+    _text(page, 72, 248, spec["next"], 10)
+    _text(page, 72, 270, spec["after"], 10)
+    return _save(doc, path)
+
+
+CJK_TWO_PARAGRAPHS = [
+    "本公司於本年度持續投資核心平台並維持營運成本穩定，管理階層認為現行策略能使企業在下一個規劃週期中具備競爭優勢，惟總體經濟環境仍具不確定性。",
+    "部分地區客戶需求於下半年轉弱，因此本報告將逐項說明各事業部門之營運成果，並提出下一年度的重點工作與資源配置方向，供董事會審議。",
+]
+
+
+def cjk_two_paragraph_block_pdf(path: Path) -> Path:
+    """Two CJK paragraphs in one PyMuPDF block, each wrapped every 30 characters with a short
+    last line that ends the sentence."""
+    doc = pymupdf.open()
+    page = _new_page(doc)
+    _text(page, 72, 80, MARKERS_BODY, 10)
+    lines = [paragraph[index:index + 30] for paragraph in CJK_TWO_PARAGRAPHS for index in range(0, len(paragraph), 30)]
+    _text(page, 72, 200, "\n".join(lines), 10.5, "china-t")
+    _text(page, 72, 340, MARKERS_BODY, 10)
+    return _save(doc, path)
+
+
 # --- Markdown injection (probes p05, p05b) --------------------------------------------------------
 
 INJECTION_LINES = [

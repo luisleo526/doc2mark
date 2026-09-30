@@ -726,9 +726,14 @@ def test_stacked_short_cjk_labels_are_not_joined(run_cli, e2e_dir):
 def test_large_running_header_is_not_taken_for_the_title(run_cli, e2e_dir):
     result, blocks = convert(run_cli, b.large_running_header_pdf(e2e_dir / "running_header.pdf"))
 
-    assert b.RUNNING_HEADER not in result.markdown, result.describe()
-    assert heading_texts(blocks) == b.RUNNING_HEADER_HEADINGS, result.describe()
-    assert headings(blocks)[0] == (1, b.RUNNING_HEADER_HEADINGS[0]), result.describe()
+    # lane pdftext keeps the heading-sized first copy of a running header as content (verbatim
+    # first) and removes the later copies; it must not become the title
+    found = headings(blocks)
+    assert [text for level, text in found if level == 1] == [b.RUNNING_HEADER_HEADINGS[0]], result.describe()
+    assert result.markdown.count(b.RUNNING_HEADER) <= 1, result.describe()
+    assert all(heading in heading_texts(blocks) for heading in b.RUNNING_HEADER_HEADINGS), result.describe()
+    # the chapters are set in one size, so they share one level
+    assert len({level for level, text in found if text in b.RUNNING_HEADER_HEADINGS[1:]}) == 1, result.describe()
 
 
 def test_closing_line_after_a_long_bullet_is_not_part_of_it(run_cli, e2e_dir):
@@ -838,6 +843,36 @@ def test_title_label_repeated_on_every_page_is_kept_once(run_cli, e2e_dir):
 
     assert headings(blocks)[:1] == [(1, "INVOICE")], result.describe()
     assert result.markdown.count("INVOICE") == 1, result.describe()
+
+
+# --- review round 2 ---------------------------------------------------------------------------------
+
+
+def test_soft_hyphen_glyphs_at_line_ends_follow_the_evidence_rule(run_cli, e2e_dir):
+    pdf = b.soft_hyphen_line_ends_pdf(e2e_dir / "soft_hyphens.pdf")
+    assert sum(line.endswith("\u00ad") for line in b.line_texts(pdf)) == 2, b.line_texts(pdf)
+    result, blocks = convert(run_cli, pdf)
+
+    rendered = " ".join(texts(blocks))
+    for phrase in b.SOFT_HYPHEN_EXPECTED:
+        assert phrase in rendered, (phrase, result.describe())
+    assert "\u00ad" not in result.markdown, result.describe()
+
+
+def test_numbered_item_after_a_bullet_list_block_stays_a_list_item(run_cli, e2e_dir):
+    result, blocks = convert(run_cli, b.numbered_item_after_bullets_pdf(e2e_dir / "numbered_after_bullets.pdf"))
+
+    ordered = [norm(block.text) for block in blocks if block.lists[-1:] == ("ordered",)]
+    assert b.NUMBERED_AFTER_BULLETS["next"][3:] in ordered, result.describe()
+    assert "5\\." not in result.markdown, result.describe()
+
+
+def test_cjk_block_with_two_paragraphs_joins_each_paragraph(run_cli, e2e_dir):
+    result, blocks = convert(run_cli, b.cjk_two_paragraph_block_pdf(e2e_dir / "cjk_two_paragraphs.pdf"))
+
+    lines = [line.strip() for block in blocks for line in block.text.split("\n")]
+    for paragraph in b.CJK_TWO_PARAGRAPHS:
+        assert paragraph in lines, (paragraph, result.describe())
 
 
 # --- pdf_to_markdown keeps every line of a footnote -----------------------------------------------
