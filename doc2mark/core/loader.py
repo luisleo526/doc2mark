@@ -643,8 +643,9 @@ class UnifiedDocumentLoader:
                     # Convert to plain text
                     result.content = result.text
 
-            # Cache result
-            if self.cache_dir:
+            # Cache result, unless OCR failed or came back empty on a page showing content: a
+            # re-run with a healthy provider must read those pages (see _ocr_incomplete).
+            if self.cache_dir and not self._ocr_incomplete(result):
                 self._cache_result(file_path, output_format, result, cache_options)
 
             return result
@@ -1191,6 +1192,15 @@ class UnifiedDocumentLoader:
         raise UnsupportedFormatError(
             f"Cannot detect format for extension: {extension}"
         )
+
+    @staticmethod
+    def _ocr_incomplete(result: ProcessedDocument) -> bool:
+        """Whether the document's OCR is not a final answer: images the provider did not answer, or
+        pages showing content whose OCR returned nothing (``metadata.extra["ocr_images"]``), or OCR
+        issues reported by the provider (``ocr_issues``). Such a result is not cached."""
+        extra = getattr(result.metadata, "extra", None) or {}
+        images = extra.get("ocr_images") or {}
+        return bool(images.get("failed") or images.get("unread_pages") or extra.get("ocr_issues"))
 
     def _get_cached(
             self,

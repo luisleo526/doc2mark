@@ -183,6 +183,14 @@ def _is_cacheable(result: OCRResult) -> bool:
                 or metadata.get("router_fallback") == "unresolved")
 
 
+def _is_final_answer(result: OCRResult) -> bool:
+    """Whether an OCR result may be cached: it carries text and did not fail. An empty or failed
+    result (an outage, a timeout, a refusal, a truncated answer) looks the same as a picture with
+    nothing to read, so it is never replayed: the next run asks the provider again."""
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return bool((result.text or "").strip()) and not metadata.get("failed")
+
+
 def _api_key_hash(provider: Any) -> Optional[str]:
     api_key = getattr(provider, "api_key", None)
     if not api_key:
@@ -931,14 +939,15 @@ class CachedOCR(BaseOCR):
     ) -> None:
         """Cache one fresh provider result and place it at every deduped position.
 
-        The value written to the cache is the clean, unmarked result. Only the
+        The value written to the cache is the clean, unmarked result, and only a
+        final answer is written (see ``_is_cacheable`` and ``_is_final_answer``). Only the
         first position is a fresh provider call this batch; the remaining
         positions are intra-batch dedup copies of the SAME single call, so they
         are flagged non-fresh (``FROM_CACHE_METADATA_KEY``) to keep a usage
         consumer from counting one provider call N times.
         """
         normalized = _normalize_result(provider_result)
-        if _is_cacheable(normalized):
+        if _is_cacheable(normalized) and _is_final_answer(normalized):
             self.cache.set(key, normalized)
         for offset, position in enumerate(positions):
             copied = _copy_result(normalized)

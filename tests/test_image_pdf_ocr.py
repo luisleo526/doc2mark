@@ -21,6 +21,15 @@ def _png(size, color):
     return buf.getvalue()
 
 
+def _text_png(size, text):
+    from PIL import ImageDraw, ImageFont
+    image = Image.new("RGB", size, "white")
+    ImageDraw.Draw(image).text((20, 20), text, fill="black", font=ImageFont.load_default(size=40))
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _make_pdf(tmp_path):
     doc = fitz.open()
     # page 0: full-page image, no text -> image-dominant
@@ -62,12 +71,11 @@ def test_document_strategy_route(tmp_path):
 
 
 def test_decorative_image_filter(tmp_path):
+    # Pictures are judged by their pixels, not by their size alone: the small plain
+    # square on page 2 carries nothing to read and is not OCR'd.
     p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
-    page = p.doc.load_page(2)
-    tiny = fitz.Rect(50, 50, 70, 70)   # 20pt on a 600pt-wide page
-    big = fitz.Rect(0, 0, 400, 600)
-    assert p._is_decorative_image(tiny, page) is True
-    assert p._is_decorative_image(big, page) is False
+    assert p._page_pictures(2) == []
+    assert p._pictures[2][1] == {"not_shown": 0, "no_content": 1}
 
 
 def _make_image_with_text_doc(tmp_path):
@@ -95,7 +103,7 @@ def test_high_coverage_but_text_rich_is_text(tmp_path):
 def test_image_doc_renders_every_page(tmp_path):
     # image-strategy document: every page rendered once as a whole image.
     p = PDFLoader(_make_image_doc(tmp_path), ocr=_StubOCR())
-    work = p._collect_all_images()
+    work = list(p._ocr_jobs())
     renders = {w["page_num"] for w in work if w.get("is_page_render")}
     assert renders == {0, 1, 2}
 
@@ -106,7 +114,7 @@ def test_text_doc_renders_only_its_picture_page_and_skips_tiny(tmp_path):
     # overrides the document route and is rendered on its own (per-page route).
     p = PDFLoader(_make_pdf(tmp_path), ocr=_StubOCR())
     assert p._document_image_strategy() == "text"
-    work = p._collect_all_images()
+    work = list(p._ocr_jobs())
     assert {w["page_num"] for w in work if w.get("is_page_render")} == {0}
     assert all(w["page_num"] != 2 for w in work)            # tiny decorative skipped
 
@@ -161,7 +169,7 @@ def test_ocr_failure_emits_placeholder_not_base64(tmp_path):
     doc = fitz.open()
     page = doc.new_page(width=600, height=800)
     page.insert_text((50, 100), "Real text content. " * 30, fontsize=11)   # text layer -> not image-dominant
-    page.insert_image(fitz.Rect(50, 300, 360, 600), stream=_png((400, 400), "green"))  # 310pt, non-decorative
+    page.insert_image(fitz.Rect(50, 300, 360, 600), stream=_text_png((400, 400), "RECEIPT 5501"))  # has content
     path = tmp_path / "ocr_fail.pdf"
     doc.save(str(path))
     doc.close()

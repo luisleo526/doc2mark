@@ -17,6 +17,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 from tests.e2e import builders_images, pdfgen
 
 PICTURE_OCR = "text:image_description"
@@ -27,6 +29,15 @@ BODY = [
     "Station 14 passed its pressure test at 16 bar without any leaks.",
     "Energy use fell to 412 MWh, down seven percent on the last year.",
 ]
+
+
+def deck_slides(count, topic):
+    """``count`` slides of five lines (about 280 characters: enough text for the text route)."""
+    return [[f"Slide {n}: {topic} for depot {n} in the northern region",
+             f"Pallets due this week: {n * 12}, trucks booked: {n + 4}",
+             "Drivers report to the gate office before seven in the morning",
+             "Loading bays three and four are closed for resurfacing works",
+             f"Temperature logs for route {n} are signed by the shift supervisor"] for n in range(1, count + 1)]
 
 
 def words(text):
@@ -85,7 +96,7 @@ def test_repeated_background_with_a_logo_is_ocrd_once_for_the_whole_deck(run_cli
     """F7 / F17: a deck whose slides all show the same background picture (one image XObject) with a logo in its
     corner sent that picture to OCR once per slide. It is OCR'd once; its text is still shown with every slide."""
     require_tool("tesseract")
-    slides = [[f"Slide {n}: quarterly figures for region {n}", f"Revenue grew {n + 3} percent"] for n in range(1, 7)]
+    slides = deck_slides(6, "quarterly figures")
     pdf = builders_images.themed_deck_pdf(e2e_dir / "logo_deck.pdf", slides, logo=["NORTHWIND"])
 
     result = run_ocr(run_cli, pdf)
@@ -149,7 +160,7 @@ def test_plain_backgrounds_and_icons_are_not_sent_to_ocr(run_cli, require_tool, 
     "a light-blue background"). Pictures with nothing to read (a plain background, an icon without text) are not
     OCR'd and leave nothing in the output; the text layer is intact."""
     require_tool("tesseract")
-    slides = [[f"Slide {n}: delivery schedule for depot {n}", f"Pallets due this week: {n * 12}"] for n in range(1, 11)]
+    slides = deck_slides(10, "delivery schedule")
     pdf = builders_images.themed_deck_pdf(e2e_dir / "themed_deck.pdf", slides)
 
     result = run_ocr(run_cli, pdf)
@@ -266,20 +277,23 @@ FLAKY_SCRIPT = (
     "    def validate_api_key(self):\n"
     "        return True\n"
     "ocr = FlakyOCR()\n"
-    "loader = UnifiedDocumentLoader(ocr_provider=ocr, ocr_cache=MemoryOCRCache())\n"
+    "cache = {'ocr_cache': MemoryOCRCache()} if sys.argv[2] == 'ocr_cache' else {'cache_dir': sys.argv[3]}\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=ocr, **cache)\n"
     "runs = [loader.load(sys.argv[1], ocr_images=True).content for _ in range(2)]\n"
     "print(json.dumps({'runs': runs, 'calls': ocr.calls}))\n"
 )
 
 
-def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_tool, e2e_dir):
-    """F3: a scanned page whose OCR came back empty (a failing provider) was dropped without a trace, and with an
-    OCR cache the empty answer was cached, so a re-run with a healthy provider dropped the page again. The empty
-    answer is not cached, the second run reads the page, and the first run marks the page it could not read."""
+@pytest.mark.parametrize("cache", ["ocr_cache", "cache_dir"])
+def test_empty_ocr_result_is_not_cached_and_the_dropped_page_is_marked(require_tool, e2e_dir, cache):
+    """F3: a scanned page whose OCR came back empty (a failing provider) was dropped without a trace, and the
+    empty answer was cached (by an OCR cache, ``ocr_cache=``, or with the whole converted document, ``cache_dir=``),
+    so a re-run with a healthy provider dropped the page again. The empty answer is not cached, the second run
+    reads the page, and the first run marks the page it could not read."""
     require_tool("tesseract")
     pdf = pdfgen.image_pdf(e2e_dir / "scan.pdf", "INVOICE 8812\nTOTAL EUR 912")
 
-    proc = run_api(e2e_dir, FLAKY_SCRIPT, pdf)
+    proc = run_api(e2e_dir, FLAKY_SCRIPT, pdf, cache, e2e_dir / "document-cache")
 
     output = json.loads(proc.stdout.strip().splitlines()[-1])
     first, second = (words(run) for run in output["runs"])

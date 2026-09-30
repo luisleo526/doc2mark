@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Sequence, Tuple
 
 import pymupdf
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from tests.e2e import pdfgen
-from tests.e2e.builders_route import A4, MARGIN, SLIDE, _png, _save, insert_lines, picture_png, solid_png, text_page
+from tests.e2e.builders_route import A4, MARGIN, SLIDE, _png, _save, insert_lines, picture_png, text_page
 
 
 def _picture(lines: Sequence[str], size: Tuple[int, int], font_px: int, background="white") -> bytes:
@@ -115,7 +115,6 @@ def themed_deck_pdf(path: Path, slides: Sequence[Sequence[str]], *, logo: Sequen
     if logo:
         image = Image.open(io.BytesIO(gradient_png((1600, 900))))
         draw = ImageDraw.Draw(image)
-        from PIL import ImageFont
         font = ImageFont.load_default(size=56)
         y = 40
         for line in logo:
