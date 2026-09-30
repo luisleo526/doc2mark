@@ -184,3 +184,29 @@ def test_combined_flags(tmp_path):
     assert config.task == Task.HANDWRITING
     assert config.structured is False
     assert config.detail == "raw"
+
+
+SPAWNED_WORKER = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark.cli import process_single_file\n"
+    "status, _, _ = process_single_file(Path(sys.argv[1]), {'ocr_provider': None, 'api_key': None}, {\n"
+    "    'load_format': 'markdown', 'extract_images': False, 'ocr_images': False, 'max_length': None,\n"
+    "    'include_metadata': False, 'retry': 0, 'verbose': False, 'quiet': sys.argv[2] == 'quiet', 'log_file': None})\n"
+    "print(status)\n"
+)
+
+
+def test_a_parallel_worker_logs_like_the_cli(tmp_path):
+    """Review of #26: a --parallel worker that does not inherit the CLI's logging (a spawned process, the default
+    on macOS and from Python 3.14) printed MuPDF's errors about a damaged PDF through Python's last-resort handler,
+    even with -q. The worker sets up the CLI's logging: -q silences them, a default run logs them on stderr."""
+    from tests.e2e import pdfgen
+
+    pdf = pdfgen.damaged_stream_pdf(tmp_path / "damaged.pdf", ["Quarterly memo", "Survey notes"], damaged=[1])
+    quiet, default = (subprocess.run([sys.executable, "-c", SPAWNED_WORKER, str(pdf), mode], capture_output=True,
+                                     text=True, check=False) for mode in ("quiet", "default"))
+
+    assert quiet.stdout.strip() == "success" and default.stdout.strip() == "success", quiet.stderr + default.stderr
+    assert "MuPDF" not in quiet.stderr, quiet.stderr
+    assert "WARNING - MuPDF error" in default.stderr, default.stderr

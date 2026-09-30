@@ -215,6 +215,69 @@ def test_an_ocr_answer_with_the_layers_characters_in_another_order_costs_about_t
     assert spent <= 4 * _positional_scan_seconds(lines, ocr) + 1.0   # slack for coverage tracing in CI
 
 
+REVENUE_ROW = "<table><tr><td>Revenue from contracts with customers</td><td>4</td><td>1,200</td></tr></table>"
+REVENUE = "Revenue from contracts with customers 1,200"
+TOTAL_REVENUE = "Total revenue from contracts with customers 1,200"
+
+
+@pytest.mark.parametrize("lines, ocr, missing, cjk", [
+    pytest.param([REVENUE, TOTAL_REVENUE], REVENUE_ROW, [TOTAL_REVENUE], False, id="absent-total-row"),
+    pytest.param([REVENUE, "4", TOTAL_REVENUE], REVENUE_ROW, [TOTAL_REVENUE], False, id="absent-total-row-note-line"),
+    pytest.param(["Income statement", REVENUE, TOTAL_REVENUE], "Income statement\n\n" + REVENUE_ROW, [TOTAL_REVENUE],
+                 False, id="absent-total-row-heading-before"),
+    pytest.param(["Revenue from contracts with customers 1,300", REVENUE], "| Revenue from contracts with customers | 4 | 1,200 |",
+                 ["Revenue from contracts with customers 1,300"], False, id="absent-row-first"),
+    pytest.param([REVENUE, "Revenue from contracts with customers 1,300"], "| Revenue from contracts with customers | 4 | 1,200 |",
+                 ["Revenue from contracts with customers 1,300"], False, id="absent-row-second"),
+    pytest.param(["Note 12", "Cash and cash equivalents at the end of the year 5,400",
+                  "Cash and cash equivalents at the end of the year 5,400 restated"],
+                 "Note 12\n\n| Cash and cash equivalents at the end of the year | (a) | 5,400 |",
+                 ["Cash and cash equivalents at the end of the year 5,400 restated"], False, id="absent-longer-by-one-word"),
+    pytest.param(["Net sales before discount 1,200", "Other text here", "Net sales before discount 1,200"],
+                 "Net sales before discount 1,200\n\nOther text here", ["Net sales before discount 1,200"], False,
+                 id="printed-twice-read-once"),
+    pytest.param(["Net sales", "(note 3)", "before discount", "Net sales before discount"],
+                 "| Net sales | (note 3) | before discount |", ["Net sales before discount"], False,
+                 id="absent-line-made-of-header-cells"),
+    pytest.param(["營業收入", "營業外", "收入"], "<table><tr><td>營業外<br>收入</td><td>1,200</td></tr></table>", ["營業收入"],
+                 True, id="cjk-absent-line-made-of-wrapped-cells"),
+    pytest.param(["營業收入"], "圖表：營業外收入趨勢", ["營業收入"], True, id="cjk-no-word-inserted-inside-a-word"),
+    pytest.param(["Assets", "a) Revenue from contracts with customers 1,200"], "Assets\n\n| Revenue from contracts with customers | 4 | 1,200 |",
+                 [], False, id="misread-edge-word-is-not-taken"),
+    pytest.param(["1. " + REVENUE], REVENUE_ROW, [], False, id="first-word-missing-at-the-start"),
+    pytest.param(["Heading", "1. " + REVENUE], "Heading\n\n" + REVENUE_ROW, [], False, id="first-word-missing-after-a-line"),
+    pytest.param(["本系統採用", "SAP ERP", "進行管理"], "本系統採用SAP ERP進行管理", [], True, id="latin-words-inside-cjk-text"),
+    pytest.param(["金額", "1,234,567", "元"], "金額1,234,567元", [], True, id="amount-inside-cjk-text"),
+    pytest.param(["Tax 1,200", "Net loss before tax 1,200"],
+                 "<table><tr><td>Net loss before</td><td>Note 4</td><td>tax 1,200</td></tr></table>",
+                 ["Tax 1,200", "Net loss before tax 1,200"], False, id="either-line-could-be-the-row"),
+    pytest.param(["AI", "AI Agent for finance teams", "Quarterly review"], "AI Agent for flnance teams\nQuarterly review",
+                 ["AI"], False, id="short-line-inside-a-misread-longer-copy"),
+    pytest.param(["AI", "AI Agent for finance teams", "Quarterly review"],
+                 "AI\nAI Agent for flnance teams\nQuarterly review", [], False, id="short-line-with-its-own-copy"),
+])
+def test_the_line_the_ocr_read_keeps_its_words_and_the_absent_one_stays_missing(tmp_path, lines, ocr, missing, cjk):
+    """Review of #26: longer lines claimed OCR words first, so an absent line that nearly contains present lines
+    took their words (a total row the OCR left out took its revenue row, a CJK row took the wrapped cells it is
+    made of) and the absent line was lost. Whole copies claim first, then the best fitting alignments; no OCR
+    word may come between two characters of one CJK word; and when either of two lines could be the OCR text,
+    both are kept."""
+    assert _tail(tmp_path, lines, ocr, cjk=cjk) == missing
+
+
+def test_many_near_misses_cost_about_the_positional_scan(tmp_path):
+    """Review of #26: each alignment converted the whole page's free-word mask to a list, so an OCR answer made
+    of many near copies of the page's lines (10,000 characters) took seconds. It costs about the positional scan."""
+    lines = ["營業收入"] * 100
+    ocr = "\n".join("營業的入收" for _ in range(2000))
+    page, measure = _page_of(tmp_path, lines, cjk=True)
+    started = time.perf_counter()
+    missing = pdf_routing.missing_painted_lines(page, measure, ocr)
+    spent = time.perf_counter() - started
+    assert missing == lines
+    assert spent <= 4 * _positional_scan_seconds(lines, ocr) + 1.0   # slack for coverage tracing in CI
+
+
 @pytest.mark.parametrize("change", ["one-character-in-thirty-left-out", "one-character-added-early"])
 def test_cjk_lines_the_ocr_read_with_a_few_characters_changed_are_found(tmp_path, change):
     """What #25 gained stays: an OCR answer that leaves out one character in thirty of a CJK line still reproduces

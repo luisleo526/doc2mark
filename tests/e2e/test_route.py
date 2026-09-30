@@ -892,9 +892,10 @@ def test_running_header_and_page_number_of_an_ocrd_page_are_not_added_again(run_
 NET_LOSS_ROW = "<table><tr><td>Net loss before tax</td><td>Note 4</td><td>1,200</td></tr></table>"
 
 
-def run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, printed, reply):
+def run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, printed, reply, printed_font="helv"):
     """The report whose second page is a scan with ``printed`` lines over it, its render OCR'd as ``reply``."""
-    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "report.pdf", REPORT, INVOICE_SCAN, printed=printed)
+    pdf = builders_route.report_with_scanned_page_pdf(e2e_dir / "report.pdf", REPORT, INVOICE_SCAN, printed=printed,
+                                                      printed_font=printed_font)
     fake_llm.script(structured=[reply])
     result = run_cli(pdf, "--ocr", "openai", "--ocr-images", env=fake_llm.env, fmt="both")
     assert result.exit_code == 0, result.describe()
@@ -944,3 +945,32 @@ def test_a_printed_latin_line_is_not_found_inside_cjk_words(run_cli, e2e_dir, fa
     result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, ["AI"], fake.page("財務AI使用介面"))
 
     assert re.search(r"^AI$", result.markdown, re.M), result.describe()
+
+
+# Review of #26: an absent line must not take the OCR words of the lines the OCR did read
+
+def test_a_printed_total_row_the_ocr_left_out_is_added_and_the_rows_it_read_are_not(run_cli, e2e_dir, fake_llm):
+    """Longer lines claimed OCR words first, so "Total revenue from contracts with customers 1,200", which the OCR
+    left out, took the words of the revenue row it read (with a "4" note cell) and of the heading before the
+    table: the total row was lost and the heading and the revenue row came out twice."""
+    heading, revenue = "Income statement", "Revenue from contracts with customers 1,200"
+    total = "Total revenue from contracts with customers 1,200"
+    row = "<table><tr><td>Revenue from contracts with customers</td><td>4</td><td>1,200</td></tr></table>"
+    result = run_scan_with_printed_lines(run_cli, e2e_dir, fake_llm, [heading, revenue, total],
+                                         fake.page(heading, tables=[fake.table(row)]))
+
+    text = words(result.markdown)
+    assert total in text, result.describe()
+    assert text.count(heading) == 1 and revenue not in text, result.describe()
+
+
+def test_a_printed_cjk_row_the_ocr_left_out_is_added_and_its_wrapped_cells_are_not(run_cli, e2e_dir, fake_llm):
+    """The same in CJK: the row 營業收入, which the OCR left out, took the characters of the wrapped cell
+    營業外 / 收入 it read, with 外 between them. No OCR word may come between two characters of one CJK word."""
+    result = run_scan_with_printed_lines(
+        run_cli, e2e_dir, fake_llm, ["營業收入", "營業外", "收入"],
+        fake.page("", tables=[fake.table("<table><tr><td>營業外<br>收入</td><td>1,200</td></tr></table>")]),
+        printed_font="china-t")
+
+    lines = result.markdown.splitlines()
+    assert "營業收入" in lines and "營業外" not in lines and "收入" not in lines, result.describe()
