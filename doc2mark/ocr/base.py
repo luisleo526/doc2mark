@@ -372,36 +372,73 @@ class BaseOCR(ABC):
         meta.update(flags)
         return replace(result, text="", document=OCRPage(), metadata=meta)
 
+    @staticmethod
+    def _has_content_besides_text(page: Any) -> bool:
+        """Whether a structured page carries anything besides ``raw.text``: tables,
+        fields, headings, metrics, dates, figures, sections, entities, relations,
+        definitions, findings or action items, or a title, summary, message, visual note
+        or page Markdown that is not itself a refusal / "no readable text" statement.
+        Such a page is content whatever its ``raw.text`` says."""
+        from doc2mark.ocr.refusal import matches_non_content_pattern
+        raw = page.raw
+        if raw.tables or raw.fields or raw.headings or raw.metrics or raw.dates:
+            return True
+        interp = page.interpretation
+        if interp is None:
+            return False
+        if (interp.figures or interp.sections or interp.typed_entities or interp.relations
+                or interp.definitions or interp.key_findings or interp.action_items):
+            return True
+        texts = (interp.page_title, interp.summary, interp.primary_message, interp.visual_notes, interp.page_markdown)
+        return any((text or "").strip() and not matches_non_content_pattern(text) for text in texts)
+
     def _screen_structured_answers(self, results: List[OCRResult]) -> None:
         """Empty (in place) every structured answer that is only a refusal or a "no
         readable text" statement, so the empty-result recovery re-reads that image.
 
         Provider-native refusals are emptied by the providers themselves; this is the
         deterministic multilingual check plus the optional ``non_content_judge`` (see
-        :mod:`doc2mark.ocr.refusal`). Answers with tables or fields are content.
+        :mod:`doc2mark.ocr.refusal`), on ``raw.text`` as the model wrote it. Only an
+        otherwise empty page can be one: a page with anything else (see
+        :meth:`_has_content_besides_text`) is content.
         """
         from doc2mark.ocr.refusal import non_content_reason
+        from doc2mark.ocr.schema import OCRPage
         judge = self._non_content_judge()
         for index, result in enumerate(results):
             doc = result.document
-            if doc is not None and (doc.raw.tables or doc.raw.fields):
-                continue
-            reason = non_content_reason(result.text or "", judge)
+            if isinstance(doc, OCRPage):
+                if self._has_content_besides_text(doc):
+                    continue
+                answer = doc.raw.text
+            else:  # a caller's own response model: its rendering is all there is
+                answer = result.text
+            reason = non_content_reason(answer or "", judge)
             if reason:
                 results[index] = self._without_content(result, non_content=reason)
 
-    def _screen_free_form_answers(self, results: List[OCRResult]) -> None:
-        """Free-form answers have no recovery behind them: a refusal becomes empty text
-        with ``metadata["ocr_refusal"] = True`` right away."""
+    def _free_form_answer(self, answer: Optional[str], *, refusal: Any = None,
+                          recovery: bool = False) -> "tuple[str, Dict[str, Any]]":
+        """The ``OCRResult.text`` and metadata flags of one free-form answer.
+
+        A provider refusal or block (``refusal``) leaves no text. A recovery call's
+        answer is returned as written (the recovery screens and sanitizes it). Any other
+        answer that is only a refusal / "no readable text" statement -- judged on the
+        answer as the model wrote it, not on its escaped rendering -- becomes empty text
+        flagged ``ocr_refusal`` (a free-form answer has no recovery behind it); the rest
+        is model Markdown, sanitized once here.
+        """
         from doc2mark.ocr.refusal import non_content_reason
-        judge = self._non_content_judge()
-        for index, result in enumerate(results):
-            if (result.metadata or {}).get("ocr_refusal"):
-                continue  # the provider already refused (flagged by the result builder)
-            reason = non_content_reason(result.text or "", judge)
-            if reason:
-                results[index] = replace(
-                    result, text="", metadata={**(result.metadata or {}), "non_content": reason, "ocr_refusal": True})
+        from doc2mark.ocr.schema import _sanitize_markdown
+        if refusal:
+            return "", {"refusal": refusal, "non_content": "provider_refusal", "ocr_refusal": True}
+        answer = answer or ""
+        if recovery:
+            return answer, {}
+        reason = non_content_reason(answer, self._non_content_judge())
+        if reason:
+            return "", {"non_content": reason, "ocr_refusal": True}
+        return _sanitize_markdown(answer), {}
 
     def _apply_recovered(
         self,
@@ -420,7 +457,8 @@ class BaseOCR(ABC):
         answer that is itself only a refusal / "no readable text" statement is not
         applied. When either answer was one, the result stays empty and is flagged
         ``metadata["ocr_refusal"] = True``, so a refusal is never indexed as page
-        content.
+        content -- unless the page carries other content (headings, dates, ...), which
+        is kept as it is.
         """
         from doc2mark.ocr.refusal import non_content_reason
         from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown
@@ -431,6 +469,9 @@ class BaseOCR(ABC):
             if text and not recovered_refused and non_content_reason(text, judge):
                 recovered_refused, text = True, ""
             if not text:
+                doc = results[i].document
+                if isinstance(doc, OCRPage) and self._has_content_besides_text(doc):
+                    continue
                 if recovered_refused or (results[i].metadata or {}).get("non_content"):
                     results[i] = self._without_content(results[i], ocr_refusal=True)
                 continue

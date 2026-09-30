@@ -18,7 +18,7 @@ satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 
 import html as _html
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from typing import Dict, List, Optional, Literal, Tuple
 
@@ -56,7 +56,9 @@ _TABLE_MARKUP_RE = re.compile(r"<\s*/?\s*(?:table|thead|tbody|tfoot|tr|td|th|cap
 _PIPE_DELIMITER_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
 _BR_TAG_RE = re.compile(r"<br\s*/?>", re.I)
 _C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f]")
-_LINE_BREAK_RE = re.compile(r"[ \t]*\n\s*")
+# A line break and the blanks around it. Only a blank run's first character may start a
+# match, so a long run of spaces without a line break costs linear time, not quadratic.
+_LINE_BREAK_RE = re.compile(r"(?<![ \t])[ \t]*\n\s*")
 _ASCII_DIGITS_RE = re.compile(r"[0-9]+")  # str.isdigit() also accepts "²", which int() rejects
 
 # Bounds on model-supplied spans. A colspan never exceeds the widest row's cell count
@@ -782,48 +784,240 @@ def normalize_table_html(html: str) -> str:
 # --------------------------------------------------------------------------- #
 # Every OCR string other than the sanitized Table.html reaches the Markdown output
 # as text, escaped per the shared escaping policy: only what would change the
-# Markdown/HTML structure is escaped. A "<" becomes "&lt;" only before a letter,
-# "/", "!" or "?" (a tag, comment or processing instruction; "x < 5" stays), and
-# "&" only where it starts an entity. Plain text (a verbatim transcription) also
-# gets a backslash before line-leading block markers, so a transcribed "# 3", "1.",
-# "==" underline or "[1]: url" line stays text instead of becoming structure.
+# Markdown/HTML structure is escaped.
+# - Outside code, a "<" becomes "&lt;" only before a letter, "/", "!" or "?" (a tag,
+#   comment or processing instruction; "x < 5" stays). Inside a code span or a fenced
+#   block, which a renderer shows verbatim, markup stays as written ("List<String>",
+#   "<div>") unless it would be live were the region not code after all: a tag with an
+#   attribute value or a dangerous name, a comment, a declaration or a processing
+#   instruction. So a region taken for code by mistake can never make anything live.
+# - Entities stay as written ("&copy;" is the model's way to write the character).
+# - No OCR text creates an image ("![" is escaped) or a link, reference definition or
+#   autolink whose target has a scheme other than http(s) or mailto, however the scheme
+#   is spelled with entities or escapes.
+# - Plain text (a verbatim transcription) also gets a backslash before line-leading
+#   headings, quotes, code fences, rules, setext underlines and link definitions, so a
+#   transcribed "# 3", "==" or "[1]: url" line stays text. Its list markers stay: a
+#   transcribed list is a list. A single-line field (a heading, a label, a cell) escapes
+#   them too, since it follows a list marker or a heading of its own.
 _TAG_START_RE = re.compile(r"<(?=[A-Za-z/!?])")
-_ENTITY_START_RE = re.compile(r"&(?=#[0-9]{1,8};|#[xX][0-9A-Fa-f]{1,8};|[A-Za-z][A-Za-z0-9]{1,31};)")
-_BLOCK_MARKER_RE = re.compile(
-    r"^([ \t]{0,3})(#{1,6}(?=[ \t]|$)|>|[-+*](?=[ \t]|$)|[0-9]{1,9}(?=[.)](?:[ \t]|$))|`{3,}|~{3,})",
-    re.M,
-)
+_BLOCK_MARKER_RE = re.compile(r"^([ \t]{0,3})(#{1,6}(?=[ \t]|$)|>|`{3,}|~{3,})", re.M)
+_LIST_MARKER_RE = re.compile(r"^([ \t]{0,3})([-+*](?=[ \t]|$)|[0-9]{1,9}(?=[.)](?:[ \t]|$)))", re.M)
 # A rule (---, ***, ___), or a setext heading underline (any run of = or -).
 _RULE_LINE_RE = re.compile(r"^([ \t]{0,3})(?=(?:[-=*_][ \t]*){3,}$|=+[ \t]*$|-+[ \t]*$)", re.M)
-# "[label]: destination" would become an invisible link reference definition.
-_LINK_DEFINITION_RE = re.compile(r"^([ \t]{0,3})(?=\[[^\]\n]*\]:)", re.M)
+# "[label]: destination" would become an invisible link reference definition, also in a
+# list item or a quote.
+_LINK_DEFINITION_RE = re.compile(
+    r"^([ \t]*(?:(?:>[ \t]*|(?:[-+*]|[0-9]{1,9}[.)])[ \t]+))*)(?=\[(?:[^\]\\\n]|\\.)*\]:)", re.M)
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.M)
+# Elements that do something even without attributes (run code, style the page, load or
+# embed content, swallow the markup after them, switch the parser to SVG/MathML).
+_LIVE_TAG_NAMES = frozenset(_DANGEROUS_TAGS) | {
+    "textarea", "title", "xmp", "plaintext", "listing", "noembed", "noframes", "frame", "frameset",
+    "img", "image", "video", "audio", "source", "track", "picture", "applet", "param", "portal",
+    "select", "option", "keygen", "isindex", "marquee", "dialog", "details", "html", "head", "body",
+}
+_TAG_NAME_RE = re.compile(r"</?([^\s/>]{1,40})")
+_LINK_TARGET_START_RE = re.compile(r"\](?:\(|:)")
+_SPACES_AND_ANGLE_RE = re.compile(r"\s*<?")
+_LINK_TARGET_RE = re.compile(r"[^\s)>]{0,512}")
+_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+_URL_IGNORED_RE = re.compile(r"[\x00-\x20\x7f]+")
+_SCHEME_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}):")
+_SAFE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
-def _neutralize_html(text: str, *, keep_breaks: bool = False) -> str:
-    text = _ENTITY_START_RE.sub("&amp;", text)
+def _fenced_blocks(text: str) -> List[Tuple[int, int]]:
+    """The fenced code blocks of ``text``, as CommonMark reads them: an opening fence
+    of three or more backticks or tildes indented at most three spaces (a backtick
+    fence's info string has no backtick), closed by a line of the same character at
+    least as long, or by the end of the text."""
+    blocks: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        match = _FENCE_OPEN_RE.search(text, pos)
+        if match is None:
+            return blocks
+        fence, info = match.group(1), match.group(2)
+        if fence[0] == "`" and "`" in info:
+            pos = match.end() + 1
+            continue
+        closer = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", re.M)
+        close = closer.search(text, match.end() + 1)
+        if close is None:
+            blocks.append((match.start(), len(text)))
+            return blocks
+        blocks.append((match.start(), close.end()))
+        pos = close.end() + 1
+
+
+def _code_spans(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    """The inline code spans of ``text[start:end]``, paired as CommonMark pairs them: a
+    backtick string opens a span when a string of exactly its length follows (inside a
+    span a backslash is literal), and a backslash-escaped backtick opens nothing."""
+    runs = [(m.start(), m.end() - m.start()) for m in _BACKTICK_RUN_RE.finditer(text, start, end)]
+    positions = [position for position, _ in runs]
+    by_length: Dict[int, List[int]] = {}
+    for position, length in runs:
+        by_length.setdefault(length, []).append(position)
+    spans: List[Tuple[int, int]] = []
+    index = 0
+    while index < len(runs):
+        position, length = runs[index]
+        backslashes, k = 0, position - 1
+        while k >= start and text[k] == "\\":
+            backslashes, k = backslashes + 1, k - 1
+        if backslashes % 2:  # the first backtick is escaped
+            position, length = position + 1, length - 1
+        candidates = by_length.get(length, [])
+        closing = bisect_right(candidates, position) if length else len(candidates)
+        if closing == len(candidates):
+            index += 1
+            continue
+        close = candidates[closing]
+        spans.append((position, close + length))
+        index = bisect_left(positions, close + length)
+    return spans
+
+
+def _code_regions(text: str, *, fences: bool) -> List[Tuple[int, int]]:
+    """Fenced code blocks (when ``fences``) and inline code spans, in order."""
+    regions: List[Tuple[int, int]] = []
+    pos = 0
+    for start, end in (_fenced_blocks(text) if fences else []):
+        regions.extend(_code_spans(text, pos, start))
+        regions.append((start, end))
+        pos = end
+    regions.extend(_code_spans(text, pos, len(text)))
+    return regions
+
+
+def _live_if_not_code(text: str, lt: int, closes: List[int], values: List[int]) -> bool:
+    """Whether the "<" at ``lt`` would start live markup if its code region were read as
+    prose: a comment, declaration or processing instruction, or a tag that closes in
+    ``text`` (``closes``: where every ">" is) and has an attribute value (``values``:
+    where every "=" is) or a name in :data:`_LIVE_TAG_NAMES`. A tag that never closes
+    cannot form in this text."""
+    if text[lt + 1] in "!?":
+        return True
+    index = bisect_left(closes, lt)
+    if index == len(closes):
+        return False
+    close = closes[index]
+    value = bisect_left(values, lt)
+    if value < len(values) and values[value] < close:
+        return True
+    name = _TAG_NAME_RE.match(text, lt, close)
+    return name is None or len(name.group(1)) == 40 or name.group(1).lower() in _LIVE_TAG_NAMES
+
+
+def _neutralize_prose(text: str, *, keep_breaks: bool) -> str:
+    """Text outside code: every "<" that could start a tag becomes "&lt;" (the inert
+    ``<br>`` stays when ``keep_breaks``), and "![" cannot start an image."""
+    text = text.replace("![", "!\\[")
     if keep_breaks:
         return "<br>".join(_TAG_START_RE.sub("&lt;", part) for part in _BR_TAG_RE.split(text))
     return _TAG_START_RE.sub("&lt;", text)
 
 
-def _escape_line_starts(text: str) -> str:
+def _neutralize_code(text: str, start: int, end: int, closes: List[int], values: List[int]) -> str:
+    """A code region ``text[start:end]``: kept as written except a "<" that would start
+    live markup outside code (see :func:`_live_if_not_code`), and "![" (an image)."""
+    out: List[str] = []
+    pos = start
+    for match in _TAG_START_RE.finditer(text, start, end):
+        if _live_if_not_code(text, match.start(), closes, values):
+            out.append(text[pos:match.start()])
+            out.append("&lt;")
+            pos = match.start() + 1
+    out.append(text[pos:end])
+    return "".join(out).replace("![", "!\\[")
+
+
+def _neutralize_span(text: str, start: int, end: int, regions: List[Tuple[int, int]],
+                     closes: List[int], values: List[int], *, keep_breaks: bool) -> str:
+    """``text[start:end]`` neutralized: code regions by :func:`_neutralize_code`, the
+    rest by :func:`_neutralize_prose`."""
+    out: List[str] = []
+    pos = start
+    first = max(bisect_right(regions, (start, len(text))) - 1, 0)
+    for region_start, region_end in regions[first:]:
+        if region_start >= end:
+            break
+        if region_end <= start:
+            continue
+        a, b = max(region_start, start), min(region_end, end)
+        out.append(_neutralize_prose(text[pos:a], keep_breaks=keep_breaks))
+        out.append(_neutralize_code(text, a, b, closes, values))
+        pos = b
+    out.append(_neutralize_prose(text[pos:end], keep_breaks=keep_breaks))
+    return "".join(out)
+
+
+def _positions(text: str, char: str) -> List[int]:
+    return [match.start() for match in re.finditer(re.escape(char), text)]
+
+
+def _neutralize(text: str) -> str:
+    """Plain text (no fenced blocks: their fences are escaped as text): code spans kept
+    as written where inert, the rest neutralized, no dangerous link."""
+    regions = _code_regions(text, fences=False)
+    return _break_dangerous_links(_neutralize_span(
+        text, 0, len(text), regions, _positions(text, ">"), _positions(text, "="), keep_breaks=False))
+
+
+def _dangerous_target(text: str, pos: int) -> bool:
+    """Whether the link target that starts at ``pos`` (after optional blanks and "<")
+    has a scheme other than http, https or mailto once its backslash escapes and
+    entities are decoded and the characters a browser ignores are dropped."""
+    pos = _SPACES_AND_ANGLE_RE.match(text, pos).end()
+    target = _LINK_TARGET_RE.match(text, pos).group(0)
+    target = _html.unescape(_BACKSLASH_ESCAPE_RE.sub(r"\1", target))
+    scheme = _SCHEME_RE.match(_URL_IGNORED_RE.sub("", target))
+    return scheme is not None and scheme.group(1).lower() not in _SAFE_LINK_SCHEMES
+
+
+def _break_dangerous_links(text: str, *, bracket: str = "\\]") -> str:
+    """Replace the "]" of every inline link or link definition (``](`` / ``]:``) whose
+    target has a dangerous scheme (``javascript:``, ``data:``, ``vbscript:``,
+    ``file:``, ...) with ``bracket`` (an escaped "]", or "&#93;" inside HTML), so it
+    closes no link. An escaped "]" is left alone."""
+    out: List[str] = []
+    last = 0
+    for match in _LINK_TARGET_START_RE.finditer(text):
+        backslashes, k = 0, match.start() - 1
+        while k >= last and text[k] == "\\":
+            backslashes, k = backslashes + 1, k - 1
+        if backslashes % 2 or not _dangerous_target(text, match.end()):
+            continue
+        out.append(text[last:match.start()])
+        out.append(bracket)
+        last = match.start() + 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _escape_line_starts(text: str, *, lists: bool = False) -> str:
     def marker(match) -> str:
         indent, token = match.group(1), match.group(2)
         return f"{indent}{token}\\" if token[0] in "0123456789" else f"{indent}\\{token}"
 
     text = _RULE_LINE_RE.sub(lambda match: match.group(1) + "\\", text)
     text = _LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text)
+    if lists:
+        text = _LIST_MARKER_RE.sub(marker, text)
     return _BLOCK_MARKER_RE.sub(marker, text)
 
 
 def _escape_text_block(text: str) -> str:
     """Plain multi-line text (a transcription, a caption) for a Markdown block."""
-    return _escape_line_starts(_neutralize_html(_clean_controls(text)))
+    return _escape_line_starts(_neutralize(_clean_controls(text)))
 
 
 def _escape_inline(text: str) -> str:
     """Plain text for a single Markdown line (a heading, list item or label)."""
-    return _escape_line_starts(" ".join(_neutralize_html(_clean_controls(text)).split()))
+    return _escape_line_starts(" ".join(_neutralize(_clean_controls(text)).split()), lists=True)
 
 
 def _escape_cell(text: str) -> str:
@@ -856,24 +1050,53 @@ def _opens_table_body(text: str, pos: int, comment_ends: List[int]) -> bool:
     return False
 
 
-def _neutralize_before_table(text: str) -> str:
-    """Text before a sanitized table. A "<" it ends with is escaped too: the sanitizer
-    can return plain text (a ``<table-x>`` is unwrapped to its text), and "<" + "img
-    src=x onerror=..." would be a live tag."""
-    text = _neutralize_html(text, keep_breaks=True)
-    return text[:-1] + "&lt;" if text.endswith("<") else text
+def _escape_definitions(text: str) -> str:
+    """Link reference definitions at line starts outside fenced blocks stay text."""
+    out: List[str] = []
+    pos = 0
+    for start, end in _fenced_blocks(text):
+        out.append(_LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text[pos:start]))
+        out.append(text[start:end])
+        pos = end
+    out.append(_LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text[pos:]))
+    return "".join(out)
+
+
+def _sanitized_table(html: str) -> str:
+    """One ``<table>`` block of model Markdown through the table sanitizer and
+    normalizer. Its text cannot start an image or a dangerous link either ("&#33;" and
+    "&#93;" read the same in an HTML block and inside a paragraph)."""
+    table = normalize_table_html(sanitize_table_html(html))
+    return _break_dangerous_links(table.replace("![", "&#33;["), bracket="&#93;")
 
 
 def _sanitize_markdown(text: str) -> str:
     """Model-written Markdown (``page_markdown``, ``Table.markdown``, a free-form OCR
-    answer): its Markdown structure is kept; each ``<table>...</table>`` block goes
-    through the ``Table.html`` sanitizer and normalizer, and every other piece of raw
-    HTML except the inert ``<br>`` is neutralized. Apply it once, to the final text."""
-    text = _clean_controls(text)
+    answer): its Markdown structure is kept; each ``<table>...</table>`` block outside
+    code goes through the ``Table.html`` sanitizer and normalizer, and the rest is
+    neutralized per the policy above (the inert ``<br>`` stays). Apply it once, to the
+    final text."""
+    text = _escape_definitions(_clean_controls(text))
+    regions = _code_regions(text, fences=True)
+    region_starts = [start for start, _ in regions]
+    closes, values = _positions(text, ">"), _positions(text, "=")
     comment_ends = [match.start() for match in _COMMENT_END_RE.finditer(text)]
+
+    def in_code(pos: int) -> bool:
+        index = bisect_right(region_starts, pos) - 1
+        return index >= 0 and pos < regions[index][1]
+
+    def prose(start: int, end: int, *, before_table: bool) -> str:
+        chunk = _neutralize_span(text, start, end, regions, closes, values, keep_breaks=True)
+        # The sanitizer can return plain text (a <table-x> is unwrapped to its text), and
+        # "<" + "img src=x onerror=..." would be a live tag.
+        return chunk[:-1] + "&lt;" if before_table and chunk.endswith("<") else chunk
+
     out: List[str] = []
     depth, start, last = 0, 0, 0
     for match in _TABLE_TAG_RE.finditer(text):
+        if in_code(match.start()):
+            continue  # a table shown as code stays code
         if not match.group(1):
             if not _opens_table_body(text, match.end(), comment_ends):
                 continue  # "<table>" mentioned in prose, not table markup
@@ -883,17 +1106,18 @@ def _sanitize_markdown(text: str) -> str:
         elif depth:
             depth -= 1
             if depth == 0:
-                out.append(_neutralize_before_table(text[last:start]))
-                out.append(normalize_table_html(sanitize_table_html(text[start:match.end()])))
+                out.append(prose(last, start, before_table=True))
+                out.append(_sanitized_table(text[start:match.end()]))
                 last = match.end()
     if depth:
         # A table still open at the end (its markup goes straight on into rows): an
         # answer cut off at max_tokens.
-        out.append(_neutralize_before_table(text[last:start]))
-        out.append(normalize_table_html(sanitize_table_html(text[start:])))
+        out.append(prose(last, start, before_table=True))
+        out.append(_sanitized_table(text[start:]))
     else:  # no table left open, or a "<table>" merely mentioned in the prose
-        out.append(_neutralize_html(text[last:], keep_breaks=True))
-    return "".join(out)
+        out.append(prose(last, len(text), before_table=False))
+    # An image or a link can still straddle a table and the text next to it.
+    return _break_dangerous_links("".join(out).replace("![", "!\\["))
 
 
 # --------------------------------------------------------------------------- #
@@ -1385,7 +1609,8 @@ class OCRPage(BaseModel):
         ``Table.html`` is the only live HTML emitted; every other field is escaped
         (see :func:`_escape_text_block`), and a table whose rows were withheld as
         illustrative is followed by a visible ``[N illustrative rows not
-        transcribed]`` marker.
+        transcribed]`` marker (fields, metrics and figures withheld likewise get
+        ``[N illustrative fields/metrics/figures not transcribed]``).
         """
         parts: List[str] = []
         raw = self.raw
@@ -1403,6 +1628,7 @@ class OCRPage(BaseModel):
             # Coverage is judged on what is emitted: the sanitized rendering (text the
             # sanitizer removes, e.g. inside an <svg>, must land in the tail).
             out = [_sanitize_markdown(md)] + [_render_table_block(table) for table in raw.tables]
+            out.append(_withheld_elements_marker(self))
             covered, missing = _coverage(raw.text, "\n".join(out))
             if covered >= _SYNTH_COVERAGE_MIN:
                 if missing:
@@ -1429,6 +1655,10 @@ class OCRPage(BaseModel):
             fig_md = _render_figures(interp.figures)
             if fig_md:
                 parts.append(fig_md)
+        # Withheld (illustrative) fields, metrics and figures leave a visible trace, as
+        # withheld table rows do.
+        parts.append(_withheld_elements_marker(self))
+        if interp is not None:
             sec_md = _render_sections(interp.sections)
             if sec_md:
                 parts.append(sec_md)
@@ -1451,6 +1681,19 @@ def _withheld_marker(table: Table) -> str:
     if table.row_count:
         return f"[{table.row_count} illustrative rows not transcribed]"
     return "" if _table_has_rows(table) else "[illustrative rows not transcribed]"
+
+
+def _withheld_elements_marker(page: "OCRPage") -> str:
+    """A visible trace of the fields, metrics and figures withheld as illustrative
+    (their values are not in the page text); "" when nothing was withheld."""
+    figures = page.interpretation.figures if page.interpretation is not None else []
+    counts = (
+        (sum(1 for f in page.raw.fields if f.illustrative), "field"),
+        (sum(1 for m in page.raw.metrics if m.illustrative), "metric"),
+        (sum(1 for f in figures if f.illustrative), "figure"),
+    )
+    return "\n\n".join(
+        f"[{count} illustrative {noun}{'s' if count > 1 else ''} not transcribed]" for count, noun in counts if count)
 
 
 def _render_table_block(table: Table) -> str:

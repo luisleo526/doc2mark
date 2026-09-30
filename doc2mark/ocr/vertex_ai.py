@@ -22,7 +22,7 @@ from doc2mark.ocr.base import (
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
     REFUSAL_USAGE_KEY,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
+from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
 from doc2mark.utils.image_utils import (
     detect_image_format as _shared_detect_image_format,
     convert_image_to_supported_format as _shared_convert_image_to_supported_format,
@@ -523,7 +523,7 @@ class VertexAIOCR(BaseOCR):
             task_list = [single] * n
 
         custom = kwargs.get("instructions")
-        if custom:
+        if custom and not kwargs.get("_firewall_retry"):
             return [custom] * n
 
         language = kwargs.get("language") or (self.config.language if self.config else None)
@@ -537,6 +537,8 @@ class VertexAIOCR(BaseOCR):
                 base = base + _RAW_DETAIL_NOTE
             if kwargs.get("synthesis_markdown"):
                 base = base + _SYNTHESIS_MARKDOWN_INSTRUCTION
+            if custom:  # the firewall's verbatim redo keeps the caller's instructions
+                base = base + "\n\nAdditional instructions from the caller: " + custom
             prompts.append(base)
         return prompts
 
@@ -573,10 +575,11 @@ class VertexAIOCR(BaseOCR):
         self, indices: List[int], images: List[bytes], kwargs: Dict[str, Any]
     ) -> List[OCRResult]:
         """Re-OCR ``images[indices]`` with the explicit verbatim DOCUMENT task (no
-        router), for the router firewall."""
+        router), for the router firewall. The caller's ``instructions`` carry over,
+        appended to the verbatim task instead of replacing it."""
         sub_kwargs = {
             k: v for k, v in kwargs.items()
-            if k not in ("structured", "tasks", "task", "context_pdfs", "instructions", "_recovery")
+            if k not in ("structured", "tasks", "task", "context_pdfs", "_recovery")
         }
         context_pdfs = kwargs.get("context_pdfs")
         if context_pdfs is not None:
@@ -645,10 +648,7 @@ class VertexAIOCR(BaseOCR):
                         results, lambda indices: self._redo_verbatim(indices, images, kwargs))
                 return results
 
-            results = self._build_legacy_results(batch_results, images, **kwargs)
-            if not kwargs.get("_recovery"):
-                self._screen_free_form_answers(results)
-            return results
+            return self._build_legacy_results(batch_results, images, **kwargs)
 
         except OCRError:
             raise
@@ -665,10 +665,10 @@ class VertexAIOCR(BaseOCR):
             image_size = len(images[i])
             token_usage = dict(token_usage or {})
             blocked = token_usage.pop(REFUSAL_USAGE_KEY, None)
-            text_result = "" if blocked else (text_result or "")
-            if not kwargs.get("_recovery"):
-                # Final free-form answer: model Markdown, sanitized once at this boundary.
-                text_result = _sanitize_markdown(text_result)
+            # Screened for a refusal on the answer as written, then sanitized once at this
+            # boundary (a recovery call's answers are screened by _apply_recovered).
+            text_result, flags = self._free_form_answer(
+                text_result, refusal=blocked, recovery=bool(kwargs.get("_recovery")))
             results.append(
                 OCRResult(
                     text=text_result,
@@ -688,8 +688,7 @@ class VertexAIOCR(BaseOCR):
                         "batch_index": i,
                         "content_type": kwargs.get("content_type"),
                         "token_usage": token_usage,
-                        **({"refusal": blocked, "non_content": "provider_refusal", "ocr_refusal": True}
-                           if blocked else {}),
+                        **flags,
                     },
                 )
             )

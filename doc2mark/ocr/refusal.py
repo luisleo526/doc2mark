@@ -8,12 +8,16 @@ answer recognized here as *no content*: it goes to the existing free-form recove
 and when that is a non-answer too, the result is empty text with
 ``metadata["ocr_refusal"] = True``.
 
-The deterministic check is conservative on purpose. It only looks at short answers
-(a few lines) and only fires when the answer *starts* with a refusal or "no text"
-phrase (English, Chinese, Japanese, Korean, German, Spanish, French), so real content
-that merely mentions an apology ("Sorry we missed you!", "I am sorry to inform you
-...", "This page intentionally left blank.") is kept. What it cannot decide is left
-to the optional judge, :data:`NonContentJudge`.
+The deterministic check is high-precision on purpose. It only looks at short answers
+(a few lines) and only fires when the WHOLE answer is a refusal or "no readable text"
+statement (English, Chinese, Japanese, Korean, German, Spanish, French): a model
+speaking about itself or about its input image, optionally with a reason made only of
+words about image quality or sensitivity ("because it's too blurry", "It may contain
+personal information.") and a stock courtesy tail ("Please provide a clearer image.",
+"If you have any other questions, feel free to ask!"). Anything else in the answer --
+a number, a quote, a description of the image, a transcribed line, a person being
+addressed -- is content, and the answer is kept. What the patterns cannot decide is
+left to the optional judge, :data:`NonContentJudge`.
 """
 
 import logging
@@ -25,15 +29,17 @@ logger = logging.getLogger(__name__)
 NonContentJudge = Callable[[str], Optional[float]]
 """Optional second opinion on a short OCR answer (``OCRConfig.non_content_judge``).
 
-Called as ``judge(ocr_text)`` with the model's answer (stripped, at most
-:data:`MAX_JUDGE_CHARS` characters) only when the deterministic patterns did not
-fire. It returns the probability, from 0.0 to 1.0, that the answer is *only* a
-refusal, an apology, an error message or a statement that the image has no readable
-text, with nothing transcribed or described from the image. A probability of at
-least :data:`JUDGE_THRESHOLD` makes the answer count as no content. ``None`` means
-"cannot judge" and keeps the answer, as does any exception the judge raises (it is
-logged). The judge must not raise for normal input and should be quick; it is called
-at most once per answer.
+Called as ``judge(ocr_text)`` with the model's answer as the model wrote it (stripped,
+not Markdown-escaped, at most :data:`MAX_JUDGE_CHARS` characters) only when the
+deterministic patterns did not fire. It returns the probability, from 0.0 to 1.0,
+that the answer is *only* a refusal, an apology, an error message or a statement that
+the image has no readable text, with nothing transcribed or described from the image.
+A probability of at least :data:`JUDGE_THRESHOLD` makes the answer count as no
+content. ``None`` means "cannot judge" and keeps the answer, as does any exception the
+judge raises (it is logged). The judge must not raise for normal input and should be
+quick; it is called at most once per answer. Cached OCR results are keyed by the
+judge's identity (its qualified name and an optional ``version`` attribute), so give
+a judge whose behaviour changes a new ``version``.
 """
 
 #: Longest answer (characters / non-empty lines) the deterministic patterns look at.
@@ -53,33 +59,79 @@ _I_NEG = (
 )
 _IMAGE_NOUN = r"(?:image|picture|photo(?:graph)?|scan|screenshot)s?"
 # The model refers to its input as "the/this (provided) image"; a person writes about
-# "your photo", "the attached photo" or "the photo you sent" -- those are page text.
+# "your photo" or "the photo you sent" -- those are page text.
 _MODEL_DETERMINER = r"(?:(?:the|this|that|these|those|any)\s+)?(?:(?:provided|given)\s+)?"
 _FILLER = r"(?:(?!your\b)\w+\s+){0,2}?"
 _NOT_THE_USERS = r"(?!\s+(?:you|that\s+you|which\s+you)\b)"
+# "this image", "the text in this image", "the contents of this document image"
+_IN_THIS_IMAGE = rf"(?:the|this|that)\s+(?:(?:provided|given)\s+)?(?:document\s+)?{_IMAGE_NOUN}\b{_NOT_THE_USERS}"
 _IMAGE_OBJECT = (
     rf"(?:{_MODEL_DETERMINER}{_FILLER}{_IMAGE_NOUN}\b{_NOT_THE_USERS}"
-    r"|(?:(?:the|any)\s+)?(?:text|content|contents|writing)\s+(?:in|on|from|of)\s+(?:the|this|that)\s+"
-    rf"(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b{_NOT_THE_USERS})"
+    rf"|(?:(?:the|any)\s+)?(?:text|content|contents|writing)\s+(?:in|on|from|of|within)\s+{_IN_THIS_IMAGE})"
 )
 # What a model refuses to transcribe (a verb people rarely use about themselves): also
-# pages, documents or text ("copyrighted book pages").
+# pages, documents or text ("copyrighted book pages", "the text from this image").
 _TRANSCRIPTION_OBJECT = (
-    rf"{_MODEL_DETERMINER}{_FILLER}(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
-    rf"{_NOT_THE_USERS}"
+    rf"(?:{_MODEL_DETERMINER}{_FILLER}(?:{_IMAGE_NOUN}|text|content|contents|document|documents|page|pages)\b"
+    rf"{_NOT_THE_USERS}(?:\s+(?:in|on|from|of)\s+{_IN_THIS_IMAGE})?|it|this|that)"
+    r"(?:\s+(?:in\s+full|in\s+(?:its|their)\s+entirety|verbatim|word\s+for\s+word))?"
 )
-_END = r"\s*[.!]?\s*$"
-# What a refusal refuses. It must end at its object, and the answer with it ("I can't
-# read the scans until Dr. Lee signs off." is a note, "I can't help falling in love" a
-# lyric); only the model's own verb, "transcribe", may go on. A refusal followed by more
-# sentences ("... If you have any other questions, feel free to ask!") reads the same as
-# a note ("I can't help. It is too late to change the order."): it is left to the judge.
+
+# A reason is made only of words about the image's quality or sensitivity: "because the
+# resolution is too low", "as it appears to contain copyrighted material". Any other word
+# (a name, a number, "a factory floor") makes it content.
+_REASON_WORD = (
+    rf"(?:it{_APOS}s|its|it|the|this|that|a|an|image|picture|photo|scan|screenshot|text|writing|handwriting"
+    r"|characters|words|resolution|quality|lighting|contrast|focus|is|are|was|were|be|too|very|quite|extremely"
+    r"|rather|so|low|poor|bad|blurry|blurred|small|tiny|faint|dark|unclear|illegible|unreadable|not|legible"
+    r"|readable|clear|visible|enough|pixelated|faded|grainy|out|of|obscured|cropped|appears|seems|looks|to"
+    r"|contain|contains|may|might|could|copyrighted|copyright|protected|material|materials|content|sensitive"
+    r"|personal|private|confidential|information|data|identifiable|details|and|or|due|lack|clarity|sharpness)\b"
+)
+_REASON_WORDS = rf"{_REASON_WORD}(?:\s+{_REASON_WORD}){{0,14}}"
+# "..., because it's too blurry", "... as it appears to contain copyrighted material"
+_REASON_CLAUSE = rf"(?:\s*,?\s*(?:because|as|since|due\s+to)\s+{_REASON_WORDS})"
+# A sentence of its own after the refusal: "It appears to be too blurry."
+_REASON_SENTENCE = (
+    rf"(?:it|this|the\s+(?:{_IMAGE_NOUN}|text|writing|handwriting|resolution|quality|content))\s+{_REASON_WORDS}"
+)
+
+# A model's stock courtesy tail: nothing from the image in it.
+_CLEARER = r"(?:clearer|sharper|higher[- ]resolution|higher[- ]quality|better(?:[- ]quality)?|more\s+legible|larger)"
+_COPY_NOUN = rf"(?:{_IMAGE_NOUN}|version|copy)"
+_COURTESY = (
+    rf"(?:please\s+(?:provide|upload|send|share|try)\s+(?:(?:a|an)\s+{_CLEARER}|another)\s+{_COPY_NOUN}"
+    rf"(?:\s+of\s+the\s+(?:page|document|text|{_IMAGE_NOUN}))?"
+    rf"|if\s+you\s+(?:can|could)\s+(?:provide|upload|share|send)\s+(?:(?:a|an)\s+{_CLEARER}|another)\s+{_COPY_NOUN}"
+    rf"(?:\s+of\s+the\s+(?:page|document|text))?\s*,?\s*i(?:{_APOS}d|\s+would|{_APOS}ll|\s+will)\s+be\s+(?:happy|glad)\s+to"
+    r"\s+(?:help|assist|try\s+again)(?:\s+with\s+(?:that|it|the\s+transcription))?"
+    r"|if\s+you\s+have\s+any\s+other\s+(?:questions|requests)(?:\s+or\s+need\s+(?:help|assistance)\s+with\s+something\s+else)?"
+    rf"\s*,?\s*(?:feel\s+free\s+to\s+ask|let\s+me\s+know|i(?:{_APOS}d|\s+would)\s+be\s+happy\s+to\s+help)"
+    r"|is\s+there\s+anything\s+else\s+i\s+can\s+(?:help\s+(?:you\s+)?with|do\s+for\s+you|assist\s+(?:you\s+)?with)"
+    rf"|let\s+me\s+know\s+if\s+there(?:{_APOS}s|\s+is)\s+anything\s+else\s+i\s+can\s+(?:help\s+(?:you\s+)?with|do\s+for\s+you))"
+)
+# "..., but I can summarize the general topic if you'd like."
+_OFFER = (
+    r"but\s+i\s+can\s+(?:summarize|describe|provide\s+a\s+(?:summary|description)\s+of)\s+"
+    r"(?:it|this|that|the\s+(?:general\s+)?(?:topic|content|contents|main\s+points|image|page|document))"
+    rf"(?:\s+for\s+you)?(?:\s+if\s+you(?:{_APOS}d|\s+would)\s+like)?"
+)
+_SENTENCE_BREAK = r"(?:(?<=[.!?])\s+|\s*\n\s*)"
+_TAIL_RES = (
+    re.compile(rf"{_SENTENCE_BREAK}{_COURTESY}\s*[.!?]?\s*$", re.IGNORECASE),
+    re.compile(rf"{_SENTENCE_BREAK}{_REASON_SENTENCE}\s*[.!]?\s*$", re.IGNORECASE),
+    re.compile(rf"\s*[,;]\s*{_OFFER}\s*[.!]?\s*$", re.IGNORECASE),
+)
+
+# What a refusal refuses: the request, the image, its text or its page.
 _BARE_REFUSED = (
-    rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request))?{_END}"
-    rf"|comply\s+with\s+(?:that|this|the)\s+request{_END}"
+    rf"(?:(?:help|assist)(?:\s+(?:you\s+)?with\s+(?:that|this|it|(?:that|this|the)\s+request|{_IMAGE_OBJECT}))?"
+    r"|comply\s+with\s+(?:that|this|it|(?:that|this|the)\s+request)"
+    r"|provide\s+(?:any\s+)?(?:assistance|help)\s+with\s+(?:that|this|it|(?:that|this|the)\s+request)"
     rf"|transcribe\s+{_TRANSCRIPTION_OBJECT}"
-    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}{_END}"
-    rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?{_END})"
+    rf"|(?:read|process|extract|identify|recogni[sz]e|analy[sz]e)\s+{_IMAGE_OBJECT}"
+    rf"|(?:provide|share|give\s+you)\s+(?:the\s+|any\s+)?(?:text|content|contents|writing)\s+(?:from|in|of)\s+{_IN_THIS_IMAGE}"
+    rf"|provide\s+(?:a\s+|the\s+|any\s+)?(?:transcription|description)(?:\s+of\s+{_IMAGE_OBJECT})?)"
 )
 # What a model declines to help with: people, or the image and its text -- never "your
 # ..." ("... help with identifying or making assumptions about people in images").
@@ -93,103 +145,126 @@ _MODEL_TOPIC = (
 _APOLOGY_REFUSED = (
     rf"(?:{_BARE_REFUSED}"
     r"|(?:help|assist)\s+(?:you\s+)?with\s+(?:identifying|recogni[sz]ing|transcribing|reading|analy[sz]ing|processing)\b"
-    rf"{_MODEL_TOPIC}{_END}"
+    rf"{_MODEL_TOPIC}"
     r"|provide\s+(?:a\s+|the\s+|any\s+)?transcription\s+of\s+"
-    rf"(?:{_TRANSCRIPTION_OBJECT}|(?:the\s+|this\s+|any\s+)?copyrighted\s+\w+(?:\s+\w+)?){_END}"
-    rf"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?{_END})"
+    rf"(?:{_TRANSCRIPTION_OBJECT}|(?:the\s+|this\s+|any\s+)?copyrighted\s+\w+(?:\s+\w+)?)"
+    r"|(?:do|fulfil?l)\s+(?:that|this)(?:\s+request)?)"
+)
+# The apology itself, and nothing between it and the refusal ("I'm sorry Dave, I'm
+# afraid I can't do that." is a quote).
+_APOLOGY = (
+    r"(?:(?:i['’]?m\s+|i\s+am\s+)?(?:very\s+|so\s+|really\s+|truly\s+|terribly\s+)?sorry"
+    r"(?:\s+for\s+(?:the|any)\s+inconvenience)?"
+    r"|unfortunately|(?:my\s+)?apologies|i\s+apologi[sz]e(?:\s+for\s+(?:the|any)\s+inconvenience)?)"
+    r"\s*[,.!]?\s*(?:but\s+)?"
 )
 _TEXT_QUALIFIER = r"(?:readable|visible|legible|discernible|recogni[sz]able|extractable|clear)"
+_TEXT_NOUN = r"(?:text|content|words|characters|writing)"
 # Absence of text, not quality ("The photo is blurry." is also an app's hint to the user).
 _BLANK = (
     r"(?:(?:mostly|completely|entirely|totally|largely|almost\s+entirely)\s+)?"
     r"(?:blank|empty|illegible|unreadable|not\s+(?:legible|readable))"
 )
 _IN_THE_IMAGE = rf"(?:in|on|within)\s+(?:this|the)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b"
+_IN_IMAGE = rf"(?:in|on|within)\s+(?:(?:this|the)\s+)?(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\b"
+_NO_TEXT = (
+    # "The image appears to be blank (or contains no visible text)", "The page seems to be
+    # mostly empty" (a page or document only with the hedge: "This page is intentionally
+    # left blank." is page text)
+    rf"(?:(?:the|this)\s+(?:(?:provided|given)\s+)?(?:{_IMAGE_NOUN}\s+(?:is|was|appears\s+to\s+be|seems\s+to\s+be"
+    r"|looks(?:\s+to\s+be)?)|(?:page|document)\s+(?:appears\s+to\s+be|seems\s+to\s+be|looks(?:\s+to\s+be)?))\s+"
+    rf"{_BLANK}(?:\s+(?:or|and)\s+(?:contains|has)\s+no\s+(?:{_TEXT_QUALIFIER}\s+)?(?:text|content|writing))?"
+    # "There is no readable text in this image", "There's no text visible in this image"
+    rf"|(?:there\s+is|there{_APOS}s|there\s+are)\s+no\s+(?:{_TEXT_QUALIFIER}\s+)?{_TEXT_NOUN}"
+    rf"(?:\s+(?:visible|present|detected))?\s+{_IN_THE_IMAGE}"
+    # "No text detected.", "No text detected in image" (doc2mark's own prompt asks for it)
+    rf"|no\s+(?:{_TEXT_QUALIFIER}\s+)?text\s+(?:was\s+|were\s+|is\s+|could\s+be\s+)?"
+    rf"(?:(?:detected|found|present|visible|recogni[sz]ed|identified|extracted|available)(?:\s+{_IN_IMAGE})?|{_IN_IMAGE})"
+    # "I don't see any text in the image", "I could not find any content to transcribe"
+    rf"|i\s+(?:do\s+not|don{_APOS}t|did\s+not|didn{_APOS}t|could\s+not|couldn{_APOS}t|cannot|can{_APOS}t)\s+"
+    rf"(?:see|find|detect|identify|locate|make\s+out)\s+any\s+(?:{_TEXT_QUALIFIER}\s+)?{_TEXT_NOUN}"
+    rf"(?:\s+to\s+(?:transcribe|extract))?(?:\s+{_IN_THE_IMAGE})?"
+    # "The image does not contain any text.", "This image contains no text."
+    rf"|(?:the|this)\s+(?:(?:provided|given)\s+)?{_IMAGE_NOUN}\s+(?:(?:does\s+not|doesn{_APOS}t|did\s+not|didn{_APOS}t)"
+    r"\s+(?:appear\s+to\s+|seem\s+to\s+)?(?:contain|have|include|show)\s+any|(?:contains|has|shows|appears\s+to\s+contain"
+    rf"|seems\s+to\s+contain)\s+no)\s+(?:{_TEXT_QUALIFIER}\s+)?{_TEXT_NOUN}"
+    # the whole answer is a placeholder: "[No content]", "No readable text.", "Illegible."
+    r"|\[\s*(?:no\s+(?:readable\s+)?(?:text|content)(?:\s+(?:found|detected|available))?"
+    r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\]"
+    r"|no\s+(?:readable\s+)?text(?:\s+(?:found|detected|available))?|illegible|unreadable)"
+)
+_END = r"\s*[.!]?"
 _ZH_IMAGE = r"(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
 # ... the image (中的文字 / 的內容), and nothing after it but the full stop.
 _ZH_IMAGE_END = (
-    r"(?:這張|这张|此|該|该|本|這個|这个)?[^。，,\n]{0,6}?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
-    r"(?:中|裡|里|上|內|内)?(?:的)?(?:文字|內容|内容|字|資訊|信息)?[。.!！]?\s*$"
+    rf"(?:這張|这张|此|該|该|本|這個|这个)?[^。，,\n0-9]{{0,6}}?{_ZH_IMAGE}"
+    r"(?:中|裡|里|上|內|内)?(?:的)?(?:文字|內容|内容|字|資訊|信息)?[。.!！]?"
 )
 _ZH_READ = r"(?:辨識|辨识|識別|识别|讀取|读取|處理|处理|轉錄|转录|解析|看清|判讀|判读)"
+# Gaps inside a non-English sentence: no digits or quotes (a number or a quote is content).
+_GAP = r"[^.\n0-9\"“”„«»「」]"
 
-# Patterns anchored at the start of the (normalized) answer. Case-insensitive. Each one
-# needs the model speaking about itself or about its input image.
-_START_PATTERNS = [
+# The whole answer (after the courtesy tail and a reason sentence are set aside) is one of
+# these. Case-insensitive; each needs the model speaking about itself or its input image.
+_WHOLE_PATTERNS = [
     # "I'm sorry, but I can't assist with that request.", "Sorry, I cannot read this image."
-    rf"(?:i{_APOS}?m\s+|i\s+am\s+)?(?:very\s+|so\s+|really\s+|truly\s+)?sorry\b[^.!?\n]{{0,60}}?"
-    rf"\b(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|must\s+not))\s+(?:\w+\s+){{0,3}}?{_APOLOGY_REFUSED}",
-    rf"(?:unfortunately|apologies|my\s+apologies|i\s+apologi[sz]e)\b[^.!?\n]{{0,60}}?\b{_I_NEG}\s+"
-    rf"(?:\w+\s+){{0,3}}?{_APOLOGY_REFUSED}",
+    rf"{_APOLOGY}(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|must\s+not))\s+(?:\w+\s+){{0,3}}?{_APOLOGY_REFUSED}"
+    rf"{_REASON_CLAUSE}?{_END}",
     # "I can't transcribe copyrighted book pages", "I am unable to read the text in this image."
-    rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_BARE_REFUSED}",
-    rf"(?=[^.\n]*\b{_IMAGE_NOUN}\b)as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,\s*"
-    rf"(?:{_I_NEG}|i\s*(?:do(?:n{_APOS}t|\s+not)|am\s+not|have\s+no))",
-    # "The image appears to be blank", "The page seems to be mostly empty" (a page or
-    # document only with the hedge: "This page is intentionally left blank." is page text)
-    rf"(?:the|this)\s+(?:(?:provided|given)\s+)?(?:{_IMAGE_NOUN}\s+(?:is|was|appears\s+to\s+be|seems\s+to\s+be"
-    r"|looks(?:\s+to\s+be)?)|(?:page|document)\s+(?:appears\s+to\s+be|seems\s+to\s+be|looks(?:\s+to\s+be)?))\s+"
-    rf"{_BLANK}",
-    # "There is no readable text in this image", "No text detected.", "I don't see any text in the image"
-    rf"(?:there\s+is|there{_APOS}s|there\s+are)\s+no\s+(?:{_TEXT_QUALIFIER}\s+)?"
-    rf"(?:text|content|words|characters|writing)\s+{_IN_THE_IMAGE}",
-    rf"no\s+(?:{_TEXT_QUALIFIER}\s+)?text\s+(?:was\s+|were\s+|is\s+|could\s+be\s+)?"
-    rf"(?:(?:detected|found|present|visible|recogni[sz]ed|identified|extracted|available)(?:\s+{_IN_THE_IMAGE})?"
-    rf"\s*[.!]?$|{_IN_THE_IMAGE})",
-    rf"i\s+(?:do\s+not|don{_APOS}t|did\s+not|didn{_APOS}t|could\s+not|couldn{_APOS}t|cannot|can{_APOS}t)\s+"
-    rf"(?:see|find|detect|identify|locate|make\s+out)\s+any\s+(?:{_TEXT_QUALIFIER}\s+)?"
-    rf"(?:text|content|words|characters|writing)(?:\s+{_IN_THE_IMAGE}|\s*[.!]?$)",
-    # the whole answer is a placeholder: "[No content]", "No readable text.", "Illegible."
-    r"\[\s*(?:no\s+(?:readable\s+)?(?:text|content)(?:\s+(?:found|detected|available))?"
-    r"|blank(?:\s+(?:page|image))?|empty(?:\s+(?:page|image))?|illegible|unreadable)\s*\][.!]?$",
-    r"(?:no\s+(?:readable\s+)?text(?:\s+(?:found|detected|available))?|illegible|unreadable)[.!]?$",
+    rf"{_I_NEG}\s+(?:\w+\s+){{0,2}}?{_BARE_REFUSED}{_REASON_CLAUSE}?{_END}",
+    # "As an AI language model, I cannot read the contents of this document image."
+    rf"as\s+an\s+ai(?:\s+(?:language\s+)?model|\s+assistant)?\s*,\s*(?:{_I_NEG}|i\s*do(?:n{_APOS}t|\s+not))\s+"
+    rf"(?:\w+\s+){{0,2}}?{_BARE_REFUSED}{_REASON_CLAUSE}?{_END}",
+    # "This image may contain sensitive personal information, so I won't transcribe it."
+    rf"(?:the|this)\s+(?:{_IMAGE_NOUN}|content|text|page|document)\s+{_REASON_WORDS}\s*[,;]\s*so\s+{_I_NEG}\s+"
+    rf"(?:transcribe|provide\s+(?:a\s+)?transcription\s+of|extract\s+(?:the\s+)?text\s+from)\s+(?:it|this|that)"
+    rf"(?:\s+{_IMAGE_NOUN})?{_END}",
+    # "The image appears to be blank.", "The page seems to be mostly empty; I could not
+    # find any content to transcribe."
+    rf"{_NO_TEXT}(?:\s*[.;,]\s*(?:and\s+)?{_NO_TEXT})?{_REASON_CLAUSE}?{_END}",
     # Chinese: first person (我) cannot read the image
-    rf"(?=[^。\n]*我)(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n]{{0,30}}?"
-    rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
-    rf"我(?:無法|无法|不能|沒辦法|没办法)[^。，,\n]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
+    rf"(?=[^。\n]*我)(?:很|非常|十分)?(?:抱歉|對不起|对不起|不好意思)[^。！？!?\n0-9]{{0,30}}?"
+    rf"(?:無法|无法|不能|沒辦法|没办法|未能)[^。，,\n0-9]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
+    rf"我(?:無法|无法|不能|沒辦法|没办法)[^。，,\n0-9]{{0,6}}?{_ZH_READ}{_ZH_IMAGE_END}",
     r"(?:這張|这张|此|該|该|本|這個|这个)?(?:圖片|图片|影像|圖像|图像|照片|畫面|画面)"
     r"(?:中|裡|里|上|內|内)?(?:並|并)?(?:沒有|没有|無|无|不含|未包含|未發現|未发现|找不到|未能找到)"
-    r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)[。.!！]?\s*$",
+    r"(?:任何)?(?:可(?:辨識|辨识|識別|识别|讀取|读取|讀|读|見|见)的?|清晰的?)?(?:文字|內容|内容|字)[。.!！]?",
     # Japanese
     r"(?=[^。\n]*(?:画像|写真|イメージ))(?![^\n]*(?:アップロード|お客様|現在))"
-    r"(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n]{0,40}?"
-    r"(?:読み取|読|認識|処理|文字起こし|転記|抽出|判読)[^。\n]{0,10}?(?:できません|ません|不可|困難)",
+    r"(?:申し訳(?:ありません|ございません)|すみません|ごめんなさい)[^。\n0-9]{0,40}?"
+    r"(?:読み取|読|認識|処理|文字起こし|転記|抽出|判読)[^。\n0-9]{0,10}?(?:できません|ません|不可|困難)(?:でした)?[。.!！]?",
     r"(?:この)?画像(?:に|には|の中に)(?:は)?(?:読み取れる|判読できる|認識できる)?(?:文字|テキスト)"
-    r"(?:は|が)(?:ありません|含まれていません|見つかりません|見当たりません)",
+    r"(?:は|が)(?:ありません|含まれていません|見つかりません|見当たりません)(?:でした)?[。.!！]?",
     # Korean
-    r"(?=[^.\n]*(?:이미지|사진|그림))(?![^\n]*(?:현재|업로드|고객님))(?:죄송|미안)(?:하지만|합니다|해요)[^.\n]{0,40}?"
-    r"(?:인식|읽|처리|추출|판독|전사)[^.\n]{0,10}?(?:수\s*없|못)",
+    rf"(?=[^.\n]*(?:이미지|사진|그림))(?![^\n]*(?:현재|업로드|고객님))(?:죄송|미안)(?:하지만|합니다|해요){_GAP}{{0,40}}?"
+    rf"(?:인식|읽|처리|추출|판독|전사){_GAP}{{0,10}}?(?:수\s*없|못){_GAP}{{0,8}}?[.!]?",
     r"(?:이\s*)?이미지(?:에는|에|에서)\s*(?:읽을\s*수\s*있는\s*)?(?:텍스트|글자|문자)(?:가|는)\s*"
-    r"(?:없습니다|없어요|보이지\s*않습니다)",
-    # German ("Ihr Foto" is a person writing to someone)
+    r"(?:없습니다|없어요|보이지\s*않습니다)[.!]?",
+    # German ("Ihr Foto" / "du" is a person writing to someone)
     r"(?=[^.\n]*\b(?:bild|bildes|bilde|foto|fotos|abbildung|grafik|scan)\b)"
-    r"(?![^\n]*\b(?:ihr|ihre|ihren|ihrem|ihrer|ihres|dein|deine|deinen|deinem)\b)"
+    r"(?![^\n]*\b(?:ihr|ihre|ihren|ihrem|ihrer|ihres|dein|deine|deinen|deinem|du|dich|dir)\b)"
     r"(?:leider\s+(?:kann|konnte)\s+ich|es\s+tut\s+mir\s+leid[,.\s]+(?:aber\s+)?ich\s+(?:kann|konnte)"
     r"|ich\s+(?:kann|konnte)\s+(?:den|diesen|dieses|das|die)\s+(?:text|bild|inhalt))\b"
-    r"[^.\n]{0,80}?\b(?:nicht|keinen|keine)\b[^.\n]{0,40}?"
-    r"(?:erkennen|lesen|entziffern|transkribieren|verarbeiten|extrahieren)",
-    r"(?:das|dieses)\s+bild\s+enth(?:ä|ae)lt\s+keinen\s+(?:lesbaren\s+|erkennbaren\s+)?text",
-    # Spanish (first person; "su foto" is a person writing to someone)
-    r"(?=[^.\n]*\b(?:imagen|foto|fotograf(?:í|i)a)\b)(?![^\n]*\b(?:su|sus|tu|tus|usted|ustedes)\b)"
-    r"(?:(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+[^.\n]{0,40}?)?no\s+(?:puedo|pude)\s+"
-    r"(?:\w+\s+){0,2}?(?:transcribir|leer|procesar|extraer|reconocer|identificar)",
+    rf"{_GAP}{{0,80}}?\b(?:nicht|keinen|keine)\b{_GAP}{{0,40}}?"
+    r"(?:erkennen|lesen|entziffern|transkribieren|verarbeiten|extrahieren)[.!]?",
+    r"(?:das|dieses)\s+bild\s+enth(?:ä|ae)lt\s+keinen\s+(?:lesbaren\s+|erkennbaren\s+)?text[.!]?",
+    # Spanish (first person; "su foto" / "tú" is a person writing to someone)
+    r"(?=[^.\n]*\b(?:imagen|foto|fotograf(?:í|i)a)\b)(?![^\n]*\b(?:su|sus|tu|tus|usted|ustedes|te|me)\b)"
+    rf"(?:(?:lo\s+siento|lamentablemente|disculpa|perd(?:ó|o)n)[,.\s]+{_GAP}{{0,40}}?)?no\s+(?:puedo|pude)\s+"
+    r"(?:\w+\s+){0,2}?(?:transcribir|leer|procesar|extraer|reconocer|identificar)"
+    r"(?:\s+[^.\n,;¿?!0-9\"“”«»]{1,60})?[.!]?",
     # French ("vous" is a person writing to someone)
     r"(?=[^.\n]*\b(?:image|photo|capture)\b)(?![^\n]*\b(?:vous|votre|vos|tu|ton|ta|tes|te)\b)"
-    r"(?:(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+[^.\n]{0,40}?)?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
+    rf"(?:(?:je\s+suis\s+)?d(?:é|e)sol(?:é|e)e?[,.\s]+{_GAP}{{0,40}}?)?je\s+ne\s+(?:peux|parviens|suis\s+pas\s+en\s+mesure)\s+"
     r"(?:pas\s+)?(?:de\s+|à\s+)?(?:\w+\s+){0,2}?"
-    r"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier)",
+    r"(?:transcrire|lire|traiter|extraire|reconna(?:î|i)tre|identifier)"
+    r"(?:\s+[^.\n,;?!0-9\"“”«»]{1,60})?[.!]?",
 ]
-_START_RE = re.compile("|".join(f"(?:{p})" for p in _START_PATTERNS), re.IGNORECASE)
-# A refusal clause anywhere in a short answer: "..., so I won't transcribe it."
-_ANYWHERE_RE = re.compile(
-    rf"\bi\s*(?:won{_APOS}?t|will\s+not|can(?:no|{_APOS})?t|can\s+not|(?:am|{_APOS}m)\s+(?:unable|not\s+able)\s+to)\s+"
-    r"(?:transcribe|provide\s+(?:a\s+)?transcription\s+of|extract\s+(?:the\s+)?text\s+from)"
-    rf"\s+(?:it|this|that)(?:\s+{_IMAGE_NOUN})?\s*(?:[.!,]|$)",
-    re.IGNORECASE,
-)
+_WHOLE_RE = re.compile("|".join(f"(?:{p})" for p in _WHOLE_PATTERNS), re.IGNORECASE)
 # An answer that asks someone to do something (resend, retake, upload, try again, "can
 # you ...", "please") reads as a support message or an app's error, which is page text as
-# often as a refusal: the patterns leave it to the judge.
+# often as a refusal: the patterns leave it to the judge. Checked after the model's stock
+# courtesy tail is set aside.
 _ADDRESSES_A_USER = re.compile(
     r"\b(?:can|could|would|will)\s+you\b|\bplease\b|\b(?:re-?take|re-?send|re-?submit|re-?upload|re-?scan|upload"
     r"|zoom|try\s+again)\b|請|请|麻煩|麻烦|再傳|再传|重新上傳|重新上传|可以再|能否|ください|お願い|주세요"
@@ -205,26 +280,42 @@ def _normalize(text: str) -> str:
     return (text or "").strip().strip(_WRAPPER_CHARS).strip()
 
 
+def _without_tails(answer: str) -> str:
+    """``answer`` without the model's stock courtesy tail, a reason sentence made only of
+    image-quality words, and an offer to summarize instead (each at most twice)."""
+    for _ in range(4):
+        for tail in _TAIL_RES:
+            match = tail.search(answer)
+            if match and match.start() > 0:
+                answer = answer[: match.start()].rstrip()
+                break
+        else:
+            break
+    return answer
+
+
 def matches_non_content_pattern(text: str) -> bool:
-    """Whether ``text`` is a short answer that starts with (or is) a refusal or a
-    "no readable text" statement, by the deterministic multilingual patterns alone."""
+    """Whether ``text`` is a short answer that is, as a whole, a refusal or a "no
+    readable text" statement, by the deterministic multilingual patterns alone."""
     answer = _normalize(text)
     if not answer or len(answer) > MAX_PATTERN_CHARS:
         return False
-    if sum(1 for line in answer.splitlines() if line.strip()) > MAX_PATTERN_LINES:
-        return False
-    if _ADDRESSES_A_USER.search(answer):
+    lines = [" ".join(line.split()) for line in answer.split("\n") if line.strip()]
+    if len(lines) > MAX_PATTERN_LINES:
         return False
     # One space between words, one line break between lines: the patterns' optional
     # whitespace cannot backtrack over long runs of blanks.
-    answer = "\n".join(" ".join(line.split()) for line in answer.split("\n") if line.strip())
-    return bool(_START_RE.match(answer) or _ANYWHERE_RE.search(answer))
+    answer = _without_tails("\n".join(lines))
+    if not answer or _ADDRESSES_A_USER.search(answer):
+        return False
+    return _WHOLE_RE.fullmatch(answer) is not None
 
 
 def non_content_reason(text: str, judge: Optional[NonContentJudge] = None) -> Optional[str]:
     """Why ``text`` is not page content -- ``"pattern"`` (deterministic match) or
     ``"judge"`` (the optional :data:`NonContentJudge` said so) -- or ``None`` to keep
-    it. Empty text is not judged here (it is simply empty)."""
+    it. Empty text is not judged here (it is simply empty). Pass the answer as the
+    model wrote it, not its Markdown-escaped rendering."""
     answer = _normalize(text)
     if not answer:
         return None

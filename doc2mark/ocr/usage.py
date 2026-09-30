@@ -30,6 +30,8 @@ from doc2mark.ocr.cache import FROM_CACHE_METADATA_KEY
 
 # Distinct error messages kept per document in ``ocr_issues["errors"]``.
 _MAX_ISSUE_ERRORS = 5
+# Issue locations kept per document in ``ocr_issues["locations"]``.
+_MAX_ISSUE_LOCATIONS = 100
 
 # Read-side key aliases: the LLM providers emit LangChain's ``usage_metadata``
 # (input_tokens/output_tokens/total_tokens), but be defensive about the common
@@ -68,7 +70,7 @@ def _first_present(usage: Dict[str, Any], keys: Iterable[str]) -> int:
 
 def new_issue_sink() -> Dict[str, Any]:
     """A fresh per-document OCR issue record (see ``pop_document_issues``)."""
-    return {"refused": 0, "failed": 0, "withheld": 0, "errors": [], "engine_error": None}
+    return {"refused": 0, "failed": 0, "withheld": 0, "errors": [], "locations": [], "engine_error": None}
 
 
 def merge_usage_into(sink: Dict[str, int], usage: Optional[Dict[str, Any]]) -> None:
@@ -164,6 +166,8 @@ class UsageAggregatingOCR(BaseOCR):
         """Start (or reset) the token-usage and OCR-issue accumulators for the current thread."""
         self._usage_local.sink = new_usage_sink()
         self._usage_local.issues = new_issue_sink()
+        self._usage_local.images_seen = 0
+        self._usage_local.last_batch = (0, 0)
 
     def pop_document_issues(self) -> Optional[Dict[str, Any]]:
         """Return this load's OCR issues and clear them, or ``None`` when there were none.
@@ -172,7 +176,10 @@ class UsageAggregatingOCR(BaseOCR):
         statement (``refused``, emitted as empty text), images that failed
         (``failed``) and images that still withhold values after the router
         firewall's verbatim redo (``withheld``), plus up to five distinct error
-        messages (``errors``).
+        messages (``errors``) and where each issue happened (``locations``: one
+        ``{"issue": "refused" | "failed" | "withheld", "image": n}`` per image, ``n``
+        counting the images OCR'd during this load from 1, with the ``page`` a pipeline
+        reports through :meth:`label_last_batch`).
 
         Raises:
             OCREngineError: the OCR engine could not run at all during this load
@@ -189,7 +196,23 @@ class UsageAggregatingOCR(BaseOCR):
         issues.pop("engine_error")
         if not (issues["refused"] or issues["failed"] or issues["withheld"] or issues["errors"]):
             return None
+        if not issues["locations"]:
+            issues.pop("locations")
         return issues
+
+    def label_last_batch(self, labels: List[Dict[str, Any]]) -> None:
+        """Attach where the images of the last OCR call of this load sit in the
+        document (``labels[i]`` for its ``i``-th image, e.g. ``{"page": 3}``) to the
+        issue locations recorded for them. Called by the pipelines that know the page
+        of each image; a no-op outside a load."""
+        issues = getattr(self._usage_local, "issues", None)
+        first, count = getattr(self._usage_local, "last_batch", (0, 0))
+        if issues is None or not count:
+            return
+        for location in issues["locations"]:
+            position = location["image"] - first - 1
+            if 0 <= position < min(count, len(labels)) and isinstance(labels[position], dict):
+                location.update(labels[position])
 
     def _note_error(self, exc: BaseException) -> None:
         issues = getattr(self._usage_local, "issues", None)
@@ -228,20 +251,32 @@ class UsageAggregatingOCR(BaseOCR):
         active."""
         sink = getattr(self._usage_local, "sink", None)
         issues = getattr(self._usage_local, "issues", None)
-        for result in results:
+        results = list(results)
+        first = getattr(self._usage_local, "images_seen", 0)
+        if issues is not None:
+            self._usage_local.images_seen = first + len(results)
+            self._usage_local.last_batch = (first, len(results))
+        for position, result in enumerate(results):
             metadata = getattr(result, "metadata", None)
             if not isinstance(metadata, dict):
                 continue
             if issues is not None:
+                found = []
                 if metadata.get("ocr_refusal"):
                     issues["refused"] += 1
+                    found.append("refused")
                 if metadata.get("failed"):
                     issues["failed"] += 1
+                    found.append("failed")
                     error = metadata.get("error")
                     if error and error not in issues["errors"] and len(issues["errors"]) < _MAX_ISSUE_ERRORS:
                         issues["errors"].append(str(error))
                 if metadata.get("router_fallback") == "unresolved":
                     issues["withheld"] += 1
+                    found.append("withheld")
+                for issue in found:
+                    if len(issues["locations"]) < _MAX_ISSUE_LOCATIONS:
+                        issues["locations"].append({"issue": issue, "image": first + position + 1})
             if sink is None or metadata.get(FROM_CACHE_METADATA_KEY):
                 continue
             merge_usage_into(sink, metadata.get("token_usage"))

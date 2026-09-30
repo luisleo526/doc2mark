@@ -40,8 +40,10 @@ FROM_CACHE_METADATA_KEY = "doc2mark_from_cache"
 _NON_LLM_CONFIG_PROVIDERS = {"doc2mark.ocr.tesseract.TesseractOCR"}
 
 _SENSITIVE_KEYS = {"api_key", "key", "secret", "password", "access_token", "refresh_token"}
-# OCRConfig fields that never change a stored result: the optional judge only decides
-# whether an answer is a refusal, and refusals are not cached (see _is_cacheable).
+# OCRConfig fields left out of the full-config signature of non-LLM providers: the
+# optional judge only screens LLM answers. For the LLM providers it is part of the key
+# (see _judge_identity): an answer the patterns kept is cached, and enabling or changing
+# a judge must screen it again rather than replay it.
 _UNCACHED_CONFIG_FIELDS = {"non_content_judge"}
 _ADDRESS_REPR_PATTERN = re.compile(r"\bat 0x[0-9a-fA-F]+\b|0x[0-9a-fA-F]+")
 _STAT_COUNTERS = (
@@ -129,6 +131,20 @@ def _stable_value(value: Any, *, strict: bool = False) -> Any:
     return {"type": _type_identity(value), "repr": repr_value}
 
 
+def _judge_identity(judge: Any) -> Optional[Dict[str, Any]]:
+    """What identifies the optional ``non_content_judge`` in a cache key: its qualified
+    name (a function's, or a callable object's class) and its optional ``version``
+    attribute -- never its memory address, so the key is stable across runs."""
+    if judge is None:
+        return None
+    target = judge if hasattr(judge, "__qualname__") else type(judge)
+    version = getattr(judge, "version", None)
+    return {
+        "name": f"{getattr(target, '__module__', '')}.{getattr(target, '__qualname__', type(judge).__name__)}",
+        "version": version if isinstance(version, (str, int, float)) else None,
+    }
+
+
 def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
     """Return only the cache-relevant LLM config knobs.
 
@@ -142,6 +158,7 @@ def _slim_llm_config(config: OCRConfig) -> Dict[str, Any]:
         "structured": config.structured,
         "detail": config.detail,
         "response_model": response_model.__name__ if response_model is not None else None,
+        "non_content_judge": _judge_identity(getattr(config, "non_content_judge", None)),
     }
 
 
@@ -158,10 +175,12 @@ def _config_cache_signature(provider: Any) -> Any:
 
 
 def _is_cacheable(result: OCRResult) -> bool:
-    """A failed image or a refusal is not a stable answer: the next run must retry it
+    """A failed image, a refusal or a result that still withholds values after the
+    router firewall's verbatim redo is not a stable answer: the next run must retry it
     rather than replay it from the cache."""
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    return not (metadata.get("failed") or metadata.get("ocr_refusal"))
+    return not (metadata.get("failed") or metadata.get("ocr_refusal")
+                or metadata.get("router_fallback") == "unresolved")
 
 
 def _api_key_hash(provider: Any) -> Optional[str]:

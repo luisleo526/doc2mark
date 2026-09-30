@@ -25,7 +25,7 @@ from doc2mark.ocr.base import (
     _SYNTHESIS_MARKDOWN_INSTRUCTION,
     REFUSAL_USAGE_KEY,
 )
-from doc2mark.ocr.schema import OCRPage, RawExtraction, _sanitize_markdown, withholding_violations
+from doc2mark.ocr.schema import OCRPage, RawExtraction, withholding_violations
 
 try:
     from pydantic import BaseModel
@@ -877,8 +877,9 @@ class OpenAIOCR(BaseOCR):
             kwargs: Dict[str, Any],
     ) -> List[OCRResult]:
         """Re-OCR ``images[indices]`` with the explicit verbatim DOCUMENT task (no
-        router), for the router firewall."""
-        sub_kwargs = {k: v for k, v in kwargs.items() if k not in ("context_pdfs", "instructions", "_recovery")}
+        router), for the router firewall. The caller's other options, ``instructions``
+        included, carry over."""
+        sub_kwargs = {k: v for k, v in kwargs.items() if k not in ("context_pdfs", "_recovery")}
         context_pdfs = kwargs.get("context_pdfs")
         if context_pdfs is not None:
             sub_kwargs["context_pdfs"] = [context_pdfs[i] for i in indices]
@@ -966,8 +967,6 @@ class OpenAIOCR(BaseOCR):
                 if not kwargs.get('_firewall_retry'):
                     results = self._enforce_router_firewall(
                         results, lambda indices: self._redo_verbatim(indices, images, language, detail, kwargs))
-            elif not kwargs.get('_recovery'):
-                self._screen_free_form_answers(results)
 
             successful = len([r for r in results if r.text])
             logger.info(f"✅ VisionAgent batch complete: {successful}/{len(images)} successful")
@@ -1056,10 +1055,10 @@ class OpenAIOCR(BaseOCR):
                 text_result, token_usage = item
                 token_usage = dict(token_usage or {})
                 refusal = token_usage.pop(REFUSAL_USAGE_KEY, None)
-                text_result = "" if refusal else (text_result or "")
-                if not kwargs.get('_recovery'):
-                    # Final free-form answer: model Markdown, sanitized once at this boundary.
-                    text_result = _sanitize_markdown(text_result)
+                # Screened for a refusal on the answer as written, then sanitized once at
+                # this boundary (a recovery call's answers are screened by _apply_recovered).
+                text_result, flags = self._free_form_answer(
+                    text_result, refusal=refusal, recovery=bool(kwargs.get('_recovery')))
                 results.append(OCRResult(
                     text=text_result,
                     confidence=1.0,
@@ -1077,8 +1076,7 @@ class OpenAIOCR(BaseOCR):
                         "model_kwargs": self.model_kwargs,
                         "token_usage": token_usage,
                         "structured": False,
-                        **({"refusal": refusal, "non_content": "provider_refusal", "ocr_refusal": True}
-                           if refusal else {}),
+                        **flags,
                     }
                 ))
 
