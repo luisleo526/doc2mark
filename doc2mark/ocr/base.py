@@ -302,7 +302,7 @@ class OCRConfig:
     #   0 = off (default; zero behavior change)
     #   1 = attach context to whole-page renders only  (one upload per image page)
     #   2 = renders + non-decorative embedded images    (opt-in; more uploads)
-    # Only Gemini/Vertex consumes it today; other providers accept-and-ignore.
+    # Gemini/Vertex and PDF-capable OpenAI models attach it; Tesseract ignores it.
     context_pages: int = 0
 
     # --- Tesseract-only (inert for LLM providers) ---

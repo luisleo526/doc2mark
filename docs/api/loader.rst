@@ -15,7 +15,7 @@ files with :meth:`~doc2mark.UnifiedDocumentLoader.load` or in batches. Guide: :d
        model='gpt-5.4-mini',
        temperature=0,
        max_tokens=8192,
-       max_workers=5,
+       max_workers=None,
        prompt_template='default',
        timeout=30,
        max_retries=3,
@@ -50,21 +50,25 @@ files with :meth:`~doc2mark.UnifiedDocumentLoader.load` or in batches. Guide: :d
 ``cache_dir``, ``ocr_cache``
    The document cache folder and the OCR answer cache (:doc:`/caching`).
 ``model``, ``temperature``, ``max_tokens``
-   For ``"openai"`` and ``"vertex_ai"``. With ``"vertex_ai"`` the default ``gpt-5.4-mini`` is
-   replaced by ``gemini-3.1-flash-lite-preview``. ``"gemini"`` ignores them (use
-   ``"vertex_ai"``).
+   For ``"openai"``, ``"vertex_ai"`` and ``"gemini"``. With Vertex AI the default
+   ``gpt-5.4-mini`` means ``ocr_config.model``, else ``gemini-3.1-flash-lite-preview``.
 ``timeout``, ``max_retries``
-   Per-request timeout (seconds) and retries of the OpenAI client; not passed to Vertex AI.
+   Per-request timeout (seconds) and retries of the OpenAI or Vertex AI client.
+``max_workers``
+   At most this many OCR requests at once, when ``ocr_config.max_concurrency`` is not set
+   (``None``: ``OCR_MAX_CONCURRENCY``, else LangChain's default).
+``top_p``, ``frequency_penalty``, ``presence_penalty``
+   Sampling settings of the OpenAI request and the Vertex AI client, sent only when they differ
+   from these defaults (the API's own).
 ``base_url``
    OpenAI-compatible endpoint (default ``OPENAI_BASE_URL``).
 ``project``, ``location``
    Vertex AI project (default ``GOOGLE_CLOUD_PROJECT``) and location.
-``prompt_template``
+``prompt_template``, ``default_prompt``
    Prompt of free-form OCR answers (``structured=False`` and the retry of an empty structured
    answer): ``default``, ``table_focused``, ``document_focused``, ``multilingual``,
-   ``form_focused``, ``receipt_focused``, ``handwriting_focused``, ``code_focused``.
-``max_workers``, ``top_p``, ``frequency_penalty``, ``presence_penalty``, ``default_prompt``
-   Accepted for compatibility; they do not change the requests.
+   ``form_focused``, ``receipt_focused``, ``handwriting_focused``, ``code_focused``, or your own
+   prompt text (``default_prompt``).
 ``table_style``
    ``"minimal_html"`` (default), ``"markdown_grid"`` or ``"styled_html"`` (:doc:`/tables`).
 ``legibility_judge``, ``boilerplate_judge``, ``judge``

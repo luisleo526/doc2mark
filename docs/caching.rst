@@ -24,11 +24,14 @@ OCR cache
 The same ``ocr_cache`` argument is accepted by :func:`~doc2mark.load`,
 :func:`~doc2mark.document_to_markdown` and the batch functions. The loader wraps its provider in
 :class:`~doc2mark.ocr.cache.CachedOCR`, which also sends identical images of one batch once. Keys
-are built from the image bytes, the provider class and its model, temperature, token limit and
-prompt settings, the per-call task, language, structured and detail settings, and the
-non-content judge; API keys enter only as a hash. The task set in ``OCRConfig`` is not part of
-the key, so do not share one cache between providers configured with different tasks. The schema
-version ``ocr-cache-v6`` is part of every key: entries written by older versions are never read.
+are built from the image bytes and every setting that changes an answer: the provider class, its
+model, temperature, token limit, endpoint, project and location, its prompt template and
+``default_prompt``, its sampling settings, the ``OCRConfig`` task, language, structured mode,
+detail, response model (with its schema), parse-error mode and neighbour-page context tier, the
+per-call options, the non-content judge, and the text of doc2mark's own prompts (so another
+doc2mark version with other prompt wording does not replay these answers). API keys enter only
+as a hash. The request timeout, retries and concurrency are not part of the key. The schema
+version ``ocr-cache-v7`` is part of every key: entries written by older versions are never read.
 
 Backends
 ~~~~~~~~
@@ -36,7 +39,7 @@ Backends
 - :class:`~doc2mark.MemoryOCRCache`: in-process, thread-safe LRU with ``max_entries`` (1024).
 - :class:`~doc2mark.RedisOCRCache`: shared between processes and machines (``pip install
   "doc2mark[redis]"``); it pings Redis when created and raises if it cannot connect. Keys start
-  with ``key_prefix`` (default ``doc2mark:ocr:ocr-cache-v6``) and expire through Redis itself.
+  with ``key_prefix`` (default ``doc2mark:ocr:ocr-cache-v7``) and expire through Redis itself.
 - :class:`~doc2mark.NoOpOCRCache`: never stores anything.
 
 :func:`~doc2mark.create_ocr_cache` builds one by name and can fall back when Redis is not
@@ -98,10 +101,12 @@ Document cache
 
 Each entry is a JSON file named by a hash of the file's path, modification time and size, the
 output format, the ``load()`` options (``extract_images``, ``ocr_images``, ``encoding``,
-``delimiter``), the table style, the OCR provider class, the judges in use and the routing
-version of the PDF pipeline. The OCR model, task, language and prompt are **not** part of the
-key: clear the folder after changing them, or the old OCR text is returned. Entries never
-expire; delete the folder to clear it. A replayed document's ``metadata.extra["token_usage"]`` is
+``delimiter``), the table style, the OCR provider with the settings that change its answers (the
+same ones as in the OCR cache key above: model, task, language, structured mode, detail,
+prompts, ...), the judges in use and the routing version of the PDF pipeline, so a changed OCR
+setting converts the file again. The schema ``doc2mark-document-cache-v2`` is part of the name:
+entries written by older versions are never read. Entries never expire; delete the folder to
+clear it. A replayed document's ``metadata.extra["token_usage"]`` is
 renamed ``token_usage_cached``, because it cost nothing this time (``metadata.extra["judge"]`` is
 replayed as it was).
 

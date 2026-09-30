@@ -54,9 +54,9 @@ What each hook decides
 
 Each returns the probability of the "yes" and ``None`` when it cannot judge. For
 ``legibility_judge`` and ``boilerplate_judge``, ``None``, an exception or a value outside
-``[0, 1]`` leaves the rule's decision in place. For ``non_content_judge``, ``None`` or an
-exception keeps the answer (it is then not written to the OCR cache); its value is not
-range-checked, so return a probability.
+``[0, 1]`` leaves the rule's decision in place. For ``non_content_judge``, ``None``, an exception
+or a value that is not a probability (outside ``[0, 1]``, NaN, not a number) keeps the answer
+(it is then not written to the OCR cache).
 
 Enabling the TypeSafe judge
 ---------------------------

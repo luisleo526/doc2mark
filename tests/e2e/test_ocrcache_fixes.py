@@ -156,15 +156,17 @@ FACADE_TIMEOUT_SCRIPT = (
 def test_facade_timeout_and_retries_reach_the_openai_client(e2e_dir, receipt):
     """Issue 10/11: ``OCR("openai", timeout=1, max_retries=1)`` went into the inert ``OCRConfig.timeout`` /
     ``max_retries`` fields (a hidden DeprecationWarning), and the request waited the provider's default 30 s
-    with 3 retries. They are the provider's request timeout and retries now: a reply held back 4 s times out,
-    is tried once more, and the image is reported failed."""
+    with 3 retries. They are the provider's request timeout and retries now: a reply held back 4 s times out
+    and is tried once more, the free-form retry of the unread image does the same, and the image is reported
+    failed."""
     with FakeOpenAI(delay=4.0) as server:
-        server.script(structured=[fake.page("ACME STORE TOTAL 12.50")])
+        server.script(structured=[fake.page("ACME STORE TOTAL 12.50")], free_form=[fake.text("ACME STORE")])
         proc = run_api(e2e_dir, FACADE_TIMEOUT_SCRIPT, receipt, env=server.env)
 
     output = last_json(proc)
     assert output["failed"] is True and "ACME" not in output["text"], output
-    assert len(server.requests) == 2, len(server.requests)
+    assert len(server.requests_of("structured")) == 2, len(server.requests)
+    assert len(server.requests_of("free_form")) == 2, len(server.requests)
 
 
 # --------------------------------------------------------------------------------------------------------------

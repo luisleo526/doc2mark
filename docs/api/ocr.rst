@@ -24,25 +24,26 @@ Configuration
      - Used by
    * - ``model``
      - ``None``
-     - OpenAI (``None``: ``gpt-5.4-mini``). The Vertex AI provider takes its model from its own
-       ``model`` argument (the loader's ``model``), not from here.
+     - OpenAI (``None``: ``gpt-5.4-mini``), Vertex AI (``None``:
+       ``gemini-3.1-flash-lite-preview``). A provider's own ``model`` argument (the loader's
+       ``model``) takes precedence.
    * - ``task``
      - ``Task.AUTO``
-     - OpenAI, Vertex AI (structured prompt). Not part of the OCR cache key.
+     - OpenAI, Vertex AI (structured prompt).
    * - ``language``
      - ``None``
      - OpenAI, Vertex AI: language of the answer. Tesseract: recognition language
        (:ref:`tesseract-languages`).
    * - ``temperature``, ``max_tokens``
      - ``None``
-     - OpenAI (defaults 0 and 8192).
+     - OpenAI, Vertex AI (defaults 0 and 8192), unless the provider's own argument is given.
    * - ``base_url``
      - ``None``
      - OpenAI (else ``OPENAI_BASE_URL``).
    * - ``max_concurrency``
      - ``None``
-     - OpenAI, Vertex AI (else ``OCR_MAX_CONCURRENCY``, else LangChain's default); PDF batch
-       size.
+     - OpenAI, Vertex AI (else the provider's ``max_workers``, else ``OCR_MAX_CONCURRENCY``, else
+       LangChain's default); PDF batch size.
    * - ``structured``
      - ``True``
      - OpenAI, Vertex AI: ``False`` gives free-form Markdown and ``document=None``.
@@ -51,8 +52,9 @@ Configuration
      - ``"raw"`` asks for no interpretation (Vertex AI also drops it).
    * - ``response_model``
      - ``None``
-     - A pydantic model to parse into instead of :class:`~doc2mark.ocr.schema.OCRPage` (Vertex AI; with
-       OpenAI a model without an ``interpretation`` field fails).
+     - A pydantic model to parse into instead of :class:`~doc2mark.ocr.schema.OCRPage` (OpenAI,
+       Vertex AI): ``OCRResult.document`` is the parsed object, ``OCRResult.text`` its fields
+       as JSON.
    * - ``on_parse_error``
      - ``"raw_text"``
      - ``"raw_text"`` keeps the raw answer when parsing fails, ``"raise"`` raises.
@@ -70,7 +72,9 @@ Configuration
    * - ``detect_tables``, ``timeout``, ``max_retries``, ``extra``
      - ``True``, ``30``, ``3``, ``None``
      - Nothing; deprecated (a non-default value makes the OpenAI and Vertex AI providers emit a
-       ``DeprecationWarning``). The request timeout and retries are provider arguments.
+       ``DeprecationWarning`` naming your line). The request timeout and retries are provider
+       arguments: the loader's ``timeout`` / ``max_retries``, and ``OCR(..., timeout=...)``
+       passes them to the provider, not to this config.
 
 Results and enums
 -----------------
@@ -80,8 +84,8 @@ Results and enums
    ``text`` (Markdown, ``""`` for a refusal or a failure), ``confidence``, ``language``,
    ``metadata`` (LLM providers: ``model``, ``token_usage``, flags such as ``failed`` and
    ``ocr_refusal``; Tesseract: engine details and ``failed``) and ``document``
-   (an :class:`~doc2mark.ocr.schema.OCRPage`, or ``None`` for free-form answers and failed Tesseract
-   images).
+   (an :class:`~doc2mark.ocr.schema.OCRPage`, the parsed object of your ``response_model``, or
+   ``None`` for free-form answers and failed Tesseract images).
 
 .. autoclass:: doc2mark.Task
    :members:
