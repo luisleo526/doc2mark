@@ -244,7 +244,8 @@ indexes such an answer as page content:
    "I can't read the text in this image.", "The image appears to be blank.", "No text
    detected.", and the same statements in Chinese, Japanese, Korean, German, Spanish
    and French. The check is conservative. Text that addresses a reader (a request to
-   resend or retake, "your photo", "please"), talks about a file, folder or system, or
+   resend or retake, "your photo", "please"), talks about a file, folder or system,
+   goes on past what it refuses ("I can't read the scans until Dr. Lee signs off.") or
    merely mentions an apology ("Sorry we missed you!", "This page intentionally left
    blank.") is kept; what the check cannot decide is left to the judge below.
 3. A structured answer with no content goes to the free-form recovery, as an empty
