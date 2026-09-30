@@ -136,18 +136,38 @@ def html_tables(markdown: str, *, nested: bool = False) -> List[List[List[Option
     return [_grid(table) for table in tables]
 
 
+def _rows(children) -> list:
+    """The rows among these children. Cells placed directly in a table or row group form a
+    row of their own, as a browser's parser gives them one (``<table><td>`` gets a ``<tr>``)."""
+    rows, cells = [], []
+    for child in children:
+        if not isinstance(child.tag, str):  # comments
+            continue
+        if child.tag in ("td", "th"):
+            cells.append(child)
+            continue
+        if cells:
+            rows.append(cells)
+            cells = []
+        if child.tag == "tr":
+            rows.append(child)
+    if cells:
+        rows.append(cells)
+    return rows
+
+
 def _row_groups(table) -> List[list]:
     groups, loose = [], []
     for child in table:
         if child.tag in ("thead", "tbody", "tfoot"):
             if loose:
-                groups.append(loose)
+                groups.append(_rows(loose))
                 loose = []
-            groups.append([row for row in child if row.tag == "tr"])
-        elif child.tag == "tr":
+            groups.append(_rows(child))
+        else:
             loose.append(child)
     if loose:
-        groups.append(loose)
+        groups.append(_rows(loose))
     return groups
 
 
