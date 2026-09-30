@@ -301,6 +301,13 @@ NEGATIVE_FORMATS = [
     ("[Red][<0]#,##0.00;[Blue][>0]#,##0.00;0.00", 1234.5, "1,234.50"),
     ("[<=100]0;[>100]#,##0", -50, "-50"),
     ("[<=100]0;[>100]#,##0", 1500, "1,500"),
+    # Quoted text is a label, never the sign, even when it contains "(" or "-".
+    ('#,##0" (est)";[Red]#,##0" (est)"', -1234, "-1,234 (est)"),
+    ('"US-$"#,##0;[Red]"US-$"#,##0', -1234, "-US-$1,234"),
+    ('#,##0;"(" #,##0 ")"', -1234, "-( 1,234 )"),
+    # A bare or backslash-escaped "(" / "-" does print the sign.
+    ("#,##0;\\(#,##0\\)", -1234, "(1,234)"),
+    ("#,##0;\\-#,##0", -1234, "-1,234"),
 ]
 
 
@@ -338,6 +345,19 @@ def test_xlsx_pictures_in_the_table_keep_their_image_data_without_ocr(run_cli, e
 def test_xlsx_picture_placed_in_a_cell_keeps_its_image_data_without_ocr(run_cli, sample_documents_dir):
     """Excel's "Place in Cell" picture (a rich value behind a #VALUE! cell) in the tracked sample."""
     result = run_cli(sample_documents_dir / "sample_spreadsheet_incell.xlsx", "--ocr", "none", "--extract-images")
+
+    assert result.exit_code == 0, result.describe()
+    assert "#VALUE!" not in result.markdown, result.describe()[:3000]
+    assert "Sample Image: [Image]" in result.markdown, result.describe()[:3000]
+    assert result.markdown.count("data:image/png;base64,") == 1, result.describe()[:3000]
+
+
+def test_xlsx_picture_placed_in_a_cell_with_single_quoted_attributes(run_cli, e2e_dir, sample_documents_dir):
+    """The same in-cell picture when the sheet XML quotes attributes with ' (vm='1'), which XML allows."""
+    path = office.requote_sheet_attribute(sample_documents_dir / "sample_spreadsheet_incell.xlsx",
+                                          e2e_dir / "incell_single_quoted.xlsx", 1, "vm")
+
+    result = run_cli(path, "--ocr", "none", "--extract-images")
 
     assert result.exit_code == 0, result.describe()
     assert "#VALUE!" not in result.markdown, result.describe()[:3000]

@@ -186,3 +186,23 @@ def test_unanswered_pdf_route_goes_native(tmp_path, image_pptx):
     assert routed is None
     pdf_process.assert_not_called()
     assert route_info == {"routed_via": "native", "route_reason": "converted PDF route unavailable"}
+
+
+def test_route_signals_fail_clearly_without_the_pipeline_helpers(monkeypatch, image_pptx):
+    """If the Office pipeline cannot be imported, the route signals raise a clear error (the
+    route records it and stays native) instead of a NameError on the helpers they share."""
+    import doc2mark.formats.office as office_module
+    from doc2mark.core.base import ProcessingError
+
+    monkeypatch.setattr(office_module, "ADVANCED_PIPELINE_AVAILABLE", False)
+    for name in ("_W_T", "_attr_int", "_docx_rendered"):
+        monkeypatch.delattr(office_module, name, raising=False)
+    p = OfficeProcessor(ocr=_StubOCR())
+    with pytest.raises(ProcessingError, match="office_advanced_pipeline"):
+        p._docx_image_signals(SAMP / "sample_document.docx")
+    with pytest.raises(ProcessingError, match="office_advanced_pipeline"):
+        p._pptx_image_signals(image_pptx)
+    route_info = {}
+    assert p._maybe_route_image_dominant(
+        image_pptx, 100, route_info=route_info, ocr_images=True, extract_images=True) is None
+    assert route_info["routed_via"] == "native" and "office_advanced_pipeline" in route_info["route_error"]

@@ -143,6 +143,23 @@ def set_cached_formula_value(path: Path, sheet_index: int, coordinate: str, cach
     return Path(path)
 
 
+def requote_sheet_attribute(source: Path, path: Path, sheet_index: int, attribute: str) -> Path:
+    """Copy ``source`` to ``path`` with ``attribute="..."`` written as ``attribute='...'`` in
+    one worksheet part (both quote styles are legal XML)."""
+    part = f"xl/worksheets/sheet{sheet_index}.xml"
+    with zipfile.ZipFile(source) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    xml = members[part].decode("utf-8")
+    xml, count = re.subn(rf'(\s{attribute})="([^"]*)"', r"\1='\2'", xml)
+    if not count:
+        raise ValueError(f"no {attribute}= attribute in {part}")
+    members[part] = xml.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, data in members.items():
+            target.writestr(name, data)
+    return Path(path)
+
+
 def prefix_sheet_namespace(path: Path, sheet_index: int, prefix: str = "x") -> Path:
     """Rewrite one worksheet part so SpreadsheetML elements carry a namespace prefix
     (``<x:c r="C2"><x:f>A2+B2</x:f>``), as the Open XML SDK writes them, instead of openpyxl's
