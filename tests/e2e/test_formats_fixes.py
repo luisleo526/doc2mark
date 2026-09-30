@@ -217,6 +217,19 @@ def test_rerunning_a_folder_run_with_the_output_inside_the_input_changes_nothing
     assert "warn" not in (first.stderr + "".join(result.stderr for result in later)).lower()
 
 
+def test_a_folder_run_can_write_into_a_folder_above_its_input(run_cli, e2e_dir):
+    """The output folder is only left out of the input files when it is inside the input folder: one above it (here
+    the parent, which holds the input folder itself) is a normal output folder."""
+    docs = e2e_dir / "work" / "docs"
+    b.write(docs / "a.txt", "Alpha file text")
+    b.write(docs / "sub" / "b.txt", "Beta file text")
+
+    result = run_cli(docs, "-r", "-o", e2e_dir / "work", "-q", raw=True)
+
+    assert result.exit_code == 0, result.describe()
+    assert tree(e2e_dir / "work") == ["a.md", "docs/a.txt", "docs/sub/b.txt", "sub/b.md"], result.describe()
+
+
 @pytest.mark.parametrize("workers", [[], ["-p", "2"]], ids=["sequential", "parallel"])
 def test_timeout_stops_a_file_that_takes_too_long_and_the_run_goes_on(run_cli, e2e_dir, workers):
     """Item 5: ``--timeout`` was only passed to ``future.result()`` after the file had finished, so nothing ever
