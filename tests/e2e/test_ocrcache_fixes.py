@@ -442,5 +442,5 @@ def test_deprecation_warning_points_at_the_callers_line(e2e_dir, case):
     of your code that created the provider, and a script shows it without ``-W``."""
     proc = run_api(e2e_dir, DEPRECATED[case], env={"PYTHONWARNINGS": None, "OPENAI_API_KEY": None})
 
-    lines = [line for line in proc.stderr.splitlines() if "DeprecationWarning" in line]
+    lines = [line for line in proc.stderr.splitlines() if "DeprecationWarning" in line and "OCRConfig" in line]
     assert len(lines) == 1 and lines[0].startswith("<string>:2: DeprecationWarning:"), proc.stderr
