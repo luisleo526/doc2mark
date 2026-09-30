@@ -706,18 +706,18 @@ def _tokens(text: str) -> List[str]:
     return words
 
 
-def _reproduced(line: str, ocr_words: List[str]) -> bool:
-    """Whether the OCR text contains the line: at least 80 % of its words, in order, in one stretch of
-    the OCR words of the same length (markup, punctuation, case and spacing ignored)."""
-    words = _tokens(line)
+def _match(words: List[str], ocr_words: List[str]) -> Optional[range]:
+    """Where the OCR words reproduce a line's ``words``: the first stretch of OCR words as long as the
+    line holding at least 80 % of its words, in order (markup, punctuation, case and spacing
+    ignored); None when there is none."""
     if not words:
-        return True
+        return range(0)
     size, needed = len(words), 0.8 * len(words)
     for start in range(max(1, len(ocr_words) - size + 1)):
         window = ocr_words[start:start + size]
         if sum(1 for a, b in zip(window, words) if a == b) >= needed:
-            return True
-    return False
+            return range(start, start + len(window))
+    return None
 
 
 _COVERING = ("fill-image", "fill-imgmask", "fill-shade", "fill-path")
@@ -737,11 +737,20 @@ def _shown(bbox: pymupdf.Rect, log: list, pixels: np.ndarray, to_pixels: pymupdf
     return region is not None and region.size > 0 and _ink_share(region) >= MIN_LAYER_INK
 
 
-def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str]:
+def missing_painted_lines(page, measure: PageMeasure, ocr_text: str, *, garbled: bool = False) -> List[str]:
     """The page's painted, legible text lines that ``ocr_text`` does not reproduce and that the
     page visibly shows (text painted over by a picture, drawn in its background colour or
-    garbled never reaches the OCR as such and is not kept)."""
+    garbled never reaches the OCR as such and is not kept).
+
+    ``garbled``: the page was OCR'd because its text layer is garbled, so only the deterministic
+    detector can vouch for a line. No line is kept when the legibility judge alone found the
+    layer garbled, nor when the OCR text holds words no layer line accounts for, as many as half
+    the words of the lines to keep: the OCR then read those lines differently, so their text
+    layer is wrong, not missed.
+    """
     if not measure.signals.visible.chars:
+        return []
+    if garbled and not measure.signals.text_layer.garbled:
         return []
     lines = []
     for block in page.get_text("dict", flags=TEXT_FLAGS).get("blocks", []):
@@ -753,20 +762,27 @@ def missing_painted_lines(page, measure: PageMeasure, ocr_text: str) -> List[str
     legible = legible_lines([[(span["text"], span.get("size", 0.0), span.get("font", "")) for span in spans]
                              for spans in lines])
     ocr_words = _tokens(ocr_text)
+    explained: Set[int] = set()
     candidates = []
     for spans, readable in zip(lines, legible):
         text = "".join(span["text"] for span in spans).strip()
-        if text and readable and not _reproduced(text, ocr_words):
-            candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans))))
+        words = _tokens(text)
+        window = _match(words, ocr_words)
+        if window is not None:
+            explained.update(window)
+        elif readable:
+            candidates.append((text, pymupdf.Rect(_union_bbox(span["bbox"] for span in spans)), len(words)))
     if not candidates:
+        return []
+    if garbled and len(ocr_words) - len(explained) >= 0.5 * sum(count for _, _, count in candidates):
         return []
     try:
         log = page.get_bboxlog()
         pixels, to_pixels = _grey(page, _INK_DPI)
-        return [text for text, bbox in candidates if _shown(bbox, log, pixels, to_pixels)]
+        return [text for text, bbox, _ in candidates if _shown(bbox, log, pixels, to_pixels)]
     except Exception as exc:  # cannot tell what shows: keep the text (verbatim first)
         logger.debug(f"Visibility check failed on page {page.number + 1}: {exc}")
-        return [text for text, _ in candidates]
+        return [text for text, _, _ in candidates]
 
 
 def describe_pages(page_numbers: Sequence[int], limit: int = 10) -> str:

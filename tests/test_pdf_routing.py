@@ -3,12 +3,15 @@ text is classified when the page cannot be checked or PyMuPDF lacks a capability
 import functools
 import io
 import logging
+import string
+from dataclasses import replace
 
 import pymupdf
 from PIL import Image, ImageDraw, ImageFont
 
 from doc2mark import UnifiedDocumentLoader
 from doc2mark.pipelines import pdf_routing
+from tests.e2e import builders_route
 
 
 def _page_with_lines(tmp_path, lines):
@@ -31,6 +34,50 @@ def test_lines_the_ocr_reproduced_with_markup_are_not_missing(tmp_path):
     assert pdf_routing.missing_painted_lines(page, measure, ocr) == []
     assert pdf_routing.missing_painted_lines(page, measure, "Figure 3 - Site plan") == [
         "Revenue: $4.2M (FY2025)", "Phase 1 complete"]
+
+
+BODY = ["Invoice total EUR 2340 due on 14 March 2026", "Delivery of 1200 units to the Rotterdam depot",
+        "Payment reference AX 7731 quoted on all remittances"]
+SHIFT = str.maketrans(string.ascii_letters, string.ascii_lowercase[3:] + string.ascii_lowercase[:3]
+                      + string.ascii_uppercase[3:] + string.ascii_uppercase[:3])
+
+
+def test_a_garbled_page_keeps_the_legible_lines_its_ocr_missed(tmp_path):
+    """m4: the OCR of a page with a garbled title read only the title (the body is too light for it); the
+    legible body lines follow the OCR, the garbled title does not."""
+    path = builders_route.garbled_title_grey_body_pdf(tmp_path / "grey.pdf", "INVOICE SUMMARY", BODY)
+    page = pymupdf.open(str(path))[0]
+    measure = pdf_routing.measure_page(page)
+    assert measure.signals.text_layer.garbled
+    assert pdf_routing.missing_painted_lines(page, measure, "# INVOICE SUMMARY", garbled=True) == BODY
+
+
+def test_a_garbled_page_keeps_no_line_its_ocr_read_differently(tmp_path):
+    """m4: next to a U+FFFD title, lines whose layer is wrong but valid Unicode (letters shifted by a bad
+    ToUnicode map) look legible to the detector; the OCR read them right, so they are not appended."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    builders_route.add_broken_font(page)
+    builders_route.insert_lines(page, ["INVOICE SUMMARY"], top=96, fontsize=24, fontname=builders_route.BROKEN_FONT)
+    shifted = [line.translate(SHIFT) for line in BODY]
+    builders_route.insert_lines(page, shifted, top=140, fontsize=11)
+    builders_route.garble(doc, "fffd")
+    doc.save(str(tmp_path / "mixed.pdf"))
+    page = pymupdf.open(str(tmp_path / "mixed.pdf"))[0]
+    measure = pdf_routing.measure_page(page)
+    ocr = "INVOICE SUMMARY\n\n" + "\n".join(BODY)
+    assert measure.signals.text_layer.garbled
+    assert pdf_routing.missing_painted_lines(page, measure, ocr, garbled=True) == []
+    assert pdf_routing.missing_painted_lines(page, measure, ocr) == shifted   # what the guard prevents
+
+
+def test_a_page_only_the_judge_found_garbled_keeps_no_line(tmp_path):
+    path = builders_route.garbled_text_pdf(tmp_path / "shifted.pdf", "INVOICE SUMMARY", BODY, "shifted")
+    page = pymupdf.open(str(path))[0]
+    measure = pdf_routing.measure_page(page)
+    judged = replace(measure, signals=replace(measure.signals, judge_legibility=0.05))
+    assert judged.signals.text_layer_illegible and not judged.signals.text_layer.garbled
+    assert pdf_routing.missing_painted_lines(page, judged, "INVOICE SUMMARY", garbled=True) == []
 
 
 def _identity(judge):
@@ -114,12 +161,12 @@ def test_invisible_text_is_kept_when_the_page_cannot_be_checked(tmp_path, monkey
         return apply_redactions(page, images=images, graphics=graphics)
 
     monkeypatch.setattr(pymupdf.Page, "apply_redactions", without_text_parameter)
-    copies = pdf_routing.PageCopies(doc)
+    page, copies = doc[0], pdf_routing.PageCopies(doc)
     with caplog.at_level(logging.WARNING, logger=pdf_routing.__name__):
-        measure = pdf_routing.measure_page(doc[0], copies=copies)
+        measure = pdf_routing.measure_page(page, copies=copies)
     assert (len(measure.layer_rects), len(measure.hidden_rects)) == (len(LEDGER) + 1, 0)
     assert "keeping it as the page's text" in caplog.text
-    assert pdf_routing.text_source(doc[0], measure, copies) is doc[0]
+    assert pdf_routing.text_source(page, measure, copies) is page
     copies.close()
 
 

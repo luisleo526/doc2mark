@@ -29,6 +29,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     judge_text_layer as _judge_text_layer,
     pages_without_text as _pages_without_text,
     VERBATIM_TAIL_REASONS as _VERBATIM_TAIL_REASONS,
+    REASON_ILLEGIBLE as _REASON_ILLEGIBLE,
     MIN_UNCAPTURED_RASTER as _MIN_UNCAPTURED_RASTER,
 )
 from doc2mark.pipelines import pdf_routing  # noqa: E402
@@ -831,8 +832,10 @@ class PDFLoader:
                 }]
                 # A page overridden to render OCR keeps whatever real painted text the
                 # OCR did not reproduce (verbatim first).
-                if self._page_routes.get(page_num, (None, None))[1] in _VERBATIM_TAIL_REASONS:
-                    missing = pdf_routing.missing_painted_lines(page, self._page_measure(page_num), render_text)
+                reason = self._page_routes.get(page_num, (None, None))[1]
+                if reason in _VERBATIM_TAIL_REASONS:
+                    missing = pdf_routing.missing_painted_lines(page, self._page_measure(page_num), render_text,
+                                                                garbled=reason == _REASON_ILLEGIBLE)
                     if missing:
                         items.append({
                             "type": "text:normal",

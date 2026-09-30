@@ -134,8 +134,11 @@ REASON_TEXT_PAGE = "dense_text_page"
 # A page overridden to render OCR for one of these reasons may still carry legible
 # painted text (a caption, a heading, a stamp, the clean body under a garbled title).
 # Whatever legible line the OCR did not reproduce is kept verbatim after the OCR, so the
-# override never loses real text. (Pages following an image document route are the
-# document's slides or scans.)
+# override never loses real text. On a garbled page only the detector can vouch for a
+# line: nothing is kept when the judge alone found the layer garbled, or when the OCR
+# read words no layer line accounts for (the layer of those lines is wrong, not missed;
+# see pdf_routing.missing_painted_lines). (Pages following an image document route are
+# the document's slides or scans.)
 VERBATIM_TAIL_REASONS = (REASON_SEARCHABLE_SCAN, REASON_NO_TEXT_LAYER, REASON_IMAGE_PAGE, REASON_ILLEGIBLE)
 
 

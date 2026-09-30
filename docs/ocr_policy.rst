@@ -195,7 +195,12 @@ text layer, a page with a garbled text layer or a scanned page may still carry
 real, legible text (a caption, a heading, a stamp, the clean body under a garbled
 title). Whatever legible line of it the OCR did not reproduce, and the page
 visibly shows, is kept verbatim after the OCR text, so an override never loses
-real text; garbled lines are not kept (the OCR read them from the render).
+real text; garbled lines are not kept (the OCR read them from the render). On a
+garbled page only the garbage detector can vouch for a line, so nothing is kept
+when the legibility judge alone found the layer garbled, or when the OCR text
+holds words no line of the layer accounts for, as many as half the words to
+keep: the OCR then read those lines differently, and their text layer is wrong,
+not missed.
 
 The margins are hysteresis: a page near a threshold follows its document, so a
 deck or a report keeps one consistent treatment, and only clear outliers switch.
