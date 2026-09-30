@@ -272,9 +272,19 @@ MEMORY_SCRIPT = (
     "        return True\n"
     "ocr = CountingOCR()\n"
     "result = UnifiedDocumentLoader(ocr_provider=ocr).load(sys.argv[1], ocr_images=True)\n"
-    "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KiB on Linux, bytes on macOS\n"
-    "peak_mb = peak / (1024 * 1024 if sys.platform == 'darwin' else 1024)\n"
-    "print(json.dumps({'batches': ocr.batches, 'peak_mb': peak_mb, 'pages': result.content.count('read ')}))\n"
+    "def peak_mb():\n"
+    "    # This process's own peak RSS. On Linux ru_maxrss also carries the parent's peak across fork+exec,\n"
+    "    # so VmHWM (per address space) is read instead; macOS reports ru_maxrss in bytes.\n"
+    "    try:\n"
+    "        with open('/proc/self/status') as status:\n"
+    "            for line in status:\n"
+    "                if line.startswith('VmHWM:'):\n"
+    "                    return int(line.split()[1]) / 1024\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+    "    return peak / (1024 * 1024 if sys.platform == 'darwin' else 1024)\n"
+    "print(json.dumps({'batches': ocr.batches, 'peak_mb': peak_mb(), 'pages': result.content.count('read ')}))\n"
 )
 
 
