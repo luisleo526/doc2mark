@@ -2541,7 +2541,7 @@ class PDFLoader:
 
     def _lines_region(self, page, lines: List[Dict[str, Any]], group=None, anchored: bool = False) -> pdf_layout.Region:
         """Where text lines stand on the page as displayed: their box (from the glyphs' baselines,
-        ``_visual_box``) and each line's width and font size."""
+        ``_visual_box``) and each line's width, font size, top and bottom."""
         matrix = page.rotation_matrix
         box, measured = None, []
         for line in lines:
@@ -2549,7 +2549,7 @@ class PDFLoader:
                 continue
             rect = pymupdf.Rect(self._visual_box(line)) * matrix
             size = max((span.get("size") or 0.0 for span in line.get("spans", [])), default=0.0)
-            measured.append((rect.width, size))
+            measured.append((rect.width, size, rect.y0, rect.y1))
             box = rect if box is None else box | rect
         return pdf_layout.Region(tuple(box) if box is not None else None, "text", tuple(measured),
                                  group=group, anchored=anchored)
@@ -2650,10 +2650,10 @@ class PDFLoader:
           it. The other lines of the same PyMuPDF block (a caption or note printed right
           against the table, a title next to a logo box) stay.
         * A running header/footer line (``_detect_page_chrome``) becomes its own item with
-          its text (escaped like all text, see ``doc2mark.utils.markdown``), so it is never
-          classified as a heading, list item or footnote: text:header / text:footer, or
-          text:normal for a line kept as content (a running header's first copy, a numbered
-          label, a page number the rule leaves).
+          its raw text, so it is never classified as a heading, list item or footnote:
+          text:header / text:footer, or text:normal for a line kept as content (a running
+          header's first copy, a numbered label, a page number the rule leaves), escaped like
+          all body text (``doc2mark.utils.markdown``).
         * Overprinted copies of a line are dropped (``_drop_overprinted_lines``).
 
         Returns ``(blocks, header/footer items)``: the text blocks in their original order,
@@ -2675,9 +2675,10 @@ class PDFLoader:
                 if chrome:
                     zone, kept = chrome
                     text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
-                    # Markdown like every other text item: a kept copy is emitted as a paragraph
+                    # a kept copy is emitted as a paragraph: Markdown, escaped like every other text item
                     chrome_items.append(_TextContent(
-                        type="text:normal" if kept else f"text:{zone}", content=escape_markdown_text(text),
+                        type="text:normal" if kept else f"text:{zone}",
+                        content=escape_markdown_text(text) if kept else text,
                         page=page_num + 1, position_y=line["bbox"][1],
                         layout=self._lines_region(page, [line], anchored=True)))
                 else:

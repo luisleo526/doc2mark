@@ -9,8 +9,8 @@ only on clear evidence of columns:
 * items that cross the gutter (a title, an abstract, a figure or a caption across the columns, a
   page number) cross it *between* the column text, never beside it; they cut the page into bands
   and keep their place between the bands;
-* in a band, at least one side is running text (three or more lines ten or more font sizes wide)
-  and the other side has text too;
+* in a band, one side is running text (three or more lines ten or more font sizes wide) standing
+  beside text on the other side;
 * the two sides are not a table or a form: they do not start their items at the same heights
   (labels next to their values, a grid of text boxes, parallel texts).
 
@@ -50,14 +50,14 @@ class Region:
     """What the reading order knows about one item of a page.
 
     ``box`` is the item's box as the page is displayed (``/Rotate`` applied), ``None`` when
-    unknown. ``kind`` is ``text``, ``table`` or ``image``. ``lines`` holds ``(width, font size)`` of
-    each line of a text item. Items with the same ``group`` (the pieces of one text block) are read
+    unknown. ``kind`` is ``text``, ``table`` or ``image``. ``lines`` holds ``(width, font size, top,
+    bottom)`` of each line of a text item, as displayed. Items with the same ``group`` (the pieces of one text block) are read
     together. ``anchored`` items (running headers and footers, footnotes, items without a box) are
     never put in a column; they are placed by their height."""
 
     box: Optional[Box]
     kind: str = "text"
-    lines: Tuple[Tuple[float, float], ...] = ()
+    lines: Tuple[Tuple[float, float, float, float], ...] = ()
     group: Optional[Hashable] = None
     anchored: bool = False
 
@@ -67,7 +67,7 @@ class _Unit:
     members: List[int]
     box: Box
     kind: str
-    lines: List[Tuple[float, float]] = field(default_factory=list)
+    lines: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
     @property
     def top(self) -> float:
@@ -169,7 +169,7 @@ def _overlap(a: _Unit, b: _Unit) -> float:
 
 
 def _size(units: Sequence[_Unit]) -> float:
-    sizes = sorted(size for unit in units for _, size in unit.lines if size > 0)
+    sizes = sorted(line[1] for unit in units for line in unit.lines if line[1] > 0)
     return sizes[len(sizes) // 2] if sizes else 10.0
 
 
@@ -257,13 +257,17 @@ def _clean(units: List[_Unit], gutter: Tuple[float, float]) -> bool:
 
 
 def _is_columns(slots: List[List[_Unit]]) -> bool:
-    """Do the filled slots of a band hold columns: running text in one of them, text in at least
-    two, and no two neighbours starting their items on the same rows?"""
-    if sum(1 for slot in slots if any(unit.kind == "text" for unit in slot)) < 2:
-        return False
-    if not any(_flowing(slot) for slot in slots):
-        return False
-    return not any(_row_aligned(first, second) for first, second in zip(slots, slots[1:]))
+    """Do the filled slots of a band hold columns: across every gutter, running text on one side
+    standing beside text on the other, and the two sides not starting their items on the same
+    rows?"""
+    for first, second in zip(slots, slots[1:]):
+        if not any(unit.kind == "text" for unit in first) or not any(unit.kind == "text" for unit in second):
+            return False
+        if not (_flowing(first, beside=second) or _flowing(second, beside=first)):
+            return False
+        if _row_aligned(first, second):
+            return False
+    return True
 
 
 def _row_aligned(left: List[_Unit], right: List[_Unit]) -> bool:
@@ -281,21 +285,23 @@ def _row_aligned(left: List[_Unit], right: List[_Unit]) -> bool:
     return share(left, right) >= _ALIGNED_SHARE or share(right, left) >= _ALIGNED_SHARE
 
 
-def _flowing(side: List[_Unit]) -> bool:
-    """Is ``side`` running text: at least three lines at least ten font sizes wide?"""
-    return sum(1 for unit in side for width, size in unit.lines
-               if size > 0 and width >= _FLOW_LINE_EMS * size) >= _FLOW_MIN_LINES
+def _flowing(side: List[_Unit], beside: Optional[List[_Unit]] = None) -> bool:
+    """Is ``side`` running text: at least three lines at least ten font sizes wide (next to the
+    text of ``beside``, when given: sharing heights with its text)?"""
+    spans = [(line[2], line[3]) for unit in beside or () for line in unit.lines]
+    return sum(1 for unit in side for width, size, top, bottom in unit.lines
+               if size > 0 and width >= _FLOW_LINE_EMS * size
+               and (beside is None or any(min(bottom, high) > max(top, low) for low, high in spans))
+               ) >= _FLOW_MIN_LINES
 
 
 def _widths(side: List[_Unit]) -> List[float]:
-    return sorted(width for unit in side for width, _ in unit.lines)
+    return sorted(line[0] for unit in side for line in unit.lines)
 
 
 def _secondary(left: List[_Unit], right: List[_Unit]) -> bool:
-    """Is the left side a sidebar or margin notes beside the right side: not running text next to
-    running text, or with lines much narrower and fewer than the right side's?"""
-    if not _flowing(left) and _flowing(right):
-        return True
+    """Is the left side a sidebar or margin notes beside the right side: lines much narrower than
+    the right side's, and fewer of them?"""
     left_widths, right_widths = _widths(left), _widths(right)
     if not left_widths or not right_widths:
         return False
