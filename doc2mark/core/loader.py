@@ -980,7 +980,10 @@ class UnifiedDocumentLoader:
 
         Args:
             input_dir: Directory containing documents
-            output_dir: Optional output directory (default: same as input)
+            output_dir: Optional output directory (default: same as input). The input tree is mirrored
+                under it; files that would share an output name (``report.txt`` and ``report.md``) are
+                written as ``report.txt.md`` and ``report.md.md``. Next to the inputs (the default) an
+                output replaces the one an earlier run wrote.
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
@@ -1159,7 +1162,8 @@ class UnifiedDocumentLoader:
 
         Args:
             file_paths: List of file paths to process
-            output_dir: Optional output directory
+            output_dir: Optional output directory (flat; files that would share an output name, such as
+                ``q1.pdf`` of two folders, are written as ``q1.pdf.md`` and ``q1.pdf-2.md``)
             output_format: Output format (MARKDOWN, JSON, TEXT)
             extract_images: Whether to extract images from documents (Office/PDF only)
             ocr_images: Whether to perform OCR on images (implies extract_images when an OCR provider is configured)
