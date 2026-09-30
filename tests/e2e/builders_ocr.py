@@ -53,6 +53,27 @@ def docx_picture_in_cell(path: Path) -> Path:
     return Path(path)
 
 
+def pptx_small_picture_deck(path: Path, slides: int = 2) -> Path:
+    """Deck whose slides each hold a text box and a small picture: text-dominant, so the Office
+    pipeline itself OCRs the pictures (a picture-dominant deck is rendered to PDF instead)."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+
+    picture = Image.new("RGB", (300, 200), "white")
+    ImageDraw.Draw(picture).rectangle((20, 20, 280, 180), outline="black", width=8)
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    deck = Presentation()
+    for number in range(1, slides + 1):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(8), Inches(2))
+        box.text_frame.text = f"Slide {number}: quarterly review notes with enough words to be a text slide."
+        box.text_frame.paragraphs[0].runs[0].font.size = Pt(20)
+        slide.shapes.add_picture(io.BytesIO(buffer.getvalue()), Inches(6), Inches(4.5), Inches(1.5), Inches(1))
+    deck.save(str(path))
+    return Path(path)
+
+
 def cjk_font(script: str = "TC", size: int = 110) -> ImageFont.FreeTypeFont:
     """The Noto Sans CJK face for ``script`` ("TC" Traditional, "SC" Simplified, "JP", "KR"),
     from the system fonts (``fonts-noto-cjk`` in the E2E image). Raises if it is not installed."""

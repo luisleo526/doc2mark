@@ -719,7 +719,7 @@ def test_blank_scanned_page_gets_no_marker(run_cli, fake_llm, e2e_dir):
 @pytest.mark.parametrize("kind", ["pptx", "xlsx"])
 def test_office_ocr_issue_locations_name_the_slide_or_sheet(run_cli, fake_llm, e2e_dir, kind):
     if kind == "pptx":
-        path = office.pptx_picture_deck(e2e_dir / "deck.pptx", ["FIRST 1111", "SECOND 2222"])
+        path = build.pptx_small_picture_deck(e2e_dir / "deck.pptx")
         expected = [{"issue": "refused", "image": 1, "slide": 1}, {"issue": "refused", "image": 2, "slide": 2}]
     else:
         path = office.workbook(e2e_dir / "book.xlsx", [
