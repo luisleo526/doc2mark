@@ -271,18 +271,26 @@ def _is_columns(slots: List[List[_Unit]]) -> bool:
 
 
 def _row_aligned(left: List[_Unit], right: List[_Unit]) -> bool:
-    """Do the two sides start their items on the same rows (a table, a form, parallel texts)?
-    Each side's first item is left out: columns start at the same height too."""
+    """Do the two sides start their items on the same rows (a form's labels and values, dates and
+    their entries, a grid of text boxes, parallel texts)? Each side's first item is left out:
+    columns start at the same height too. A side of short items (not running text) is in rows
+    when half its items start where an item of the other side starts; two sides of running text
+    need at least two such rows on each side, since one paragraph can start level with another
+    by chance."""
     tolerance = max(_ALIGN_MIN, _ALIGN_EMS * _size(left + right))
 
-    def share(side: List[_Unit], other: List[_Unit]) -> float:
+    def aligned(side: List[_Unit], other: List[_Unit]) -> Tuple[int, int]:
         rest = sorted(side, key=lambda unit: unit.top)[1:]
-        if not rest:
-            return 0.0
         hits = sum(1 for unit in rest if any(abs(unit.top - peer.top) <= tolerance for peer in other))
-        return hits / len(rest)
+        return hits, len(rest)
 
-    return share(left, right) >= _ALIGNED_SHARE or share(right, left) >= _ALIGNED_SHARE
+    left_hits, left_rest = aligned(left, right)
+    right_hits, right_rest = aligned(right, left)
+    left_rows = left_rest > 0 and left_hits >= _ALIGNED_SHARE * left_rest
+    right_rows = right_rest > 0 and right_hits >= _ALIGNED_SHARE * right_rest
+    if (left_rows and not _flowing(left)) or (right_rows and not _flowing(right)):
+        return True
+    return left_rows and right_rows and min(left_hits, right_hits) >= 2
 
 
 def _flowing(side: List[_Unit], beside: Optional[List[_Unit]] = None) -> bool:

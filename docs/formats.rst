@@ -165,7 +165,30 @@ Markdown conventions for PDF text:
   only the styled words.
 - **Escaping.** Text that looks like Markdown or HTML is escaped (``\# of patients``,
   ``&lt;img …>``) so it renders as written; the Office Markdown output follows the
-  same rule.
+  same rule. The kept first copy of a running header or footer is escaped too
+  (``&lt;Draft> ACME Corp``). A numbered item that starts a new list right after
+  bullets (or bullets after numbers) follows a blank line, so no renderer reads it
+  as part of the item above.
+
+Reading order of PDF pages:
+
+- A page is read top to bottom. A ``/Rotate`` page (landscape pages of reports,
+  turned tables) is read as it is displayed, so a table follows its title and the
+  running header and page number stay at the edges.
+- Columns are read one after the other, top to bottom within each column: two or
+  three columns, of equal or unequal widths. Text, a figure or a caption across the
+  columns (a title, an abstract, a full-width figure) keeps its place between the
+  columns above and below it. Running headers open the page; footnotes and page
+  numbers close it.
+- A sidebar or pull-quote beside the main text (much narrower, with fewer lines) is
+  read after the text it stands beside, as a whole.
+- Columns need clear evidence: a vertical strip of white space between items that
+  stand side by side, running text (lines ten or more font sizes wide) beside text
+  on the other side, and nothing crossing the strip next to them. Items on the two
+  sides that start at the same heights (a form's labels and values, a grid of text
+  boxes, parallel texts) are rows, not columns. Without that evidence, and on pages
+  that mix different column layouts, the page keeps its top-to-bottom order.
+  Reordering never drops or repeats text: the pieces of a paragraph stay together.
 
 Legacy Office formats (DOC, PPT, PPS, XLS, RTF)
 -----------------------------------------------
