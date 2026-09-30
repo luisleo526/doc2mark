@@ -97,14 +97,23 @@ def _parse_html_table(text: str) -> Grid:
     return Grid("html", rows, spans, header_rows)
 
 
+_GFM_INLINE = re.compile(r"\\([!-/:-@\[-`{-~])|<br\s*/?>|&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{0,31});")
+
+
 def _gfm_cell(raw: str) -> str:
     """One pipe-table cell as a GFM renderer shows it (cmark-gfm / markdown-it): the backslash of an
-    escaped pipe is dropped, then backslash-escaped ASCII punctuation loses its backslash, entities are
-    decoded and ``<br>`` is a line break."""
+    escaped pipe is dropped, then, in one left-to-right pass, backslash-escaped ASCII punctuation loses
+    its backslash, ``<br>`` is a line break and entities are decoded (so ``\\<br>`` is the text
+    ``<br>``, not a line break)."""
     text = raw.replace("\\|", "|")
-    text = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", text)
-    text = re.sub(r"<br\s*/?>", "\n", text)
-    return html.unescape(text).strip()
+
+    def inline(match):
+        if match.group(1) is not None:
+            return match.group(1)
+        token = match.group(0)
+        return "\n" if token.startswith("<") else html.unescape(token)
+
+    return _GFM_INLINE.sub(inline, text).strip()
 
 
 def _split_pipe_row(line: str) -> List[str]:
@@ -459,14 +468,16 @@ def test_t16_t22_office_cell_line_breaks_and_controls(run_cli, e2e_dir):
     xlsx = convert(run_cli, B.control_chars_xlsx(e2e_dir / "controls.xlsx"))
     [sheet] = tables(xlsx)
     assert [row[0] for row in sheet.rows] == ["Item", "A", "B", "C", "D"], xlsx.markdown
-    assert sheet.row_starting("A")[1].split() == ["line1", "line2"], xlsx.markdown
-    assert sheet.row_starting("B")[1].split() == ["cr", "only"], xlsx.markdown
+    # a line break inside a cell stays a line break: <br> in a pipe table, as GFM renders it
+    assert sheet.row_starting("A")[1] == "line1\nline2", xlsx.markdown
+    assert sheet.row_starting("B")[1] == "cr\nonly", xlsx.markdown
+    assert "| A | line1<br>line2 |" in xlsx.markdown, xlsx.markdown
     assert sheet.row_starting("D")[1] == "ok", xlsx.markdown
     assert "\r" not in xlsx.markdown and "\r" not in xlsx.json["content"]
 
     pptx = convert(run_cli, B.soft_break_pptx(e2e_dir / "softbreak.pptx"))
     [slide] = tables(pptx)
-    assert slide.row_starting("softbreak")[1].split() == ["line", "one", "tail"], pptx.markdown
+    assert slide.row_starting("softbreak")[1] == "line one\ntail", pptx.markdown
     assert slide.row_starting("markup")[1] == "a | b <script>x</script> & c", pptx.markdown
     for text in (pptx.markdown, pptx.json["content"]):
         _assert_no_raw_markup(text)
@@ -478,8 +489,24 @@ def test_t18_markdown_grid_cells_are_escaped(run_cli, e2e_dir):
     [table] = tables(result)
     assert table.kind == "grid", result.markdown
     assert table.rows == [["Region", "Q1", None], ["North", "10 | 20", "30"],
-                          ["Notes", "line one line two", "<i>x</i>"]], result.markdown
+                          ["Notes", "line one\nline two", "<i>x</i>"]], result.markdown
+    assert "line one<br>line two" in result.markdown, result.markdown
     _assert_no_raw_markup(result.markdown)
+
+
+@pytest.mark.parametrize("style", ["markdown", "markdown_grid", "minimal_html"])
+def test_r2_backslashes_in_cells_read_back_exactly(run_cli, e2e_dir, style):
+    """A Markdown renderer consumes a backslash before ASCII punctuation (``\\*`` is an escaped star)
+    or before the ``<br>`` of a line break (``\\<br>`` is escaped text): such backslashes, and one
+    that ends a cell, are doubled, so every cell reads back exactly as GFM renders it. HTML cells keep
+    backslashes as they are."""
+    merged = style != "markdown"
+    path = B.backslash_table_pdf(e2e_dir / "paths.pdf", merged=merged)
+    result = convert(run_cli, path, *(["--table-style", style] if merged else []))
+
+    [table] = tables(result)
+    assert table.kind == {"markdown": "markdown", "markdown_grid": "grid", "minimal_html": "html"}[style]
+    assert table.rows[1 if merged else 0:] == B.BACKSLASH_ROWS, result.markdown
 
 
 # --- T1: a span never overwrites a value (safety net in TableData) ----------------------------------------

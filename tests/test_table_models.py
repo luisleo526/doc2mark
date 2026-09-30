@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from doc2mark.core.table import Cell, TableData, TableRenderer, TableStyle
+from doc2mark.core.table import Cell, TableData, TableRenderer, TableStyle, markdown_cell
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +460,27 @@ class TestTableRenderer:
         table = TableData(cells=cells)
         result = TableRenderer(table_style=TableStyle.MINIMAL_HTML).render(table)
         assert 'rowspan="2"' in result
+
+
+@pytest.mark.unit
+class TestMarkdownCell:
+    """Pipe-table cell escaping: structure-changing characters only (policy shared with body text)."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("line1\nline2", "line1<br>line2"),  # a line break stays one (GFM <br>)
+        ("line1\r\n\r\nline3\n", "line1<br><br>line3"),  # CR/LF normalised, blank line kept, ends trimmed
+        ("a | b", "a \\| b"),
+        ("C:\\Users\\*.txt", "C:\\Users\\\\*.txt"),  # before ASCII punctuation: doubled
+        ("\\\\server\\share", "\\\\\\server\\share"),  # before a backslash: doubled; before a letter: kept
+        ("ends with \\", "ends with \\\\"),  # at the end of the cell: doubled
+        ("C:\\temp\\\nD:\\data", "C:\\temp\\\\<br>D:\\data"),  # before a line break: doubled
+        ("a \\| b", "a \\\\\\| b"),  # the backslash before a pipe is doubled, the pipe escaped
+        ("x \\y \\。", "x \\y \\。"),  # before a letter or non-ASCII punctuation: kept
+        ("<b> & &amp; x < 5", "&lt;b> & &amp;amp; x < 5"),
+        ("bell\x07here", "bellhere"),
+    ])
+    def test_escaping(self, text, expected):
+        assert markdown_cell(text) == expected
 
 
 # ---------------------------------------------------------------------------

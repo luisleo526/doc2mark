@@ -389,6 +389,24 @@ def merged_special_pdf(path: Path) -> Path:
     return Path(path)
 
 
+BACKSLASH_ROWS = [["Key", "Value"], ["glob", "C:\\Users\\*.txt"], ["unc", "\\\\server\\share"],
+                  ["trailing", "ends with \\"], ["escaped", "a \\| b \\_c\\_"], ["two lines", "C:\\temp\\\nD:\\data"]]
+
+
+def backslash_table_pdf(path: Path, *, merged: bool) -> Path:
+    """A ruled table of Windows paths and escape-like text (``BACKSLASH_ROWS``): backslashes before
+    ASCII punctuation, at the end of a cell and at the end of a cell's first line. ``merged`` adds a
+    ``Paths`` title row spanning both columns, so the table renders through the HTML / grid path."""
+    rows = ([["Paths", ""]] if merged else []) + BACKSLASH_ROWS
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    ruled_table(page, 50, 50, [70, 220], [18] * (len(rows) - 1) + [30], grid(rows),
+                merges=[(0, 0, 1, 2)] if merged else [])
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
+
 def control_chars_xlsx(path: Path) -> Path:
     """Workbook whose cells hold CR/LF, a lone CR and a tab (the only control characters a worksheet
     accepts)."""
