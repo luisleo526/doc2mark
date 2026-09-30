@@ -16,8 +16,12 @@ that OpenAI strict mode (which requires all properties to be present) is
 satisfiable, and Optional fields serialize as ``anyOf: [T, null]``.
 """
 
+import copy
+import html as _html
 import re
-from typing import List, Optional, Literal
+from bisect import bisect_left, bisect_right
+from collections import Counter
+from typing import Dict, List, Optional, Literal, Tuple
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -28,124 +32,1163 @@ from pydantic import BaseModel, Field, field_validator
 # Table.html is produced by a vision model reading a (possibly adversarial)
 # document image and flows into rendered output via OCRPage.to_markdown(). To
 # avoid an HTML-injection / XSS sink, it is sanitized to a strict allowlist of
-# table-structural tags + span attributes; everything else is dropped.
+# table-structural tags + span attributes (plus the inert <br>); everything else
+# is dropped. Every other model-supplied string is escaped when rendered (see
+# "Markdown boundary" below).
 _ALLOWED_TABLE_TAGS = frozenset({
     "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "col", "colgroup",
 })
 _ALLOWED_TABLE_ATTRS = frozenset({"colspan", "rowspan", "scope"})
+_SCOPE_VALUES = frozenset({"row", "col", "rowgroup", "colgroup"})
 _DANGEROUS_TAGS = (
     "script", "style", "iframe", "object", "embed", "link", "meta", "base",
     "form", "input", "button", "noscript", "template", "svg", "math",
 )
+# Block elements a model uses for line structure inside a cell (or around a table).
+# They are unwrapped like every other non-table tag, but each becomes a line break
+# first, so "<p>Q1</p><p>2024</p>" reads "Q1<br>2024", never "Q12024".
+_BLOCK_TAGS = frozenset({
+    "p", "div", "li", "ul", "ol", "dl", "dt", "dd", "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "pre", "section", "article", "header", "footer", "address", "figure",
+    "figcaption", "hr", "center", "main", "nav", "aside",
+})
+_ROW_GROUP_TAGS = ("thead", "tbody", "tfoot")
+_TABLE_MARKUP_RE = re.compile(r"<\s*/?\s*(?:table|thead|tbody|tfoot|tr|td|th|caption)\b", re.I)
+_PIPE_DELIMITER_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.I)
+_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f]")
+# A line break and the blanks around it. Only a blank run's first character may start a
+# match, so a long run of spaces without a line break costs linear time, not quadratic.
+_LINE_BREAK_RE = re.compile(r"(?<![ \t])[ \t]*\n\s*")
+_ASCII_DIGITS_RE = re.compile(r"[0-9]+")  # str.isdigit() also accepts "²", which int() rejects
+
+# Bounds on model-supplied spans. A colspan never exceeds the widest row's cell count
+# (nor HTML's own cap of 1000) and a rowspan never runs past its row group, so a
+# model cannot make one table cost seconds or megabytes. Past _MAX_GRID_CELLS the
+# grid is left unpadded rather than materialized.
+_MAX_COLSPAN = 1000
+_MAX_GRID_CELLS = 250_000
+# Column slots a table layout may visit; spans that claim more are dropped.
+_MAX_LAYOUT_WORK = 500_000
+# Padding may add at most this many empty cells per cell the model wrote (plus a small
+# allowance), so a small table cannot be padded into megabytes.
+_MAX_PADS_PER_CELL = 8
+_PAD_ALLOWANCE = 64
+# The pad-alignment search: rows longer than this, or past this many column slots per
+# table, are padded at the end.
+_MAX_ALIGNED_ROW_CELLS = 256
+_MAX_ALIGNMENT_WORK = 200_000
+
+
+def _clean_controls(text: str) -> str:
+    """Normalize line separators to ``\\n`` and drop the other C0 control characters
+    (``\\t`` and ``\\n`` are kept). ``\\r``, vertical tab and form feed are line breaks
+    in the sources, so they become ``\\n`` instead of gluing words together."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0b", "\n").replace("\x0c", "\n")
+    return _C0_CONTROL_RE.sub("", text)
+
+
+def _tag(element) -> str:
+    return element.tag.lower() if isinstance(element.tag, str) else ""
+
+
+def _strip_code_fence(text: str) -> str:
+    """Strip a leading ```/```html ... ``` code fence a model might wrap the table in."""
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text[: text.rfind("```")]
+    return text.strip()
+
+
+def _split_pipe_row(line: str) -> List[str]:
+    """Cells of one GFM pipe-table row (a ``|`` right after a backslash is cell text)."""
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    cells, current, last = [], "", ""
+    for ch in body:
+        if ch == "|" and last != "\\":
+            cells.append(current)
+            current = ""
+        elif ch == "|":
+            current = current[:-1] + "|"
+        else:
+            current += ch
+        last = ch
+    cells.append(current)
+    return [cell.strip() for cell in cells]
+
+
+def _escape_html_keep_breaks(text: str) -> str:
+    return "<br>".join(_html.escape(part, quote=False) for part in _BR_TAG_RE.split(text))
+
+
+def _pipe_tables_to_html(text: str) -> Optional[str]:
+    """Convert the GFM pipe tables in a markup-free ``html`` field into HTML tables,
+    keeping every other line as text; ``None`` when the field holds no pipe table."""
+    lines = text.split("\n")
+    out: List[str] = []
+    found = False
+    i = 0
+    while i < len(lines):
+        if ("|" in lines[i] and i + 1 < len(lines) and "|" in lines[i + 1]
+                and _PIPE_DELIMITER_RE.match(lines[i + 1])):
+            rows = [_split_pipe_row(lines[i])]
+            i += 2
+            while i < len(lines) and lines[i].strip() and "|" in lines[i]:
+                rows.append(_split_pipe_row(lines[i]))
+                i += 1
+            html = ["<table>"]
+            for r, row in enumerate(rows):
+                tag = "th" if r == 0 else "td"
+                html.append("<tr>" + "".join(
+                    f"<{tag}>{_escape_html_keep_breaks(cell)}</{tag}>" for cell in row) + "</tr>")
+            html.append("</table>")
+            out.append("".join(html))
+            found = True
+        else:
+            if lines[i].strip():
+                out.append(_escape_html_keep_breaks(lines[i].strip()))
+            i += 1
+    return "\n".join(out) if found else None
+
+
+def _remove_keep_tail(element) -> None:
+    """Remove ``element`` (and its content) but keep the text that follows it."""
+    parent = element.getparent()
+    if element.tail:
+        previous = element.getprevious()
+        if previous is not None:
+            previous.tail = (previous.tail or "") + element.tail
+        else:
+            parent.text = (parent.text or "") + element.tail
+    parent.remove(element)
+
+
+def _break_around(element) -> None:
+    """Line breaks on both sides of a block element (redundant ones are tidied later)."""
+    element.addprevious(element.makeelement("br", {}))
+    after = element.makeelement("br", {})
+    after.tail, element.tail = element.tail, None
+    element.addnext(after)
+
+
+def _text_lines(text: Optional[str]) -> List[str]:
+    """Non-blank lines of ``text``, whitespace-collapsed."""
+    return [" ".join(line.split()) for line in (text or "").split("\n") if line.strip()]
+
+
+def _wrap_stray_rows(frag) -> None:
+    """Give rows/cells/row groups that sit outside any table a table of their own."""
+    run: List = []
+
+    def flush() -> None:
+        if not run:
+            return
+        table = frag.makeelement("table", {})
+        run[0].addprevious(table)
+        row = None
+        for element in run:
+            if _tag(element) in ("td", "th"):
+                if row is None:
+                    row = table.makeelement("tr", {})
+                    table.append(row)
+                row.append(element)
+            else:
+                row = None
+                table.append(element)
+        run.clear()
+
+    for child in list(frag):
+        if _tag(child) in ("tr", "td", "th") + _ROW_GROUP_TAGS:
+            run.append(child)
+        else:
+            flush()
+    flush()
+
+
+def _add_lines(parent, lines: List[str], *, at_start: bool = False) -> None:
+    """Add ``lines`` to ``parent`` separated by <br> (at the start or the end of it)."""
+    if not lines:
+        return
+    if at_start:
+        old_text, existing = parent.text, list(parent)
+        parent.text = lines[0]
+        children = []
+        for line in lines[1:]:
+            br = parent.makeelement("br", {})
+            br.tail = line
+            children.append(br)
+        if (old_text and old_text.strip()) or existing:
+            br = parent.makeelement("br", {})
+            br.tail = old_text
+            children.append(br)
+        parent[:] = children + existing  # one pass, not one insert per line
+        return
+    for line in lines:
+        if len(parent) == 0 and not (parent.text or "").strip():
+            parent.text = line
+            continue
+        br = parent.makeelement("br", {})
+        br.tail = line
+        parent.append(br)
+
+
+def _caption_of(table):
+    for child in table:
+        if _tag(child) == "caption":
+            return child
+    caption = table.makeelement("caption", {})
+    table.insert(0, caption)
+    return caption
+
+
+def _split_newlines_into_breaks(cell) -> None:
+    """Newlines inside cell text become <br> (the shared HTML-cell rule); one pass."""
+    def split(text: Optional[str]) -> Tuple[Optional[str], list]:
+        pieces = _LINE_BREAK_RE.split(text or "")
+        if len(pieces) == 1:
+            return text, []
+        breaks = []
+        for piece in pieces[1:]:
+            br = cell.makeelement("br", {})
+            br.tail = piece
+            breaks.append(br)
+        return pieces[0], breaks
+
+    cell.text, children = split(cell.text)
+    added = bool(children)
+    for child in list(cell):
+        child.tail, breaks = split(child.tail)
+        children.append(child)
+        children.extend(breaks)
+        added = added or bool(breaks)
+    if added:
+        cell[:] = children
+
+
+def _tidy_breaks(cell) -> None:
+    """Keep a <br> only between two pieces of content: drop leading, trailing and
+    repeated ones (one pass; their text is kept)."""
+    content_since_break = bool((cell.text or "").strip())
+    last_kept = None
+    for kid in list(cell):
+        has_tail_text = bool((kid.tail or "").strip())
+        if _tag(kid) == "br":
+            if content_since_break:
+                last_kept, content_since_break = kid, False
+            else:
+                _remove_keep_tail(kid)
+        else:
+            content_since_break = True
+        if has_tail_text:
+            content_since_break = True
+    if last_kept is not None and not content_since_break:
+        _remove_keep_tail(last_kept)
+
+
+def _wrap_loose_cells(container) -> None:
+    """Cells placed directly in a table or row group (no <tr>) get a row of their own,
+    as a browser would give them."""
+    run: List = []
+
+    def flush() -> None:
+        if run:
+            row = container.makeelement("tr", {})
+            run[0].addprevious(row)
+            for cell in run:
+                row.append(cell)
+            run.clear()
+
+    for child in list(container):
+        if _tag(child) in ("td", "th"):
+            run.append(child)
+        else:
+            flush()
+    flush()
+
+
+def _tidy_table(table) -> None:
+    """Clean one table's own structure: no text or <br> between rows/cells (it moves to
+    the caption, verbatim and in reading order), no pretty-printing whitespace, <br> for
+    in-cell newlines."""
+    stray: List[str] = []
+    containers = [table] + [child for child in table if _tag(child) in _ROW_GROUP_TAGS]
+    for container in containers:
+        _wrap_loose_cells(container)
+    rows = [row for container in containers for row in container if _tag(row) == "tr"]
+
+    def collect(node) -> None:
+        stray.extend(_text_lines(node.text))
+        node.text = None
+        for child in list(node):
+            if (_tag(child) == "tr" and _tag(node) != "tr") or (node is table and _tag(child) in _ROW_GROUP_TAGS):
+                collect(child)
+            stray.extend(_text_lines(child.tail))
+            child.tail = None
+            if _tag(child) == "br":
+                node.remove(child)
+
+    collect(table)
+    for row in rows:
+        for cell in row:
+            if _tag(cell) in ("td", "th"):
+                _split_newlines_into_breaks(cell)
+                _tidy_breaks(cell)
+    if stray:
+        _add_lines(_caption_of(table), stray)
+    for child in table:
+        if _tag(child) == "caption":
+            _split_newlines_into_breaks(child)
+            _tidy_breaks(child)
+
+
+def _restructure(frag) -> None:
+    """Give every table a clean structure and keep the text around the tables: text
+    before a table becomes (the start of) its <caption>; text after the last table
+    stays after it, one line per <br>."""
+    _wrap_stray_rows(frag)
+    pending = _text_lines(frag.text)
+    frag.text = None
+    last_table = None
+    for child in list(frag):
+        tail = child.tail
+        child.tail = None
+        tag = _tag(child)
+        if tag == "table":
+            if pending:
+                _add_lines(_caption_of(child), pending, at_start=True)
+                pending = []
+            last_table = child
+        else:  # a stray caption/br/col: keep its text for the next table
+            pending.extend(_text_lines(child.text_content()) if tag == "caption" else [])
+            frag.remove(child)
+        pending.extend(_text_lines(tail))
+    if pending:
+        if last_table is None:
+            _add_lines(frag, pending)
+        else:
+            last_table.tail = pending[0]
+            anchor = last_table
+            for line in pending[1:]:
+                br = frag.makeelement("br", {})
+                br.tail = line
+                anchor.addnext(br)
+                anchor = br
+    for table in frag.iter("table"):
+        _tidy_table(table)
+
+
+def _serialize(frag) -> str:
+    from lxml import etree
+    head = _html.escape(frag.text, quote=False) if frag.text else ""
+    return (head + "".join(etree.tostring(child, encoding="unicode", method="html") for child in frag)).strip()
 
 
 def sanitize_table_html(html: str) -> str:
     """Sanitize model-produced table HTML to a strict table-only allowlist.
 
-    Keeps only table-structural tags and ``colspan``/``rowspan``/``scope``
-    attributes (cell text is preserved); drops scripts, styles, event handlers,
-    URLs, and every other tag/attribute. Fails **closed**: returns ``""`` when the
-    input is empty or cannot be parsed, so unsanitized HTML is never emitted.
+    Keeps only table-structural tags, ``<br>`` and the ``colspan``/``rowspan``/``scope``
+    attributes (integer spans, the four ``scope`` keywords); drops scripts, styles, event handlers, URLs,
+    comments, processing instructions and every other tag/attribute, keeping their
+    text. Line structure inside a cell (``<br>``, ``<p>``, ``<li>``, ``<div>`` or a raw
+    newline) becomes ``<br>``, so words and numbers never run together. Text outside
+    any table is kept: before a table it becomes that table's ``<caption>`` (a title or
+    a unit line such as ``Unit: NT$ thousand``), after the last table it follows it.
+    A Markdown pipe table put in the field is converted to an HTML table. Fails
+    **closed**: returns ``""`` when the input is empty or cannot be parsed, so
+    unsanitized HTML is never emitted.
     """
     if not html or not html.strip():
         return ""
-    text = html.strip()
-    # Strip a leading ```/```html ... ``` code fence a model might wrap it in.
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-        if text.rstrip().endswith("```"):
-            text = text[: text.rfind("```")]
-    text = text.strip()
+    text = _strip_code_fence(_clean_controls(html).strip())
     if not text:
         return ""
+    if not _TABLE_MARKUP_RE.search(text):
+        converted = _pipe_tables_to_html(text)
+        if converted is not None:
+            text = converted
     try:
         from lxml import etree, html as lxml_html
         frag = lxml_html.fragment_fromstring(text, create_parent="div")
     except Exception:
         return ""  # fail closed — never emit unparsed LLM HTML
-    # 1. Remove dangerous elements together with their text content.
+    # 1. Comments and processing instructions carry hidden text/markup: drop them.
+    etree.strip_elements(frag, etree.Comment, etree.ProcessingInstruction, with_tail=False)
+    # 2. Remove dangerous elements together with their text content.
     etree.strip_elements(frag, *_DANGEROUS_TAGS, with_tail=False)
-    # 2. Unwrap every remaining non-allowlisted element (keeps inner text).
+    # 3. Block elements separate lines: mark their boundaries before unwrapping.
+    for element in list(frag.iter()):
+        if element is not frag and _tag(element) in _BLOCK_TAGS:
+            _break_around(element)
+    # 4. Unwrap every remaining non-allowlisted element (keeps inner text).
     #    strip_tags preserves the root wrapper, so nested <div>/<span>/<a>/... go.
     present = {e.tag for e in frag.iter() if isinstance(e.tag, str)}
-    unwrap = tuple(t for t in present if t.lower() not in _ALLOWED_TABLE_TAGS)
+    unwrap = tuple(t for t in present if t.lower() not in _ALLOWED_TABLE_TAGS and t.lower() != "br")
     if unwrap:
         etree.strip_tags(frag, *unwrap)
-    # 3. Drop every attribute outside the allowlist; require integer spans.
-    for el in frag.iter():
-        if not isinstance(el.tag, str):
+    # 5. Drop every attribute outside the allowlist; require integer spans.
+    for element in frag.iter():
+        if not isinstance(element.tag, str) or element is frag:
             continue
-        for attr in list(el.attrib):
+        for attr in list(element.attrib):
             name = attr.lower()
-            if name not in _ALLOWED_TABLE_ATTRS:
-                del el.attrib[attr]
-            elif name in ("colspan", "rowspan") and not el.attrib[attr].strip().isdigit():
-                del el.attrib[attr]
-    inner = "".join(etree.tostring(child, encoding="unicode") for child in frag)
-    return inner.strip()
+            value = element.attrib[attr].strip()
+            if _tag(element) == "br" or name not in _ALLOWED_TABLE_ATTRS:
+                del element.attrib[attr]
+            elif name in ("colspan", "rowspan"):
+                if _ASCII_DIGITS_RE.fullmatch(value):
+                    element.attrib[attr] = str(int(value))
+                else:
+                    del element.attrib[attr]
+            elif value.lower() not in _SCOPE_VALUES:
+                del element.attrib[attr]
+    # 6. Structure: keep the text around tables, tidy rows, cells and line breaks.
+    _restructure(frag)
+    return _serialize(frag)
+
+
+# --------------------------------------------------------------------------- #
+# Table grid normalization                                                    #
+# --------------------------------------------------------------------------- #
+_NUMERIC_CELL_RE = re.compile(
+    r"^[(\[]?[+\-\u2212\u2013]?\s*(?:[A-Z]{1,3}\$|[$\u20ac\u00a3\u00a5\u20a9\u20b9])?\s*\d[\d,.\s]*"
+    r"(?:%|\u2030|[kKmMbB]|\u842c|\u4e07|\u5104|\u4ebf)?\s*[)\]]?$"
+)
+_NULL_CELL_TEXT = frozenset({"-", "\u2013", "\u2014", "n/a", "na", "nil", "none"})
+
+
+def _row_groups(table) -> List[list]:
+    """The table's own rows, grouped by row group (thead/tbody/tfoot, or runs of rows
+    placed directly in the table). Rows of nested tables are not included."""
+    groups: List[list] = []
+    loose: List = []
+    for child in table:
+        tag = _tag(child)
+        if tag in _ROW_GROUP_TAGS:
+            if loose:
+                groups.append(loose)
+                loose = []
+            rows = [row for row in child if _tag(row) == "tr"]
+            if rows:
+                groups.append(rows)
+        elif tag == "tr":
+            loose.append(child)
+    if loose:
+        groups.append(loose)
+    return groups
+
+
+def _span_value(value: Optional[str]) -> int:
+    value = (value or "1").strip()
+    return int(value) if _ASCII_DIGITS_RE.fullmatch(value) else 1
+
+
+def _write_span(cell, name: str, value: int) -> bool:
+    current = cell.get(name)
+    if value == 1:
+        if current is not None and current.strip() != "1":
+            del cell.attrib[name]
+            return True
+        return False
+    if current is None or current.strip() != str(value):
+        cell.set(name, str(value))
+        return True
+    return False
+
+
+def _is_blank_cell(cell) -> bool:
+    return not cell.text_content().strip() and all(_tag(child) == "br" for child in cell)
+
+
+def _cell_kind(cell) -> Optional[str]:
+    """"num" for a number-like cell (amounts, percents, years), "text" otherwise,
+    ``None`` for an empty or placeholder cell."""
+    text = " ".join(cell.text_content().split())
+    if not text or text.lower() in _NULL_CELL_TEXT:
+        return None
+    return "num" if _NUMERIC_CELL_RE.match(text) else "text"
+
+
+def _dominant(votes: Counter) -> Optional[str]:
+    total = sum(votes.values())
+    if not total:
+        return None
+    value, count = votes.most_common(1)[0]
+    return value if count / total >= 0.6 else None
+
+
+def _place(cells: list, carried: set, spans: dict) -> List[Tuple[object, int]]:
+    """HTML table layout of one row: each cell starts at the first column not covered
+    by a rowspan from above."""
+    placed, col = [], 0
+    for cell in cells:
+        while col in carried:
+            col += 1
+        placed.append((cell, col))
+        col += spans[cell][1]
+    return placed
+
+
+def _occupancy(carried: set, placed: list, spans: dict) -> int:
+    columns = set(carried)
+    for cell, start in placed:
+        columns.update(range(start, start + spans[cell][1]))
+    return len(columns)
+
+
+def _pad_position(cells: list, carried: set, spans: dict, deficit: int,
+                  kinds: List[Optional[str]], tags: List[Optional[str]], budget: List[int]) -> int:
+    """Where a short row lost its cell(s): the insertion point for ``deficit`` empty
+    cells that best lines the row's cells up with their columns (numbers under number
+    columns, labels under label columns, <td> under <td>). Pads never go before a cell
+    that spans rows (moving it would change the rows below). Ties keep the pads at the
+    end of the row, the historical behaviour; header rows are always padded at the end,
+    and so is every row once the table's search ``budget`` (column slots) is spent."""
+    first = max((index + 1 for index, cell in enumerate(cells) if spans[cell][0] > 1), default=0)
+    cost = (len(cells) - first + 1) * (len(cells) + deficit + len(carried))
+    if (first >= len(cells) or len(cells) > _MAX_ALIGNED_ROW_CELLS or cost > budget[0]
+            or all(_tag(cell) == "th" for cell in cells)):
+        return len(cells)
+    budget[0] -= cost
+    cell_kinds = [_cell_kind(cell) for cell in cells]
+    best, best_score = len(cells), -1
+    for position in range(len(cells), first - 1, -1):
+        sequence = list(range(position)) + [None] * deficit + list(range(position, len(cells)))
+        col, score = 0, 0
+        for index in sequence:
+            while col in carried:
+                col += 1
+            if index is None:
+                col += 1
+                continue
+            cell = cells[index]
+            colspan = spans[cell][1]
+            if colspan == 1 and col < len(kinds):
+                if tags[col] is not None and tags[col] == _tag(cell):
+                    score += 1
+                if kinds[col] is not None and kinds[col] == cell_kinds[index]:
+                    score += 1
+            col += colspan
+        if score > best_score:
+            best, best_score = position, score
+    return best
+
+
+def _lay_out(groups: List[list], cells: dict, spans: dict, visit) -> Dict[object, Tuple[int, list]]:
+    """HTML table layout, row group by row group, with rowspan carry-over.
+    ``visit(row, carried)`` may change ``cells[row]`` before the row is placed.
+    Returns ``{row: (occupied columns, [(cell, start column)])}``."""
+    layout = {}
+    for group in groups:
+        carry: Dict[int, int] = {}
+        for row in group:
+            carried = {col for col, left in carry.items() if left > 0}
+            visit(row, carried)
+            placed = _place(cells[row], carried, spans)
+            layout[row] = _occupancy(carried, placed, spans), placed
+            carry = {col: left - 1 for col, left in carry.items() if left > 1}
+            for cell, start in placed:
+                rowspan, colspan = spans[cell]
+                if rowspan > 1:
+                    for col in range(start, start + colspan):
+                        carry[col] = max(carry.get(col, 0), rowspan - 1)
+    return layout
+
+
+def _layout_work(groups: List[list], cells: dict, spans: dict) -> int:
+    """Upper bound of the column slots a layout visits: per row, its own spans plus
+    every span reaching down into it from the rows above (counted without laying out)."""
+    work = 0
+    for group in groups:
+        delta = [0] * (len(group) + 1)
+        reaching = 0
+        for r, row in enumerate(group):
+            reaching += delta[r]
+            work += reaching + sum(spans[cell][1] for cell in cells[row])
+            for cell in cells[row]:
+                rowspan, colspan = spans[cell]
+                if rowspan > 1:
+                    delta[r + 1] += colspan
+                    delta[r + rowspan] -= colspan
+    return work
+
+
+def _normalize_table(table, pad_budget: List[int]) -> bool:
+    """Make one table a rectangular grid; return whether it changed. See
+    :func:`normalize_table_html`. ``pad_budget`` holds the empty cells the whole field
+    may still add; padding is skipped (the table stays ragged) when it would exceed
+    that or :data:`_MAX_PADS_PER_CELL` per written cell."""
+    groups = _row_groups(table)
+    rows = [row for group in groups for row in group]
+    if not rows:
+        return False
+    cells = {row: [c for c in row if _tag(c) in ("td", "th")] for row in rows}
+    unit_width = max(len(row_cells) for row_cells in cells.values())
+    if unit_width == 0:
+        return False
+    changed = False
+
+    # 1. Bound the spans: colspan <= the widest row's cell count, rowspan <= the rows
+    #    left in its row group; rowspan="0" means "to the end of the row group".
+    colspan_cap = min(unit_width, _MAX_COLSPAN)
+    spans: Dict[object, Tuple[int, int]] = {}
+    for group in groups:
+        for r, row in enumerate(group):
+            remaining = len(group) - r
+            for cell in cells[row]:
+                colspan = min(max(_span_value(cell.get("colspan")), 1), colspan_cap)
+                rowspan = _span_value(cell.get("rowspan"))
+                rowspan = remaining if rowspan == 0 else min(max(rowspan, 1), remaining)
+                changed = _write_span(cell, "colspan", colspan) or changed
+                changed = _write_span(cell, "rowspan", rowspan) or changed
+                spans[cell] = (rowspan, colspan)
+    #    Spans that together still claim a grid too large to lay out (or to render)
+    #    are dropped; every cell and its text stays.
+    if _layout_work(groups, cells, spans) > _MAX_LAYOUT_WORK:
+        for cell in spans:
+            changed = _write_span(cell, "colspan", 1) or changed
+            changed = _write_span(cell, "rowspan", 1) or changed
+            spans[cell] = (1, 1)
+
+    # 2. Reference width: rows no rowspan reaches into cannot carry a double count.
+    reference = []
+    for group in groups:
+        covered_until = -1
+        for r, row in enumerate(group):
+            if covered_until < r:
+                reference.append(sum(spans[c][1] for c in cells[row]))
+            for cell in cells[row]:
+                covered_until = max(covered_until, r + spans[cell][0] - 1)
+    reference_width = max(reference)
+
+    # 3. A row wider than the reference that also emitted an empty cell for a position
+    #    a rowspan above already covers (a double-counted rowspan) loses those empty
+    #    cells; nothing with text is ever removed.
+    def drop_double_counts(row, carried) -> None:
+        nonlocal changed
+        excess = _occupancy(carried, _place(cells[row], carried, spans), spans) - reference_width
+        natural = 0
+        for cell in list(cells[row]):
+            start, natural = natural, natural + spans[cell][1]
+            if excess > 0 and start in carried and spans[cell] == (1, 1) and _is_blank_cell(cell):
+                _remove_keep_tail(cell)
+                cells[row].remove(cell)
+                excess -= 1
+                changed = True
+
+    layout = _lay_out(groups, cells, spans, drop_double_counts)
+    width = max(occupancy for occupancy, _ in layout.values())
+    pads_needed = sum(width - occupancy for occupancy, _ in layout.values())
+    written = sum(len(row_cells) for row_cells in cells.values())
+    if (width * len(rows) > _MAX_GRID_CELLS or pads_needed > pad_budget[0]
+            or pads_needed > _MAX_PADS_PER_CELL * written + _PAD_ALLOWANCE):
+        return changed
+    pad_budget[0] -= pads_needed
+
+    # 4. Column profiles from the complete (full-width) data rows.
+    kind_votes = [Counter() for _ in range(width)]
+    tag_votes = [Counter() for _ in range(width)]
+    for row in rows:
+        occupancy, placed = layout[row]
+        if occupancy != width or all(_tag(c) == "th" for c in cells[row]):
+            continue
+        for cell, start in placed:
+            if spans[cell][1] == 1 and start < width:
+                tag_votes[start][_tag(cell)] += 1
+                kind = _cell_kind(cell)
+                if kind:
+                    kind_votes[start][kind] += 1
+    kinds = [_dominant(v) for v in kind_votes]
+    tags = [_dominant(v) for v in tag_votes]
+    budget = [_MAX_ALIGNMENT_WORK]
+
+    # 5. Pad every short row with empty cells where its cells line up best, then (a
+    #    safety net for overlapping spans) pad whatever is still short at its end.
+    def pad(row, carried, *, align: bool) -> None:
+        nonlocal changed
+        row_cells = cells[row]
+        deficit = width - _occupancy(carried, _place(row_cells, carried, spans), spans)
+        if deficit <= 0:
+            return
+        pads = [row.makeelement("td", {}) for _ in range(deficit)]
+        for new in pads:
+            spans[new] = (1, 1)
+        position = len(row_cells)
+        if align:
+            candidate = _pad_position(row_cells, carried, spans, deficit, kinds, tags, budget)
+            trial = row_cells[:candidate] + pads + row_cells[candidate:]
+            # Keep a mid-row insertion only if the row then spans exactly the grid
+            # (a shifted colspan can overlap a rowspan differently); else pad at the end.
+            if candidate < len(row_cells) and _occupancy(carried, _place(trial, carried, spans), spans) == width:
+                position = candidate
+        for new in pads:
+            if position < len(row_cells):
+                row_cells[position].addprevious(new)
+            else:
+                row.append(new)
+        row_cells[position:position] = pads
+        changed = True
+
+    _lay_out(groups, cells, spans, lambda row, carried: pad(row, carried, align=True))
+    _lay_out(groups, cells, spans, lambda row, carried: pad(row, carried, align=False))
+    return changed
 
 
 def normalize_table_html(html: str) -> str:
-    """Repair a model-emitted ``<table>`` into a rectangular grid.
+    """Repair model-emitted ``<table>`` markup into rectangular grids.
 
     A valid table has every row occupy the same number of columns. Vision models
-    transcribing a complex table (e.g. one with a sparse, header-less unit column)
-    can switch their column count mid-table, emitting rows of unequal effective
-    width — the data then misaligns and ``colspan`` arithmetic overflows. This
-    enforces the invariant deterministically: the grid width is the maximum
-    columns any row occupies (honouring ``colspan`` AND ``rowspan`` carry-over),
-    and every short row is padded with empty ``<td>`` cells to that width. It is a
-    no-op for already-rectangular tables and never drops content. Fails open: on
-    any parse error the (already-sanitized) input is returned unchanged.
+    transcribing a complex table can switch their column count mid-table, emitting
+    rows of unequal effective width -- the data then misaligns. This enforces the
+    invariant deterministically, per table (a nested table or a second table in the
+    same field keeps its own grid):
+
+    - spans are bounded: ``colspan`` never exceeds the widest row's cell count,
+      ``rowspan`` never runs past its row group, and ``rowspan="0"`` is written out as
+      the number of rows to the end of the group (its HTML meaning);
+    - an empty cell emitted for a position that a rowspan above already covers (a
+      double-counted rowspan) is dropped when it makes the row too wide;
+    - a short row is padded with empty ``<td>`` cells to the grid width, inserted
+      where the row's cells then line up best with their columns (so ``Cost | 80``
+      under ``Item | Unit | 2024`` keeps ``80`` under ``2024``); without a clear
+      signal the pads go at the end of the row.
+
+    It is a no-op for already-rectangular tables and never drops a cell with content.
+    Its cost is linear in the size of the grid. Fails open: on any parse error the
+    (already-sanitized) input is returned unchanged.
     """
-    if not html or not html.strip():
+    if not html or not html.strip() or "<table" not in html.lower():
         return html
     try:
-        from lxml import etree, html as lxml_html
+        from lxml import html as lxml_html
         frag = lxml_html.fragment_fromstring(html, create_parent="div")
     except Exception:
         return html
-    rows = frag.findall(".//tr")
-    if not rows:
-        return html
-
-    # First pass: lay every cell onto a grid, tracking colspan width and rowspan
-    # carry-over, to learn the true grid width and each row's occupied columns.
-    occupied: set = set()
-    row_occupancy: List[int] = []
-    for r, tr in enumerate(rows):
-        col = 0
-        for cell in (e for e in tr if isinstance(e.tag, str) and e.tag in ("td", "th")):
-            while (r, col) in occupied:
-                col += 1
-            try:
-                cspan = max(1, int(cell.get("colspan", 1)))
-            except (TypeError, ValueError):
-                cspan = 1
-            try:
-                rspan = max(1, int(cell.get("rowspan", 1)))
-            except (TypeError, ValueError):
-                rspan = 1
-            for dr in range(rspan):
-                for dc in range(cspan):
-                    occupied.add((r + dr, col + dc))
-            col += cspan
-    width = max((c for (_, c) in occupied), default=-1) + 1
-    if width <= 0:
-        return html
-    for r in range(len(rows)):
-        row_occupancy.append(sum(1 for c in range(width) if (r, c) in occupied))
-
-    # Second pass: pad each short row with empty <td> cells up to the grid width.
     changed = False
-    for tr, occ in zip(rows, row_occupancy):
-        for _ in range(width - occ):
-            etree.SubElement(tr, "td")  # appends an empty <td> to the row
+    pad_budget = [_MAX_GRID_CELLS]  # empty cells all tables of this field may add
+    for table in list(frag.iter("table")):
+        # Repeat until nothing changes (at most 3 rounds): dropping a double-counted
+        # cell can lower the colspan cap, so the result is stable on re-validation.
+        for _ in range(3):
+            if not _normalize_table(table, pad_budget):
+                break
             changed = True
-    if not changed:
-        return html
-    inner = "".join(etree.tostring(child, encoding="unicode") for child in frag)
-    return inner.strip()
+    return _serialize(frag) if changed else html
+
+
+# --------------------------------------------------------------------------- #
+# Markdown boundary: escaping model-supplied text                             #
+# --------------------------------------------------------------------------- #
+# Every OCR string other than the sanitized Table.html reaches the Markdown output
+# as text, escaped per the shared escaping policy: only what would change the
+# Markdown/HTML structure is escaped.
+# - Outside code, a "<" becomes "&lt;" only before a letter, "/", "!" or "?" (a tag,
+#   comment or processing instruction; "x < 5" stays). Inside a code span or a fenced
+#   block, which a renderer shows verbatim, markup stays as written ("List<String>",
+#   "<div>") unless it would be live were the region not code after all: a tag with an
+#   attribute value or a dangerous name, a comment, a declaration or a processing
+#   instruction. So a region taken for code by mistake can never make anything live.
+# - Entities stay as written ("&copy;" is the model's way to write the character).
+# - No OCR text creates an image ("![" is escaped) or a link, reference definition or
+#   autolink whose target has a scheme other than http(s) or mailto, however the scheme
+#   is spelled with entities or escapes.
+# - Plain text (a verbatim transcription) also gets a backslash before line-leading
+#   headings, quotes, code fences, rules, setext underlines and link definitions, so a
+#   transcribed "# 3", "==" or "[1]: url" line stays text. Its list markers stay: a
+#   transcribed list is a list. A single-line field (a heading, a label, a cell) escapes
+#   them too, since it follows a list marker or a heading of its own.
+_TAG_START_RE = re.compile(r"<(?=[A-Za-z/!?])")
+_BLOCK_MARKER_RE = re.compile(r"^([ \t]{0,3})(#{1,6}(?=[ \t]|$)|>|`{3,}|~{3,})", re.M)
+_LIST_MARKER_RE = re.compile(r"^([ \t]{0,3})([-+*](?=[ \t]|$)|[0-9]{1,9}(?=[.)](?:[ \t]|$)))", re.M)
+# A rule (---, ***, ___), or a setext heading underline (any run of = or -).
+_RULE_LINE_RE = re.compile(r"^([ \t]{0,3})(?=(?:[-=*_][ \t]*){3,}$|=+[ \t]*$|-+[ \t]*$)", re.M)
+# "[label]: destination" would become an invisible link reference definition, also in a
+# list item or a quote.
+_LINK_DEFINITION_RE = re.compile(
+    r"^([ \t]*(?:(?:>[ \t]*|(?:[-+*]|[0-9]{1,9}[.)])[ \t]+))*)(?=\[(?:[^\]\\\n]|\\.)*\]:)", re.M)
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)$", re.M)
+# Elements that do something even without attributes (run code, style the page, load or
+# embed content, swallow the markup after them, switch the parser to SVG/MathML).
+_LIVE_TAG_NAMES = frozenset(_DANGEROUS_TAGS) | {
+    "textarea", "title", "xmp", "plaintext", "listing", "noembed", "noframes", "frame", "frameset",
+    "img", "image", "video", "audio", "source", "track", "picture", "applet", "param", "portal",
+    "select", "option", "keygen", "isindex", "marquee", "dialog", "details", "html", "head", "body",
+}
+_TAG_NAME_RE = re.compile(r"</?([^\s/>]{1,40})")
+_LINK_TARGET_START_RE = re.compile(r"\](?:\(|:)")
+_SPACES_AND_ANGLE_RE = re.compile(r"\s*(?:<\s*)?")
+# The target up to where it surely ends. Blanks and line breaks inside are kept: some
+# renderers keep them in the URL, and a browser drops tabs and line breaks from it
+# ("java\tscript:", "java\nscript:").
+_LINK_TARGET_RE = re.compile(r"[^)>\"']{0,512}")
+_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+_URL_IGNORED_RE = re.compile(r"[\x00-\x20\x7f]+")
+_SCHEME_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]{0,31}):")
+_SAFE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
+
+
+def _fenced_blocks(text: str) -> List[Tuple[int, int]]:
+    """The fenced code blocks of ``text``, as CommonMark reads them: an opening fence
+    of three or more backticks or tildes indented at most three spaces (a backtick
+    fence's info string has no backtick), closed by a line of the same character at
+    least as long, or by the end of the text."""
+    blocks: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        match = _FENCE_OPEN_RE.search(text, pos)
+        if match is None:
+            return blocks
+        fence, info = match.group(1), match.group(2)
+        if fence[0] == "`" and "`" in info:
+            pos = match.end() + 1
+            continue
+        closer = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", re.M)
+        close = closer.search(text, match.end() + 1)
+        if close is None:
+            blocks.append((match.start(), len(text)))
+            return blocks
+        blocks.append((match.start(), close.end()))
+        pos = close.end() + 1
+
+
+def _code_spans(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    """The inline code spans of ``text[start:end]``, paired as CommonMark pairs them: a
+    backtick string opens a span when a string of exactly its length follows (inside a
+    span a backslash is literal), and a backslash-escaped backtick opens nothing."""
+    runs = [(m.start(), m.end() - m.start()) for m in _BACKTICK_RUN_RE.finditer(text, start, end)]
+    positions = [position for position, _ in runs]
+    by_length: Dict[int, List[int]] = {}
+    for position, length in runs:
+        by_length.setdefault(length, []).append(position)
+    spans: List[Tuple[int, int]] = []
+    index = 0
+    while index < len(runs):
+        position, length = runs[index]
+        backslashes, k = 0, position - 1
+        while k >= start and text[k] == "\\":
+            backslashes, k = backslashes + 1, k - 1
+        if backslashes % 2:  # the first backtick is escaped
+            position, length = position + 1, length - 1
+        candidates = by_length.get(length, [])
+        closing = bisect_right(candidates, position) if length else len(candidates)
+        if closing == len(candidates):
+            index += 1
+            continue
+        close = candidates[closing]
+        spans.append((position, close + length))
+        index = bisect_left(positions, close + length)
+    return spans
+
+
+def _code_regions(text: str, *, fences: bool) -> List[Tuple[int, int]]:
+    """Fenced code blocks (when ``fences``) and inline code spans, in order."""
+    regions: List[Tuple[int, int]] = []
+    pos = 0
+    for start, end in (_fenced_blocks(text) if fences else []):
+        regions.extend(_code_spans(text, pos, start))
+        regions.append((start, end))
+        pos = end
+    regions.extend(_code_spans(text, pos, len(text)))
+    return regions
+
+
+def _live_if_not_code(text: str, lt: int, closes: List[int], values: List[int]) -> bool:
+    """Whether the "<" at ``lt`` would start live markup if its code region were read as
+    prose: a comment, declaration or processing instruction, or a tag that closes in
+    ``text`` (``closes``: where every ">" is) and has an attribute value (``values``:
+    where every "=" is) or a name in :data:`_LIVE_TAG_NAMES`. A tag that never closes
+    cannot form in this text."""
+    if text[lt + 1] in "!?":
+        return True
+    index = bisect_left(closes, lt)
+    if index == len(closes):
+        return False
+    close = closes[index]
+    value = bisect_left(values, lt)
+    if value < len(values) and values[value] < close:
+        return True
+    name = _TAG_NAME_RE.match(text, lt, close)
+    return name is None or len(name.group(1)) == 40 or name.group(1).lower() in _LIVE_TAG_NAMES
+
+
+def _neutralize_prose(text: str, *, keep_breaks: bool) -> str:
+    """Text outside code: every "<" that could start a tag becomes "&lt;" (the inert
+    ``<br>`` stays when ``keep_breaks``), and "![" cannot start an image."""
+    text = text.replace("![", "!\\[")
+    if keep_breaks:
+        return "<br>".join(_TAG_START_RE.sub("&lt;", part) for part in _BR_TAG_RE.split(text))
+    return _TAG_START_RE.sub("&lt;", text)
+
+
+def _neutralize_code(text: str, start: int, end: int, closes: List[int], values: List[int]) -> str:
+    """A code region ``text[start:end]``: kept as written except a "<" that would start
+    live markup outside code (see :func:`_live_if_not_code`), and "![" (an image)."""
+    out: List[str] = []
+    pos = start
+    for match in _TAG_START_RE.finditer(text, start, end):
+        if _live_if_not_code(text, match.start(), closes, values):
+            out.append(text[pos:match.start()])
+            out.append("&lt;")
+            pos = match.start() + 1
+    out.append(text[pos:end])
+    return "".join(out).replace("![", "!\\[")
+
+
+def _neutralize_span(text: str, start: int, end: int, regions: List[Tuple[int, int]],
+                     closes: List[int], values: List[int], *, keep_breaks: bool) -> str:
+    """``text[start:end]`` neutralized: code regions by :func:`_neutralize_code`, the
+    rest by :func:`_neutralize_prose`."""
+    out: List[str] = []
+    pos = start
+    first = max(bisect_right(regions, (start, len(text))) - 1, 0)
+    for region_start, region_end in regions[first:]:
+        if region_start >= end:
+            break
+        if region_end <= start:
+            continue
+        a, b = max(region_start, start), min(region_end, end)
+        out.append(_neutralize_prose(text[pos:a], keep_breaks=keep_breaks))
+        out.append(_neutralize_code(text, a, b, closes, values))
+        pos = b
+    out.append(_neutralize_prose(text[pos:end], keep_breaks=keep_breaks))
+    return "".join(out)
+
+
+def _positions(text: str, char: str) -> List[int]:
+    return [match.start() for match in re.finditer(re.escape(char), text)]
+
+
+def _neutralize(text: str) -> str:
+    """Plain text (no fenced blocks: their fences are escaped as text): code spans kept
+    as written where inert, the rest neutralized, no dangerous link."""
+    regions = _code_regions(text, fences=False)
+    return _break_dangerous_links(_neutralize_span(
+        text, 0, len(text), regions, _positions(text, ">"), _positions(text, "="), keep_breaks=False))
+
+
+def _dangerous_target(text: str, pos: int) -> bool:
+    """Whether the link target that starts at ``pos`` (after optional blanks and "<")
+    has a scheme other than http, https or mailto once its backslash escapes and
+    entities are decoded and the characters a browser ignores are dropped."""
+    pos = _SPACES_AND_ANGLE_RE.match(text, pos).end()
+    target = _LINK_TARGET_RE.match(text, pos).group(0)
+    target = _html.unescape(_BACKSLASH_ESCAPE_RE.sub(r"\1", target))
+    scheme = _SCHEME_RE.match(_URL_IGNORED_RE.sub("", target))
+    return scheme is not None and scheme.group(1).lower() not in _SAFE_LINK_SCHEMES
+
+
+def _break_dangerous_links(text: str, *, bracket: str = "\\]", escaped_too: bool = False) -> str:
+    """Replace the "]" of every inline link or link definition (``](`` / ``]:``) whose
+    target has a dangerous scheme (``javascript:``, ``data:``, ``vbscript:``,
+    ``file:``, ...) with ``bracket`` (an escaped "]", "&#93;" inside HTML, or "] " in
+    plain text), so it closes no link. An escaped "]" is left alone, unless
+    ``escaped_too`` (plain text that another renderer escapes: its escaping of the
+    backslash would free the bracket)."""
+    out: List[str] = []
+    last = 0
+    for match in _LINK_TARGET_START_RE.finditer(text):
+        backslashes, k = 0, match.start() - 1
+        while k >= last and text[k] == "\\":
+            backslashes, k = backslashes + 1, k - 1
+        if (backslashes % 2 and not escaped_too) or not _dangerous_target(text, match.end()):
+            continue
+        out.append(text[last:match.start()])
+        out.append(bracket)
+        last = match.start() + 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+def plain_ocr_text(text: str, document: Optional["OCRPage"] = None) -> str:
+    """An OCR result's text for a renderer that escapes it itself -- a table cell's
+    ``[Image: <text>]`` label goes through the table renderer's own cell escaping. That
+    needs plain text, not this module's escaped Markdown (escaped twice, "<" would read
+    as "&lt;"): the structured page's verbatim transcription (without one, its tables'
+    cell text), or else the model's Markdown as it wrote it (this module's escapes undone,
+    its sanitized tables as their cell text). A table cell still renders inline Markdown,
+    so an image and a link to a target other than http(s) or mailto are broken with a
+    blank ("! [", "] ("), which that escaping keeps."""
+    if isinstance(document, OCRPage) and (document.raw.text.strip() or document.raw.tables):
+        plain = document.raw.text.strip() or _tables_text(document.raw.tables)
+    else:
+        plain = _unsanitized_markdown(text or "")
+    return _break_dangerous_links(plain.replace("![", "! ["), bracket="] ", escaped_too=True)
+
+
+def _tables_text(tables: List["Table"]) -> str:
+    """The cell text of ``tables``, one line per table."""
+    from lxml import html as lxml_html
+    lines = []
+    for table in tables:
+        if table.html:
+            fragment = lxml_html.fragment_fromstring(table.html, create_parent="div")
+            cells = []
+            for cell in fragment.iter("caption", "th", "td"):
+                own = copy.deepcopy(cell)  # its own text: a nested table's cells come on their own
+                for nested in own.findall(".//table"):
+                    nested.drop_tree()
+                cells.append(" ".join(own.text_content().split()))
+        else:
+            cells = [cell.strip() for row in [table.caption, *table.headers, *sum(table.rows, [])]
+                     for cell in ([row] if isinstance(row, str) else row)]
+        lines.append(" ".join(cell for cell in cells if cell))
+    return "\n".join(line for line in lines if line)
+
+
+_TABLE_TOKEN_RE = re.compile(r"<(/?)table\b[^<>]*>", re.I)
+
+
+def _unsanitized_markdown(markdown_text: str) -> str:
+    """Text :func:`_sanitize_markdown` wrote, back to the model's Markdown: its escapes
+    ("&lt;", "!\\[", "\\[", "\\]") undone and each sanitized table as its cell text."""
+    out: List[str] = []
+    depth, start, last = 0, 0, 0
+    for match in _TABLE_TOKEN_RE.finditer(markdown_text):
+        if not match.group(1):
+            if depth == 0:
+                start = match.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                out.append(_unescaped(markdown_text[last:start]))
+                out.append(_tables_text([Table.model_construct(html=markdown_text[start:match.end()])]))
+                last = match.end()
+    out.append(_unescaped(markdown_text[last:start] if depth else markdown_text[last:]))
+    if depth:
+        out.append(_tables_text([Table.model_construct(html=markdown_text[start:])]))
+    return "".join(out).strip()
+
+
+def _unescaped(text: str) -> str:
+    return text.replace("&lt;", "<").replace("!\\[", "![").replace("\\[", "[").replace("\\]", "]")
+
+
+def _escape_line_starts(text: str, *, lists: bool = False) -> str:
+    def marker(match) -> str:
+        indent, token = match.group(1), match.group(2)
+        return f"{indent}{token}\\" if token[0] in "0123456789" else f"{indent}\\{token}"
+
+    text = _RULE_LINE_RE.sub(lambda match: match.group(1) + "\\", text)
+    text = _LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text)
+    if lists:
+        text = _LIST_MARKER_RE.sub(marker, text)
+    return _BLOCK_MARKER_RE.sub(marker, text)
+
+
+def _escape_text_block(text: str) -> str:
+    """Plain multi-line text (a transcription, a caption) for a Markdown block."""
+    return _escape_line_starts(_neutralize(_clean_controls(text)))
+
+
+def _escape_inline(text: str) -> str:
+    """Plain text for a single Markdown line (a heading, list item or label)."""
+    return _escape_line_starts(" ".join(_neutralize(_clean_controls(text)).split()), lists=True)
+
+
+def _escape_cell(text: str) -> str:
+    """Plain text for one Markdown table cell: one line, ``|`` escaped."""
+    text = re.sub(r"\\(?=\|)", r"\\\\", _escape_inline(text))
+    return text.replace("|", "\\|")
+
+
+_TABLE_TAG_RE = re.compile(r"<(/?)table\b[^<>]*>", re.I)
+# What follows an opening <table> tag in real markup, after whitespace and at most a
+# few comments (prose that merely mentions "<table>" goes on with words).
+_TABLE_BODY_TAG_RE = re.compile(r"<(?:tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b", re.I)
+_SPACES_RE = re.compile(r"\s*")
+_COMMENT_END_RE = re.compile("-->")
+_MAX_LEADING_COMMENTS = 8
+
+
+def _opens_table_body(text: str, pos: int, comment_ends: List[int]) -> bool:
+    """Whether table markup follows ``pos``. A comment ends at the first "-->" after it
+    (``comment_ends``: where every "-->" in ``text`` starts, in order), so a check costs
+    a few lookups however many comments or tags the text repeats."""
+    for _ in range(_MAX_LEADING_COMMENTS + 1):
+        pos = _SPACES_RE.match(text, pos).end()
+        if not text.startswith("<!--", pos):
+            return _TABLE_BODY_TAG_RE.match(text, pos) is not None
+        index = bisect_left(comment_ends, pos + 4)
+        if index == len(comment_ends):
+            return False  # a comment that never ends
+        pos = comment_ends[index] + 3
+    return False
+
+
+def _escape_definitions(text: str) -> str:
+    """Link reference definitions at line starts outside fenced blocks stay text."""
+    out: List[str] = []
+    pos = 0
+    for start, end in _fenced_blocks(text):
+        out.append(_LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text[pos:start]))
+        out.append(text[start:end])
+        pos = end
+    out.append(_LINK_DEFINITION_RE.sub(lambda match: match.group(1) + "\\", text[pos:]))
+    return "".join(out)
+
+
+def _sanitized_table(html: str) -> str:
+    """One ``<table>`` block of model Markdown through the table sanitizer and
+    normalizer. Its text cannot start an image or a dangerous link either ("&#33;" and
+    "&#93;" read the same in an HTML block and inside a paragraph)."""
+    table = normalize_table_html(sanitize_table_html(html))
+    return _break_dangerous_links(table.replace("![", "&#33;["), bracket="&#93;")
+
+
+def _sanitize_markdown(text: str) -> str:
+    """Model-written Markdown (``page_markdown``, ``Table.markdown``, a free-form OCR
+    answer): its Markdown structure is kept; each ``<table>...</table>`` block outside
+    code goes through the ``Table.html`` sanitizer and normalizer, and the rest is
+    neutralized per the policy above (the inert ``<br>`` stays). Apply it once, to the
+    final text."""
+    text = _escape_definitions(_clean_controls(text))
+    regions = _code_regions(text, fences=True)
+    region_starts = [start for start, _ in regions]
+    closes, values = _positions(text, ">"), _positions(text, "=")
+    comment_ends = [match.start() for match in _COMMENT_END_RE.finditer(text)]
+
+    def in_code(pos: int) -> bool:
+        index = bisect_right(region_starts, pos) - 1
+        return index >= 0 and pos < regions[index][1]
+
+    def prose(start: int, end: int, *, before_table: bool) -> str:
+        chunk = _neutralize_span(text, start, end, regions, closes, values, keep_breaks=True)
+        # The sanitizer can return plain text (a <table-x> is unwrapped to its text), and
+        # "<" + "img src=x onerror=..." would be a live tag.
+        return chunk[:-1] + "&lt;" if before_table and chunk.endswith("<") else chunk
+
+    out: List[str] = []
+    depth, start, last = 0, 0, 0
+    for match in _TABLE_TAG_RE.finditer(text):
+        if in_code(match.start()):
+            continue  # a table shown as code stays code
+        if not match.group(1):
+            if not _opens_table_body(text, match.end(), comment_ends):
+                continue  # "<table>" mentioned in prose, not table markup
+            if depth == 0:
+                start = match.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                out.append(prose(last, start, before_table=True))
+                out.append(_sanitized_table(text[start:match.end()]))
+                last = match.end()
+    if depth:
+        # A table still open at the end (its markup goes straight on into rows): an
+        # answer cut off at max_tokens.
+        out.append(prose(last, start, before_table=True))
+        out.append(_sanitized_table(text[start:]))
+    else:  # no table left open, or a "<table>" merely mentioned in the prose
+        out.append(prose(last, len(text), before_table=False))
+    # An image or a link can still straddle a table and the text next to it.
+    return _break_dangerous_links("".join(out).replace("![", "!\\["))
 
 
 # --------------------------------------------------------------------------- #
@@ -632,6 +1675,13 @@ class OCRPage(BaseModel):
 
         Used as the back-compat ``OCRResult.text`` and by pipelines that want a
         single string. Prefers structured tables/fields over the flat text dump.
+
+        This is the Markdown boundary for model output: the sanitized
+        ``Table.html`` is the only live HTML emitted; every other field is escaped
+        (see :func:`_escape_text_block`), and a table whose rows were withheld as
+        illustrative is followed by a visible ``[N illustrative rows not
+        transcribed]`` marker (fields, metrics and figures withheld likewise get
+        ``[N illustrative fields/metrics/figures not transcribed]``).
         """
         parts: List[str] = []
         raw = self.raw
@@ -646,17 +1696,12 @@ class OCRPage(BaseModel):
         # to the standard verbatim rendering — never worse than today.
         md = (interp.page_markdown or "").strip() if interp is not None else ""
         if md:
-            table_text = " ".join((t.html or t.markdown or "") for t in raw.tables)
-            covered, missing = _coverage(raw.text, md + "\n" + table_text)
+            # Coverage is judged on what is emitted: the sanitized rendering (text the
+            # sanitizer removes, e.g. inside an <svg>, must land in the tail).
+            out = [_sanitize_markdown(md)] + [_render_table_block(table) for table in raw.tables]
+            out.append(_withheld_elements_marker(self))
+            covered, missing = _coverage(raw.text, "\n".join(out))
             if covered >= _SYNTH_COVERAGE_MIN:
-                out = [md]
-                for table in raw.tables:
-                    if table.html:
-                        out.append(table.html.strip())
-                    elif table.markdown:
-                        out.append(table.markdown.strip())
-                    elif table.headers or table.rows:
-                        out.append(_render_table(table))
                 if missing:
                     out.append("<!-- raw-verbatim-tail\n" + "\n".join(missing) + "\n-->")
                 return "\n\n".join(p for p in out if p)
@@ -666,16 +1711,10 @@ class OCRPage(BaseModel):
         if interp is not None and interp.page_title:
             title = interp.page_title.strip()
             if title and not raw.text.lstrip().startswith(title):
-                parts.append(f"# {title}")
+                parts.append(f"# {_escape_inline(title)}")
         if raw.text:
-            parts.append(raw.text.strip())
-        for table in raw.tables:
-            if table.html:
-                parts.append(table.html.strip())
-            elif table.markdown:
-                parts.append(table.markdown.strip())
-            elif table.headers or table.rows:
-                parts.append(_render_table(table))
+            parts.append(_escape_text_block(raw.text.strip()))
+        parts.extend(_render_table_block(table) for table in raw.tables)
         # Typed metrics give a degraded-render payoff for the numeric index; skip
         # illustrative (sample/mockup) values so they never read as real data.
         real_metrics = [m for m in raw.metrics if not m.illustrative]
@@ -687,10 +1726,57 @@ class OCRPage(BaseModel):
             fig_md = _render_figures(interp.figures)
             if fig_md:
                 parts.append(fig_md)
+        # Withheld (illustrative) fields, metrics and figures leave a visible trace, as
+        # withheld table rows do.
+        parts.append(_withheld_elements_marker(self))
+        if interp is not None:
             sec_md = _render_sections(interp.sections)
             if sec_md:
                 parts.append(sec_md)
         return "\n\n".join(p for p in parts if p)
+
+
+def _table_has_rows(table: Table) -> bool:
+    """Whether any data row of the table was transcribed (in any representation)."""
+    if table.rows:
+        return True
+    if table.html and len(re.findall(r"<tr[\s>]", table.html, re.I)) > 1:
+        return True
+    return len([line for line in table.markdown.splitlines() if line.strip().startswith("|")]) > 2
+
+
+def _withheld_marker(table: Table) -> str:
+    """A visible trace of rows withheld from an illustrative (screenshot) table."""
+    if not table.illustrative:
+        return ""
+    if table.row_count:
+        return f"[{table.row_count} illustrative rows not transcribed]"
+    return "" if _table_has_rows(table) else "[illustrative rows not transcribed]"
+
+
+def _withheld_elements_marker(page: "OCRPage") -> str:
+    """A visible trace of the fields, metrics and figures withheld as illustrative
+    (their values are not in the page text); "" when nothing was withheld."""
+    figures = page.interpretation.figures if page.interpretation is not None else []
+    counts = (
+        (sum(1 for f in page.raw.fields if f.illustrative), "field"),
+        (sum(1 for m in page.raw.metrics if m.illustrative), "metric"),
+        (sum(1 for f in figures if f.illustrative), "figure"),
+    )
+    return "\n\n".join(
+        f"[{count} illustrative {noun}{'s' if count > 1 else ''} not transcribed]" for count, noun in counts if count)
+
+
+def _render_table_block(table: Table) -> str:
+    if table.html:
+        body = table.html.strip()
+    elif table.markdown:
+        body = _sanitize_markdown(table.markdown.strip())
+    elif table.headers or table.rows:
+        body = _render_table(table)
+    else:
+        body = ""
+    return "\n\n".join(p for p in (body, _withheld_marker(table)) if p)
 
 
 def _render_metrics(metrics: List["Metric"]) -> str:
@@ -702,7 +1788,7 @@ def _render_metrics(metrics: List["Metric"]) -> str:
         unit = (m.unit or "").strip()
         if unit and unit not in value:
             value = f"{value} {unit}".strip()
-        lines.append(f"| {label} | {value} |")
+        lines.append(f"| {_escape_cell(label)} | {_escape_cell(value)} |")
     return "\n".join(lines)
 
 
@@ -713,9 +1799,9 @@ def _render_figures(figures: List["Figure"]) -> str:
     for fig in figures:
         if fig.illustrative:
             continue
-        title = (fig.title or "").strip()
+        title = _escape_inline(fig.title or "")
         head = f"**Figure: {title}**" if title else f"**Figure ({fig.kind})**"
-        sub = " ".join(s for s in ((fig.meaning or "").strip(), (fig.trend or "").strip()) if s)
+        sub = " ".join(s for s in (_escape_inline(fig.meaning or ""), _escape_inline(fig.trend or "")) if s)
         body: List[str] = []
         pts = [p for p in fig.data_points if (p.label or "").strip() or (p.value or "").strip()]
         if pts:
@@ -723,24 +1809,26 @@ def _render_figures(figures: List["Figure"]) -> str:
                 body.append("| Series | Category | Value |")
                 body.append("| --- | --- | --- |")
                 for p in pts:
-                    body.append(f"| {(p.series or '').strip()} | {(p.label or '').strip()} | {(p.value or '').strip()} |")
+                    body.append(f"| {_escape_cell(p.series or '')} | {_escape_cell(p.label or '')} "
+                                f"| {_escape_cell(p.value or '')} |")
             else:
                 body.append("| Category | Value |")
                 body.append("| --- | --- |")
                 for p in pts:
-                    body.append(f"| {(p.label or '').strip()} | {(p.value or '').strip()} |")
+                    body.append(f"| {_escape_cell(p.label or '')} | {_escape_cell(p.value or '')} |")
         edge_lines: List[str] = []
         connected: set = set()
         for e in fig.edges:
-            frm, to = (e.from_label or "").strip(), (e.to_label or "").strip()
+            frm, to = _escape_inline(e.from_label or ""), _escape_inline(e.to_label or "")
             if frm or to:
-                arrow = f" --{e.label.strip()}-->" if (e.label or "").strip() else " -->"
+                label = _escape_inline(e.label or "")
+                arrow = f" --{label}-->" if label else " -->"
                 edge_lines.append(f"- {frm}{arrow} {to}".rstrip())
                 connected.update({e.from_label, e.to_label})
         for n in fig.nodes:
             if n.label and n.label not in connected:
-                kind = f" ({n.kind.strip()})" if (n.kind or "").strip() else ""
-                edge_lines.append(f"- {n.label.strip()}{kind}")
+                kind = f" ({_escape_inline(n.kind)})" if (n.kind or "").strip() else ""
+                edge_lines.append(f"- {_escape_inline(n.label)}{kind}")
         if not (sub or body or edge_lines):
             continue
         lines = [head]
@@ -758,33 +1846,40 @@ def _render_sections(sections: List["Section"]) -> str:
         return ""
     lines = ["**Section outline**"]
     for s in sections:
-        heading = (s.heading or "").strip()
+        heading = _escape_inline(s.heading or "")
         if not heading:
             continue
         indent = "  " * max(0, s.level - 1)
         lines.append(f"{indent}- {heading}")
-        if (s.summary or "").strip():
-            lines.append(f"{indent}  {s.summary.strip()}")
+        summary = _escape_inline(s.summary or "")
+        if summary:
+            lines.append(f"{indent}  {summary}")
         for kp in s.key_points:
-            if (kp or "").strip():
-                lines.append(f"{indent}  - {kp.strip()}")
+            point = _escape_inline(kp or "")
+            if point:
+                lines.append(f"{indent}  - {point}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _render_table(table: Table) -> str:
-    """Render a simple markdown table from headers + rows."""
+    """Render a simple markdown table from headers + rows.
+
+    Cells are escaped for a pipe table (``|`` as ``\\|``, line breaks as spaces), and
+    the width is the widest row, so no cell is cut off.
+    """
     lines: List[str] = []
     if table.caption:
-        lines.append(table.caption.strip())
-    width = len(table.headers) or (len(table.rows[0]) if table.rows else 0)
+        lines.append(_escape_text_block(table.caption.strip()))
+        lines.append("")
+    width = max([len(table.headers)] + [len(row) for row in table.rows])
     if not width:
-        return "\n".join(lines)
-    headers = table.headers or [""] * width
-    lines.append("| " + " | ".join(headers) + " |")
+        return "\n".join(lines).strip()
+    headers = list(table.headers) + [""] * (width - len(table.headers))
+    lines.append("| " + " | ".join(_escape_cell(h) for h in headers) + " |")
     lines.append("| " + " | ".join(["---"] * width) + " |")
     for row in table.rows:
         cells = list(row) + [""] * (width - len(row))
-        lines.append("| " + " | ".join(cells[:width]) + " |")
+        lines.append("| " + " | ".join(_escape_cell(c) for c in cells) + " |")
     return "\n".join(lines)
 
 
@@ -822,26 +1917,31 @@ def _coverage(raw_text: str, rendered: str):
     return 1 - len(missing) / len(toks), sorted(set(missing))
 
 
-def router_invariants(page: "OCRPage") -> List[str]:
-    """Return the router firewall violations for a structured page (empty = OK).
-
-    Protects the BM42 invariant: real printed values are never withheld (marked
-    ``illustrative``) except on a high-confidence ``screenshot`` page. Verbatim
-    substring checks are whitespace-normalized (see :func:`_norm_ws`). Intended as
-    a CI/eval assertion over recorded structured outputs.
-    """
-    violations: List[str] = []
+def _withholds_values(page: "OCRPage") -> bool:
     raw = page.raw
-    interp = page.interpretation
-    text_n = _norm_ws(raw.text or "")
-    headings_n = {_norm_ws(h) for h in raw.headings}
-    figs = interp.figures if interp else []
-    has_illustrative = (
+    figs = page.interpretation.figures if page.interpretation else []
+    return (
         any(t.illustrative for t in raw.tables)
         or any(f.illustrative for f in raw.fields)
         or any(m.illustrative for m in raw.metrics)
         or any(fig.illustrative for fig in figs)          # Figure gated like Table
     )
+
+
+def withholding_violations(page: "OCRPage", *, context_attached: Optional[bool] = None) -> List[str]:
+    """The router-firewall violations that withhold printed values (empty = OK).
+
+    The subset of :func:`router_invariants` that the OCR providers enforce at run
+    time on every structured result (a violating result is redone with a verbatim
+    task): withheld (``illustrative``) values anywhere but on a high-confidence,
+    legible ``screenshot``, and a ``described``/``caption`` fidelity without the
+    meaning in ``interpretation.summary``. With ``context_attached=False`` (no
+    neighbor-page PDF was attached to the request) any withholding is a violation
+    too: the router's third gate needs that context, and the prompt says so.
+    """
+    violations: List[str] = []
+    interp = page.interpretation
+    has_illustrative = _withholds_values(page)
     dtype = interp.document_type if interp else None
     fidelity = interp.content_fidelity if interp else "verbatim"
 
@@ -860,6 +1960,31 @@ def router_invariants(page: "OCRPage") -> List[str]:
     # 3. described/caption must carry meaning in the interpretation.
     if fidelity in ("described", "caption") and (interp is None or not interp.summary.strip()):
         violations.append(f"content_fidelity={fidelity!r} but interpretation.summary is empty")
+    # 4. Without neighbor-page context the policy is VERBATIM: nothing may be withheld.
+    if context_attached is False and has_illustrative:
+        violations.append("values withheld as illustrative although no neighbor-page context was attached")
+    return violations
+
+
+def router_invariants(page: "OCRPage") -> List[str]:
+    """Return the router firewall violations for a structured page (empty = OK).
+
+    Protects the BM42 invariant: real printed values are never withheld (marked
+    ``illustrative``) except on a high-confidence ``screenshot`` page. Verbatim
+    substring checks are whitespace-normalized (see :func:`_norm_ws`). The OCR
+    providers enforce the withholding subset (:func:`withholding_violations`) on
+    every structured result; the full set also serves as a CI/eval assertion over
+    recorded structured outputs.
+    """
+    raw = page.raw
+    interp = page.interpretation
+    text_n = _norm_ws(raw.text or "")
+    headings_n = {_norm_ws(h) for h in raw.headings}
+    figs = interp.figures if interp else []
+    fidelity = interp.content_fidelity if interp else "verbatim"
+
+    # 1-3. Withholding (see withholding_violations).
+    violations: List[str] = withholding_violations(page)
     # 4. skipped implies an empty raw layer.
     if fidelity == "skipped" and (raw.text.strip() or raw.tables or raw.fields):
         violations.append("content_fidelity='skipped' but raw is not empty")
@@ -948,4 +2073,5 @@ __all__ = [
     "sanitize_table_html",
     "normalize_table_html",
     "router_invariants",
+    "withholding_violations",
 ]

@@ -202,7 +202,9 @@ Supported formats:
     ocr_group.add_argument(
         "--ocr-lang",
         default="eng",
-        help="Language for Tesseract OCR (default: eng)"
+        help="Language for Tesseract OCR: Tesseract codes such as eng, deu, chi_tra or eng+chi_tra, "
+             "or a long name such as chinese_traditional (default: eng). A language that is not "
+             "installed fails the run."
     )
 
     ocr_group.add_argument(

@@ -402,3 +402,46 @@ def test_loader_with_cache_counts_fresh_load_then_zero_on_ocr_cache_hit(tmp_path
     second = loader.load(img_path, extract_images=True, ocr_images=True)
     assert inner.image_count == 1  # OCR served from cache, no fresh provider call
     assert "token_usage" not in (second.metadata.extra or {})
+
+
+# --------------------------------------------------------------------------- #
+# OCR issue locations                                                         #
+# --------------------------------------------------------------------------- #
+class _IssueOCR(BaseOCR):
+    """Provider stub returning scripted metadata per image, call after call."""
+
+    def __init__(self, *batches):
+        super().__init__()
+        self.batches = list(batches)
+
+    def batch_process_images(self, images, **kwargs):
+        return [OCRResult(text="", metadata=dict(meta)) for meta in self.batches.pop(0)]
+
+
+def test_issue_locations_count_images_across_calls_and_take_the_page_a_pipeline_names():
+    ocr = UsageAggregatingOCR(_IssueOCR(
+        [{}, {"ocr_refusal": True}],
+        [{"failed": True, "error": "boom"}, {}, {"router_fallback": "unresolved"}],
+    ))
+    ocr.begin_document_usage()
+
+    ocr.batch_process_images([b"a", b"b"])
+    ocr.label_last_batch([{"page": 1}, {"page": 3}])
+    ocr.batch_process_images([b"c", b"d", b"e"])
+
+    issues = ocr.pop_document_issues()
+    assert issues["refused"] == 1 and issues["failed"] == 1 and issues["withheld"] == 1
+    assert issues["locations"] == [
+        {"issue": "refused", "image": 2, "page": 3},
+        {"issue": "failed", "image": 3},
+        {"issue": "withheld", "image": 5},
+    ]
+
+
+def test_no_issues_no_locations_key():
+    ocr = UsageAggregatingOCR(_IssueOCR([{}]))
+    ocr.begin_document_usage()
+    ocr.batch_process_images([b"a"])
+    ocr.label_last_batch([{"page": 1}])
+
+    assert ocr.pop_document_issues() is None

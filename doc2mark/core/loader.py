@@ -621,6 +621,14 @@ class UnifiedDocumentLoader:
                     if result.metadata.extra is None:
                         result.metadata.extra = {}
                     result.metadata.extra["token_usage"] = token_usage
+                # Raises OCREngineError when the OCR engine could not run at all (the
+                # pipelines degrade that to placeholders); otherwise stamp the issues.
+                ocr_issues = usage_ocr.pop_document_issues()
+                if ocr_issues:
+                    if result.metadata.extra is None:
+                        result.metadata.extra = {}
+                    result.metadata.extra["ocr_issues"] = ocr_issues
+                    logger.warning(f"OCR issues in {file_path.name}: {ocr_issues}")
 
             # Apply output format conversion if needed
             if output_format != OutputFormat.MARKDOWN:
