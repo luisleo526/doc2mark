@@ -99,6 +99,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
     "pytest-timeout>=2.0.0",
+    "markdown-it-py>=3.0.0",
     "black>=23.0.0",
     "isort>=5.0.0",
     "flake8>=6.0.0",

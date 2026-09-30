@@ -192,13 +192,13 @@ class TestPDFFootnoteDetection:
         from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
         import pymupdf
 
-        # We can't easily unit-test _convert_block_to_markdown_with_type
-        # without a real document, so we test the conditions directly.
-        # The heuristic: block_y > 85% of page, font < 0.9 * avg, starts with digit pattern.
+        # We can't easily unit-test _classify_block without a real document, so we
+        # test the conditions directly. The heuristic: block_y > 85% of page,
+        # font < 0.9 * avg, starts with digit pattern.
 
         # This is a structural test — verify the method exists and handles
         # footnote classification without crashing.
-        assert hasattr(PDFLoader, '_convert_block_to_markdown_with_type')
+        assert hasattr(PDFLoader, '_classify_block')
 
 
 # ---------------------------------------------------------------------------

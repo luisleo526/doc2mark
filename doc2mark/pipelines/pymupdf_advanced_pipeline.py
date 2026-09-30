@@ -4,7 +4,7 @@ import logging
 import numbers
 import re
 import unicodedata
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Any, Union, Optional, Tuple
 import pymupdf
 
 from doc2mark.utils.image_utils import detect_image_format, get_mime_type
+from doc2mark.utils.markdown import escape_heading_closing, escape_inline_pieces, escape_line_start
 from doc2mark.core.table import TableStyle, TableRenderer, TableData
 
 # --- Image-dominant page OCR strategy ---------------------------------------
@@ -89,6 +90,13 @@ logger = logging.getLogger(__name__)
 from doc2mark.core.types import SimpleContent  # shared content model
 
 
+@dataclass
+class _TextContent(SimpleContent):
+    """A text item that may be a heading: ``heading`` is its (font size, outline depth), from
+    which ``PDFLoader._choose_title`` picks the title and ``_finalize_text_items`` the levels."""
+    heading: Optional[Tuple[float, int]] = None
+
+
 @dataclass(frozen=True)
 class _HeadingFeatures:
     normalized: str
@@ -98,8 +106,6 @@ class _HeadingFeatures:
     max_size_ratio: float
     is_bold: bool
     is_all_caps: bool
-    has_list_pattern: bool
-    list_line_count: int
     is_explicit_marker: bool
     is_structured_marker: bool
     text_after_marker: str
@@ -110,6 +116,10 @@ class _HeadingFeatures:
     separator_count: int
     has_form_field_shape: bool
     has_long_clause_shape: bool
+    letter_count: int = 0
+    has_color_signal: bool = False
+    is_bare_structured_marker: bool = False
+    is_bare_cjk_explicit_marker: bool = False
 
 
 @dataclass(slots=True)
@@ -135,6 +145,443 @@ class _PageLine:
     template: Optional[str] = None
     numbers: Tuple[int, ...] = ()
     totals: Tuple[Tuple[int, int], ...] = ()  # (N, M) of each masked "N/M" or "N of M"
+
+
+# --- PDF text blocks -> Markdown ---------------------------------------------
+# Ligature glyphs (U+FB00..U+FB06) become their letters so lexical retrieval
+# matches "financial", not "ﬁnancial".
+_LIGATURES = {code: unicodedata.normalize("NFKC", chr(code)) for code in range(0xFB00, 0xFB07)}
+_BOLD_FONT_NAME = re.compile(r"bold|black|heavy|semibold|demibold", re.IGNORECASE)
+_ITALIC_FONT_NAME = re.compile(r"italic|oblique", re.IGNORECASE)
+_CHAR_FLAG_BOLD = 8             # MuPDF FZ_STEXT_BOLD: bold font face or synthetic bold
+_MIN_PAGE_BODY_CHARS = 300      # fewer body characters: use the document's body size
+_RUNNING_TEXT_UNITS = 30        # a line this long (CJK characters count twice) is running text
+_PROFILE_MAX_PAGES = 60         # pages sampled for the document body size
+# Glyphs that always mark list items, including the Symbol/Wingdings bullets that
+# Word exports in the private use area (U+F0B7 and friends).
+_BULLET_GLYPHS = "•◦▪▫●○■‣⁃∙·➢➤►▶❖◆◇✓✔➔"
+_PUA_BULLETS = "\uf0b7\uf0a7\uf0a8\uf076\uf06e\uf0d8\uf0de\uf0e0\uf0fc\uf0a1"
+_LIST_GLYPH = re.compile(rf"(?:[{_BULLET_GLYPHS}]\s+|[{_PUA_BULLETS}]\s*)(?=\S)")
+# Bullets that carry meaning (a check mark, an arrow, a dash): they stay in the item text after the
+# Markdown marker. Word writes its Wingdings check mark and arrows into the private use area.
+_MEANINGFUL_BULLETS = "✓✔➔➤►▶➢–—"
+_PUA_MEANINGFUL_BULLETS = {"\uf0fc": "\u2713", "\uf0d8": "\u27a2", "\uf0e0": "\u2794"}
+# ASCII bullets and dashes are list markers only next to other list items;
+# alone they are text ("+ 20% bonus", "* marked fields", "— Mark Twain").
+_LIST_CONTEXT_BULLET = re.compile(r"([-*+–—])\s+(?=\S)")
+_LIST_ORDERED = re.compile(r"(\d{1,2})([.)])\s+(?=\S)")
+_ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+_CJK_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+               "壹": 1, "貳": 2, "參": 3, "肆": 4, "伍": 5, "陸": 6, "柒": 7, "捌": 8, "玖": 9, "拾": 10}
+# Enumerations that are list markers only in a sequence (a, b, c / i, ii, iii / 一、二、):
+# a lone "A. Smith", "E. coli", "p. 12" or "I. Background" is ordinary text.
+_LIST_ENUMERATIONS = [
+    (re.compile(r"\(([a-z])\)\s*(?=\S)"), "paren-lower", "alpha"),
+    (re.compile(r"\(([A-Z])\)\s*(?=\S)"), "paren-upper", "alpha"),
+    (re.compile(r"\(([ivxlcdm]{1,6})\)\s*(?=\S)"), "paren-lower-roman", "roman"),
+    (re.compile(r"\(([IVXLCDM]{1,6})\)\s*(?=\S)"), "paren-upper-roman", "roman"),
+    (re.compile(r"([a-z])([.)])\s+(?=\S)"), "lower", "alpha"),
+    (re.compile(r"([A-Z])([.)])\s+(?=\S)"), "upper", "alpha"),
+    (re.compile(r"([ivxlcdm]{1,6})([.)])\s+(?=\S)"), "lower-roman", "roman"),
+    (re.compile(r"([IVXLCDM]{1,6})([.)])\s+(?=\S)"), "upper-roman", "roman"),
+    (re.compile(r"[(（](\d{1,3})[)）]\s*(?=\S)"), "paren-number", "number"),
+    (re.compile(r"[(（]([一二三四五六七八九十]{1,3})[)）]\s*(?=\S)"), "paren-cjk", "cjk"),
+    (re.compile(r"([一二三四五六七八九十]{1,3})([、．.])\s*(?=\S)"), "cjk", "cjk"),
+    (re.compile(r"([壹貳參肆伍陸柒捌玖拾]{1,3})([、．.])\s*(?=\S)"), "cjk-formal", "cjk"),
+    (re.compile(r"((?:\d{1,3}\.)+)(\d{1,3})\.?\s+(?=\S)"), "dotted", "number"),
+]
+# Text that is only a list marker (Word draws the marker and the item text as
+# separate lines because of the tab between them).
+_MARKER_ONLY = re.compile(
+    rf"(?:[{_BULLET_GLYPHS}{_PUA_BULLETS}]|[-*+–—]|\d{{1,3}}[.)]|[a-zA-Z][.)]|[ivxlcdmIVXLCDM]{{1,6}}[.)]"
+    r"|[(（](?:\d{1,3}|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6}|[一二三四五六七八九十]{1,3})[)）]"
+    r"|[一二三四五六七八九十壹貳參肆伍陸柒捌玖拾]{1,3}[、．])"
+)
+# Captions start with a numbered label ("Figure 3:", "Table 2.1", "Fig. 4 Revenue",
+# "圖1", "表 2："); "Tablets …", "Fighting …" and "Table 3 shows …" do not.
+_CAPTION_LABEL = re.compile(
+    r"(?:(?i:figure|fig\.|table|tbl\.|tab\.|chart|graph|exhibit|plate|scheme|image|photo|diagram|illustration|map)"
+    r"\s*(?:[A-Z]?\d+(?:[.\-–]\d+)*[a-z]?|[IVXLC]+|[A-Z])"
+    r"(?=\s*$|\s*[.:：\-–—|)]|\s+(?:[A-Z(\"“'‘]|[^\x00-\x7f])))"
+    r"|(?:附圖|附图|附表|圖|图|表)\s*[0-9０-９一二三四五六七八九十]+"
+)
+# Caption-shaped lead words for text directly attached to an image or table.
+_CAPTION_KEYWORD = re.compile(r"(?i:sources?|notes?|credits?|photo)\b|資料來源|资料来源|來源|来源|註|说明|說明|備註|备注")
+# A hyphen before these words is a suspended hyphen ("short- and long-term"), not a line-end join.
+_SUSPENDED_HYPHEN_WORDS = {"and", "or", "to", "nor"}
+_WORD = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:-[A-Za-zÀ-ÖØ-öø-ÿ]+)*")
+# The plain word at the end of a line (not the last part of a hyphenated compound)
+_TRAILING_WORD = re.compile(r"(?<![A-Za-zÀ-ÖØ-öø-ÿ-])[A-Za-zÀ-ÖØ-öø-ÿ]+$")
+# A form label at the start of a CJK line ("提案單位："): not the wrapped end of the line before it.
+_LABEL_START = re.compile(r"[^\s：:，,。.]{1,12}[：:]")
+# Raised text that stays inline: ordinal suffixes after a number (Word raises them) and marks.
+_INLINE_RAISED_MARKS = set("\u00ae\u2122\u2120\u00a9")
+_SENTENCE_END = re.compile(r"[.!?。！？][\"'”’)\]」』]*$")
+# The first thing a wrapped line may start with: a CJK character, a Latin word or number, with the
+# opening brackets and quotes before it that cannot end the line above.
+_LINE_START_TOKEN = re.compile(r"[「『（(【《〈“‘\"']*(?:[A-Za-z0-9]+|\S)")
+# A line that ends a sentence or a lead-in: the next line starts afresh, even after a full line.
+_LEAD_IN_END = re.compile(r"[.!?。！？:：;；][\"'”’)\]」』]*$")
+# A heading number set a tab apart from its title ("1.2", "IV.", "Chapter 3", "第一章", "一、").
+_HEADING_NUMBER = re.compile(
+    r"(?:(?i:chapter|section|part|article|appendix)\s+)?(?:\d{1,3}(?:\.\d{1,3})*|[IVXLCDM]{1,6}|[A-Z])[.:)]?"
+    r"|第\s*[一二三四五六七八九十百千零〇\d]+\s*[章節节條条篇部款項项編编]"
+    r"|[一二三四五六七八九十壹貳參肆伍陸柒捌玖拾]{1,3}[、．.]")
+_CJK_CHAR = re.compile("[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+@dataclass
+class _Run:
+    """A piece of a line with one style; ``text`` has ligatures expanded."""
+    text: str
+    bold: bool
+    italic: bool
+    superscript: bool
+
+
+@dataclass
+class _LineView:
+    """One non-empty PDF line: its styled runs and the dominant style of its characters."""
+    runs: List[_Run]
+    text: str
+    size: float
+    bold: bool
+    italic: bool
+    color: int
+    bbox: Optional[Tuple[float, float, float, float]]    # from the baseline, see _line_geometry
+    baseline: Optional[float] = None
+    solid_bold: bool = False                             # (nearly) every character is bold
+
+
+@dataclass
+class _BlockView:
+    lines: List[_LineView]
+    text: str
+    size: float
+    bold: bool
+    italic: bool
+    color: int
+    bbox: Optional[Tuple[float, float, float, float]] = None
+
+
+@dataclass
+class _ListMarker:
+    """A list marker at the start of a line. ``kind`` is ``glyph`` / ``ordered`` (always a list
+    item), ``bullet`` (``-``/``*``/``+``/dashes, a list item next to other bullets) or ``enum``
+    (letters, roman numerals, CJK or parenthesised numbers, a list item only in a sequence)."""
+    kind: str
+    text: str                        # the marker as written, without the spaces after it
+    length: int                      # characters to drop from the line to get the item text
+    sequence: Tuple[Tuple[str, int], ...] = ()   # (family, value) readings for "enum"
+    delimiter: str = ""
+
+
+def _weighted_median(weights: Dict[float, float]) -> float:
+    total = sum(weights.values())
+    if total <= 0:
+        return 0.0
+    running = 0.0
+    for size in sorted(weights):
+        running += weights[size]
+        if running >= total / 2:
+            return size
+    return max(weights)
+
+
+def _size_key(size: float) -> float:
+    """Font size rounded to half a point, so 10.98pt and 11pt compare equal."""
+    return round(size * 2) / 2
+
+
+def _is_chromatic(color: int) -> bool:
+    """True for clearly coloured text (blue headings), False for black and greys."""
+    red, green, blue = (color >> 16) & 255, (color >> 8) & 255, color & 255
+    return max(red, green, blue) - min(red, green, blue) >= 48
+
+
+def _is_cjk(char: str) -> bool:
+    return bool(char) and bool(_CJK_CHAR.match(char))
+
+
+def _roman_value(text: str) -> int:
+    values = [_ROMAN_VALUES[ch] for ch in text.lower()]
+    total = 0
+    for index, value in enumerate(values):
+        total += -value if index + 1 < len(values) and value < values[index + 1] else value
+    return total
+
+
+def _cjk_value(text: str) -> int:
+    if text in ("十", "拾"):
+        return 10
+    if text[0] in "十拾":
+        return 10 + _CJK_DIGITS.get(text[1:], 0)
+    if len(text) >= 2 and text[1] in "十拾":
+        return _CJK_DIGITS.get(text[0], 0) * 10 + (_CJK_DIGITS.get(text[2:], 0) if len(text) > 2 else 0)
+    return _CJK_DIGITS.get(text, 0)
+
+
+def _parse_list_marker(text: str) -> Optional[_ListMarker]:
+    """The list marker that starts ``text`` (see ``_ListMarker``), or None."""
+    text = (text or "").lstrip()
+    match = _LIST_GLYPH.match(text)
+    if match:
+        return _ListMarker("glyph", text[0], match.end())
+    match = _LIST_ORDERED.match(text)
+    if match and int(match.group(1)) > 0:
+        return _ListMarker("ordered", match.group(1) + match.group(2), match.end(), delimiter=match.group(2))
+    match = _LIST_CONTEXT_BULLET.match(text)
+    if match:
+        return _ListMarker("bullet", match.group(1), match.end())
+    readings, found = [], None
+    for pattern, family, numbering in _LIST_ENUMERATIONS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        found = found or match
+        if numbering == "alpha":
+            value = ord(match.group(1).lower()) - ord("a") + 1
+        elif numbering == "roman":
+            value = _roman_value(match.group(1))
+        elif numbering == "cjk":
+            value = _cjk_value(match.group(1))
+        elif family == "dotted":
+            family, value = "dotted:" + match.group(1), int(match.group(2))
+        else:
+            value = int(match.group(1))
+        delimiter = match.group(2) if family in ("lower", "upper", "lower-roman", "upper-roman", "cjk",
+                                                   "cjk-formal") else ""
+        readings.append((family + delimiter, value))
+    if not readings:
+        return None
+    return _ListMarker("enum", text[:found.end()].rstrip(), found.end(), tuple(readings))
+
+
+def _markers_in_sequence(first: Optional[_ListMarker], second: Optional[_ListMarker]) -> bool:
+    """True when ``second`` can follow ``first`` in one list."""
+    if first is None or second is None:
+        return False
+    if first.kind in ("glyph", "bullet") and second.kind in ("glyph", "bullet"):
+        return first.kind == "glyph" or second.kind == "glyph" or first.text == second.text
+    if first.kind == "enum" and second.kind == "enum":
+        return any(family_a == family_b and value_b == value_a + 1
+                   for family_a, value_a in first.sequence for family_b, value_b in second.sequence)
+    return False
+
+
+def _text_units(text: str) -> int:
+    """Length of ``text`` for the running-text threshold: its non-space characters, a CJK
+    character counting twice (it is about as wide as two Latin letters)."""
+    return sum(1 for char in text if not char.isspace()) + len(_CJK_CHAR.findall(text))
+
+
+def _follows(first: Optional[_ListMarker], second: Optional[_ListMarker]) -> bool:
+    """True when ``second`` is the next item after ``first`` in one list: ``1.`` -> ``2.``,
+    ``a)`` -> ``b)``, a bullet -> a bullet."""
+    if first is None or second is None:
+        return False
+    if first.kind == "ordered" and second.kind == "ordered":
+        return first.delimiter == second.delimiter and int(second.text[:-1]) == int(first.text[:-1]) + 1
+    return _markers_in_sequence(first, second)
+
+
+def _item_markers(markers: List[Optional[_ListMarker]], previous: str = "",
+                  following: str = "") -> List[Optional[_ListMarker]]:
+    """Of the markers that start the lines of a block (``_parse_list_marker``), those that make
+    their line a list item. Bullets and numbers always do; ``-``/``*``/``+``/dashes only next to
+    other bullets; letters, roman numerals and CJK/parenthesised numbers only in a sequence
+    (a, b, c) with a neighbouring item, which may be ``previous`` (the item line before the
+    block) or ``following`` (the line after it)."""
+    items = [index for index, marker in enumerate(markers) if marker is not None]
+    result: List[Optional[_ListMarker]] = [None] * len(markers)
+    for position, index in enumerate(items):
+        marker = markers[index]
+        if marker.kind in ("glyph", "ordered"):
+            result[index] = marker
+            continue
+        before = markers[items[position - 1]] if position > 0 else _parse_list_marker(previous)
+        after = markers[items[position + 1]] if position + 1 < len(items) else _parse_list_marker(following)
+        if _markers_in_sequence(before, marker) or _markers_in_sequence(marker, after):
+            result[index] = marker
+    return result
+
+
+def _line_join(previous: str, following: str, wrap: int, cjk: str = "") -> Optional[str]:
+    """How a line (``following``) attaches to the line before it (``previous``, both stripped
+    text), given how it follows it on the page (``wrap``, see ``PDFLoader._line_wraps``):
+
+    - ``"hyphen"``: the previous line ends with a hyphen after a letter or digit; the hyphen is
+      kept and the lines are joined (``top-`` + ``down`` -> ``top-down``). Word and LibreOffice
+      break lines after an existing hyphen and do not hyphenate by default, so a line-end hyphen
+      is part of the word; ``PDFLoader._finalize_text_items`` removes it only when the document
+      spells the joined word without it elsewhere. A soft hyphen (U+00AD) at a line end is
+      handled the same way and written ``-``: some text layers read the printed hyphen so;
+    - ``"direct"``: CJK text on both sides of the line break (CJK has no spaces), when ``cjk``
+      says the break is inside a wrapped CJK paragraph (``"paragraph"``, see
+      ``PDFLoader._cjk_joins``: stacked labels and items stay apart) or inside a heading
+      (``"heading"``, except after a bare heading number such as ``第一章``);
+    - None: the line break stays: before a line that starts with a list or outline marker or a
+      CJK form label (``提案單位：``), at a hyphen before ``and``/``or`` (``short-`` + ``and
+      long-term``) and at every other line end."""
+    if not previous or not following or not wrap or _parse_list_marker(following) is not None:
+        return None
+    if previous[-1] in "-\u2010\u00ad" and len(previous) >= 2 and previous[-2].isalnum() and following[0].isalnum():
+        return None if following.split(None, 1)[0].lower() in _SUSPENDED_HYPHEN_WORDS else "hyphen"
+    if cjk and _is_cjk(previous[-1]) and _is_cjk(following[0]) and not _LABEL_START.match(following):
+        if cjk == "paragraph" or (cjk == "heading" and not _HEADING_NUMBER.fullmatch(previous)):
+            return "direct"
+    return None
+
+
+def _strip_runs(runs: List["_Run"]) -> List["_Run"]:
+    """``runs`` without the whitespace at their start and end."""
+    runs = [run for run in runs if run.text]
+    while runs and not runs[0].text.strip():
+        runs = runs[1:]
+    while runs and not runs[-1].text.strip():
+        runs = runs[:-1]
+    if runs:
+        runs[0] = replace(runs[0], text=runs[0].text.lstrip())
+        runs[-1] = replace(runs[-1], text=runs[-1].text.rstrip())
+    return runs
+
+
+def _physical_lines(lines: List[List["_Run"]], wraps: List[int], hyphen_joins: Optional[Counter] = None,
+                    cjk_heading: bool = False, cjk_joins: Optional[List[bool]] = None) -> List[List["_Run"]]:
+    """The styled runs of a block's lines (one run list per line) after joining the line breaks
+    that split a word (see ``_line_join``), one run list per output line. Emphasis is rendered
+    afterwards, so a bold phrase that wraps stays one bold phrase. Each kept line-end hyphen
+    between two plain words (not inside a longer compound such as ``self-`` +
+    ``service-oriented``) is counted in ``hyphen_joins`` as ``(part before, part after)``,
+    lowercased. CJK line breaks are joined inside a heading (``cjk_heading``) or where
+    ``cjk_joins`` (per line, see ``PDFLoader._cjk_joins``) says so; see ``_line_join``."""
+    physical: List[List[_Run]] = []
+    previous = ""
+    for index, line in enumerate(lines):
+        runs = _strip_runs(line)
+        text = "".join(run.text for run in runs)
+        if not text:
+            continue
+        cjk = "heading" if cjk_heading else "paragraph" if cjk_joins and cjk_joins[index] else ""
+        join = _line_join(previous, text, wraps[index] if index < len(wraps) else 2, cjk) if physical else None
+        if join is None:
+            physical.append(runs)
+        else:
+            if join == "hyphen" and previous.endswith("\u00ad"):
+                last = physical[-1][-1]  # a soft hyphen read for the printed one: write the hyphen
+                physical[-1][-1] = replace(last, text=last.text[:-1] + "-")
+            if join == "hyphen" and hyphen_joins is not None:
+                before = _TRAILING_WORD.search(previous[:-1])
+                after = _WORD.match(text)
+                if before and after and "-" not in after.group(0):
+                    hyphen_joins[(before.group(0).lower(), after.group(0).lower())] += 1
+            physical[-1] = physical[-1] + runs
+        previous = text
+    return physical
+
+
+def _stays_inline(text: str, before: str) -> bool:
+    """Raised text that is not a superscript to mark: an ordinal suffix after a number (``1st``,
+    Word raises it) or a trademark/registered/copyright sign."""
+    core = text.strip()
+    if core and all(char in _INLINE_RAISED_MARKS for char in core):
+        return True
+    return core.lower() in ("st", "nd", "rd", "th") and before.rstrip()[-1:].isdigit()
+
+
+def _starts_with_raised_number(line: "_LineView") -> bool:
+    """True when the line starts with a raised number (a footnote number in Word's footnote
+    area)."""
+    runs = [run for run in line.runs if run.text.strip()]
+    return bool(runs) and runs[0].superscript and runs[0].text.strip().isdigit()
+
+
+def _is_punctuation(char: str) -> bool:
+    """CommonMark (0.31) punctuation: a Unicode punctuation (P*) or symbol (S*) character, which
+    covers all ASCII punctuation."""
+    return bool(char) and unicodedata.category(char)[0] in "PS"
+
+
+def _emphasis_fits(before: str, core: str, after: str) -> bool:
+    """True when emphasis markers around ``core`` (``before`` / ``after``: the characters next to
+    it, "" at a line edge) keep Latin words whole (no ``A**I**``) and CommonMark can open and
+    close them: a marker next to punctuation inside needs a space, punctuation or the line edge
+    outside, so ``的**資料治理、**流程`` stays unmarked and ``的**資料治理、流程。**`` is marked."""
+    for outside, inside in ((before, core[:1]), (after, core[-1:])):
+        if outside.isalnum() and not _is_cjk(outside):
+            return False
+        if outside and not outside.isspace() and not _is_punctuation(outside) and _is_punctuation(inside):
+            return False
+    return True
+
+
+def _sampled_pages(count: int) -> List[int]:
+    """At most ``_PROFILE_MAX_PAGES`` page indexes: the first 10 and an even spread of the rest."""
+    if count <= _PROFILE_MAX_PAGES:
+        return list(range(count))
+    step = (count - 10) / (_PROFILE_MAX_PAGES - 10)
+    return list(range(10)) + sorted({10 + int(index * step) for index in range(_PROFILE_MAX_PAGES - 10)})
+
+
+def _wrap_inline(text: str, marker: str) -> str:
+    """Wrap ``text`` in an inline marker, keeping surrounding spaces outside it."""
+    core = text.strip()
+    if not core:
+        return text
+    start = len(text) - len(text.lstrip())
+    return f"{text[:start]}{marker}{core}{marker}{text[start + len(core):]}"
+
+
+def _render_runs(runs: List[_Run], emphasis: bool = True) -> str:
+    """Inline Markdown for the styled runs of one line: escaped text (the whole line is escaped
+    at once, so a ``<`` in one run sees the letter in the next), ``^x^`` superscripts and, when
+    ``emphasis`` is set, ``**bold**`` / ``*italic*`` around exactly the styled runs.
+
+    A styled run is emphasised only where the markers keep Latin words whole and render
+    (``_emphasis_fits``): markers inside a word would split it for lexical retrieval (``A**I**``),
+    and CommonMark cannot close emphasis between CJK characters after punctuation
+    (``的**資料治理、**流程``). Such runs keep their text without markers."""
+    escaped = escape_inline_pieces("".join(run.text for run in runs))
+    groups: List[List[Any]] = []   # [markdown text, (bold, italic)]
+    offset = 0
+    for run in runs:
+        text = "".join(escaped[offset:offset + len(run.text)])
+        offset += len(run.text)
+        if run.superscript:
+            text = _wrap_inline(text.replace("^", "\\^"), "^")
+        style = (run.bold, run.italic) if emphasis else (False, False)
+        if groups and (style == groups[-1][1] or not run.text.strip()):
+            groups[-1][0] += text
+        else:
+            groups.append([text, style])
+    pieces: List[str] = []
+    for index, (text, (bold, italic)) in enumerate(groups):
+        marker = "***" if bold and italic else "**" if bold else "*" if italic else ""
+        if marker and text.strip():
+            before = text[:1] if text[:1].isspace() else (groups[index - 1][0][-1:] if index else "")
+            after = text[-1:] if text[-1:].isspace() else (groups[index + 1][0][:1] if index + 1 < len(groups) else "")
+            if _emphasis_fits(before, text.strip(), after):
+                text = _wrap_inline(text, marker)
+        pieces.append(text)
+    return "".join(pieces)
+
+
+def _drop_prefix(runs: List[_Run], count: int) -> List[_Run]:
+    """``runs`` without their first ``count`` characters."""
+    kept: List[_Run] = []
+    for run in runs:
+        if count >= len(run.text):
+            count -= len(run.text)
+            continue
+        kept.append(_Run(run.text[count:], run.bold, run.italic, run.superscript) if count else run)
+        count = 0
+    return kept
+
+
+def _outline_depth(text: str) -> int:
+    """Depth of a leading decimal outline number: ``1`` -> 1, ``1.2`` -> 2, ``1.2.3.`` -> 3."""
+    match = re.match(r"(\d{1,3}(?:\.\d{1,3})*)\.?(?=\s|$)", text)
+    return match.group(1).count(".") + 1 if match else 0
 
 
 class PDFLoader:
@@ -382,6 +829,9 @@ class PDFLoader:
         self._text_options = (ocr_images, ocr_results_map)
         self._chrome_regions = None
         self._first_text_page_num = None
+        self._body_size = None
+        # Line-end hyphens kept while joining lines, see _finalize_text_items
+        self._hyphen_joins = Counter()
         if extract_images and ocr_images:
             if show_progress:
                 logger.info("Collecting all images for batch OCR processing...")
@@ -419,8 +869,12 @@ class PDFLoader:
             # Add page content to document
             document["content"].extend(page_content)
 
+        # The title, chosen among all headings before repeated tables are retyped
+        self._choose_title(document["content"])
         # Post-process: detect and tag repeated headers/footers
         self._detect_repeated_content(document)
+        # Document-wide decisions on the text: line-end hyphens and heading levels
+        self._finalize_text_items(document)
 
         self._record_routing(document, ocr_active=bool(ocr_images))
 
@@ -472,6 +926,109 @@ class PDFLoader:
                 logger.info(f"Successfully processed {len(image_data_list)} images with configured OCR")
         except Exception as e:
             logger.error(f"Batch OCR processing failed: {e}; emitting image placeholders")
+
+    @staticmethod
+    def _choose_title(content: List[Dict[str, Any]]) -> None:
+        """Keep one ``text:title``: the largest title candidate (a heading of the first page with
+        text, near its largest font size, see ``_is_title_candidate``) when no other heading of
+        the document is as large, the others become sections. Running header and footer lines
+        are taken out before conversion (``_detect_page_chrome``), but the heading-sized first
+        copy of a running header stays as content: a candidate whose text also stands alone on
+        another page yields to one whose text does not, and such repeated headings do not
+        compete; when every candidate repeats (a title that is also the running header,
+        ``INVOICE`` on every page), the largest one is the title, so its text is kept once."""
+        pages: Dict[str, set] = defaultdict(set)
+        for item in content:
+            if item.get("type", "").startswith("text:"):
+                pages[" ".join((item.get("content") or "").split())].add(item.get("page"))
+
+        def repeated(item: Dict[str, Any]) -> bool:
+            return len(pages[" ".join((item.get("content") or "").split())]) > 1
+
+        headings = [(item, item["_heading"][0]) for item in content
+                    if item.get("_heading") is not None and item.get("type") in ("text:title", "text:section")]
+        rivals = [(item, size) for item, size in headings if not repeated(item)]
+        candidates = [(item, size) for item, size in headings if item["type"] == "text:title"]
+        pool = [candidate for candidate in candidates if not repeated(candidate[0])] or candidates
+        title = None
+        if pool:
+            largest, size = max(pool, key=lambda candidate: candidate[1])
+            if not any(other_size >= size - 0.25 for other, other_size in rivals if other is not largest):
+                title = largest
+        for item, _ in candidates:
+            if item is not title:
+                item["type"] = "text:section"
+
+    def _finalize_text_items(self, document: Dict[str, Any]) -> None:
+        """Decisions on the text items that need the whole document, made once every page is
+        converted. Modifies document["content"] in place:
+
+        - a line-end hyphen kept while joining two lines (``top-`` + ``down``, see ``_line_join``)
+          is removed only when the document spells the joined word without it elsewhere and
+          never with it outside those line ends (``invest-`` + ``ment`` next to ``investment``);
+        - heading levels: 1 for the title (``_choose_title``); sections are ranked by the heading
+          font sizes of the document and decimal outline depths (``1.2`` is deeper than ``1``),
+          and each is one level below the nearest open section that ranks above it, so no level
+          is skipped and sections of one rank under the same parent share a level.
+        Only emitted headings count, so text in table regions (bold header cells) never takes a
+        level."""
+        content = document.get("content", [])
+        self._remove_line_end_hyphens(content)
+        self._assign_heading_levels(content)
+
+    def _remove_line_end_hyphens(self, content: List[Dict[str, Any]]) -> None:
+        """Remove the line-end hyphens the document shows to be hyphenation (see
+        ``_finalize_text_items``)."""
+        joins = getattr(self, "_hyphen_joins", None)
+        if not joins:
+            return
+        counts = Counter(word.lower() for item in content
+                         if item.get("type", "").startswith("text:") or item.get("type") == "table"
+                         for word in _WORD.findall(item.get("content") or ""))
+        removable = {f"{before}-{after}": len(before) for (before, after), joined in joins.items()
+                     if counts[before + after] > 0 and counts[f"{before}-{after}"] == joined}
+        if not removable:
+            return
+
+        def dehyphenate(match):
+            cut_at = removable.get(match.group(0).lower())
+            word = match.group(0)
+            return word if cut_at is None else word[:cut_at] + word[cut_at + 1:]
+
+        for item in content:
+            if item.get("type", "").startswith("text:") and "-" in (item.get("content") or ""):
+                item["content"] = _WORD.sub(dehyphenate, item["content"])
+
+    @staticmethod
+    def _assign_heading_levels(content: List[Dict[str, Any]]) -> None:
+        """Set ``level`` on the headings (see ``_finalize_text_items``) and remove the private
+        ``_heading`` data from every item."""
+        headings = []
+        for item in content:
+            heading = item.pop("_heading", None)
+            if heading is not None and item.get("type") in ("text:title", "text:section"):
+                headings.append((item, heading[0], heading[1]))
+        sections = [(size, depth) for item, size, depth in headings if item["type"] == "text:section"]
+        tiers: List[float] = []
+        for size in sorted({size for size, _ in sections}, reverse=True):
+            if not tiers or tiers[-1] - size > 0.25:
+                tiers.append(size)
+
+        def rank(size: float, depth: int) -> int:
+            return max(2 + sum(1 for tier in tiers if tier > size + 0.25), 1 + depth)
+
+        # A section is one level below the nearest open section that ranks above it.
+        open_ranks: List[int] = []
+        for item, size, depth in headings:
+            if item["type"] == "text:title":
+                item["level"] = 1
+                open_ranks = []
+                continue
+            own = rank(size, depth)
+            while open_ranks and open_ranks[-1] >= own:
+                open_ranks.pop()
+            open_ranks.append(own)
+            item["level"] = min(1 + len(open_ranks), 6)
 
     def _detect_repeated_content(self, document: Dict[str, Any]) -> None:
         """Retype repeated page furniture that only exists as whole items.
@@ -1642,6 +2199,7 @@ class PDFLoader:
         # this page's block opens, so blocks never nest.
         self._page_chrome_regions(page_num)
         self._get_first_text_page_num()
+        self._document_body_size()
         content_items = []
         with self._text_page(page, ocr_images, ocr_results_map) as text_page:
             # A rotated page's tables are found and read uncropped, in one frame; its CropBox
@@ -1663,12 +2221,16 @@ class PDFLoader:
         simple_content = []
         for item in content_items:
             if item.type.startswith("text:"):
-                simple_content.append({
+                entry = {
                     "type": item.type,
                     "content": item.content,
                     "page": item.page,
                     "position_y": item.position_y
-                })
+                }
+                heading = getattr(item, "heading", None)
+                if heading is not None:
+                    entry["_heading"] = heading  # (font size, outline depth), see _finalize_text_items
+                simple_content.append(entry)
             elif item.type == "table":
                 simple_content.append({
                     "type": "table",
@@ -1694,7 +2256,9 @@ class PDFLoader:
 
         Blocks are filtered line by line first (``_filter_text_blocks``): text inside a
         table is left to the table item, running headers/footers become text:header /
-        text:footer items, and overprinted duplicates are emitted once.
+        text:footer items, and overprinted duplicates are emitted once. The remaining blocks
+        are regrouped into paragraphs, headings and lists (``_prepare_text_blocks``), then
+        classified and rendered (``_text_item_from_block``).
         """
         text_items = []
         self._restore_cropbox(page, page_num)
@@ -1704,41 +2268,22 @@ class PDFLoader:
         # Get text dictionary with formatting info
         text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
 
-        # First pass: collect all font sizes to determine averages
-        all_font_sizes = []
-        for block in text_dict["blocks"]:
-            if block["type"] == 0:  # Text block
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        if span["size"] > 0:
-                            all_font_sizes.append(span["size"])
-
-        # Calculate font size statistics
-        if all_font_sizes:
-            avg_font_size = sum(all_font_sizes) / len(all_font_sizes)
-            max_font_size = max(all_font_sizes)
-        else:
-            avg_font_size = 12
-            max_font_size = 12
+        # Body font size (robust: character-weighted, without superscripts, table cells or
+        # chart labels) and the largest real font size on the page
+        avg_font_size, max_font_size = self._page_font_stats(text_dict, table_bboxes)
 
         # Get image positions for caption detection
         image_bboxes = self._get_image_bboxes(page)
 
         blocks, chrome_items = self._filter_text_blocks(page, text_dict["blocks"], table_bboxes, page_num)
         text_items.extend(chrome_items)
-        for block in blocks:
-            # Analyze block and determine text type
-            markdown_text, text_type = self._convert_block_to_markdown_with_type(
+        # Regroup into paragraphs, headings and lists, then classify and render each one
+        for block in self._prepare_text_blocks(blocks, avg_font_size):
+            item = self._text_item_from_block(
                 block, avg_font_size, max_font_size, page_num, image_bboxes, table_bboxes
             )
-
-            if markdown_text.strip():  # Only add non-empty text
-                text_items.append(SimpleContent(
-                    type=text_type,
-                    content=markdown_text,
-                    page=page_num + 1,
-                    position_y=block["bbox"][1]
-                ))
+            if item is not None:
+                text_items.append(item)
 
         return text_items
 
@@ -2050,167 +2595,979 @@ class PDFLoader:
 
     def _is_near_image_or_table(self, bbox: tuple, image_bboxes: List[tuple], table_bboxes: List[tuple],
                                 threshold: float = 50) -> bool:
-        """Check if text is near an image or table (potential caption)"""
+        """True when the text box sits at most ``threshold`` points above or below an image or a
+        table (without overlapping it) and overlaps it horizontally or is roughly centred on it."""
         x0, y0, x1, y1 = bbox
         text_center_x = (x0 + x1) / 2
-
-        # Check proximity to images
-        for img_bbox in image_bboxes:
-            img_x0, img_y0, img_x1, img_y1 = img_bbox
-            img_center_x = (img_x0 + img_x1) / 2
-
-            # Check if text is below or above image and reasonably aligned
-            vertical_distance = min(abs(y0 - img_y1), abs(img_y0 - y1))
-            horizontal_overlap = min(x1, img_x1) - max(x0, img_x0)
-            center_distance = abs(text_center_x - img_center_x)
-
-            if vertical_distance < threshold and (horizontal_overlap > 0 or center_distance < 100):
+        for other_x0, other_y0, other_x1, other_y1 in list(image_bboxes or []) + list(table_bboxes or []):
+            gap = max(other_y0 - y1, y0 - other_y1)
+            if gap < -2 or gap > threshold:
+                continue
+            horizontal_overlap = min(x1, other_x1) - max(x0, other_x0)
+            if horizontal_overlap > 0 or abs(text_center_x - (other_x0 + other_x1) / 2) < 100:
                 return True
-
-        # Check proximity to tables
-        for table_bbox in table_bboxes:
-            table_x0, table_y0, table_x1, table_y1 = table_bbox
-            table_center_x = (table_x0 + table_x1) / 2
-
-            # Check if text is above or below table and reasonably aligned
-            vertical_distance = min(abs(y0 - table_y1), abs(table_y0 - y1))
-            horizontal_overlap = min(x1, table_x1) - max(x0, table_x0)
-            center_distance = abs(text_center_x - table_center_x)
-
-            if vertical_distance < threshold and (horizontal_overlap > 0 or center_distance < 100):
-                return True
-
         return False
 
-    def _convert_block_to_markdown_with_type(self, block: Dict[str, Any], avg_font_size: float, max_font_size: float,
-                                             page_num: int, image_bboxes: List[tuple], table_bboxes: List[tuple]) -> \
-            Tuple[str, str]:
-        """Convert a text block to markdown format and determine its type"""
-        lines = []
+    # --- font statistics ------------------------------------------------------------------------
 
-        # Analyze block characteristics
-        block_max_size = 0
-        block_min_size = float('inf')
-        has_list_pattern = False
-        list_line_count = 0
-        total_text = ""
-        is_bold = False
-        is_all_caps = True
-        line_count = 0
+    @staticmethod
+    def _is_superscript_span(span: Dict[str, Any]) -> bool:
+        """A short span that PyMuPDF flags as superscript (exponent, footnote mark, ordinal). A
+        long flagged span is a raised phrase on a designed page, not a superscript."""
+        return bool((span.get("flags", 0) or 0) & pymupdf.TEXT_FONT_SUPERSCRIPT) \
+            and 0 < len((span.get("text") or "").strip()) <= 6
 
-        for line in block["lines"]:
-            line_text = ""
-            line_size = 0
+    @classmethod
+    def _span_style(cls, span: Dict[str, Any]) -> Tuple[bool, bool, bool]:
+        """(bold, italic, superscript) of a PyMuPDF span. Bold also comes from MuPDF's bold
+        character flag (synthetic bold) and from the font name (``Calibri-Bold``)."""
+        flags = span.get("flags", 0) or 0
+        font = span.get("font") or ""
+        bold = (bool(flags & pymupdf.TEXT_FONT_BOLD) or bool((span.get("char_flags") or 0) & _CHAR_FLAG_BOLD)
+                or bool(_BOLD_FONT_NAME.search(font)))
+        italic = bool(flags & pymupdf.TEXT_FONT_ITALIC) or bool(_ITALIC_FONT_NAME.search(font))
+        return bold, italic, cls._is_superscript_span(span)
 
-            for span in line["spans"]:
-                line_text += span["text"]
-                line_size = max(line_size, span["size"])
-                is_bold = is_bold or (span["flags"] & pymupdf.TEXT_FONT_BOLD)
+    @staticmethod
+    def _span_in_boxes(span: Dict[str, Any], boxes: List[tuple]) -> bool:
+        bbox = span.get("bbox")
+        if not bbox or not boxes:
+            return False
+        center_x, center_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        return any(x0 <= center_x <= x1 and y0 <= center_y <= y1 for x0, y0, x1, y1 in boxes)
 
-            if line_text.strip():
-                total_text += line_text.strip() + " "
-                block_max_size = max(block_max_size, line_size)
-                block_min_size = min(block_min_size, line_size)
-                line_count += 1
+    def _size_weights(self, text_dict: Dict[str, Any], table_bboxes: List[tuple] = None,
+                      running_only: bool = False) -> Tuple[Dict[float, float], float]:
+        """Characters per font size (superscripts and table cells left out), and the largest size
+        of a span with at least two letters (so drop caps, bullets and KPI numbers do not count).
+        With ``running_only`` only lines of running text count (at least ``_RUNNING_TEXT_UNITS``
+        characters, a CJK character counting twice): table cells, headings and labels are short."""
+        weights: Dict[float, float] = defaultdict(float)
+        max_size = 0.0
+        for block in text_dict.get("blocks", []):
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", []):
+                if running_only and _text_units(self._raw_line_text(line)) < _RUNNING_TEXT_UNITS:
+                    continue
+                for span in line.get("spans", []):
+                    size = span.get("size", 0) or 0
+                    text = span.get("text") or ""
+                    chars = sum(1 for char in text if not char.isspace())
+                    if size <= 0 or not chars or self._is_superscript_span(span):
+                        continue
+                    if table_bboxes and self._span_in_boxes(span, table_bboxes):
+                        continue
+                    weights[size] += chars
+                    if sum(1 for char in text if char.isalpha()) >= 2:
+                        max_size = max(max_size, size)
+        return weights, max_size
 
-                # Check if not all caps
-                if not line_text.isupper() or not any(c.isalpha() for c in line_text):
-                    is_all_caps = False
+    def _page_font_stats(self, text_dict: Dict[str, Any], table_bboxes: List[tuple] = None) -> Tuple[float, float]:
+        """Body font size and largest font size of a page, for heading detection.
 
-                if self._has_list_marker(line_text.strip()):
-                    has_list_pattern = True
-                    list_line_count += 1
+        The body size is the character-weighted median size of the page's text without
+        superscripts and table cells, so chart labels, footnote markers and small table text do
+        not pull it down. A page with little text (a cover, a slide) uses the document's body
+        size instead (``_document_body_size``)."""
+        weights, max_size = self._size_weights(text_dict, table_bboxes)
+        body = _weighted_median(weights)
+        if sum(weights.values()) < _MIN_PAGE_BODY_CHARS:
+            document_body = self._document_body_size()
+            if document_body > 0:
+                body = document_body
+        if body <= 0:
+            body = 12.0
+        return body, max(max_size, body)
 
-        total_text = total_text.strip()
+    def _document_body_size(self) -> float:
+        """Body font size of the whole document (0.0 without a document), computed once per
+        conversion, before a page's ``_text_page`` block opens (``_process_page``): the
+        character-weighted median size of the running text of at most ``_PROFILE_MAX_PAGES``
+        pages (``_sampled_pages``), each read through ``_text_page`` and dropped before the next
+        is read. Only lines of running text count
+        (``_size_weights``): headings, chart labels and most table cells are shorter. Table
+        regions themselves are not detected here (that would run ``find_tables`` on every sampled
+        page a second time). A document with little running text uses all of its text."""
+        if getattr(self, "_body_size", None) is not None:
+            return self._body_size
+        self._body_size = 0.0
+        doc = getattr(self, "doc", None)
+        if doc is None:
+            return 0.0
+        running: Dict[float, float] = defaultdict(float)
+        every: Dict[float, float] = defaultdict(float)
+        try:
+            for number in _sampled_pages(len(doc)):
+                with self._text_page(doc.load_page(number)) as page:
+                    text_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_LIGATURES)
+                for totals, running_only in ((running, True), (every, False)):
+                    for size, chars in self._size_weights(text_dict, running_only=running_only)[0].items():
+                        totals[size] += chars
+        except Exception as e:
+            logger.debug(f"Document body size unavailable: {e}")
+        self._body_size = _weighted_median(running if sum(running.values()) >= _MIN_PAGE_BODY_CHARS else every)
+        logger.debug(f"Document body size: {self._body_size:.1f}pt")
+        return self._body_size
 
-        # Caption patterns
-        caption_patterns = [
-            r'^(Figure|Fig\.?|Table|Tbl\.?|Chart|Graph|Image|Plate|Scheme)\s*\d*[\.:)]?',
-            r'^(Source|Note|Notes)[\.:)]',
-            r'^\d+\.\d+[\.:)]',  # Numbered captions like "1.1:" or "2.3."
-        ]
+    # --- regrouping PyMuPDF blocks ----------------------------------------------------------------
 
-        is_caption_pattern = any(re.match(pattern, total_text, re.IGNORECASE) for pattern in caption_patterns)
-        normalized_total_text = self._normalized_heading_text(total_text)
-        structured_total_match = self._structured_heading_match(normalized_total_text)
-        is_bare_structured_heading = (
-            structured_total_match is not None
-            and structured_total_match.end() == len(normalized_total_text)
+    @staticmethod
+    def _raw_line_text(line: Dict[str, Any]) -> str:
+        return "".join(span.get("text") or "" for span in line.get("spans", []))
+
+    @staticmethod
+    def _boxes_union(*boxes) -> Optional[tuple]:
+        boxes = [box for box in boxes if box]
+        if not boxes:
+            return None
+        return (min(box[0] for box in boxes), min(box[1] for box in boxes),
+                max(box[2] for box in boxes), max(box[3] for box in boxes))
+
+    def _block_from_lines(self, block: Dict[str, Any], lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+        bbox = self._boxes_union(*(line.get("bbox") for line in lines)) or block.get("bbox")
+        new_block = {key: value for key, value in block.items() if key not in ("lines", "bbox", "_views")}
+        new_block["lines"] = lines
+        if bbox is not None:
+            new_block["bbox"] = bbox
+        return new_block
+
+    def _prepare_text_blocks(self, blocks: List[Dict[str, Any]], body_size: float) -> List[Dict[str, Any]]:
+        """Regroup PyMuPDF text blocks into the units Markdown needs.
+
+        - a list marker drawn as its own line (Word separates ``1.`` or U+F0B7 from the item
+          text with a tab) is joined to the item text on the same row;
+        - leading or trailing heading lines (larger, bolder or coloured) are split off the
+          paragraph MuPDF grouped them with;
+        - list items are split off the lead-in line before them and the paragraph after them;
+        - a drop cap is put back in front of the word it starts;
+        - consecutive blocks that continue one paragraph (a CJK paragraph exported line by
+          line), one heading (a title over two blocks) or one list are merged.
+        The blocks keep the PyMuPDF shape (``bbox``, ``lines``, ``spans``); non-text blocks and
+        empty lines are dropped. ``_top`` is the top of the PyMuPDF block a piece came from,
+        ``_views`` holds the analysed lines (``_line_view``, computed once per line),
+        ``_prev_item`` / ``_next_item`` the list lines of the neighbouring blocks, so a lettered
+        item can see the rest of its sequence, and ``_wrapped_start`` marks a block whose first
+        line the block before wrapped onto (double-spaced text has a block per line)."""
+        memo: Dict[int, Tuple[Dict[str, Any], Optional[_LineView]]] = {}
+
+        def view_of(line: Dict[str, Any]) -> Optional[_LineView]:
+            cached = memo.get(id(line))
+            if cached is None or cached[0] is not line:
+                cached = memo[id(line)] = (line, self._line_view(line))
+            return cached[1]
+
+        pieces: List[Dict[str, Any]] = []
+        for block in blocks:
+            if block.get("type", 0) != 0:
+                continue
+            lines = [line for line in block.get("lines", []) if self._raw_line_text(line).strip()]
+            if lines:
+                top = (block.get("bbox") or self._boxes_union(*(line.get("bbox") for line in lines)) or (0.0, 0.0))[1]
+                block = self._block_from_lines(block, self._join_marker_lines(lines))
+                block["_top"] = top
+                pieces.extend(self._split_block_by_style(block, view_of))
+        prepared: List[Dict[str, Any]] = []
+        for index, piece in enumerate(pieces):
+            before = (self._last_item_text(pieces[index - 1])
+                      if index and self._blocks_adjacent(pieces[index - 1], piece, view_of) else "")
+            after = (self._raw_line_text(pieces[index + 1]["lines"][0]).strip()
+                     if index + 1 < len(pieces) and self._blocks_adjacent(piece, pieces[index + 1], view_of) else "")
+            prepared.extend(self._split_list_items(piece, view_of, before, after))
+        prepared = self._merge_drop_caps(prepared, body_size, view_of)
+        prepared = self._merge_continuation_blocks(prepared, body_size, view_of)
+        for index, block in enumerate(prepared):
+            block["_views"] = [view_of(line) for line in block["lines"]]
+            block.pop("_prev_item", None)
+            block.pop("_next_item", None)
+            block.pop("_wrapped_start", None)
+            if index > 0 and self._blocks_adjacent(prepared[index - 1], block, view_of):
+                block["_prev_item"] = self._last_item_text(prepared[index - 1])
+                if self._wraps_onto_block(prepared[index - 1], block, view_of):
+                    block["_wrapped_start"] = True
+            if index + 1 < len(prepared) and self._blocks_adjacent(block, prepared[index + 1], view_of):
+                block["_next_item"] = self._raw_line_text(prepared[index + 1]["lines"][0]).strip()
+        return prepared
+
+    def _last_item_text(self, block: Dict[str, Any]) -> str:
+        """Text of the last line of ``block`` that starts with a list marker ("" if none)."""
+        for line in reversed(block["lines"]):
+            text = self._raw_line_text(line).strip()
+            if _parse_list_marker(text) is not None:
+                return text
+        return ""
+
+    def _join_marker_lines(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Join a line that is only a list marker to the item text that follows it on the same row."""
+        joined: List[Dict[str, Any]] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            text = self._raw_line_text(line)
+            if index + 1 < len(lines) and _MARKER_ONLY.fullmatch(text.strip()) \
+                    and self._same_row(line, lines[index + 1]):
+                following = lines[index + 1]
+                spans = list(line.get("spans", []))
+                following_spans = list(following.get("spans", []))
+                if not text[-1:].isspace() and following_spans:
+                    spans.append(dict(following_spans[0], text=" "))
+                merged = dict(following)
+                merged["spans"] = spans + following_spans
+                bbox = self._boxes_union(line.get("bbox"), following.get("bbox"))
+                if bbox is not None:
+                    merged["bbox"] = bbox
+                joined.append(merged)
+                index += 2
+                continue
+            joined.append(line)
+            index += 1
+        return joined
+
+    def _same_row(self, first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+        a, _ = self._line_geometry(first)
+        b, _ = self._line_geometry(second)
+        if not a or not b:
+            return True
+        overlap = min(a[3], b[3]) - max(a[1], b[1])
+        return b[0] >= a[0] and overlap >= 0.5 * min(a[3] - a[1], b[3] - b[1])
+
+    def _split_block_by_style(self, block: Dict[str, Any], view_of: Optional[Callable] = None) -> List[Dict[str, Any]]:
+        """Split heading lines off a block whose other lines have a different style."""
+        lines = block["lines"]
+        if len(lines) < 2:
+            return [block]
+        view_of = view_of or self._line_view
+        views = [view_of(line) for line in lines]
+        if any(view is None for view in views):
+            return [block]
+        groups: List[List[int]] = []
+        for index, view in enumerate(views):
+            key = (_size_key(view.size), view.bold, _is_chromatic(view.color))
+            previous = views[groups[-1][-1]] if groups else None
+            if previous is not None and key == (_size_key(previous.size), previous.bold, _is_chromatic(previous.color)):
+                groups[-1].append(index)
+            else:
+                groups.append([index])
+        if len(groups) == 1:
+            return [block]
+        cuts = []
+        for number in range(len(groups) - 1):
+            upper, lower = groups[number], groups[number + 1]
+            # A heading starts the block or follows a finished sentence; it never interrupts one
+            # (a bold phrase that fills a line in the middle of a paragraph stays in it).
+            upper_starts_fresh = upper[0] == 0 or bool(_SENTENCE_END.search(views[upper[0] - 1].text.strip()))
+            upper_ends_sentence = bool(_SENTENCE_END.search(views[upper[-1]].text.strip()))
+            if (self._is_heading_run(views, upper, lower) and upper_starts_fresh) or (
+                    self._is_heading_run(views, lower, upper) and upper_ends_sentence):
+                cuts.append(lower[0])
+        if not cuts:
+            return [block]
+        pieces, start = [], 0
+        for cut in cuts + [len(lines)]:
+            if lines[start:cut]:
+                pieces.append(self._block_from_lines(block, lines[start:cut]))
+            start = cut
+        return pieces
+
+    @staticmethod
+    def _is_heading_run(views: List[_LineView], run: List[int], other: List[int]) -> bool:
+        """True when the lines ``run`` look like a heading next to the lines ``other``."""
+        if len(run) > 3:
+            return False
+        texts = [views[index].text.strip() for index in run]
+        marker = _parse_list_marker(texts[0])
+        if any(len(text) > 100 for text in texts) or (marker is not None and marker.kind in ("glyph", "bullet")):
+            return False  # bulleted lines are list items, never headings
+        size = max(views[index].size for index in run)
+        other_size = max(views[index].size for index in other)
+        if other_size <= 0:
+            return False
+        if size >= other_size * 1.08:
+            return True
+        if size < other_size * 0.95 or (_SENTENCE_END.search(texts[-1]) and not texts[-1].endswith(("?", "？"))):
+            return False
+        bold = all(views[index].solid_bold for index in run) and not any(views[index].bold for index in other)
+        colored = (len(run) <= 2 and all(_is_chromatic(views[index].color) for index in run)
+                   and not any(_is_chromatic(views[index].color) for index in other))
+        return bold or colored
+
+    def _split_list_items(self, block: Dict[str, Any], view_of: Callable, previous_item: str = "",
+                          next_line: str = "") -> List[Dict[str, Any]]:
+        """Split a block where a list starts or ends inside it: before the first item after a
+        lead-in line, and before a line after an item that does not continue the item (see
+        ``_continues_item``). Word and LibreOffice exports often put a lead-in sentence, its
+        bullets and the next paragraph in one block. ``previous_item`` / ``next_line`` are the
+        list lines of the neighbouring blocks, so an ``(a)`` next to its lead-in joins the ``(b)``
+        of the next block. Footnotes grouped in one block are split before each raised number. A
+        piece that follows a list or starts a footnote is marked ``_starts_paragraph``, so
+        ``_merge_continuation_blocks`` keeps it apart."""
+        lines = block["lines"]
+        if len(lines) < 2:
+            return [block]
+        views = [view_of(line) for line in lines]
+        if any(view is None for view in views):
+            return [block]
+        markers = self._line_markers(views, previous_item, next_line)
+        wrapped = self._wrapped_onto(views)
+        # A line is "between items" when a later line of the block, or the first line of the next
+        # block, is an item of the same list.
+        last = max((index for index, marker in enumerate(markers) if marker is not None), default=None)
+        continued = last is not None and _follows(markers[last], _parse_list_marker(next_line))
+        between = [False] * len(views)
+        later = continued
+        for index in range(len(views) - 1, -1, -1):
+            between[index] = later
+            later = later or markers[index] is not None
+        layout = self._list_layout(views, markers, between)
+        cuts: List[int] = []
+        fresh = set()
+        item: Optional[Tuple[_LineView, _ListMarker]] = None
+        for index, view in enumerate(views):
+            if index and _starts_with_raised_number(view):
+                cuts.append(index)
+                fresh.add(index)
+                item = None
+            elif markers[index] is not None:
+                if item is None and index > 0:
+                    cuts.append(index)
+                item = (view, markers[index])
+            elif item is not None and not self._continues_item(
+                    item, views[index - 1], view, wrapped[index], layout, between[index]):
+                cuts.append(index)
+                fresh.add(index)
+                item = None
+        if not cuts:
+            return [block]
+        pieces, start = [], 0
+        for cut in cuts + [len(lines)]:
+            piece = self._block_from_lines(block, lines[start:cut])
+            if start in fresh:
+                piece["_starts_paragraph"] = True
+            pieces.append(piece)
+            start = cut
+        return pieces
+
+    def _line_markers(self, lines: List[_LineView], previous_item: str = "", next_line: str = "",
+                      wrapped_start: bool = False) -> List[Optional[_ListMarker]]:
+        """Per line, the list marker that makes it a list item, or None (``_item_markers``). A
+        marker other than a bullet glyph that starts a wrapped line of running text is text
+        (``… was`` / ``87. Management …``, spaced en dashes): the line before ends no sentence or
+        lead-in, the marker would not have fitted at its end (``_wrapped_onto``; for the first
+        line, ``wrapped_start``) and no item of the same list comes before or after it
+        (``_has_list_context``)."""
+        markers = [_parse_list_marker(line.text) for line in lines]
+        wrapped = self._wrapped_onto(lines)
+        for index, marker in enumerate(markers):
+            if marker is None or marker.kind == "glyph":
+                continue
+            if index == 0 and not wrapped_start:
+                continue
+            if index and (not wrapped[index] or _LEAD_IN_END.search(lines[index - 1].text.strip())):
+                continue
+            if not self._has_list_context(lines, markers, index, previous_item, next_line):
+                markers[index] = None
+        return _item_markers(markers, previous_item, next_line)
+
+    @staticmethod
+    def _has_list_context(lines: List[_LineView], markers: List[Optional[_ListMarker]], index: int,
+                          previous_item: str, next_line: str) -> bool:
+        """True when the marker of line ``index`` belongs to a list: an earlier item that it
+        follows (``previous_item``: the last item line of the block before) or a later item that
+        follows it (``next_line``: the first line of the block after) exists. Bulleted items hang,
+        so two bullets count only when the lines between them are indented past the bullet."""
+        marker = markers[index]
+
+        def hang_between(first: int, second: int) -> bool:
+            x0 = lines[first].bbox[0] if lines[first].bbox else None
+            return (marker.kind != "bullet" or x0 is None
+                    or all(line.bbox is not None and line.bbox[0] > x0 + 2 for line in lines[first + 1:second]))
+
+        if any(markers[other] is not None and _follows(markers[other], marker) and hang_between(other, index)
+               for other in range(index)):
+            return True
+        if any(markers[other] is not None and _follows(marker, markers[other]) and hang_between(index, other)
+               for other in range(index + 1, len(markers))):
+            return True
+        return _follows(_parse_list_marker(previous_item), marker) or _follows(marker, _parse_list_marker(next_line))
+
+    @staticmethod
+    def _list_layout(lines: List[_LineView], markers: List[Optional[_ListMarker]],
+                     between: List[bool]) -> Optional[str]:
+        """How the lists of a block continue their items: ``"hanging"`` when a line right after
+        an item, or between two items, is indented past the item's marker; ``"flush"`` when a line
+        between two items starts at the marker's margin; None when the block does not show it."""
+        hanging = flush = False
+        marker_x = None
+        for index, line in enumerate(lines):
+            if markers[index] is not None:
+                marker_x = line.bbox[0] if line.bbox else None
+                continue
+            if marker_x is None or not line.bbox:
+                continue
+            if line.bbox[0] > marker_x + 2 and (between[index] or markers[index - 1] is not None):
+                hanging = True
+            elif abs(line.bbox[0] - marker_x) <= 2 and between[index]:
+                flush = True
+        return "hanging" if hanging else "flush" if flush else None
+
+    @staticmethod
+    def _wrapped_onto(lines: List[_LineView], right_edge: Optional[float] = None) -> List[bool]:
+        """Per line, True when the line before it wrapped onto it: the first word of the line
+        would not have fitted at the end of the line before, within the right edge (by default
+        the block's; word processors break lines this way)."""
+        if right_edge is None:
+            right_edge = max((line.bbox[2] for line in lines if line.bbox), default=0.0)
+        wrapped = [False]
+        for previous, line in zip(lines, lines[1:]):
+            text = line.text.strip()
+            same_row = (previous.baseline is not None and line.baseline is not None
+                        and line.baseline - previous.baseline < 0.5 * max(previous.size, line.size, 1.0))
+            if not previous.bbox or not line.bbox or not text or same_row:
+                wrapped.append(False)
+                continue
+            word = text[:1] if _is_cjk(text[:1]) else text.split()[0]
+            char_width = (line.bbox[2] - line.bbox[0]) / max(len(text), 1)
+            wrapped.append(previous.bbox[2] + char_width * (len(word) + 1) > right_edge)
+        return wrapped
+
+    def _wraps_onto_block(self, upper: Dict[str, Any], lower: Dict[str, Any], view_of: Callable) -> bool:
+        """True when the last line of ``upper`` wrapped onto the first line of ``lower``: same
+        style, no sentence or lead-in end, and the first word would not have fitted. A block that
+        holds list items is not a paragraph: a marker after it starts the next item or list."""
+        if self._last_item_text(upper):
+            return False
+        views = [view for view in map(view_of, upper["lines"] + lower["lines"]) if view is not None and view.bbox]
+        last, first = view_of(upper["lines"][-1]), view_of(lower["lines"][0])
+        if last is None or first is None or not last.bbox or not first.bbox or not views:
+            return False
+        if abs(last.size - first.size) > 0.5 or last.bold != first.bold or _LEAD_IN_END.search(last.text.strip()):
+            return False
+        return self._wrapped_onto([last, first], max(view.bbox[2] for view in views))[1]
+
+    @staticmethod
+    def _continues_item(item: Tuple[_LineView, _ListMarker], previous: _LineView, line: _LineView,
+                        wrapped: bool, layout: Optional[str], between: bool) -> bool:
+        """True when ``line`` (without a list marker) continues the list item that starts with the
+        line ``item``:
+
+        - it is indented past the item's marker (a hanging indent), or it goes on with a sentence
+          (lowercase after a line that ends none);
+        - in a list whose items hang (``layout``), any other line starts a paragraph;
+        - left of the marker: numbered or lettered clauses whose number is indented like a first
+          line, when the line sits between two items or the line before wrapped onto it;
+        - at the marker's margin: between two items of the list (a list typed flush), or when the
+          line before wrapped onto it in a flush list, or in CJK text (which wraps anywhere)."""
+        view, marker = item
+        if not view.bbox or not line.bbox:
+            return True
+        if line.bbox[0] > view.bbox[0] + 2:
+            return True
+        if line.text.lstrip()[:1].islower() and not _SENTENCE_END.search(previous.text.strip()):
+            return True
+        if layout == "hanging":
+            return False
+        if line.bbox[0] < view.bbox[0] - 2:
+            return marker.kind in ("ordered", "enum") and (between or wrapped)
+        if between:
+            return True
+        return wrapped and (layout == "flush" or _is_cjk(line.text.lstrip()[:1]))
+
+    def _merge_drop_caps(self, blocks: List[Dict[str, Any]], body_size: float,
+                         view_of: Optional[Callable] = None) -> List[Dict[str, Any]]:
+        """Put a drop cap (a one-letter block at least twice the body size) back in front of the
+        lowercase word it starts: the first line of a paragraph of two or more lines that starts
+        just right of the letter, within the letter's height."""
+        view_of = view_of or self._line_view
+        # Paragraphs that start with a lowercase letter are rare, so each letter checks them all.
+        paragraphs = []
+        for index, block in enumerate(blocks):
+            first = view_of(block["lines"][0]) if len(block["lines"]) >= 2 else None
+            if first is not None and first.bbox and first.text.lstrip()[:1].islower():
+                paragraphs.append((index, first.bbox))
+        removed, taken = set(), set()
+        for index, block in enumerate(blocks if paragraphs else []):
+            if len(block["lines"]) != 1:
+                continue
+            view = view_of(block["lines"][0])
+            if view is None or not view.bbox or not (len(view.text.strip()) == 1 and view.text.strip().isalpha()) \
+                    or view.size < 2 * body_size:
+                continue
+            box = view.bbox
+            for other_index, first_box in paragraphs:
+                if other_index in taken:
+                    continue
+                center_y = (first_box[1] + first_box[3]) / 2
+                if -2 <= first_box[0] - box[2] <= 2 * body_size and box[1] - 2 <= center_y <= box[3]:
+                    other = blocks[other_index]
+                    first = other["lines"][0]
+                    spans = list(first.get("spans", []))
+                    letter = dict(spans[0], text=view.text.strip()) if spans else {"text": view.text.strip()}
+                    merged_line = dict(first)
+                    merged_line["spans"] = [letter] + spans
+                    other["lines"] = [merged_line] + list(other["lines"][1:])
+                    other["bbox"] = self._boxes_union(other.get("bbox"), block.get("bbox"))
+                    removed.add(index)
+                    taken.add(other_index)
+                    break
+        return [block for index, block in enumerate(blocks) if index not in removed]
+
+    def _merge_continuation_blocks(self, blocks: List[Dict[str, Any]], body_size: float,
+                                   view_of: Optional[Callable] = None) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        for block in blocks:
+            if merged and self._continues_block(merged[-1], block, body_size, view_of):
+                merged[-1] = self._block_from_lines(merged[-1], merged[-1]["lines"] + block["lines"])
+            else:
+                merged.append(block)
+        return merged
+
+    def _continues_block(self, previous: Dict[str, Any], block: Dict[str, Any], body_size: float,
+                         view_of: Optional[Callable] = None) -> bool:
+        """True when ``block`` continues the paragraph, heading or list of ``previous``."""
+        if not previous.get("bbox") or not block.get("bbox") or block.get("_starts_paragraph"):
+            return False
+        view_of = view_of or self._line_view
+        last = view_of(previous["lines"][-1])
+        first = view_of(block["lines"][0])
+        if last is None or first is None or last.baseline is None or first.baseline is None:
+            return False
+        if _starts_with_raised_number(first):
+            return False  # the next footnote
+        size = max(last.size, first.size)
+        if abs(last.size - first.size) > 0.5 or size <= 0:
+            return False
+        pitch = first.baseline - last.baseline   # baseline to baseline
+        if pitch < 0.8 * size or pitch > 2.2 * size:
+            return False
+        first_marker = _parse_list_marker(first.text)
+        if first_marker is not None:
+            # The next item of the list in ``previous`` (not a numbered heading below another one)
+            leading = view_of(previous["lines"][0])
+            if leading is None or _parse_list_marker(leading.text) is None or size >= body_size * 1.15:
+                return False
+            if leading.bbox and first.bbox[0] < leading.bbox[0] - 2:
+                return False
+            # the next item of that list: a bullet after bullets, 5. after 4., b) after a)
+            return _follows(_parse_list_marker(self._last_item_text(previous)), first_marker)
+        if last.bold != first.bold or _is_chromatic(last.color) != _is_chromatic(first.color):
+            return False
+        if _SENTENCE_END.search(last.text.strip()):
+            return False
+        # An indented line starts a new paragraph; the line after an indented first line starts
+        # further left, at the margin.
+        left_aligned = last.bbox[0] - 4 * size <= first.bbox[0] <= last.bbox[0] + 3
+        if size >= body_size * 1.15 or last.bold:
+            # A heading drawn as separate blocks, one per line (a title over two lines).
+            centred = abs((first.bbox[0] + first.bbox[2]) / 2 - (last.bbox[0] + last.bbox[2]) / 2) <= size
+            return ((left_aligned or centred) and pitch <= 1.6 * size
+                    and len(previous["lines"]) + len(block["lines"]) <= 3)
+        # A paragraph continues when its previous line runs to the right edge of the column.
+        right_edge = max(previous["bbox"][2], block["bbox"][2])
+        return left_aligned and last.bbox[2] >= right_edge - 1.5 * size
+
+    def _blocks_adjacent(self, upper: Dict[str, Any], lower: Dict[str, Any],
+                         view_of: Optional[Callable] = None) -> bool:
+        view_of = view_of or self._line_view
+        last = view_of(upper["lines"][-1])
+        first = view_of(lower["lines"][0])
+        if last is None or first is None or last.baseline is None or first.baseline is None:
+            return True
+        return 0 < first.baseline - last.baseline <= 3.2 * max(last.size, first.size, 1.0)
+
+    # --- block analysis -----------------------------------------------------------------------------
+
+    def _line_view(self, line: Dict[str, Any]) -> Optional[_LineView]:
+        spans = [(span, (span.get("text") or "").translate(_LIGATURES)) for span in line.get("spans", [])]
+        spans = [(span, text) for span, text in spans if text]
+        raised_spans = self._raised_small_spans([span for span, _ in spans])
+        runs: List[_Run] = []
+        size = bold_chars = italic_chars = total = 0
+        sizes = []
+        colors: Dict[int, int] = defaultdict(int)
+        before = ""
+        for index, (span, text) in enumerate(spans):
+            bold, italic, raised = self._span_style(span)
+            raised = raised or index in raised_spans
+            # ordinal suffixes (1st) and trademark signs are raised but read inline
+            runs.append(_Run(text, bold, italic, raised and not _stays_inline(text, before)))
+            before += text
+            chars = sum(1 for char in text if not char.isspace())
+            sizes.append(span.get("size", 0) or 0)
+            if not chars or raised:
+                continue
+            size = max(size, span.get("size", 0) or 0)
+            total += chars
+            bold_chars += chars if bold else 0
+            italic_chars += chars if italic else 0
+            colors[span.get("color", 0) or 0] += chars
+        text = "".join(run.text for run in runs)
+        if not text.strip():
+            return None
+        bbox, baseline = self._line_geometry(line)
+        return _LineView(
+            runs=runs,
+            text=text,
+            size=size or max(sizes or [0]),
+            bold=total > 0 and bold_chars * 2 > total,
+            italic=total > 0 and italic_chars * 2 > total,
+            color=max(colors, key=colors.get) if colors else 0,
+            bbox=bbox,
+            baseline=baseline,
+            solid_bold=total > 0 and bold_chars >= 0.9 * total,
         )
-        heading_features = self._build_heading_features(
-            total_text,
-            line_count=line_count,
-            block_max_size=block_max_size,
-            avg_font_size=avg_font_size,
-            max_font_size=max_font_size,
-            is_bold=is_bold,
-            is_all_caps=is_all_caps,
-            has_list_pattern=has_list_pattern,
-            list_line_count=list_line_count,
+
+    @classmethod
+    def _raised_small_spans(cls, spans: List[Dict[str, Any]]) -> set:
+        """Indexes of short spans set smaller and higher than the rest of their line: superscripts
+        PyMuPDF did not flag (it compares with the previous character, so a footnote number that
+        starts a line is missed)."""
+        measured = [(index, span) for index, span in enumerate(spans)
+                    if (span.get("text") or "").strip() and span.get("origin") and (span.get("size") or 0) > 0
+                    and not cls._is_superscript_span(span)]
+        if len(measured) < 2:
+            return set()
+        main_size = max(span["size"] for _, span in measured)
+        baseline = max(span["origin"][1] for _, span in measured if span["size"] >= 0.9 * main_size)
+        return {index for index, span in measured
+                if len(span["text"].strip()) <= 6 and span["size"] <= 0.8 * main_size
+                and span["origin"][1] <= baseline - 0.2 * main_size}
+
+    @classmethod
+    def _line_geometry(cls, line: Dict[str, Any]) -> Tuple[Optional[tuple], Optional[float]]:
+        """A horizontal line's box from its baseline and font size, and its baseline. PyMuPDF's
+        own line bbox follows the font's ascender and descender, which some fonts make several
+        lines tall (Cambria in PyMuPDF 1.28), so gaps and order are measured from baselines.
+        Rotated lines and lines without span origins keep the PyMuPDF bbox (no baseline)."""
+        bbox = line.get("bbox")
+        raw = tuple(bbox) if bbox else None
+        direction = line.get("dir") or (1, 0)
+        spans = [span for span in line.get("spans", []) if (span.get("text") or "").strip()]
+        if not spans or abs(direction[0] - 1) > 0.01 or abs(direction[1]) > 0.01:
+            return raw, None
+        main = [span for span in spans if not cls._is_superscript_span(span)] or spans
+        origins = [span["origin"][1] for span in main if span.get("origin")]
+        size = max((span.get("size", 0) or 0) for span in main)
+        if not origins or size <= 0:
+            return raw, None
+        baseline = max(origins)
+        boxes = [span["bbox"] for span in spans if span.get("bbox")]
+        x0 = min(box[0] for box in boxes) if boxes else (raw[0] if raw else 0.0)
+        x1 = max(box[2] for box in boxes) if boxes else (raw[2] if raw else 0.0)
+        return (x0, baseline - 0.8 * size, x1, baseline + 0.25 * size), baseline
+
+    def _block_view(self, block: Dict[str, Any]) -> Optional[_BlockView]:
+        views = block.get("_views")
+        if views is None:
+            views = [self._line_view(line) for line in block.get("lines", [])]
+        lines = [view for view in views if view is not None]
+        if not lines:
+            return None
+        chars = [(view, sum(1 for char in view.text if not char.isspace())) for view in lines]
+        total = sum(count for _, count in chars) or 1
+        colors: Dict[int, int] = defaultdict(int)
+        for view, count in chars:
+            colors[view.color] += count
+        return _BlockView(
+            lines=lines,
+            text=" ".join(view.text.strip() for view in lines),
+            size=max(view.size for view in lines),
+            bold=sum(count for view, count in chars if view.bold) * 2 > total,
+            italic=sum(count for view, count in chars if view.italic) * 2 > total,
+            color=max(colors, key=colors.get),
+            bbox=self._boxes_union(*(view.bbox for view in lines)) or block.get("bbox"),
         )
-        is_heading_candidate = self._is_probable_heading_features(
-            heading_features,
-            require_layout_signal=True,
+
+    @staticmethod
+    def _is_all_caps(text: str) -> bool:
+        """At least four Latin letters, none lowercase, and no CJK (CJK has no case)."""
+        latin = [char for char in text if char.isascii() and char.isalpha()]
+        return len(latin) >= 4 and not any(char.islower() for char in latin) and not _CJK_CHAR.search(text)
+
+    def _view_heading_features(self, view: _BlockView, body_size: float, max_size: float) -> _HeadingFeatures:
+        return self._build_heading_features(
+            view.text,
+            line_count=len(view.lines),
+            block_max_size=view.size,
+            avg_font_size=body_size,
+            max_font_size=max_size,
+            is_bold=view.bold,
+            is_all_caps=self._is_all_caps(view.text),
+            has_color_signal=_is_chromatic(view.color),
         )
+
+    def _list_markers(self, view: _BlockView, block: Dict[str, Any]) -> List[Optional[_ListMarker]]:
+        """Per line, the list marker that makes it a list item, or None (see ``_line_markers``);
+        a lettered item may continue a sequence from the previous or next block."""
+        return self._line_markers(view.lines, block.get("_prev_item", ""), block.get("_next_item", ""),
+                                  block.get("_wrapped_start", False))
+
+    @staticmethod
+    def _may_be_heading(view: _BlockView, markers: List[Optional[_ListMarker]]) -> bool:
+        """Bulleted lines and blocks of two or more list items are lists, even when they are bold."""
+        first = _parse_list_marker(view.lines[0].text)
+        if first is not None and first.kind in ("glyph", "bullet"):
+            return False
+        return sum(1 for marker in markers if marker is not None) < 2
+
+    def _is_title_candidate(self, page_num: int, features: _HeadingFeatures) -> bool:
+        """A heading that may be the document title: on the first page with text, short and near
+        the page's largest font size. ``_choose_title`` keeps at most one."""
+        return (page_num == self._get_first_text_page_num() and self._has_title_layout_signal(features)
+                and features.length < 120 and features.line_count <= 3)
+
+    def _is_attached_caption(self, block: Dict[str, Any], view: _BlockView, body_size: float,
+                             image_bboxes: List[tuple], table_bboxes: List[tuple]) -> bool:
+        """Caption-shaped text directly above or below an image or table: short, not larger than
+        the body text, and italic, smaller than the body text or starting with a caption word
+        (``Source:``, ``Note``, ``資料來源``)."""
+        bbox = view.bbox
+        if not bbox or not (image_bboxes or table_bboxes):
+            return False
+        if len(view.lines) > 4 or len(view.text) > 300 or view.size > body_size * 1.02:
+            return False
+        if not (view.italic or view.size <= body_size * 0.92 or _CAPTION_KEYWORD.match(view.text.strip())):
+            return False
+        return self._is_near_image_or_table(tuple(bbox), image_bboxes, table_bboxes,
+                                            threshold=max(14.0, 1.5 * body_size))
+
+    # --- classification and rendering ---------------------------------------------------------------
+
+    def _text_item_from_block(self, block: Dict[str, Any], avg_font_size: float, max_font_size: float,
+                              page_num: int, image_bboxes: List[tuple],
+                              table_bboxes: List[tuple]) -> Optional[SimpleContent]:
+        markdown_text, text_type, heading = self._classify_block(
+            block, avg_font_size, max_font_size, page_num, image_bboxes, table_bboxes)
+        if not markdown_text.strip():
+            return None
+        # position_y: the top of the PyMuPDF block the text came from, as for a whole block, so the
+        # pieces of one block stay together and in order when the page's items are sorted
+        top = block.get("_top", (block.get("bbox") or (0, 0, 0, 0))[1])
+        return _TextContent(type=text_type, content=markdown_text, page=page_num + 1, position_y=top, heading=heading)
+
+    def _classify_block(self, block: Dict[str, Any], avg_font_size: float, max_font_size: float,
+                        page_num: int, image_bboxes: List[tuple], table_bboxes: List[tuple]) -> \
+            Tuple[str, str, Optional[Tuple[float, int]]]:
+        """Type of a text block (``text:title`` / ``section`` / ``caption`` / ``list`` / ``footnote`` /
+        ``normal``), its Markdown content and, for headings, its font size and outline depth. A
+        ``text:title`` is a candidate: ``_choose_title`` picks the title, ``_finalize_text_items``
+        the levels."""
+        view = self._block_view(block)
+        if view is None:
+            return "", "text:normal", None
+        markers = self._list_markers(view, block)
+        wraps = self._line_wraps(view.lines)
+        total_text = view.text
+        block_max_size = view.size
+        heading_features = self._view_heading_features(view, avg_font_size, max_font_size)
 
         # Determine text type based on characteristics
         text_type = "text:normal"  # Default
+        heading = None
 
-        # Check if it's a footnote (small text at bottom of page with numeric marker)
-        # page_num is 0-indexed here
+        # Check if it's a footnote (small text at bottom of page with numeric marker, or with a
+        # raised number, as in Word's footnote area); page_num is 0-indexed here
         try:
             page_height = self.doc.load_page(page_num).rect.height if page_num >= 0 else 0
             if page_height > 0:
-                block_y_pct = block["bbox"][1] / page_height
-                if (block_y_pct > 0.85
-                        and block_max_size < avg_font_size * 0.9
-                        and re.match(r'^[\d\*\u2020\u2021\u00a7]+[\.\)\s]', total_text.strip())):
+                block_y_pct = (view.bbox or block["bbox"])[1] / page_height
+                if block_y_pct > 0.85 and (
+                        (block_max_size < avg_font_size * 0.9
+                         and re.match(r'^[\d\*\u2020\u2021\u00a7]+[\.\)\s]', total_text.strip()))
+                        or (_starts_with_raised_number(view.lines[0]) and block_max_size < avg_font_size * 0.95)):
                     text_type = "text:footnote"
-        except (IndexError, AttributeError):
+        except (IndexError, AttributeError, KeyError, TypeError):
             pass
 
         # Only run further classification if not already classified as footnote
         if text_type == "text:normal":
-            # Check if it's a caption (various criteria)
-            if (is_caption_pattern and not is_bare_structured_heading) or \
-                    (self._is_near_image_or_table(block["bbox"], image_bboxes, table_bboxes) and
-                     (len(total_text) < 150 or block_max_size < avg_font_size)):
+            if _CAPTION_LABEL.match(total_text.strip()) and len(view.lines) <= 6:
+                # "Figure 3: …", "Table 2.1 …", "圖1 …"
                 text_type = "text:caption"
-            # Check if it's a title (very large font on first few pages)
-            elif (page_num == self._get_first_text_page_num()
-                  and is_heading_candidate
-                  and self._has_title_layout_signal(heading_features)
-                  and heading_features.length < 120
-                  and line_count <= 2):
-                text_type = "text:title"
-            # Check if it's a section header (various criteria)
-            elif is_heading_candidate and heading_features.length < 100 and line_count <= 2:
-                text_type = "text:section"
-            # Check if it's a list (majority of lines have list pattern)
-            elif has_list_pattern and (list_line_count >= line_count * 0.5 or line_count == 1):
+            elif (self._is_probable_heading_features(heading_features, require_layout_signal=True)
+                  and heading_features.length <= 100 and not self._starts_mid_row(view.lines)
+                  and not self._spread_on_row(view.lines, wraps) and self._may_be_heading(view, markers)):
+                heading = (_size_key(view.size), _outline_depth(heading_features.normalized))
+                text_type = "text:title" if self._is_title_candidate(page_num, heading_features) else "text:section"
+            elif self._is_attached_caption(block, view, avg_font_size, image_bboxes, table_bboxes):
+                text_type = "text:caption"
+            elif markers and markers[0] is not None:
                 text_type = "text:list"
 
-        # Generate markdown
-        markdown_text = self._convert_block_to_markdown(
-            block,
-            preserve_structured_headings=text_type in ("text:title", "text:section"),
-            allow_heading_formatting=text_type in ("text:title", "text:section"),
-        )
+        markdown_text = self._render_block(view, text_type, markers, wraps)
 
         # Debug logging for classification
         if text_type != "text:normal":
             logger.debug(
                 f"Classified as {text_type}: '{total_text[:50]}...' (size: {block_max_size:.1f}, avg: {avg_font_size:.1f})")
 
-        return markdown_text, text_type
+        return markdown_text, text_type, heading
+
+    @staticmethod
+    def _line_wraps(lines: List[_LineView]) -> List[int]:
+        """How each line follows the line before it (see ``_line_join``): 0 = not its continuation
+        (beside it on the same row, as labels under icons, or more than two lines below it),
+        1 = on the next row, 2 = on the next row after a line that runs to the right edge of the
+        block (a wrapped line). The first line counts as 2."""
+        right_edge = max((line.bbox[2] for line in lines if line.bbox), default=0.0)
+        wraps = [2]
+        for previous, line in zip(lines, lines[1:]):
+            if previous.baseline is None or line.baseline is None or not previous.bbox or not line.bbox:
+                wraps.append(2)
+                continue
+            size = max(previous.size, line.size, 1.0)
+            pitch = line.baseline - previous.baseline
+            if pitch < 0.5 * size or pitch > 2.0 * size or line.bbox[0] > previous.bbox[2]:
+                wraps.append(0)
+            else:
+                wraps.append(2 if previous.bbox[2] >= right_edge - 2 * size else 1)
+        return wraps
+
+    @staticmethod
+    def _cjk_joins(lines: List[_LineView]) -> List[bool]:
+        """Per line, True when the CJK line break before it is inside a wrapped paragraph, so it
+        is joined without a space. The line before must have wrapped onto this one: CJK text
+        wraps at any character, so the gap it leaves at the block's right edge is narrower than
+        this line's first character, or its first Latin word or an opening bracket with the
+        character after it (which cannot end a line), plus under 1 em that line-start rules may
+        leave. And the paragraph must go on: this line wraps onto the next one too, ends a
+        sentence, lead-in or bracket, or ends a paragraph of two or more wrapped lines. Stacked
+        labels and items, of varying length and without sentence ends, stay apart, and so does a
+        paragraph from the next one in the same block. In a block of two lines the first must
+        also be running text: a short label above a sentence is not one paragraph with it."""
+        joins = [False] * len(lines)
+        if len(lines) < 2 or any(line.bbox is None for line in lines):
+            return joins
+        right_edge = max(line.bbox[2] for line in lines)
+
+        def wraps_onto(previous: _LineView, line: _LineView) -> bool:
+            text = line.text.strip()
+            token = _LINE_START_TOKEN.match(text)
+            char_width = (line.bbox[2] - line.bbox[0]) / max(len(text), 1)
+            first = char_width * len(token.group(0) if token else text[:1])
+            return previous.bbox[2] + first + 0.9 * max(previous.size, 1.0) > right_edge
+
+        wrapped = [False] + [wraps_onto(previous, line) for previous, line in zip(lines, lines[1:])]
+        for index in range(1, len(lines)):
+            previous, line = lines[index - 1], lines[index]
+            if not wrapped[index] or (len(lines) == 2 and _text_units(previous.text) < _RUNNING_TEXT_UNITS):
+                continue
+            text = line.text.strip()
+            goes_on = index + 1 < len(lines) and wrapped[index + 1]
+            joins[index] = bool(goes_on or _LEAD_IN_END.search(text) or text[-1:] in ")）」』】"
+                                or (index > 1 and joins[index - 1]))
+        return joins
+
+    @staticmethod
+    def _spread_on_row(lines: List[_LineView], wraps: List[int]) -> bool:
+        """True when a line sits on the same row as the line before it, far from it (more than
+        2.5 em apart): labels side by side (under icons, in a grid), not one heading. A heading
+        number that starts the block (``1.2``, ``Chapter 3``, ``第一章``) may sit any distance
+        from its title."""
+        for index, (previous, line, wrap) in enumerate(zip(lines, lines[1:], wraps[1:])):
+            if wrap == 0 and previous.bbox and line.bbox \
+                    and line.bbox[0] - previous.bbox[2] > 2.5 * max(previous.size, line.size, 1.0) \
+                    and not (index == 0 and _HEADING_NUMBER.fullmatch(previous.text.strip())):
+                return True
+        return False
+
+    @staticmethod
+    def _starts_mid_row(lines: List[_LineView]) -> bool:
+        """True when the first line starts well right of the second one without being centred
+        above it: the tail of a sentence that began elsewhere, not a heading."""
+        if len(lines) < 2 or not lines[0].bbox or not lines[1].bbox:
+            return False
+        first, second = lines[0].bbox, lines[1].bbox
+        size = max(lines[0].size, lines[1].size, 1.0)
+        centred = abs((first[0] + first[2]) / 2 - (second[0] + second[2]) / 2) <= size
+        return first[0] > second[0] + 2 * size and not centred
+
+    def _render_block(self, view: _BlockView, text_type: str, markers: List[Optional[_ListMarker]],
+                      wraps: Optional[List[int]] = None) -> str:
+        """Markdown for a classified block. Text is escaped (``doc2mark.utils.markdown``) and kept
+        verbatim otherwise: lines are joined only where a word is broken (``_line_join``),
+        headings become one line without emphasis, list markers are normalised (see
+        ``_render_list``), superscripts are written ``^x^`` and bold/italic mark exactly the
+        styled runs of body text."""
+        wraps = wraps if wraps is not None else self._line_wraps(view.lines)
+        if text_type == "text:list":
+            return self._render_list(view, markers, wraps)
+        heading = text_type in ("text:title", "text:section")
+        physical = _physical_lines([line.runs for line in view.lines], wraps, getattr(self, "_hyphen_joins", None),
+                                   cjk_heading=heading, cjk_joins=None if heading else self._cjk_joins(view.lines))
+        if heading:
+            return escape_heading_closing(" ".join(_render_runs(runs, emphasis=False) for runs in physical))
+        if text_type == "text:caption":
+            return "\n".join(escape_line_start(_render_runs(runs, emphasis=False)) for runs in physical)
+        if text_type == "text:footnote":
+            # The footnote number stays at the line start, plain even when it is raised:
+            # pdf_to_markdown turns it into [^N]:
+            first = physical[0] if physical else []
+            if first and first[0].superscript and first[0].text.strip().isdigit():
+                label = replace(first[0], superscript=False)
+                if len(first) > 1 and not first[1].text[:1].isspace():
+                    label = replace(label, text=label.text + " ")
+                physical[0] = [label] + first[1:]
+            lines = [_render_runs(runs) for runs in physical]
+            return "\n".join(lines[:1] + [escape_line_start(line) for line in lines[1:]])
+        return "\n".join(escape_line_start(_render_runs(runs)) for runs in physical)
+
+    def _render_list(self, view: _BlockView, markers: List[Optional[_ListMarker]], wraps: List[int]) -> str:
+        """Markdown list for a block whose first line is a list item. Lines without a marker
+        continue the item above them; items indented further than the previous item are nested.
+        Bullets become ``- `` (``-``, ``*`` and ``+`` keep their own character); a bullet that
+        carries meaning (``✓``, ``➔``, a dash, Word's Wingdings check mark and arrows as their
+        Unicode forms) stays in the item text (``- ✓ Approved``);
+        numbered items keep their number; letters and roman numerals stay in the item text."""
+        items: List[Tuple[Optional[float], str, List[List[_Run]], List[int], List[_LineView]]] = []
+        for index, (line, marker) in enumerate(zip(view.lines, markers)):
+            if marker is None:
+                if items:
+                    items[-1][2].append(line.runs)
+                    items[-1][3].append(wraps[index])
+                    items[-1][4].append(line)
+                continue
+            indent = len(line.text) - len(line.text.lstrip())
+            if marker.kind == "enum":
+                prefix, runs = "- ", line.runs
+            elif marker.kind == "ordered":
+                prefix, runs = f"{marker.text} ", _drop_prefix(line.runs, indent + marker.length)
+            elif marker.text in _MEANINGFUL_BULLETS:
+                prefix, runs = "- ", _drop_prefix(line.runs, indent)
+            elif marker.text in _PUA_MEANINGFUL_BULLETS:
+                glyph = _Run(_PUA_MEANINGFUL_BULLETS[marker.text] + " ", False, False, False)
+                prefix, runs = "- ", [glyph] + _drop_prefix(line.runs, indent + marker.length)
+            else:
+                prefix = f"{marker.text} " if marker.text in ("-", "*", "+") else "- "
+                runs = _drop_prefix(line.runs, indent + marker.length)
+            items.append((line.bbox[0] if line.bbox else None, prefix, [runs], [2], [line]))
+
+        output: List[str] = []
+        stack: List[Tuple[Optional[float], str, str]] = []   # open levels: (x0, indent, marker prefix)
+        joins = getattr(self, "_hyphen_joins", None)
+        for x0, prefix, item_lines, item_wraps, item_views in items:
+            while len(stack) > 1 and x0 is not None and stack[-1][0] is not None and x0 < stack[-1][0] - 2:
+                stack.pop()
+            if not stack:
+                indent = ""
+            elif x0 is not None and stack[-1][0] is not None and x0 > stack[-1][0] + 2:
+                indent = stack[-1][1] + " " * len(stack[-1][2])
+            else:
+                indent = stack.pop()[1]
+            stack.append((x0, indent, prefix))
+            physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
+            lines = [_render_runs(runs) for runs in physical] or [""]
+            output.append(indent + prefix + escape_line_start(lines[0]))
+            continuation = indent + " " * len(prefix)
+            output.extend(continuation + escape_line_start(line) for line in lines[1:])
+        return "\n".join(output)
 
     def _normalized_heading_text(self, text: str) -> str:
         return re.sub(r'\s+', ' ', (text or '')).strip()
 
     def _explicit_heading_match(self, normalized: str):
         explicit_heading_patterns = [
-            r'^第\s*[一二三四五六七八九十百千\d]+\s*[條章节章節篇]',
-            r'^(附錄|附件|附表)\s*[A-Za-z\d一二三四五六七八九十百千]*',
+            r'^第\s*[一二三四五六七八九十百千零〇\d]+\s*[條条章節节篇款項项編编]',
+            r'^(附錄|附录|附件|附表)\s*(?:[A-Za-z\d]+|[一二三四五六七八九十百千]+)(?![A-Za-z\d])',
             r'^(Appendix|Chapter|Section)\b',
         ]
         for pattern in explicit_heading_patterns:
@@ -2236,36 +3593,13 @@ class PDFLoader:
         return None
 
     def _has_structured_marker_boundary(self, normalized: str, match) -> bool:
-        """Avoid treating decimal/version prefixes as outline markers."""
+        """Avoid treating decimal/version/percentage prefixes as outline markers."""
         if match.end() >= len(normalized):
             return True
         next_char = normalized[match.end()]
-        if next_char.isspace():
+        if next_char.isspace() or _is_cjk(next_char):
             return True
-        if re.match(r'[\u4e00-\u9fff]', next_char):
-            return True
-        return not next_char.isascii() or not next_char.isalnum()
-
-    def _has_list_marker(self, text: str) -> bool:
-        normalized = self._normalized_heading_text(text)
-        if not normalized:
-            return False
-        if re.match(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', normalized):
-            return True
-        if re.match(r'^(?:\d+|[a-zA-Z])[\.\)]\s+', normalized):
-            return True
-        return self._structured_heading_match(normalized) is not None
-
-    def _is_explicit_heading_text(self, text: str) -> bool:
-        normalized = self._normalized_heading_text(text)
-        return self._explicit_heading_match(normalized) is not None
-
-    def _is_structured_heading_text(self, text: str) -> bool:
-        normalized = self._normalized_heading_text(text)
-        match = self._structured_heading_match(normalized)
-        if not match:
-            return False
-        return match.end() == len(normalized) or bool(normalized[match.end():].strip())
+        return next_char in ".)、．:：）"
 
     def _build_heading_features(
         self,
@@ -2277,8 +3611,7 @@ class PDFLoader:
         max_font_size: float = 0.0,
         is_bold: bool = False,
         is_all_caps: bool = False,
-        has_list_pattern: bool = False,
-        list_line_count: int = 0,
+        has_color_signal: bool = False,
     ) -> _HeadingFeatures:
         normalized = self._normalized_heading_text(text)
         explicit_match = self._explicit_heading_match(normalized)
@@ -2294,6 +3627,12 @@ class PDFLoader:
             and len(normalized) > 32
             and any(separator in text_after_marker for separator in (',', '，', '、', ':', '：'))
         )
+        # A question or exclamation mark may end a heading; sentence punctuation elsewhere may not.
+        inner = normalized[:-1] if normalized[-1:] in "?!？！" else normalized
+        # "第一章 總則" or "第 1 條": an article/chapter marker followed by a space, a bracket or nothing
+        bare_cjk_explicit = bool(re.match(
+            r'^第\s*[一二三四五六七八九十百千零〇\d]+\s*[條条章節节篇款項项編编](?:$|\s|[（(【\[])', normalized
+        )) and len(normalized) <= 20 and line_count == 1
 
         return _HeadingFeatures(
             normalized=normalized,
@@ -2303,31 +3642,41 @@ class PDFLoader:
             max_size_ratio=max_size_ratio,
             is_bold=is_bold,
             is_all_caps=is_all_caps,
-            has_list_pattern=has_list_pattern,
-            list_line_count=list_line_count,
             is_explicit_marker=explicit_match is not None,
             is_structured_marker=has_structured_marker,
             text_after_marker=text_after_marker,
-            has_cjk=bool(re.search(r'[\u4e00-\u9fff]', normalized)),
+            has_cjk=bool(re.search(r'[一-鿿]', normalized)),
             has_checkbox_marker=bool(re.match(r'^[□■☑☐]', normalized)),
-            has_sentence_punctuation=bool(re.search(r'[。！？!?；;]', normalized) or normalized.endswith('.')),
+            has_sentence_punctuation=bool(re.search(r'[。！？!?；;]', inner) or normalized.endswith('.')),
             has_trailing_continuation=normalized.endswith(('，', ',', '、', '；', ';')),
             separator_count=separator_count,
             has_form_field_shape=bool(re.search(r'_{3,}|\.{4,}|…{2,}', normalized)),
             has_long_clause_shape=has_long_clause_shape,
+            letter_count=sum(1 for char in normalized if char.isalpha()),
+            has_color_signal=has_color_signal,
+            is_bare_structured_marker=structured_match is not None and not text_after_marker,
+            is_bare_cjk_explicit_marker=bare_cjk_explicit,
         )
 
-    def _has_heading_layout_signal(self, features: _HeadingFeatures) -> bool:
-        return (
-            features.size_ratio >= 1.2
-            or (features.is_bold and features.size_ratio >= 1.05)
-            or features.is_all_caps
-        )
+    def _heading_signal_strength(self, features: _HeadingFeatures) -> int:
+        """How strongly the layout marks a block as a heading: 3 = clearly larger (or larger and
+        bold), 2 = bold at body size, or slightly larger and all caps or coloured, 1 = coloured
+        at body size (enough only together with an outline marker), 0 = body text."""
+        ratio = features.size_ratio
+        if ratio >= 1.15 or (features.is_bold and ratio >= 1.05):
+            return 3
+        if (features.is_bold and ratio >= 0.95) or (
+                ratio >= 1.05 and (features.is_all_caps or features.has_color_signal)):
+            return 2
+        if features.has_color_signal and ratio >= 0.95:
+            return 1
+        return 0
 
     def _has_title_layout_signal(self, features: _HeadingFeatures) -> bool:
         return (
             features.max_size_ratio >= 0.85
-            and (features.size_ratio >= 1.15 or features.is_bold or features.is_all_caps)
+            and (features.size_ratio >= 1.15
+                 or ((features.is_bold or features.is_all_caps) and features.size_ratio >= 1.05))
         )
 
     def _has_hard_body_shape(self, features: _HeadingFeatures) -> bool:
@@ -2350,6 +3699,16 @@ class PDFLoader:
             return True
         return features.has_long_clause_shape
 
+    def _fits_relaxed_heading_shape(self, features: _HeadingFeatures) -> bool:
+        """Latin headings with a comma or a colon ("Property, Plant and Equipment", "Part II:
+        Management Discussion and Analysis"): short enough to still be a heading when the layout
+        clearly marks them as one."""
+        if features.has_cjk or features.has_long_clause_shape:
+            return False
+        commas = sum(features.normalized.count(separator) for separator in (',', '，'))
+        colons = sum(features.normalized.count(separator) for separator in (':', '：'))
+        return commas <= 2 and colons <= 1 and features.length <= (60 if colons else 40)
+
     def _is_probable_heading_features(
         self,
         features: _HeadingFeatures,
@@ -2358,120 +3717,42 @@ class PDFLoader:
     ) -> bool:
         if not features.normalized:
             return False
-        if features.line_count > 2:
+        if features.letter_count < 2 and not features.is_bare_structured_marker:
+            return False  # numbers, KPI figures, drop caps
+        if features.line_count > 3:
             return False
         if self._has_hard_body_shape(features):
             return False
 
-        has_layout_signal = self._has_heading_layout_signal(features)
+        strength = self._heading_signal_strength(features)
+        if features.line_count == 3 and strength < 3:
+            return False
         has_soft_body_shape = self._has_soft_body_shape(features)
+        if has_soft_body_shape and strength >= 2 and self._fits_relaxed_heading_shape(features):
+            has_soft_body_shape = False
 
         if features.is_explicit_marker:
+            if require_layout_signal and strength == 0 and not features.is_bare_cjk_explicit_marker:
+                return False  # "Section 5 applies to …", "Chapter 1 - Introduction" at body size
             return features.length <= 80 and not (has_soft_body_shape and features.length > 60)
 
-        if require_layout_signal and not has_layout_signal:
+        if require_layout_signal and strength == 0:
             return False
 
         if features.is_structured_marker:
             if features.has_long_clause_shape:
                 return False
-            if has_soft_body_shape and not has_layout_signal:
+            if has_soft_body_shape and strength < 2:
                 return False
             return features.length <= 80
 
         if has_soft_body_shape:
             return False
+        if require_layout_signal and strength < 2:
+            return False  # colour alone marks a heading only together with an outline marker
 
         length_limit = 24 if features.has_cjk else 80
         return features.length <= length_limit
-
-    def _is_probable_heading_text(self, text: str) -> bool:
-        """Return True for short structural heading shapes without body blockers."""
-        features = self._build_heading_features(text)
-        return self._is_probable_heading_features(features, require_layout_signal=False)
-
-    def _convert_block_to_markdown(
-        self,
-        block: Dict[str, Any],
-        preserve_structured_headings: bool = False,
-        allow_heading_formatting: bool = False,
-    ) -> str:
-        """Convert a text block to markdown format"""
-        lines = []
-
-        # Analyze font sizes to detect headers
-        font_sizes = []
-        for line in block["lines"]:
-            for span in line["spans"]:
-                font_sizes.append(span["size"])
-
-        avg_size = sum(font_sizes) / len(font_sizes) if font_sizes else 12
-
-        for line in block["lines"]:
-            line_text = ""
-            line_size = 0
-            is_bold = False
-            is_italic = False
-
-            # Combine spans in the line
-            for span in line["spans"]:
-                line_text += span["text"]
-                line_size = span["size"]
-                is_bold = is_bold or (span["flags"] & pymupdf.TEXT_FONT_BOLD)
-                is_italic = is_italic or (span["flags"] & pymupdf.TEXT_FONT_ITALIC)
-
-            line_text = line_text.strip()
-            if not line_text:
-                continue
-
-            # First check if this is a list item BEFORE applying any formatting
-            list_match = re.match(
-                r'^([\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]|\d+[\.\)]|[a-zA-Z][\.\)])\s+',
-                line_text)
-            
-            if (preserve_structured_headings
-                    and self._is_structured_heading_text(line_text)
-                    and self._is_probable_heading_text(line_text)):
-                markdown_line = line_text
-            elif list_match:
-                # Handle list items without applying text formatting
-                marker = list_match.group(1)
-                if marker in '•\u2022\u25CF\u25AA\u25A0' or marker == '-' or marker == '*':
-                    # Bullet point
-                    markdown_line = re.sub(r'^[\u2022•\-\*\u2013\u2014\u25AA\u25AB\u25CF\u25CB\u25A0\u25A1]\s+', '- ',
-                                           line_text)
-                elif re.match(r'\d+[\.\)]', marker):
-                    # Numbered list
-                    markdown_line = re.sub(r'^(\d+)[\.\)]\s+', r'\1. ', line_text)
-                else:
-                    # Letter list (a., b., etc.) - convert to bullet
-                    markdown_line = re.sub(r'^[a-zA-Z][\.\)]\s+', '- ', line_text)
-            # Detect headers based on size
-            elif allow_heading_formatting and line_size > avg_size * 1.5 and self._is_probable_heading_text(line_text):
-                # Large text -> H1
-                markdown_line = f"# {line_text}"
-            elif allow_heading_formatting and line_size > avg_size * 1.3 and self._is_probable_heading_text(line_text):
-                # Medium large text -> H2
-                markdown_line = f"## {line_text}"
-            elif allow_heading_formatting and line_size > avg_size * 1.15 and self._is_probable_heading_text(line_text):
-                # Slightly larger text -> H3
-                markdown_line = f"### {line_text}"
-            else:
-                # Regular text
-                markdown_line = line_text
-
-                # Apply bold/italic formatting only for non-list items
-                if is_bold and is_italic:
-                    markdown_line = f"***{markdown_line}***"
-                elif is_bold:
-                    markdown_line = f"**{markdown_line}**"
-                elif is_italic:
-                    markdown_line = f"*{markdown_line}*"
-
-            lines.append(markdown_line)
-
-        # Join lines with appropriate spacing
-        return "\n".join(lines) + "\n"
 
     def _extract_tables_as_markdown(self, page, page_num: int) -> Tuple[List[SimpleContent], List[Tuple]]:
         """Extract the page's tables as Markdown/HTML (see :mod:`doc2mark.pipelines.pdf_tables`).
@@ -2874,29 +4155,28 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
                 markdown_parts.append(f"<!-- page {item['page']} -->")
             current_page = item['page']
         
-        if item_type == "text:title":
-            # Use # for main titles
-            markdown_parts.append(f"# {content}")
-            markdown_parts.append("")  # Empty line after title
-            
-        elif item_type == "text:section":
-            # Use ## for section headers
-            markdown_parts.append(f"## {content}")
-            markdown_parts.append("")  # Empty line after section
-            
+        if item_type in ("text:title", "text:section"):
+            # ATX heading at the item's level (title 1, sections from 2, see _assign_heading_levels); the
+            # content is one escaped line (older JSON may still end in a newline)
+            level = item.get("level") or (1 if item_type == "text:title" else 2)
+            heading = " ".join(part.strip() for part in content.split("\n") if part.strip())
+            markdown_parts.append(f"{'#' * max(1, min(int(level), 6))} {heading}")
+            markdown_parts.append("")  # Empty line after heading
+
         elif item_type == "text:normal":
             # Regular paragraphs
             markdown_parts.append(content)
             markdown_parts.append("")  # Empty line after paragraph
-            
+
         elif item_type == "text:list":
             # List items (already formatted with bullets/numbers)
             markdown_parts.append(content)
             markdown_parts.append("")  # Empty line after list
-            
+
         elif item_type == "text:caption":
-            # Captions in italics
-            markdown_parts.append(f"*{content}*")
+            # Captions in italics, one emphasis per line so every line is valid Markdown
+            caption_lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+            markdown_parts.append("\n".join(f"*{line}*" for line in caption_lines))
             markdown_parts.append("")  # Empty line after caption
             
         elif item_type == "text:image_description":
@@ -2915,13 +4195,14 @@ def pdf_to_markdown(json_data: Dict[str, Any]) -> str:
             # Table content already includes trailing newlines
             
         elif item_type == "text:footnote":
-            # Format as markdown footnote definition if it matches N. pattern
+            # Format as markdown footnote definition if it matches N. pattern; every line of the
+            # footnote is kept (DOTALL), not just the first one
             footnote_text = content.strip()
-            m = re.match(r'^(\d+)[\.\)\s]+(.+)', footnote_text)
+            m = re.match(r'^(\d+)[\.\)\s]+(.+)', footnote_text, re.DOTALL)
             if m:
                 markdown_parts.append(f"[^{m.group(1)}]: {m.group(2)}")
             else:
-                markdown_parts.append(footnote_text)
+                markdown_parts.append(escape_line_start(footnote_text))
             markdown_parts.append("")
 
         elif item_type == "image":
