@@ -426,7 +426,7 @@ class OpenAIOCR(BaseOCR):
             max_retries: Maximum number of retries for failed requests
             base_url: Optional base URL for OpenAI-compatible API endpoints
             top_p, frequency_penalty, presence_penalty: Sampling settings sent with every
-                request when set (reasoning models such as gpt-5 reject them)
+                request when set (some models, such as reasoning models, may reject them)
             **kwargs: Further request settings, sent with every request
         """
         # Use provided API key or fall back to environment variable

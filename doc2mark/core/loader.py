@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 DOCUMENT_CACHE_SCHEMA = "doc2mark-document-cache-v2"
 
 # The API's own defaults of the loader's sampling settings: a value equal to its default is
-# not sent (reasoning models such as gpt-5 reject the parameters).
+# not sent (some models, such as OpenAI's reasoning models, may reject the parameters).
 _SAMPLING_DEFAULTS = {"top_p": 1.0, "frequency_penalty": 0.0, "presence_penalty": 0.0}
 
 

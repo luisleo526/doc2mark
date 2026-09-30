@@ -89,8 +89,8 @@ def test_sampling_settings_reach_the_openai_request(e2e_dir, fake_llm, receipt, 
 
 
 def test_default_requests_carry_no_sampling_settings(e2e_dir, fake_llm, receipt):
-    """The loader's defaults (the API's own defaults) are not sent: reasoning models such as gpt-5 reject the
-    parameters, and a default request stays as it was."""
+    """The loader's defaults (the API's own defaults) are not sent: a default request stays as it was (some models,
+    such as OpenAI's reasoning models, may reject the parameters)."""
     fake_llm.script(structured=[fake.page("ACME STORE TOTAL 12.50")])
 
     run_api(e2e_dir, SAMPLING_SCRIPT, "loader", receipt, "{}", env=fake_llm.env)
