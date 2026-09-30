@@ -2561,14 +2561,17 @@ class PDFLoader:
         page chrome: they open or close the page (``pdf_layout.Region.edge``)."""
         box, measured = None, []
         try:
-            matrix = page.rotation_matrix
+            matrix = page.rotation_matrix if page.rotation % 360 else None
             for line in lines:
                 if not self._raw_line_text(line).strip():
                     continue
-                rect = pymupdf.Rect(self._visual_box(line)) * matrix
+                rect = self._visual_box(line)
+                if matrix is not None:
+                    rect = tuple(pymupdf.Rect(rect) * matrix)
                 size = max((span.get("size") or 0.0 for span in line.get("spans", [])), default=0.0)
-                measured.append((rect.width, size, rect.y0, rect.y1))
-                box = rect if box is None else box | rect
+                measured.append((rect[2] - rect[0], size, rect[1], rect[3]))
+                box = rect if box is None else (min(box[0], rect[0]), min(box[1], rect[1]),
+                                                max(box[2], rect[2]), max(box[3], rect[3]))
         except Exception as e:   # unknown place: the item is placed by its height alone
             logger.debug(f"Line geometry unavailable: {e}")
             box, measured = None, []
@@ -2681,14 +2684,17 @@ class PDFLoader:
         (a vertical margin stamp such as arXiv's, a turned axis label, upside-down text). They are
         never headings and do not set the page's largest font size (``_size_weights``). A page
         set mostly in vertical lines (vertical CJK) marks nothing."""
-        matrix = page.rotation_matrix
-        origin = pymupdf.Point(0, 0) * matrix
+        turns = (page.rotation // 90) % 4
 
         def upright(line: Dict[str, Any]) -> bool:
             dx, dy = line.get("dir") or (1.0, 0.0)
-            shown = pymupdf.Point(dx, dy) * matrix - origin
-            return shown.x > 0.9 and abs(shown.y) < 0.2
+            for _ in range(turns):   # as displayed: each /Rotate quarter turn is clockwise
+                dx, dy = -dy, dx
+            return dx > 0.9 and abs(dy) < 0.2
 
+        if all(upright(line) for block in text_dict.get("blocks", []) if block.get("type", 0) == 0
+               for line in block.get("lines", [])):
+            return
         measured, upright_chars, total_chars = [], 0, 0
         for block in text_dict.get("blocks", []):
             if block.get("type", 0) != 0:
