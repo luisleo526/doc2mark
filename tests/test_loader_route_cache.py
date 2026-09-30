@@ -2,6 +2,14 @@
 import pymupdf
 
 from doc2mark import UnifiedDocumentLoader
+from doc2mark.ocr.base import BaseOCR, OCRResult
+
+
+class _BlankOCR(BaseOCR):
+    """An OCR provider that reads nothing (the judge is consulted only when OCR runs)."""
+
+    def batch_process_images(self, images, **kwargs):
+        return [OCRResult(text="") for _ in images]
 
 
 def _text_pdf(path):
@@ -16,13 +24,14 @@ def _text_pdf(path):
 def test_cached_result_is_not_reused_for_a_different_judge(tmp_path):
     pdf = _text_pdf(tmp_path / "doc.pdf")
     cache = tmp_path / "cache"
-    UnifiedDocumentLoader(ocr_provider=None, cache_dir=str(cache)).load(pdf)
+    UnifiedDocumentLoader(ocr_provider=_BlankOCR(), cache_dir=str(cache)).load(pdf, ocr_images=True)
     seen = []
 
     def judge(page_text):
         seen.append(page_text)
         return 0.9
 
-    UnifiedDocumentLoader(ocr_provider=None, cache_dir=str(cache), legibility_judge=judge).load(pdf)
+    UnifiedDocumentLoader(ocr_provider=_BlankOCR(), cache_dir=str(cache), legibility_judge=judge).load(
+        pdf, ocr_images=True)
 
     assert len(seen) == 1 and "legible text" in seen[0]

@@ -1,12 +1,13 @@
 """E2E tests for the OCR strategy routing: which pages are OCR'd from their render and which keep their text layer.
 
 Every test runs the installed ``doc2mark`` CLI on a PDF built at test time by ``builders_route`` (or the committed
-``sample_documents/test-table.pdf``) and asserts only on what the run writes. OCR is real Tesseract. Two tests use
+``sample_documents/test-table.pdf``) and asserts only on what the run writes. OCR is real Tesseract. Three tests use
 the public Python API in a subprocess instead, because what they cover has no CLI switch: ``ocr_images=True``
 without ``extract_images`` (the CLI already turns extraction on for ``--ocr-images``) and the
 ``legibility_judge`` hook (a Python callable).
 
-IDs: ``R-F*`` are findings of the routing review, ``H-F*`` of the text-structure review.
+IDs: ``R-F*`` are findings of the routing review, ``H-F*`` of the text-structure review; ``B1``, ``M*`` and ``m*``
+are items of the review of the routing change itself (round 1).
 """
 
 import json
@@ -614,3 +615,168 @@ def test_legibility_judge_decides_pages_the_detector_cannot(require_tool, e2e_di
         assert "Rotterdam" in content and "Lqyrlfh" not in content, output
     else:
         assert "Lqyrlfh wrwdo HXU 2340" in content, output
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Review round 1: what invisible text is, fail open (B1, M1, M2), blank pages (m2), detector false positives (m3),
+# garbled pages keep their legible lines (m4), no judge without OCR (m5)
+
+LEDGER = [f"Ledger line {n:02d}: pallet {4400 + n} checked in at dock {n % 5 + 1}" for n in range(1, 21)]
+
+
+@pytest.mark.parametrize("ink, paper, watermark", [(0, 255, "diagonal"), (0, 255, "stamp"), (215, 255, None),
+                                                   (60, 110, None)],
+                         ids=["diagonal-translucent-watermark", "horizontal-stamp", "faint-grey-scan",
+                              "dark-on-grey-scan"])
+def test_scan_ocr_layer_is_kept_under_a_watermark_and_on_faint_scans(run_cli, e2e_dir, ink, paper, watermark):
+    """B1: without OCR a searchable scan's invisible OCR layer is its only text. A watermark or stamp painted
+    across the scan, and a faint or low-contrast scan, made the hidden-text check see "nothing under it" and
+    drop most of the layer (4 and 17 of 20 lines kept, and 0 on the grey scans). Every line is emitted, once."""
+    pdf = builders_route.layered_scan_pdf(e2e_dir / "layered_scan.pdf", LEDGER, ink=ink, paper=paper,
+                                          watermark=watermark)
+
+    result = run_cli(pdf, "--ocr", "none", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    text = words(result.markdown)
+    assert [line for line in LEDGER if text.count(line) != 1] == [], result.describe()
+    assert "hidden_text" not in extra(result), extra(result)
+
+
+def test_outlined_heading_is_kept_when_a_figure_on_its_page_is_ocrd(run_cli, require_tool, e2e_dir):
+    """M1: a heading drawn as outlines keeps its text only in the invisible copy over it. OCR of another picture
+    on the page (a figure) used to drop every invisible span of the page, so the heading disappeared; only the
+    invisible text over a picture whose OCR returned text is replaced now."""
+    require_tool("tesseract")
+    body = [f"Body line {n}: the pump programme stays within its budget of EUR {400 + n} thousand." for n in
+            range(1, 7)]
+    pdf = builders_route.outlined_heading_report_pdf(e2e_dir / "outlined_heading.pdf", "QUARTERLY OUTLOOK 2026",
+                                                     body, ["FIGURE 7 PUMP CURVE", "FLOW 40 M3 AT 6 BAR"])
+
+    result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    text = words(result.markdown)
+    assert "PUMP CURVE" in text.upper(), result.describe()
+    assert text.count("QUARTERLY OUTLOOK 2026") == 1, result.describe()
+    assert all(line in text for line in body), result.describe()
+
+
+def test_hidden_words_on_table_rules_and_pictures_are_not_emitted(run_cli, e2e_dir):
+    """M2: invisible words straddling an inner vertical and an inner horizontal table rule, overlapping a painted
+    line and lying on a plain picture are hidden text: a rule or a flat picture under them is not something the
+    words transcribe (the one on the horizontal rule was emitted as "layer")."""
+    intro = REPORT[0][:2]
+    rows = [["Item", "Qty", "Price"], ["Pumps", "12", "EUR 400"], ["Seals", "40", "EUR 12"]]
+    hidden = ["HIDDENRULE", "HIDDENEDGE", "HIDDENOVERLAP", "HIDDENPICTURE"]
+    pdf = builders_route.ruled_table_with_hidden_words_pdf(e2e_dir / "ruled_hidden.pdf", intro, rows, hidden)
+
+    result = run_cli(pdf, "--ocr", "none", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    text = words(result.markdown)
+    assert [word for word in hidden if word in text] == [], result.describe()
+    assert all(line in text for line in intro), result.describe()
+    for value in ("Item", "Pumps", "EUR 400", "Seals", "EUR 12"):
+        assert value in text, result.describe()
+    assert [entry["page"] for entry in extra(result).get("hidden_text", [])] == [1], extra(result)
+
+
+def test_blank_page_with_header_and_footer_rules_is_not_ocrd(run_cli, require_tool, e2e_dir):
+    """m2: "This page intentionally left blank" between two ruled contract pages has no usable text layer, but
+    its header and footer rules are line art, not content only OCR can read: the page keeps its text path."""
+    require_tool("tesseract")
+    first = [f"Clause 1.{n}: the supplier shall deliver {1000 + n} units by 30 June 2026." for n in range(1, 21)]
+    last = [f"Clause 2.{n}: the buyer shall pay within {n + 10} days of delivery." for n in range(1, 21)]
+    pdf = builders_route.ruled_contract_pdf(e2e_dir / "contract.pdf", [first, [], last])
+
+    result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert extra(result)["ocr_routing"] == {"document_route": "text", "overrides": []}, extra(result)
+    assert not [item for item in page_items(result, 2) if item["type"] == RENDER_OCR], result.describe()
+    blank_page = words(" ".join(item["content"] for item in text_layer_items(result, 2)))
+    assert "This page intentionally left blank" in blank_page, result.describe()
+    text = words(result.markdown)
+    assert all(line in text for line in first + last), result.describe()
+
+
+EPIGRAPH = "C'\xe9tait ferm\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK} disait-il"
+
+
+def test_an_accent_before_an_ellipsis_and_a_quote_is_not_mojibake(run_cli, e2e_dir):
+    """m3: "ferm\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK}" reads as one UTF-8 sequence decoded as
+    cp1252, so this one-line page was reported garbled. Mojibake mangles every accented letter of a text layer;
+    one lone match is ordinary punctuation."""
+    pdf = builders_route.epigraph_pdf(e2e_dir / "epigraph.pdf", EPIGRAPH)
+
+    result = run_cli(pdf, "--ocr", "none", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert EPIGRAPH in words(result.markdown), result.describe()
+    assert "text_layer_quality" not in extra(result), extra(result)
+
+
+def test_rating_stars_from_an_icon_font_do_not_send_the_page_to_ocr(run_cli, require_tool, e2e_dir):
+    """m3: a row of five private-use glyphs (rating stars of an icon font) on a short product page counted as
+    garbage, so the legible page was replaced by OCR of its render. Short private-use rows on a page that
+    otherwise reads as text are icons."""
+    require_tool("tesseract")
+    cards = [("Pump P-200", "Rated 4.8 by 312 customers"), ("Pump P-300", "Rated 4.6 by 208 customers")]
+    pdf = builders_route.rating_cards_pdf(e2e_dir / "cards.pdf", cards)
+
+    result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    assert not [item for item in page_items(result, 1) if item["type"] == RENDER_OCR], result.describe()
+    page_text = words(" ".join(item["content"] for item in text_layer_items(result, 1)))
+    for name, rating in cards:
+        assert name in page_text and rating in page_text, result.describe()
+    assert "text_layer_quality" not in extra(result), extra(result)
+
+
+def test_garbled_title_page_keeps_the_legible_body_the_ocr_cannot_read(run_cli, require_tool, e2e_dir):
+    """m4: a page with a garbled title is OCR'd from its render, but its light-grey body is lighter than
+    Tesseract's binarisation threshold and never reaches the OCR text. The legible body lines the OCR did not
+    reproduce are kept verbatim after it (the garbled title is not)."""
+    require_tool("tesseract")
+    pdf = builders_route.garbled_title_grey_body_pdf(e2e_dir / "grey_body.pdf", "INVOICE SUMMARY", INVOICE_BODY)
+
+    result = run_cli(pdf, "--ocr", "tesseract", "--ocr-images", fmt="both")
+
+    assert result.exit_code == 0, result.describe()
+    routing = extra(result)["ocr_routing"]
+    assert routing["overrides"] == [{"page": 1, "route": "image", "reason": "illegible_text_layer"}], routing
+    text = words(result.markdown)
+    assert "INVOICE SUMMARY" in text.upper(), result.describe()
+    assert all(text.count(line) == 1 for line in INVOICE_BODY), result.describe()
+    assert "\ufffd" not in result.markdown, result.describe()
+
+
+NO_OCR_JUDGE_SCRIPT = (
+    "import json, sys\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "seen = []\n"
+    "def judge(page_text):\n"
+    "    seen.append(page_text)\n"
+    "    return 0.05\n"
+    "provider = None if sys.argv[2] == 'none' else sys.argv[2]\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=provider, legibility_judge=judge)\n"
+    "result = loader.load(sys.argv[1])\n"
+    "print(json.dumps({'judged': seen, 'content': result.content}))\n"
+)
+
+
+@pytest.mark.parametrize("provider", ["none", "tesseract"])
+def test_legibility_judge_is_not_consulted_when_no_ocr_runs(require_tool, e2e_dir, provider):
+    """m5: the judge's verdict can only send a page to OCR. Without an OCR provider, or with one but without
+    ``ocr_images``, it was still called on every page; now it is not called, and the text is kept."""
+    if provider != "none":
+        require_tool(provider)
+    pdf = builders_route.garbled_text_pdf(e2e_dir / "shifted.pdf", "INVOICE SUMMARY", INVOICE_BODY, "shifted")
+
+    proc = run_api(e2e_dir, NO_OCR_JUDGE_SCRIPT, pdf, provider)
+
+    output = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert output["judged"] == [], output
+    assert "Lqyrlfh wrwdo HXU 2340" in words(output["content"]), output

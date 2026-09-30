@@ -1,9 +1,11 @@
 """PDF builders for the OCR-routing E2E tests (``tests/e2e/test_route.py``).
 
 Ports of the routing review's probe fixtures (``p11``, ``p11b``, ``p12``, ``p12b``,
-``p13``), made at test time with PyMuPDF and Pillow only: text uses PyMuPDF's
-built-in fonts (Helvetica, the Nimbus Roman clone ``tiro``, Droid Sans Fallback as
-``china-t``), so no system font is needed. Nothing from ``doc2mark`` is imported.
+``p13``) and of the round-1 review of the routing change (``p1*``, ``p2``, ``p3``, ``p8``,
+``p9``), made at test time with PyMuPDF and Pillow only: text uses PyMuPDF's built-in
+fonts (Helvetica, the Nimbus Roman clone ``tiro``, Droid Sans Fallback as ``china-t``)
+and pictures Pillow's built-in font, so no system font is needed. Nothing from
+``doc2mark`` is imported.
 
 A "broken" text layer is made the way real designed/print PDFs break it: the
 glyphs render correctly, but the embedded font's ToUnicode map is removed or
@@ -466,4 +468,146 @@ def report_with_covered_text_scan_pdf(path: Path, report: Sequence[str], scan_te
     page = doc.new_page(width=A4[0], height=A4[1])
     insert_lines(page, [covered], top=A4[1] / 2, fontsize=11)
     page.insert_image(page.rect, stream=pdfgen.text_png(scan_text))
+    return _save(doc, path)
+
+
+# ------------------------------------------------------------ routing review, round 1
+
+
+def layered_scan_pdf(path: Path, lines: Sequence[str], *, ink: int = 0, paper: int = 255,
+                     watermark: Optional[str] = None) -> Path:
+    """Searchable scan whose OCR layer sits exactly on the scanned lines (reviewer fixtures ``p1c_diag``,
+    ``p1b_*``, ``p2``): one A4 page that is a full-page greyscale picture (150 DPI) of ``lines`` in grey
+    ``ink`` on grey ``paper``, with an INVISIBLE (render mode 3) text line over each picture line.
+
+    ``watermark`` paints real text over the scan, as document-management and scanner software stamp it:
+    ``"diagonal"`` a big translucent grey "CONFIDENTIAL DRAFT" at 45 degrees across the page, ``"stamp"``
+    a horizontal light-grey "CONFIDENTIAL" across the middle lines.
+    """
+    size, font_px = (1240, 1754), 28
+    image = Image.new("L", size, paper)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=font_px)
+    boxes, y = [], 120
+    for line in lines:
+        box = draw.textbbox((100, y), line, font=font)
+        if box[2] > size[0] or box[3] > size[1]:
+            raise ValueError(f"line does not fit the scan: {line!r}")
+        draw.text((100, y), line, fill=ink, font=font)
+        boxes.append(box)
+        y = box[3] + font_px
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_image(page.rect, stream=_png(image))
+    scale = A4[0] / size[0], A4[1] / size[1]
+    for line, (left, top, _, bottom) in zip(lines, boxes):
+        page.insert_text((left * scale[0], bottom * scale[1]), line, fontsize=(bottom - top) * scale[1] * 1.1,
+                         render_mode=3)
+    if watermark == "diagonal":
+        origin = pymupdf.Point(90, 700)
+        page.insert_text(origin, "CONFIDENTIAL DRAFT", fontsize=64, color=(0.8, 0.8, 0.8), fill_opacity=0.3,
+                         morph=(origin, pymupdf.Matrix(45)))
+    elif watermark == "stamp":
+        page.insert_text((40, A4[1] / 2), "CONFIDENTIAL", fontsize=72, color=(0.85, 0.85, 0.85))
+    elif watermark is not None:
+        raise ValueError(f"unknown watermark {watermark!r}")
+    return _save(doc, path)
+
+
+def outlined_heading_report_pdf(path: Path, heading: str, body: Sequence[str], figure: Sequence[str]) -> Path:
+    """A report page whose heading is drawn as glyph OUTLINES (vector paths) under an INVISIBLE live copy of
+    the heading, as design tools export outlined titles, followed by a real text body and a figure (a
+    picture of ``figure`` lines) that the text route OCRs (reviewer fixture ``p3_outlined``)."""
+    source = pymupdf.open()
+    outlined = source.new_page(width=A4[0], height=A4[1])
+    insert_lines(outlined, [heading], top=MARGIN + 26, fontsize=26)
+    svg = outlined.get_svg_image(text_as_path=True)
+    source.close()
+    vector = pymupdf.open("pdf", pymupdf.open(stream=svg.encode(), filetype="svg").convert_to_pdf())
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.show_pdf_page(page.rect, vector, 0)
+    vector.close()
+    insert_lines(page, [heading], top=MARGIN + 26, fontsize=26, render_mode=3)
+    y = insert_lines(page, body, top=MARGIN + 80, fontsize=11)
+    page.insert_image(pymupdf.Rect(MARGIN, y + 20, MARGIN + 400, y + 220),
+                      stream=picture_png(figure, (1200, 600), font_px=64))
+    return _save(doc, path)
+
+
+def ruled_table_with_hidden_words_pdf(path: Path, intro: Sequence[str], rows: Sequence[Sequence[str]],
+                                      hidden: Sequence[str]) -> Path:
+    """A text page with a ruled table and four INVISIBLE words (reviewer fixture ``p8``): ``hidden[0]``
+    straddles an inner vertical rule of the table, ``hidden[1]`` an inner horizontal rule, ``hidden[2]``
+    overlaps the second intro line, and ``hidden[3]`` lies on a plain navy picture below the table."""
+    doc = pymupdf.open()
+    page = text_page(doc, intro)
+    x0, y0, col_w, row_h = MARGIN, 300, 150, 30
+    for r in range(len(rows) + 1):
+        page.draw_line((x0, y0 + r * row_h), (x0 + len(rows[0]) * col_w, y0 + r * row_h))
+    for c in range(len(rows[0]) + 1):
+        page.draw_line((x0 + c * col_w, y0), (x0 + c * col_w, y0 + len(rows) * row_h))
+    for r, row in enumerate(rows):
+        for c, value in enumerate(row):
+            page.insert_text((x0 + c * col_w + 5, y0 + r * row_h + 20), value, fontsize=10)
+    straddle = pymupdf.get_text_length(hidden[0], fontname="helv", fontsize=10) / 2
+    page.insert_text((x0 + col_w - straddle, y0 + 2 * row_h - 8), hidden[0], fontsize=10, render_mode=3)
+    page.insert_text((x0 + 2 * col_w + 30, y0 + row_h + 4), hidden[1], fontsize=10, render_mode=3)
+    page.insert_text((MARGIN + 80, MARGIN + 11 + 16.5), hidden[2], fontsize=11, render_mode=3)
+    picture = pymupdf.Rect(MARGIN, y0 + len(rows) * row_h + 60, MARGIN + 200, y0 + len(rows) * row_h + 160)
+    page.insert_image(picture, stream=solid_png((200, 100), "navy"))
+    page.insert_text((picture.x0 + 10, picture.y0 + 55), hidden[3], fontsize=10, render_mode=3, color=(1, 1, 1))
+    return _save(doc, path)
+
+
+def ruled_contract_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
+    """A contract whose every page has a grey header rule, a grey footer rule and a page number; an empty
+    ``pages[i]`` gives a page that only says "This page intentionally left blank" (reviewer fixture ``p9``)."""
+    doc = pymupdf.open()
+    for number, lines in enumerate(pages, 1):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.draw_line((MARGIN, 50), (A4[0] - MARGIN, 50), color=(0.5, 0.5, 0.5), width=0.75)
+        page.draw_line((MARGIN, A4[1] - 42), (A4[0] - MARGIN, A4[1] - 42), color=(0.5, 0.5, 0.5), width=0.75)
+        page.insert_text((A4[0] / 2, A4[1] - 27), str(number), fontsize=9)
+        if lines:
+            insert_lines(page, lines, top=MARGIN + 10, fontsize=10)
+        else:
+            page.insert_text((200, A4[1] / 2), "This page intentionally left blank", fontsize=10)
+    return _save(doc, path)
+
+
+def epigraph_pdf(path: Path, line: str) -> Path:
+    """A page holding one short line of French in an embedded Unicode font (Nimbus Roman), so accents,
+    ellipsis and curly quotes extract exactly as written."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.insert_font(fontname="F1", fontbuffer=pymupdf.Font("tiro").buffer)
+    page.insert_text((MARGIN * 2, A4[1] / 3), line, fontname="F1", fontsize=14)
+    return _save(doc, path)
+
+
+def rating_cards_pdf(path: Path, cards: Sequence[Tuple[str, str]]) -> Path:
+    """A product page: per ``(name, rating)`` card, the name, a row of five rating stars drawn with a font
+    whose text layer maps them to private-use code points (as icon fonts do) and the rating line."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    add_broken_font(page)
+    y = MARGIN + 18
+    for name, rating in cards:
+        y = insert_lines(page, [name], top=y, fontsize=18)
+        y = insert_lines(page, ["*****"], top=y, fontsize=14, fontname=BROKEN_FONT)
+        y = insert_lines(page, [rating], top=y, fontsize=11) + 20
+    garble(doc, "pua")
+    return _save(doc, path)
+
+
+def garbled_title_grey_body_pdf(path: Path, title: str, body: Sequence[str]) -> Path:
+    """A page whose big black title extracts as U+FFFD and whose body is real text in light grey
+    (0.72), legible on the page but lighter than Tesseract's binarisation threshold."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    add_broken_font(page)
+    y = insert_lines(page, [title], top=MARGIN + 24, fontsize=24, fontname=BROKEN_FONT)
+    insert_lines(page, body, top=y + 12, fontsize=11, color=(0.72, 0.72, 0.72))
+    garble(doc, "fffd")
     return _save(doc, path)

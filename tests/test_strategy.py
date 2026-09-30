@@ -56,6 +56,7 @@ from doc2mark.core.strategy import (  # noqa: E402
     decide_page_route,
     document_signals,
     judge_text_layer,
+    legible_lines,
     text_layer_stats,
     text_weight,
 )
@@ -106,6 +107,39 @@ def test_lone_private_use_icons_and_french_spacing_are_not_garbage():
     assert text_layer_stats(bullets).garbage_glyphs == 0
     french = [("Qualit\u00e9\u00a0: livraison le 3 mai, libert\u00e9\u00a0!", 11.0)] * 10
     assert text_layer_stats(french).garbage_glyphs == 0
+
+
+def test_one_mojibake_like_match_among_clean_text_is_punctuation():
+    # e-acute, ellipsis, right double quote are the cp1252 bytes E9 85 94: one valid UTF-8 sequence
+    quote = "C'\xe9tait ferm\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK} disait-il"
+    assert text_layer_stats([(quote, 12.0)]).garbage_glyphs == 0
+    assert text_layer_stats([(quote, 12.0), ("Il \xe9tait arriv\xe9\N{HORIZONTAL ELLIPSIS}\N{RIGHT DOUBLE QUOTATION MARK}",
+                                             12.0)]).garbage_glyphs == 0
+    # a typical sequence (a Latin-1 letter read back as two characters), or two distinct ones, is mojibake
+    assert text_layer_stats([("R\xc3\xa9sum\xc3\xa9", 12.0)]).garbage_glyphs == 4
+    assert text_layer_stats([("\xe6\N{EM DASH}\xa5\xe6\N{LATIN SMALL LIGATURE OE}\xac", 12.0)]).garbage_glyphs == 6
+
+
+def test_icon_font_glyphs_and_short_private_use_rows_are_icons():
+    stars = chr(0xE02A) * 5
+    cards = [("Pump P-200", 18.0), (stars, 14.0), ("Rated 4.8 by 312 customers", 11.0)] * 2
+    assert text_layer_stats(cards).garbage_glyphs == 0
+    icons = [(chr(0xF005) * 12, 14.0, "FontAwesome5Free-Solid"), ("Rated by 312 customers", 11.0, "Helvetica")]
+    assert text_layer_stats(icons).garbage_glyphs == 0
+    # a long private-use run in a text font, or a row on a page with (almost) no letters, is a broken layer
+    assert text_layer_stats([(chr(0xE02A) * 12, 14.0, "Tiro"), ("Rated by 312 customers", 11.0)]).garbage_glyphs == 12
+    assert text_layer_stats([(stars, 14.0), ("4.8", 11.0)]).garbage_glyphs == 5
+
+
+def test_legible_lines_judges_each_line_in_the_context_of_its_page():
+    title = [(chr(0xFFFD) * 15, 24.0)]
+    body = [[("Invoice total EUR 2340 due on 14 March 2026", 11.0)], [("Delivery to the Rotterdam depot", 11.0)]]
+    assert legible_lines([title] + body) == [False, True, True]
+    # one broken ligature does not make a line unreadable
+    assert legible_lines([[("the ef" + chr(0xFFFD) + "cient pump runs at 40 m3/h", 11.0)]]) == [True]
+    # mojibake is judged per page: with two sequences on the page, each mangled line is unreadable
+    menu = [[("Caf\xc3\xa9 au lait", 11.0)], [("Cr\xc3\xa8me br\xc3\xbbl\xc3\xa9e", 11.0)], [("Plain tea", 11.0)]]
+    assert legible_lines(menu) == [False, False, True]
 
 
 # --- The optional legibility judge -----------------------------------------------------------------------------
