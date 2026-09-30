@@ -839,3 +839,83 @@ def test_terminating_the_cli_stops_its_workers_and_their_libreoffice(e2e_dir):
         assert _gone(pid), f"LibreOffice (pid {pid}) is still running after the CLI was terminated"
     finally:
         _clean_up(proc, pidfile)
+
+
+CLI_START_METHOD = (
+    "import multiprocessing, sys\n"
+    "multiprocessing.set_start_method(sys.argv[1])\n"
+    "from doc2mark.cli import main\n"
+    "sys.argv = ['doc2mark', *sys.argv[2:]]\n"
+    "main()\n"
+)
+
+
+@pytest.mark.parametrize("method", ["spawn", "forkserver"])
+def test_a_folder_run_works_with_every_multiprocessing_start_method(e2e_dir, method):
+    """Review: Python 3.14 starts workers with ``forkserver`` on Linux (macOS and Windows use ``spawn``). There the
+    parent of a worker is the fork server, not the CLI, so a watchdog that compared ``os.getppid()`` with the CLI's
+    pid ended every worker at start ("a conversion worker process did not start")."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "a.txt", "Alpha file text")
+    b.write(docs / "b.txt", "Beta file text")
+    out = e2e_dir / "converted"
+
+    proc = subprocess.run([sys.executable, "-c", CLI_START_METHOD, method, str(docs), "-p", "2", "-o", str(out), "-q"],
+                          cwd=e2e_dir, capture_output=True, stdin=subprocess.DEVNULL, timeout=120, check=False,
+                          encoding="utf-8")
+
+    assert proc.returncode == 0, proc.stderr
+    assert tree(out) == ["a.md", "b.md"], proc.stderr
+
+
+BATCH_NESTED = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "docs = Path(sys.argv[1])\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=None)\n"
+    "for _ in range(3):\n"
+    "    loader.batch_process(docs, output_dir=docs / 'md', show_progress=False)\n"
+)
+
+
+def test_batch_process_does_not_read_an_output_folder_inside_its_input_folder(e2e_dir):
+    """Review (same class as the CLI's re-runs): ``batch_process("docs", output_dir="docs/md")`` converted the outputs
+    of the run before (``recursive=True`` is the default), so every run added copies of the text."""
+    docs = e2e_dir / "docs"
+    b.write(docs / "a.txt", "Alpha file text")
+    b.write(docs / "sub" / "b.txt", "Beta file text")
+
+    subprocess.run([sys.executable, "-c", BATCH_NESTED, str(docs)], cwd=e2e_dir, check=True, capture_output=True,
+                   stdin=subprocess.DEVNULL, timeout=120)
+
+    assert tree(docs) == ["a.txt", "md/a.md", "md/sub/b.md", "sub/b.txt"]
+
+
+BATCH_IN_PLACE = (
+    "import json, sys\n"
+    "from pathlib import Path\n"
+    "from doc2mark import UnifiedDocumentLoader\n"
+    "docs = Path(sys.argv[1])\n"
+    "loader = UnifiedDocumentLoader(ocr_provider=None)\n"
+    "runs = [loader.batch_process(docs, show_progress=False) for _ in range(2)]\n"
+    "print(json.dumps([{Path(k).name: [Path(f).name for f in v['output_files']] for k, v in run.items()}\n"
+    "                  for run in runs]))\n"
+)
+
+
+def test_batch_process_next_to_the_inputs_never_rewrites_a_source_with_its_own_conversion(e2e_dir):
+    """Review: a Markdown file converted into its own folder wrote its conversion over itself, which dropped its front
+    matter. Next to the inputs a run can still be repeated: ``a.md``, the output of ``a.txt``, is an input of the
+    second run and is left alone."""
+    docs = e2e_dir / "docs"
+    source = "---\ntitle: Kept\ntags: [a, b]\n---\n# Post\n\nBody text\n"
+    b.write(docs / "post.md", source)
+    b.write(docs / "a.txt", "Alpha file text")
+
+    first, second = run_api(e2e_dir, BATCH_IN_PLACE, docs)
+
+    assert read(docs / "post.md") == source
+    assert tree(docs) == ["a.md", "a.txt", "post.md"]
+    assert first["post.md"] == [] and second["post.md"] == [] and first["a.txt"] == ["a.md"], (first, second)
+    assert read(docs / "a.md").strip() == "Alpha file text"

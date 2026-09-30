@@ -8,7 +8,7 @@ import unicodedata
 from pathlib import Path
 
 from doc2mark.core.structure import tables_and_sections
-from doc2mark.utils.output_paths import plan_output_names
+from doc2mark.utils.output_paths import is_inside, plan_output_names
 
 
 def plan(names, suffixes=(".md",), out="/out", root="/in"):
@@ -78,3 +78,16 @@ def test_sections_and_tables_come_from_the_content_items():
         (1, "Report", 1), (3, "Scope and aims", 1), (2, "1.2 Numbered heading", 2)]
     assert [(t["format"], t["page"]) for t in tables] == [("html", 2), ("markdown", 3)]
     assert tables[1]["content"].startswith("| a | b |")
+
+
+def test_a_folder_is_inside_another_by_identity_not_by_spelling(tmp_path):
+    """On a case-insensitive file system ``Docs/md`` and ``docs`` are the same folders; a symlink is the same
+    thing on any system."""
+    docs = tmp_path / "docs"
+    (docs / "md" / "sub").mkdir(parents=True)
+    (tmp_path / "alias").symlink_to(docs, target_is_directory=True)
+
+    assert is_inside(docs / "md", docs) and is_inside(docs, docs)
+    assert is_inside(tmp_path / "alias" / "md" / "sub", docs)
+    assert is_inside(docs / "md" / "sub" / "not-there-yet" / "deeper", docs / "md")
+    assert not is_inside(docs, docs / "md") and not is_inside(tmp_path / "other", docs)
