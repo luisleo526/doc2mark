@@ -111,10 +111,10 @@ clear it. A replayed document's ``metadata.extra["token_usage"]`` is
 renamed ``token_usage_cached``, because it cost nothing this time (``metadata.extra["judge"]`` is
 replayed as it was).
 
-A document is **not** stored when its OCR is not a final answer: an image whose OCR failed, a
-PDF picture that could not be extracted, a PDF page that shows content but whose OCR returned
+A document is **not** stored when its OCR is not a final answer: an image whose OCR failed
+(flagged failed by the provider, or its request raised, for example without an API key), a PDF
+picture that could not be extracted, a PDF page that shows content but whose OCR returned
 nothing (``ocr_images["unread_pages"]``), an image the provider itself refused or blocked
 (``ocr_issues["provider_refused"]``), or, with the optional judge, a question the judge could not
-answer. An ``INFO`` log line names the reason; the next load converts it again. One gap: a Word,
-PowerPoint, Excel or image file whose OCR request raised an error (for example no API key) is
-stored with the error text (``OCR failed``), so clear the folder after fixing the cause.
+answer. An ``INFO`` log line names the reason; the next load converts it again, so a run after
+the key or the provider is fixed reads the pictures.

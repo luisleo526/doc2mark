@@ -297,16 +297,18 @@ Failures and reports
 --------------------
 
 A per-image failure of any provider (a timeout, a rate limit, a server error) comes back as a
-result flagged ``metadata["failed"]``; in a PDF the picture shows ``[image: OCR unavailable]``.
-Errors raised by an OCR request (a missing key or extra) are listed in the document's report.
-Neither fails the document. An OCR engine that cannot run at all -- Tesseract without the program
+result flagged ``metadata["failed"]``; the picture shows ``[image: OCR unavailable]`` (PDF, Word,
+PowerPoint, Excel and image files alike). An OCR request that raises (a missing key or extra)
+fails every picture it carried: they show the same marker, and the error is listed in the
+document's report. Neither fails the document, and neither is stored in ``cache_dir``. An OCR engine that cannot run at all -- Tesseract without the program
 or the requested language -- makes :meth:`~doc2mark.UnifiedDocumentLoader.load` raise
 :class:`~doc2mark.ProcessingError` (its ``__cause__`` is ``doc2mark.ocr.base.OCREngineError``)
 and the CLI exit 1, instead of writing placeholder text.
 
 The loader reports per document in ``metadata.extra["ocr_issues"]``, present only when something
 happened: ``refused`` (answers emitted empty as refusals), ``provider_refused`` (of those, the
-provider's own refusal or safety block), ``failed``, ``withheld`` (sample values a screenshot
+provider's own refusal or safety block), ``failed`` (answers flagged failed, and the images of a
+request that raised), ``withheld`` (sample values a screenshot
 left out; the Markdown says ``[N illustrative rows not transcribed]``), ``suspected`` (answers
 kept although the judge rated them close to no content), up to five ``errors`` and
 ``locations``: one ``{"issue", "image", "page" | "slide" | "sheet"}`` per affected image

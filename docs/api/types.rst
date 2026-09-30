@@ -37,8 +37,10 @@ are ``None`` unless the format sets them:
    * - ``title``
      - HTML (``<title>``).
    * - ``slide_count``
-     - PowerPoint, but the value is unreliable (it counts the text "Slide " in the output); use
-       ``page_count``.
+     - PowerPoint (the number of slides, also for a deck read through the Office image route).
+   * - ``sheet_names``, ``total_cells``
+     - Excel: every sheet in workbook order, and the number of cells that show a value (all
+       sheets).
    * - ``line_count``
      - Text and Markdown files.
    * - ``header_count``, ``frontmatter``
@@ -57,8 +59,7 @@ are ``None`` unless the format sets them:
      - JSON (``data_type`` is the Python type name: ``dict``, ``list``, ...).
    * - ``element_count``, ``root_tag``
      - XML.
-   * - ``language``, ``creation_date``, ``modification_date``, ``author``, ``sheet_names``,
-       ``total_cells``
+   * - ``language``, ``creation_date``, ``modification_date``, ``author``
      - Not set by the default processors.
 
 Enums

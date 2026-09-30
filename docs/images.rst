@@ -32,8 +32,11 @@ the text the provider read:
    Total 9.50
 
 When the provider finds no text, the section is ``## OCR Extraction`` with *No text detected in
-image*; when OCR fails for this image, it says so there and the file still converts (an OCR
-engine that cannot run at all, such as Tesseract without its language data, fails the load).
+image*; when OCR fails for this image (the request raised, for example without an API key, or the
+provider flagged the answer failed), the section shows ``[image: OCR unavailable]``, the failure
+is counted in ``metadata.extra["ocr_issues"]`` and the file still converts, but is not stored in
+``cache_dir`` (an OCR engine that cannot run at all, such as Tesseract without its language data,
+fails the load).
 ``extract_images=True`` (implied by ``ocr_images=True`` with a provider) also returns the image
 re-encoded as PNG in ``result.images`` (``{"type": "image", "content": <base64>, "format":
 "png", "width", "height", "original_format", "filename"}``). ``metadata`` has ``page_count`` 1,
@@ -57,10 +60,11 @@ placed where the picture is (``text:image_description`` items):
   unavailable]`` where it shows; a logo repeated at the same place on most pages is kept once.
   Scanned pages and pages whose content is only in pictures are OCR'd as a whole-page render
   instead (:doc:`ocr_policy`).
-- **Word, PowerPoint, Excel.** Pictures are OCR'd in one batch per document; a picture in which
-  OCR finds no text adds nothing, one whose OCR fails leaves the text ``OCR failed``. A picture
-  in a Word or Excel table cell is marked ``[Image]`` (``[Image: OCR text]`` with OCR) in its
-  cell. Word and PowerPoint files made mostly of pictures
+- **Word, PowerPoint, Excel.** Pictures are OCR'd in one batch per document (in Word, the
+  pictures of headers, footers and text boxes too); a picture in which OCR finds no text adds
+  nothing, one whose OCR failed leaves ``[image: OCR unavailable]``, as in PDFs. A picture in a
+  Word or Excel table cell is marked ``[Image]`` (``[Image: OCR text]`` with OCR) in its cell.
+  Word and PowerPoint files made mostly of pictures
   can be converted to PDF and OCR'd page by page (the Office image route, :doc:`formats`).
 
 ``metadata.extra["ocr_images"]`` (PDF) reports how many requests were sent and which pictures
