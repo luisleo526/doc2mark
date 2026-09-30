@@ -3893,15 +3893,15 @@ class PDFLoader:
         output: List[str] = []
         stack: List[Tuple[Optional[float], str, str]] = []   # open levels: (x0, indent, marker prefix)
         joins = getattr(self, "_hyphen_joins", None)
-        previous = None   # marker prefix of the item above
+        opened = None   # kind of list that opened the current run of lines (bullets, ``1.`` or ``1)``)
         for x0, prefix, item_lines, item_wraps, item_views in items:
             while len(stack) > 1 and x0 is not None and stack[-1][0] is not None and x0 < stack[-1][0] - 2:
                 stack.pop()
-            # An item that starts another kind of list than the item above it (numbers after
-            # bullets, bullets after numbers, ``1)`` after ``1.``), or a nested numbered list that
-            # does not start at 1, goes after a blank line: without one it reads as a lazy
-            # continuation of the item above in renderers that keep list types apart (Python-Markdown's
-            # sane_lists) and, nested, in CommonMark too.
+            # A blank line goes before an item that would otherwise read as a lazy continuation of
+            # the text above it: an item of another kind than the list its lines continue (numbers
+            # after bullets, bullets after numbers, ``1)`` after ``1.``) in renderers that keep list
+            # types apart (Python-Markdown's sane_lists), and a nested numbered list that does not
+            # start at 1 (CommonMark too).
             kind = list_kind(prefix)
             if not stack:
                 indent, new_list = "", False
@@ -3909,13 +3909,13 @@ class PDFLoader:
                 indent = stack[-1][1] + " " * len(stack[-1][2])
                 new_list = kind != "-" and prefix.rstrip()[:-1] != "1"
             else:
-                sibling = stack.pop()
-                indent = sibling[1]
-                new_list = kind != list_kind(sibling[2]) or kind != list_kind(previous)
+                indent = stack.pop()[1]
+                new_list = kind != opened
             if new_list and output:
                 output.append("")
+            if opened is None or (new_list and output):
+                opened = kind
             stack.append((x0, indent, prefix))
-            previous = prefix
             physical = _physical_lines(item_lines, item_wraps, joins, cjk_joins=self._cjk_joins(item_views))
             lines = [_render_runs(runs) for runs in physical] or [""]
             output.append(indent + prefix + escape_line_start(lines[0]))
