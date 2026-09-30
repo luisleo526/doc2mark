@@ -180,44 +180,31 @@ class TestPDFHeaderFooterDedup:
         types = [item["type"] for item in doc["content"]]
         assert "text:header" not in types
 
-    def test_dedup_detects_repeated_header(self):
-        """Content at top of >50% of pages should be retyped to text:header."""
-        from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
+    def test_dedup_detects_repeated_header(self, tmp_path):
+        """A line at the top of every page is a running header: its first copy stays as
+        plain text, the others are typed text:header; body stays."""
         import pymupdf
+        from doc2mark.pipelines.pymupdf_advanced_pipeline import PDFLoader
 
-        loader = PDFLoader.__new__(PDFLoader)
-
-        # Mock self.doc with page heights
-        class MockPage:
-            def __init__(self):
-                self.rect = type('Rect', (), {'height': 800})()
-
-        class MockDoc:
-            def __len__(self):
-                return 5
-            def load_page(self, n):
-                return MockPage()
-
-        loader.doc = MockDoc()
-
-        # Create content with repeated header on 4/5 pages
-        doc = {"pages": 5, "content": []}
+        doc = pymupdf.open()
         for p in range(1, 6):
-            doc["content"].append({
-                "type": "text:normal", "content": "Company Name",
-                "page": p, "position_y": 20  # top 2.5% of 800px page
-            })
-            doc["content"].append({
-                "type": "text:normal", "content": f"Unique body text page {p}",
-                "page": p, "position_y": 400
-            })
+            page = doc.new_page(width=612, height=800)
+            page.insert_text((72, 30), "Company Name", fontsize=9)
+            page.insert_text((72, 400), f"Unique body text page {p}", fontsize=11)
+        path = tmp_path / "running_header.pdf"
+        doc.save(str(path))
+        doc.close()
 
-        loader._detect_repeated_content(doc)
+        loader = PDFLoader(path)
+        try:
+            data = loader.convert_to_json(extract_images=False, show_progress=False)
+        finally:
+            loader.close()
 
-        header_items = [i for i in doc["content"] if i["type"] == "text:header"]
-        normal_items = [i for i in doc["content"] if i["type"] == "text:normal"]
-        assert len(header_items) == 5, "All 5 repeated headers should be retyped"
-        assert len(normal_items) == 5, "Body text should remain text:normal"
+        header_items = [i for i in data["content"] if i["type"] == "text:header"]
+        normal_items = [i["content"].strip() for i in data["content"] if i["type"] == "text:normal"]
+        assert [(i["page"], i["content"].strip()) for i in header_items] == [(p, "Company Name") for p in range(2, 6)]
+        assert normal_items == ["Company Name"] + [f"Unique body text page {p}" for p in range(1, 6)]
 
     def test_dedup_preserves_all_items(self):
         """Dedup should retype, never remove items from json_content."""
