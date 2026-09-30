@@ -1266,7 +1266,7 @@ class UnifiedDocumentLoader:
         
         Args:
             result: Processing result
-            output_path: Base output path (without extension)
+            output_path: Base output path (without extension; a dot in the file name is part of it)
             output_format: Output format
             
         Returns:
@@ -1276,14 +1276,14 @@ class UnifiedDocumentLoader:
 
         if output_format == OutputFormat.MARKDOWN:
             # Save markdown
-            md_path = output_path.with_suffix('.md')
+            md_path = output_path.with_name(f"{output_path.name}.md")
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(result.content)
             output_files.append(str(md_path))
 
         elif output_format == OutputFormat.JSON:
             # Save JSON
-            json_path = output_path.with_suffix('.json')
+            json_path = output_path.with_name(f"{output_path.name}.json")
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
             output_files.append(str(json_path))

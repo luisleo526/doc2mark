@@ -536,6 +536,9 @@ else applies by default.
 - **`batch_process()` finds every file `load()` accepts.** It globbed lower-case extensions only and not
   `.htm`, so `report.PDF`, `Notes.TXT` and `page.htm` were skipped. One walk now takes every supported
   extension in any case (`.htm` and `.markdown` too), in path order. (#28)
+- **`batch_process()` keeps the dots of a file name in its output.** The output name was made with
+  `with_suffix` on the stem, so `v1.2.txt` and `v1.3.txt` both wrote `v1.md` and one conversion was lost;
+  they write `v1.2.md` and `v1.3.md` (also for `batch_process_files()` and JSON output). (#28)
 - **`ProcessedDocument.tables` and `.sections` are filled.** No processor set them, so a batch result's
   `tables_found` was always 0 and the JSON output had `"tables": null`. They are read from the content
   items: one `{"page", "format", "content"}` per `table` item and one `{"level", "title", "page"}` per
