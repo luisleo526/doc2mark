@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-01
+
 ### Behaviour changes
 
 What existing users will notice compared with 0.6.1, in their output, their install and their CLI
