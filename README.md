@@ -18,12 +18,105 @@ thinned without losing text, multi-column pages are read in order, and scanned p
 by a vision LLM into a structured schema** (or by local Tesseract). It is built for what comes
 *after* conversion: feeding clean, structured text to an LLM or a retrieval pipeline.
 
+What distinguishes doc2mark is how it decides the ambiguous cases: **deterministic rules settle
+the clear ones, and an optional quality judge, [TypeSafe's Jev](https://docs.typesafe.ai), settles
+the ones the rules cannot** (is this text layer gibberish? is this repeated line page chrome? is
+this OCR answer only a refusal?). The judge is off by default and doc2mark works fully without it:
+[see the highlight below](#highlight-jev-quality-judge).
+
 Documentation: <https://luisleo526.github.io/doc2mark/>
 
 ---
 
+## Highlight: Jev quality judge
+
+doc2mark's rules are deterministic, and when the evidence is weak they keep the text. For the
+cases the rules cannot settle you can add an **optional** judge,
+[TypeSafe's Jev](https://docs.typesafe.ai) (a calibrated yes/no model), which is asked only about
+those cases. It makes three decisions:
+
+- **Is this PDF page's text layer legible?** A layer can be valid Unicode and still be nonsense
+  (shifted letters, glyph IDs read as characters), which no character rule sees. A page the judge
+  rates illegible is OCR'd from its render instead of being indexed as gibberish (OCR must be on).
+- **Is this repeated header/footer line page chrome?** A line the rules kept on several pages is
+  thinned, normally to its first copy; titles, per-page labels and real content are meant to stay,
+  and the judge never removes a line's last copy. On the held-out TEST set it took out 62
+  repeated copies, none of a line that needed them.
+- **Is this OCR answer only a refusal or an error?** (LLM OCR providers.) Such an answer is
+  re-read or dropped instead of being indexed as page text.
+
+Accuracy of each decision on the labelled sets in `tests/data/judge`, rules alone → rules +
+judge:
+
+| Decision | TEST | EXTERNAL |
+|----------|:---:|:---:|
+| Text layer legible? | 67.4 % → 100 % (46 items) | 68.8 % → 100 % (16 items) |
+| Repeated line is page chrome? | 50.0 % → 95.2 % (42) | 66.7 % → 100 % (3 asked of 20) |
+| OCR answer is a refusal or error? | 76.7 % → 97.8 % (90) | 62.5 % → 83.3 % (24) |
+
+TEST is held out from calibration; EXTERNAL (60 items) was written by a reviewer and never used
+for calibration. **The sets are small: read the numbers as a direction, not a guarantee.** The
+judge is not always right: on EXTERNAL it kept 4 of 9 refusals (3 of them flagged as suspected),
+and on TEST it called one real answer (a search page's "no results") no content. Of the 20
+EXTERNAL repeated-line items only 3 reach the judge; the rules decide the other 17 (a running
+header's first copy).
+
+Measured for PR #22 and re-measured on 2026-09-30 at `becb74b` with a fresh verdict cache
+(`eval/docs_audit/run_judge_eval.sh`, [results](eval/docs_audit/results/judge_eval.md)); all six
+cells were the same.
+
+On a real 30-page Traditional-Chinese company deck (private, so never committed and not
+re-measured since PR #22), the brand line printed beside every slide title went from 29 copies to
+1, and all garbled variants of its page texts were caught (3 of 6 without the judge).
+
+Cost and latency: Jev is priced per input token ($0.042 per million, output free); a question
+averaged $0.000019 to $0.000029 on the labelled sets and a request takes about 210 ms (p50). A
+12-page text report took 13 questions and $0.00029, and added 1.2 s (2026-09-30, Linux host).
+Verdicts are cached on disk, so converting the same document again sends nothing.
+
+It is **off by default**. To turn it on:
+
+```bash
+pip install "doc2mark[typesafe]"          # also part of doc2mark[all]
+export TYPESAFE_API_KEY=...
+doc2mark report.pdf --ocr tesseract --ocr-images --judge typesafe -o report.md   # Python: judge="typesafe"
+```
+
+Without the extra or the key, doc2mark logs one warning and the output is the same as without a
+judge. **With the judge on, text from your documents is sent to a third party** (TypeSafe): up to
+1,500 characters of each judged PDF page, the judged header/footer lines and short OCR answers.
+Do not enable it for documents your agreement with TypeSafe does not cover.
+
+### Judge details: Python, fallbacks, privacy
+
+The same switch from Python (`judge="typesafe"`, or `DOC2MARK_JUDGE=typesafe` in the
+environment); the record of what the judge did is in `metadata.extra["judge"]`:
+
+```python
+from doc2mark import UnifiedDocumentLoader
+
+loader = UnifiedDocumentLoader(ocr_provider="tesseract", judge="typesafe")  # or DOC2MARK_JUDGE=typesafe
+result = loader.load("report.pdf", ocr_images=True)
+print(result.metadata.extra.get("judge"))     # questions asked, cached, failed, tokens, cost
+```
+
+A question the service cannot answer (network error, timeout, rate limit, invalid answer) is
+decided by the rules, and a conversion never fails because of the judge.
+
+The full privacy note: with the judge on, document text is sent to a third party (TypeSafe,
+`api.typesafe.ai`): up to 1,500 characters of each judged PDF page (with OCR on, nearly every text
+page), the judged header/footer lines and OCR answers of up to 600 characters. Per TypeSafe's
+documentation Jev is not trained on customer requests or responses, but zero data retention is
+offered only to enterprise customers ([TypeSafe legal](https://docs.typesafe.ai/legal)). Do not
+enable the judge for documents your agreement with TypeSafe does not cover. Cost, latency,
+privacy and the full evaluation: [Judge](https://luisleo526.github.io/doc2mark/judge.html).
+
 ## Why doc2mark
 
+- **Jev quality judge (optional).** Deterministic rules decide the clear cases; an optional judge,
+  [TypeSafe's Jev](https://docs.typesafe.ai), decides three ambiguous ones: is a PDF page's text
+  layer legible, is a repeated line page chrome, is an OCR answer only a refusal. Off by default;
+  with it on, document text is sent to TypeSafe. ([Highlight](#highlight-jev-quality-judge))
 - **Complex tables survive.** Merged cells (`rowspan`/`colspan`) from Word, PowerPoint, Excel and
   ruled PDF tables are kept as a small HTML table inside the Markdown; other tables are ordinary
   Markdown tables (PowerPoint tables are always HTML). A line break inside a cell is `<br>`. ([Tables](#tables))
@@ -53,8 +146,9 @@ pip install "doc2mark[ocr]"         # + OpenAI and Tesseract OCR providers
 pip install "doc2mark[all]"         # every optional feature
 ```
 
-Python 3.10+. Other extras: `vertex_ai` (Gemini), `typesafe` (optional quality judge),
-`tokenizers` (token-sized chunks), `redis` (shared OCR cache), `heif` (HEIC/HEIF images), `mime`.
+Python 3.10+. Other extras: `vertex_ai` (Gemini), `typesafe` (the optional
+[Jev quality judge](#highlight-jev-quality-judge)), `tokenizers` (token-sized chunks), `redis`
+(shared OCR cache), `heif` (HEIC/HEIF images), `mime`.
 Tesseract OCR needs the `tesseract` program and its language data; legacy `.doc`/`.xls`/`.ppt`/
 `.rtf` files need LibreOffice. See [Installation](https://luisleo526.github.io/doc2mark/installation.html).
 
@@ -216,57 +310,6 @@ More: [OCR](https://luisleo526.github.io/doc2mark/ocr.html),
 [when pages are OCR'd](https://luisleo526.github.io/doc2mark/ocr_policy.html),
 [caching](https://luisleo526.github.io/doc2mark/caching.html).
 
-## Optional: quality judge (TypeSafe/Jev)
-
-doc2mark's rules are deterministic, and when the evidence is weak they keep the text. Three of
-those open decisions can be handed to an optional judge, [TypeSafe's Jev](https://docs.typesafe.ai),
-which is asked only about the cases the rules leave open:
-
-- **Is this PDF page's text layer legible?** A layer can be valid Unicode and still be nonsense
-  (shifted letters, glyph IDs read as characters). A page the judge rates illegible is OCR'd from
-  its render (OCR must be on).
-- **Is this repeated header/footer line page chrome?** A line the rules kept on several pages is
-  thinned, normally to its first copy; the judge never removes a line's last copy.
-- **Is this OCR answer only a refusal or an error?** (LLM OCR providers.) Such an answer is re-read
-  or dropped instead of being indexed as page text.
-
-Accuracy of each decision on the labelled sets in `tests/data/judge`, rules alone → rules +
-judge. TEST is held out from calibration; EXTERNAL (60 items) was written by a reviewer and never
-used for calibration. The sets are small: read the numbers as a direction, not a guarantee.
-
-| Decision | TEST | EXTERNAL |
-|----------|:---:|:---:|
-| Text layer legible? | 67.4 % → 100 % (46 items) | 68.8 % → 100 % (16 items) |
-| Repeated line is page chrome? | 50.0 % → 95.2 % (42) | 66.7 % → 100 % (3 asked of 20) |
-| OCR answer is a refusal or error? | 76.7 % → 97.8 % (90) | 62.5 % → 83.3 % (24) |
-
-Measured for PR #22 and re-measured on 2026-09-30 at `becb74b` with a fresh verdict cache
-(`eval/docs_audit/run_judge_eval.sh`, [results](eval/docs_audit/results/judge_eval.md)); all six
-cells were the same.
-
-It is **off by default**. To turn it on:
-
-```bash
-pip install "doc2mark[typesafe]"          # also part of doc2mark[all]
-export TYPESAFE_API_KEY=...
-doc2mark report.pdf --ocr tesseract --ocr-images --judge typesafe -o report.md
-```
-
-```python
-from doc2mark import UnifiedDocumentLoader
-
-loader = UnifiedDocumentLoader(ocr_provider="tesseract", judge="typesafe")  # or DOC2MARK_JUDGE=typesafe
-result = loader.load("report.pdf", ocr_images=True)
-print(result.metadata.extra.get("judge"))     # questions asked, cached, failed, tokens, cost
-```
-
-Without the extra or the key the output is the same as without a judge, and a question the
-service cannot answer is decided by the rules. **With the judge on, document text is sent to a
-third party** (TypeSafe, `api.typesafe.ai`): up to 1,500 characters of each judged PDF page (with
-OCR on, nearly every text page), the judged header/footer lines and OCR answers of up to 600
-characters. Do not enable it for documents your agreement with TypeSafe does not cover. Cost,
-latency, privacy and the full evaluation: [Judge](https://luisleo526.github.io/doc2mark/judge.html).
-
 ## Documentation
 
 - [Quickstart](https://luisleo526.github.io/doc2mark/quickstart.html) and a
@@ -275,6 +318,7 @@ latency, privacy and the full evaluation: [Judge](https://luisleo526.github.io/d
   [the result model](https://luisleo526.github.io/doc2mark/output.html),
   [PDF text structure](https://luisleo526.github.io/doc2mark/pdf.html),
   [chunking](https://luisleo526.github.io/doc2mark/chunking.html),
+  [the optional quality judge](https://luisleo526.github.io/doc2mark/judge.html),
   [CLI](https://luisleo526.github.io/doc2mark/cli.html),
   [troubleshooting](https://luisleo526.github.io/doc2mark/troubleshooting.html)
 - [API reference](https://luisleo526.github.io/doc2mark/api/index.html)

@@ -134,3 +134,5 @@ Next steps
 - :doc:`ocr` -- providers, tasks and structured OCR results.
 - :doc:`pdf` -- how PDF text becomes Markdown (headings, lists, reading order, running headers).
 - :doc:`tables` -- merged cells and table styles.
+- :doc:`judge` -- the optional Jev quality judge for the cases the rules cannot settle (off by
+  default; with it on, document text is sent to TypeSafe).
