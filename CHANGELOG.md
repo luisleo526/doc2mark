@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-01
+
 ### Documentation
 - **The optional Jev quality judge is now the highlight of the README and the docs landing page.**
   The README names it in the intro, opens with a "Highlight: Jev quality judge" section (the three
