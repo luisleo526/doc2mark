@@ -48,7 +48,7 @@ _add(
     Entry(F, 'pip install "doc2mark[ocr,tokenizers]"', mode="skip", reason=INSTALL),
     Entry(F, "tesseract-ocr-chi-tra", mode="skip", reason=APT),
     Entry(F, "libreoffice-writer libreoffice-calc", mode="skip", reason=APT),
-    Entry(F, "doc2mark --help", mode="bash", expect=["usage: doc2mark", "0.6.1"]),
+    Entry(F, "doc2mark --help", mode="bash", expect=["usage: doc2mark", "re:^\\d+\\.\\d+\\.\\d+$"]),
 )
 
 # --------------------------------------------------------------------------- quickstart.rst

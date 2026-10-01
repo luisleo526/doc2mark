@@ -11,10 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The optional Jev quality judge is now the highlight of the README and the docs landing page.**
   The README names it in the intro, opens with a "Highlight: Jev quality judge" section (the three
   decisions and what each changes, the measured before/after table with its small-sample caveat,
-  cost and latency, how to turn it on, what it sends to TypeSafe) and lists it first under "Why
-  doc2mark"; `docs/index.rst` gets a matching block that links to the judge page. The figures are
-  the ones already published in `docs/judge.rst`; the judge itself did not change (optional, off
-  by default). (#32)
+  cost and latency, how to turn it on, what it sends to TypeSafe; the former "Optional: quality
+  judge" section is merged into it) and lists it first under "Why doc2mark"; `docs/index.rst` gets
+  a matching block that links to the judge page. The figures are the ones already published in
+  `docs/judge.rst`; the judge itself did not change (optional, off by default). (#32)
 
 ## [0.7.0] - 2026-10-01
 

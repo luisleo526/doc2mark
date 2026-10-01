@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Re-measure the published numbers of the optional TypeSafe/Jev judge (README.md "Optional:
-# quality judge", docs/judge.rst "Cost and latency" and "How well it works") in Docker on a
-# spark host, with FRESH verdict caches: every verdict is a real request, nothing is replayed.
+# Re-measure the published numbers of the optional TypeSafe/Jev judge (README.md "Highlight: the
+# optional Jev quality judge", docs/judge.rst "Cost and latency" and "How well it works") in Docker
+# on a spark host, with FRESH verdict caches: every verdict is a real request, nothing is replayed.
 #
 # Usage, on a spark (linux/arm64, docker without sudo):
 #
