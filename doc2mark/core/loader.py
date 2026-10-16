@@ -1283,6 +1283,26 @@ class UnifiedDocumentLoader:
 
         return results
 
+    @staticmethod
+    def _image_bytes(image_info: Any) -> Optional[bytes]:
+        """The picture bytes of one ``ProcessedDocument.images`` item, or None when it holds no picture.
+
+        Word, PowerPoint and Excel files give ``{"data": <bytes>}``, a PDF gives its pictures as base64 text,
+        ``{"data": <str>, "type": "base64"}``, and an image file gives base64 text under ``"content"``; a bare
+        ``bytes`` or base64 ``str`` item is accepted too. A picture read by OCR, ``{"text": ..., "type": "ocr"}``,
+        has no bytes.
+        """
+        if isinstance(image_info, dict):
+            if 'data' in image_info:
+                image_info = image_info['data']
+            elif 'content' in image_info:
+                return base64.b64decode(image_info['content'])
+            else:
+                return None
+        if isinstance(image_info, str):
+            return base64.b64decode(image_info)
+        return bytes(image_info) if isinstance(image_info, (bytes, bytearray, memoryview)) else None
+
     def _save_result(
             self,
             result: ProcessedDocument,
@@ -1334,22 +1354,7 @@ class UnifiedDocumentLoader:
             for i, image_info in enumerate(result.images):
                 image_path = images_dir / f"image_{i:03d}.png"
                 
-                # Handle different image data formats
-                image_data = None
-                if isinstance(image_info, dict):
-                    # Check for different possible keys
-                    if 'data' in image_info:
-                        image_data = image_info['data']
-                    elif 'content' in image_info:
-                        # Base64 encoded data
-                        import base64
-                        image_data = base64.b64decode(image_info['content'])
-                elif isinstance(image_info, bytes):
-                    image_data = image_info
-                elif isinstance(image_info, str):
-                    # Assume it's base64 encoded
-                    import base64
-                    image_data = base64.b64decode(image_info)
+                image_data = self._image_bytes(image_info)
                 
                 if image_data:
                     with open(image_path, 'wb') as f:

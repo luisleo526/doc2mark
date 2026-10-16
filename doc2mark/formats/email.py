@@ -37,6 +37,24 @@ def _html_to_markdown(html: str) -> str:
         return text.strip()
 
 
+def _text_of(part: email.message.Message) -> Optional[str]:
+    """The text of a ``text/*`` part, or None when the standard library does not give a string.
+
+    ``get_content()`` raises ``LookupError`` for a charset name Python has no codec for (``unknown-8bit``,
+    ``iso-8859-8-i``, a misspelt name). Such a part is read as UTF-8 instead, replacing what is not valid UTF-8, so
+    that one odd label does not lose the whole message.
+    """
+    try:
+        text = part.get_content()
+    except LookupError:
+        logger.warning(
+            f"Unknown charset {part.get_content_charset()!r} in a {part.get_content_type()} part; "
+            f"reading it as UTF-8"
+        )
+        text = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+    return text if isinstance(text, str) else None
+
+
 class EmailProcessor(BaseProcessor):
     """Processor for .eml (RFC 822) email files."""
 
@@ -107,31 +125,42 @@ class EmailProcessor(BaseProcessor):
         Preference order:
         1. text/plain part
         2. text/html part converted to markdown
+
+        What the sender attached (a part with ``Content-Disposition: attachment`` and everything inside an
+        attached message) is not body text: it never hides or joins the body. It is read only when the message
+        has no other text, so that a message whose only text is attached still shows it.
         """
         # Walk parts for multipart messages; for simple messages the loop
         # still works (a non-multipart message yields itself).
         plain_parts = []
         html_parts = []
+        attached_plain = []
+        attached_html = []
+        attached = set()  # ids of the parts that are, or lie inside, an attachment
 
         for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                attached.update(id(inner) for inner in part.walk())
+            is_attached = id(part) in attached
             content_type = part.get_content_type()
             # Skip multipart containers themselves
             if part.get_content_maintype() == "multipart":
                 continue
             if content_type == "text/plain":
-                payload = part.get_content()
-                if isinstance(payload, str):
-                    plain_parts.append(payload)
+                payload = _text_of(part)
+                if payload is not None:
+                    (attached_plain if is_attached else plain_parts).append(payload)
             elif content_type == "text/html":
-                payload = part.get_content()
-                if isinstance(payload, str):
-                    html_parts.append(payload)
+                payload = _text_of(part)
+                if payload is not None:
+                    (attached_html if is_attached else html_parts).append(payload)
 
-        if plain_parts:
-            return "\n".join(plain_parts)
+        for plain, html in ((plain_parts, html_parts), (attached_plain, attached_html)):
+            if plain:
+                return "\n".join(plain)
 
-        if html_parts:
-            return _html_to_markdown("\n".join(html_parts))
+            if html:
+                return _html_to_markdown("\n".join(html))
 
         return ""
 

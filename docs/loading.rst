@@ -123,11 +123,9 @@ share an output name (``report.txt`` and ``report.md``) are written as ``report.
 input files. Without one (next to the inputs) an output replaces the one an earlier run wrote, so
 the run can be repeated, but it is never written over the file it was converted from (a Markdown
 file keeps its front matter), and two files of one folder with the same stem write the same
-file. When pictures were extracted it also writes a ``<name>_images/`` folder (a
-known issue: a PDF whose pictures were extracted without OCR is then reported as failed although
-its ``.md`` was written). With ``output_format="text"`` no file is written. Without
-``output_dir`` the files are written next to the inputs. One file failing does not stop the
-batch.
+file. When pictures were extracted it also writes a ``<name>_images/`` folder. With
+``output_format="text"`` no file is written. Without ``output_dir`` the files are written next to
+the inputs. One file failing does not stop the batch.
 
 The returned dict maps each input path (a string, in input order) to a result:
 

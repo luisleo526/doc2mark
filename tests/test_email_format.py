@@ -161,6 +161,140 @@ class TestMultipartEmail:
         assert "watcher@example.com" in data["headers"]["Cc"]
 
 
+class TestAttachments:
+    """The body of a message is its text; what the sender attached is not."""
+
+    @staticmethod
+    def _message(subject: str) -> EmailMessage:
+        msg = EmailMessage()
+        msg["From"] = "alice@example.com"
+        msg["To"] = "bob@example.com"
+        msg["Subject"] = subject
+        msg["Date"] = "Mon, 01 Jan 2024 12:00:00 +0000"
+        return msg
+
+    def test_text_attachment_does_not_replace_an_html_body(self, tmp_path):
+        """Breaks if a text/plain attachment counts as the body: it then hides the text/html body."""
+        msg = self._message("HTML body and a text file")
+        msg.set_content("<html><body><p>The body of the message.</p></body></html>", subtype="html")
+        msg.add_attachment("Contents of the attached file.", subtype="plain", filename="notes.txt")
+
+        result = EmailProcessor().process(_write_eml(tmp_path / "html_attachment.eml", msg))
+
+        assert "The body of the message." in result.content
+        assert "Contents of the attached file." not in result.content
+
+    def test_text_attachment_is_not_glued_onto_a_plain_body(self, tmp_path):
+        """Breaks if the text of an attached file is appended to the body of the message."""
+        msg = self._message("Plain body and a text file")
+        msg.set_content("The body of the message.")
+        msg.add_attachment("Contents of the attached file.", subtype="plain", filename="notes.txt")
+
+        result = EmailProcessor().process(_write_eml(tmp_path / "plain_attachment.eml", msg))
+
+        assert "The body of the message." in result.content
+        assert "Contents of the attached file." not in result.content
+
+    def test_attached_message_is_not_part_of_the_body(self, tmp_path):
+        """Breaks if the body of a message attached to this one (a forward) is read as this body."""
+        forwarded = self._message("Forwarded")
+        forwarded.set_content("Words of the forwarded message.")
+        msg = self._message("See the attached message")
+        msg.set_content("The body of the message.")
+        msg.add_attachment(forwarded)
+
+        result = EmailProcessor().process(_write_eml(tmp_path / "forward.eml", msg))
+
+        assert "The body of the message." in result.content
+        assert "Words of the forwarded message." not in result.content
+
+    def test_content_disposition_decides_what_is_body_text(self, tmp_path):
+        """Breaks if attached text joins the body, if inline text is left out, or if a message whose only
+        text is attached comes out empty."""
+        raw = (
+            "From: alice@example.com\r\n"
+            "To: bob@example.com\r\n"
+            "Subject: Inline and attached\r\n"
+            "MIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+            "\r\n"
+            "--BOUNDARY\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "\r\n"
+            "First part of the body.\r\n"
+            "--BOUNDARY\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            'Content-Disposition: inline; filename="more.txt"\r\n'
+            "\r\n"
+            "Second part of the body.\r\n"
+            "--BOUNDARY\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            'Content-Disposition: attachment; filename="notes.txt"\r\n'
+            "\r\n"
+            "Contents of the attached file.\r\n"
+            "--BOUNDARY--\r\n"
+        )
+        path = tmp_path / "inline_and_attached.eml"
+        path.write_bytes(raw.encode("ascii"))
+
+        result = EmailProcessor().process(path)
+
+        assert "First part of the body." in result.content
+        assert "Second part of the body." in result.content
+        assert "Contents of the attached file." not in result.content
+
+        # When the attached file is all the text there is, it is shown (as before)
+        only_attached = (
+            "From: alice@example.com\r\n"
+            "To: bob@example.com\r\n"
+            "Subject: Only an attachment\r\n"
+            "MIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+            "\r\n"
+            "--BOUNDARY\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            'Content-Disposition: attachment; filename="notes.txt"\r\n'
+            "\r\n"
+            "Contents of the attached file.\r\n"
+            "--BOUNDARY--\r\n"
+        )
+        path = tmp_path / "only_attached.eml"
+        path.write_bytes(only_attached.encode("ascii"))
+
+        assert "Contents of the attached file." in EmailProcessor().process(path).content
+
+
+class TestUnknownCharset:
+    """A charset name Python has no codec for must not lose the whole message."""
+
+    @pytest.mark.parametrize(
+        "subtype, body",
+        [
+            ("plain", b"Caf\xc3\xa9 au lait"),
+            ("html", b"<p>Caf\xc3\xa9 au lait</p>"),
+        ],
+    )
+    def test_message_with_an_unknown_charset_is_still_read(self, tmp_path, subtype, body):
+        """Breaks if the LookupError of the standard-library text reader escapes process()."""
+        raw = (
+            b"From: alice@example.com\r\n"
+            b"To: bob@example.com\r\n"
+            b"Subject: Odd charset\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b"Content-Type: text/" + subtype.encode("ascii") + b'; charset="unknown-8bit"\r\n'
+            b"Content-Transfer-Encoding: 8bit\r\n"
+            b"\r\n" + body + b"\r\n"
+        )
+        path = tmp_path / "odd_charset.eml"
+        path.write_bytes(raw)
+
+        result = EmailProcessor().process(path)
+
+        assert "Odd charset" in result.content
+        # The bytes are UTF-8, the way nearly all mail that names no usable charset is written
+        assert b"Caf\xc3\xa9 au lait".decode("utf-8") in result.content
+
+
 class TestEmailProcessorInit:
     """Verify constructor accepts optional ocr and kwargs."""
 
