@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Batch processing no longer reports a PDF with pictures as failed.** `batch_process`,
+  `batch_process_files` and the batch convenience functions with `extract_images=True` wrote the base64
+  text of a PDF's pictures into a binary file; that raised `a bytes-like object is required, not 'str'`
+  after the Markdown file was written, and the PDF was listed as `failed`. The pictures are now decoded and
+  saved to `<name>_images/` like those of Word, PowerPoint and Excel files (the known issue is removed from
+  `docs/loading.rst`).
+- **E-mail (`.eml`): attachments are not body text, and an unknown charset name no longer loses the
+  message.** A `text/plain` attachment used to count as the body: a mail with an HTML body and a `.txt`
+  attachment showed only the attachment, and a plain mail got the attachment's text appended. Parts with
+  `Content-Disposition: attachment`, and everything inside an attached message, are now read only when
+  the message has no other text (so a mail whose only text is attached still shows it). A text part whose
+  charset name Python has no codec for (`unknown-8bit`, `iso-8859-8-i`) raised `LookupError` (reported as
+  `Processing failed: unknown encoding`); it is now read as UTF-8, replacing invalid bytes.
+- **The built-in HTML converter (used when `markdownify` is not installed, and for the HTML body of an
+  e-mail) no longer puts CSS and JavaScript into the Markdown, leaves a stray `[` for an anchor without
+  `href`, or writes backticks inside a fenced code block.** The converter used when `markdownify` is
+  installed is unchanged.
+
 ## [0.7.1] - 2026-10-01
 
 ### Documentation

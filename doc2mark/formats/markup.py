@@ -17,6 +17,9 @@ from doc2mark.core.base import (
 
 logger = logging.getLogger(__name__)
 
+# Elements whose text is code or styling, not document content
+_NON_CONTENT_TAGS = frozenset({'script', 'style'})
+
 
 class SimpleHTMLToMarkdown(HTMLParser):
     """Simple HTML to Markdown converter (from original UnifiedMarkdownLoader)"""
@@ -30,9 +33,14 @@ class SimpleHTMLToMarkdown(HTMLParser):
         self.in_pre = False
         self.in_code = False
         self.href = None
+        self.non_content_depth = 0
 
     def handle_starttag(self, tag, attrs):
         self.current_tag = tag
+
+        if tag in _NON_CONTENT_TAGS:
+            self.non_content_depth += 1
+            return
 
         if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
             level = int(tag[1])
@@ -47,7 +55,8 @@ class SimpleHTMLToMarkdown(HTMLParser):
             self.markdown.append('*')
         elif tag == 'code':
             self.in_code = True
-            self.markdown.append('`')
+            if not self.in_pre:  # inside a fenced block the backticks would become part of the code
+                self.markdown.append('`')
         elif tag == 'pre':
             self.in_pre = True
             self.markdown.append('\n```\n')
@@ -67,10 +76,12 @@ class SimpleHTMLToMarkdown(HTMLParser):
                 self.list_item_count += 1
                 self.markdown.append(f'{self.list_item_count}. ')
         elif tag == 'a':
+            self.href = None
             for attr in attrs:
                 if attr[0] == 'href':
-                    self.href = attr[1]
-            self.markdown.append('[')
+                    self.href = attr[1] or None
+            if self.href:  # an anchor without a target is plain text: no bracket that is never closed
+                self.markdown.append('[')
         elif tag == 'img':
             alt_text = ''
             src = ''
@@ -84,6 +95,10 @@ class SimpleHTMLToMarkdown(HTMLParser):
             self.markdown.append('\n---\n')
 
     def handle_endtag(self, tag):
+        if tag in _NON_CONTENT_TAGS:
+            self.non_content_depth = max(0, self.non_content_depth - 1)
+            return
+
         if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
             self.markdown.append('\n')
         elif tag == 'p':
@@ -94,7 +109,8 @@ class SimpleHTMLToMarkdown(HTMLParser):
             self.markdown.append('*')
         elif tag == 'code':
             self.in_code = False
-            self.markdown.append('`')
+            if not self.in_pre:
+                self.markdown.append('`')
         elif tag == 'pre':
             self.in_pre = False
             self.markdown.append('\n```\n')
@@ -108,6 +124,8 @@ class SimpleHTMLToMarkdown(HTMLParser):
             self.href = None
 
     def handle_data(self, data):
+        if self.non_content_depth:
+            return
         if self.in_pre:
             self.markdown.append(data)
         else:

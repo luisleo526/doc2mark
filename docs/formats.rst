@@ -193,8 +193,9 @@ Markup
 
 - **HTML** is parsed with BeautifulSoup and converted with ``markdownify`` when that package is
   installed (``pip install markdownify``; it is not a doc2mark dependency). Without it a much
-  simpler built-in converter is used and a warning is logged: tables are flattened and script or
-  style text can leak. Metadata: ``title``, ``word_count``, ``link_count``, ``image_count``.
+  simpler built-in converter is used and a warning is logged: tables are flattened and the spaces
+  next to bold, italic and link text are lost (the text of ``<script>`` and ``<style>`` is left
+  out). Metadata: ``title``, ``word_count``, ``link_count``, ``image_count``.
 - **XML** is parsed with defusedxml and written as a heading tree (element names as headings,
   attributes as lists, text kept). Metadata: ``root_tag``, ``element_count``.
 - **Markdown** is kept as written. YAML front matter is moved to ``metadata.frontmatter`` when
@@ -212,6 +213,9 @@ E-mail
 
 ``.eml`` files are read with the standard-library ``email`` package: ``# <Subject>``, then
 ``From``, ``To``, ``Cc`` and ``Date`` lines, a rule and the body. The body is every
-``text/plain`` part joined (including text attachments), or, without one, the ``text/html`` part
-converted with the built-in HTML converter. Attachments are not converted and nothing is OCR'd.
-The metadata has only the file name, format and size.
+``text/plain`` part joined, or, without one, the ``text/html`` part converted with the built-in
+HTML converter. Text the sender attached (a part with ``Content-Disposition: attachment``, or a
+message attached to this one) is not part of the body and never hides it; it is read only when
+the message has no other text. Attachments are not converted and nothing is OCR'd. A text part
+whose charset name Python has no codec for (``unknown-8bit``, ``iso-8859-8-i``) is read as UTF-8,
+with invalid bytes replaced. The metadata has only the file name, format and size.
