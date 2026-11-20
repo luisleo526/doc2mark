@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Text PDFs keep CJK characters in reading order when a fallback font is drawn separately.**
+  When reading a tagged LibreOffice PDF, doc2mark could move the first character of `值班表` after the
+  paragraph or split `健康檢查` mid-word. It now rejoins touching text fragments on the same horizontal baseline.
 - **Batch processing no longer reports a PDF with pictures as failed.** `batch_process`,
   `batch_process_files` and the batch convenience functions with `extract_images=True` wrote the base64
   text of a PDF's pictures into a binary file; that raised `a bytes-like object is required, not 'str'`
