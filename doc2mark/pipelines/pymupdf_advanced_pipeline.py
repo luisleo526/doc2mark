@@ -8,6 +8,7 @@ import unicodedata
 from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from itertools import groupby
 from pathlib import Path
 from typing import Callable, Dict, List, Any, Union, Optional, Tuple
 
@@ -3186,6 +3187,7 @@ class PDFLoader:
     def _prepare_text_blocks(self, blocks: List[Dict[str, Any]], body_size: float) -> List[Dict[str, Any]]:
         """Regroup PyMuPDF text blocks into the units Markdown needs.
 
+        - touching fragments of a line with a displaced CJK glyph are read left to right.
         - a list marker drawn as its own line (Word separates ``1.`` or U+F0B7 from the item
           text with a tab) is joined to the item text on the same row;
         - leading or trailing heading lines (larger, bolder or coloured) are split off the
@@ -3215,6 +3217,7 @@ class PDFLoader:
             lines = [line for line in block.get("lines", []) if self._raw_line_text(line).strip()]
             if lines:
                 top = (block.get("bbox") or self._boxes_union(*(line.get("bbox") for line in lines)) or (0.0, 0.0))[1]
+                lines = self._join_cjk_fragments(lines)
                 block = self._block_from_lines(block, self._join_marker_lines(lines))
                 block["_top"] = top
                 pieces.extend(self._split_block_by_style(block, view_of))
@@ -3239,6 +3242,34 @@ class PDFLoader:
             if index + 1 < len(prepared) and self._blocks_adjacent(block, prepared[index + 1], view_of):
                 block["_next_item"] = self._raw_line_text(prepared[index + 1]["lines"][0]).strip()
         return prepared
+
+    def _join_cjk_fragments(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Restore a physical line when a PDF paints a CJK fallback glyph out of order.
+
+        MuPDF can return each run as a separate line in paint order. Join only
+        fragments on one horizontal baseline whose edges touch in reading order.
+        Keep the original spans so an inline font change or space survives.
+        """
+        if len(lines) < 2 or not any(_CJK_CHAR.search(self._raw_line_text(line)) for line in lines):
+            return lines
+        joined = []
+        for baseline, group in groupby(lines, key=lambda line: self._line_geometry(line)[1]):
+            row = list(group)
+            if (baseline is None or len(row) < 2
+                    or any(line.get("wmode") or not line.get("bbox") for line in row)):
+                joined.extend(row)
+                continue
+            ordered = sorted(row, key=lambda line: line["bbox"][0])
+            spans = [span for line in ordered for span in line["spans"]]
+            # Glyph advances can round differently across fonts.
+            tolerance = 0.05 * min(span.get("size") or 0 for span in spans)
+            if (ordered != row and any(_CJK_CHAR.search(span.get("text") or "") for span in spans)
+                    and not any(span.get("bidi", 0) % 2 for span in spans)
+                    and all(abs(right["bbox"][0] - left["bbox"][2]) <= tolerance
+                            for left, right in zip(ordered, ordered[1:]))):
+                row = [dict(ordered[0], spans=spans, bbox=self._union_bbox(line["bbox"] for line in row))]
+            joined.extend(row)
+        return joined
 
     def _last_item_text(self, block: Dict[str, Any]) -> str:
         """Text of the last line of ``block`` that starts with a list marker ("" if none)."""
