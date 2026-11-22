@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 __author__ = "Hao Liang Wen"
 __email__ = "luisleo52655@gmail.com"
 
