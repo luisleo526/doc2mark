@@ -2,7 +2,7 @@ PDF text structure
 ==================
 
 A PDF's text layer is a set of positioned glyphs; doc2mark turns it into Markdown with PyMuPDF
-(1.27.1 or later) and deterministic rules. The rules keep the text as printed unless there is
+(``>=1.27.1,<2``) and deterministic rules. The rules keep the text as printed unless there is
 strong evidence to change it (*verbatim first*): when in doubt, a line stays where it is and as
 it is. Tables are described in :doc:`tables`, and which pages are OCR'd in :doc:`ocr_policy`.
 Each page after the first starts with a ``<!-- page N -->`` comment in the Markdown, and every

@@ -8,8 +8,8 @@ doc2mark needs Python 3.10 or later (CI tests 3.10 to 3.13).
    pip install doc2mark
 
 The base install converts PDF, Word, Excel, PowerPoint, images, HTML, XML, Markdown, text, CSV,
-JSON and e-mail files without any model or API key. Its dependencies are PyMuPDF 1.27.1 or
-later, numpy, python-docx, openpyxl, python-pptx, BeautifulSoup and lxml, Markdown, chardet,
+JSON and e-mail files without any model or API key. Its dependencies are PyMuPDF (``>=1.27.1,<2``),
+numpy, python-docx, openpyxl, python-pptx, BeautifulSoup and lxml, Markdown, chardet,
 Pillow, pydantic 2 and defusedxml. pandas is not a dependency: if your own code uses it, install
 it yourself.
 

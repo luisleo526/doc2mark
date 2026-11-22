@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Pin PyMuPDF below 2 until doc2mark supports 2.x.** Fresh doc2mark 0.7.2 installs on Python 3.11
+  and later pulled in PyMuPDF 2.1 and mishandled tables, rotated pages and image bands.
 - **Text PDFs keep CJK characters in reading order when a fallback font is drawn separately.**
   When reading a tagged LibreOffice PDF, doc2mark could move the first character of `值班表` after the
   paragraph or split `健康檢查` mid-word. It now rejoins touching text fragments on the same horizontal baseline.
